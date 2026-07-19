@@ -29,18 +29,32 @@ pub struct Keymap;
 impl Keymap {
     /// Global bindings. Kept as a `match` for locality; a later revision moves
     /// these into a config-driven table.
+    ///
+    /// **Windows Terminal caveat**: `Ctrl+Shift+P` is grabbed by WT for its
+    /// own command palette **by default** and never reaches this dispatcher.
+    /// Users on WT should either (a) unbind it in WT's Settings → Actions
+    /// or (b) use the `F1` alternate we register below. Same story with
+    /// `Alt+[` / `Alt+]`: some terminal setups swallow the Alt modifier on
+    /// ASCII punctuation, so we also accept `Ctrl+PageUp` / `Ctrl+PageDown`.
     pub fn dispatch(key: KeyEvent) -> KeymapOutcome {
+        tracing::trace!(?key, "keymap dispatch");
+
         // Ctrl+Q: quit.
         if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             return KeymapOutcome::Run("app.quit");
         }
-        // Ctrl+Shift+P: palette.
+        // Palette:
+        //   Ctrl+Shift+P  (design doc primary; blocked by WT by default)
+        //   F1            (alternate — no terminal is known to intercept F1)
         if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && key.modifiers.contains(KeyModifiers::SHIFT)
         {
+            return KeymapOutcome::Run("app.palette.open");
+        }
+        if matches!(key.code, KeyCode::F(1)) {
             return KeymapOutcome::Run("app.palette.open");
         }
         // Ctrl+T / Ctrl+W: new / close shell tab (only meaningful when shells
@@ -62,6 +76,19 @@ impl Keymap {
             && key.modifiers.contains(KeyModifiers::ALT)
         {
             return KeymapOutcome::Run("app.resize.toggle");
+        }
+        // Tab cycling — accept both bindings so at least one works on every
+        // terminal setup. Ctrl+PageUp/Down come through even on terminals
+        // that swallow the Alt modifier on `[` / `]`.
+        if matches!(key.code, KeyCode::PageUp)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return KeymapOutcome::Run("workspace.tab.prev");
+        }
+        if matches!(key.code, KeyCode::PageDown)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return KeymapOutcome::Run("workspace.tab.next");
         }
         // All Alt-modifier bindings share one block for clarity.
         if key.modifiers.contains(KeyModifiers::ALT) {
@@ -188,6 +215,37 @@ mod tests {
         assert_eq!(
             Keymap::dispatch(key(KeyCode::Char('['), KeyModifiers::ALT)),
             KeymapOutcome::Run("workspace.tab.prev"),
+        );
+    }
+
+    #[test]
+    fn f1_opens_palette() {
+        assert_eq!(
+            Keymap::dispatch(key(KeyCode::F(1), KeyModifiers::NONE)),
+            KeymapOutcome::Run("app.palette.open"),
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_p_opens_palette_when_terminal_lets_it_through() {
+        assert_eq!(
+            Keymap::dispatch(key(
+                KeyCode::Char('P'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            KeymapOutcome::Run("app.palette.open"),
+        );
+    }
+
+    #[test]
+    fn ctrl_pageup_pgdn_cycle_tab() {
+        assert_eq!(
+            Keymap::dispatch(key(KeyCode::PageUp, KeyModifiers::CONTROL)),
+            KeymapOutcome::Run("workspace.tab.prev"),
+        );
+        assert_eq!(
+            Keymap::dispatch(key(KeyCode::PageDown, KeyModifiers::CONTROL)),
+            KeymapOutcome::Run("workspace.tab.next"),
         );
     }
 

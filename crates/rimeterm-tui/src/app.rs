@@ -2480,7 +2480,6 @@ fn quadrant_title(idx: usize) -> &'static str {
         _ => "Focus shells (bottom-right)",
     }
 }
-
 /// Remove a pane from the registry; underlying Session's Drop closes the pty.
 fn drop_pane(panes: &mut PaneRegistry, id: PaneId) {
     if let Some(boxed) = panes.remove(id) {
@@ -2489,7 +2488,7 @@ fn drop_pane(panes: &mut PaneRegistry, id: PaneId) {
 }
 
 fn hint_bar_text() -> String {
-    "Ctrl+Q Quit · Ctrl+Shift+P Palette · Alt+H/J/K/L Nav · Alt+1..4 Quadrant · Alt+[/] Tab · Ctrl+T new shell · F10 Menu".into()
+    "Ctrl+Q Quit · F1 / Ctrl+Shift+P Palette · Alt+H/J/K/L Nav · Alt+1..4 Quadrant · Ctrl+PgUp/PgDn or Alt+[/] Tab · Ctrl+T new shell · F10 Menu".into()
 }
 
 fn point_in_rect(x: u16, y: u16, r: Rect) -> bool {
