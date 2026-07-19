@@ -141,7 +141,15 @@ impl Session {
             })?;
         let grid_reader = Arc::clone(&grid);
         let events_tx_reader = events_tx.clone();
-        tokio::task::spawn_blocking(move || read_loop(reader, grid_reader, events_tx_reader));
+        // Wrap the writer once here; `read_loop` needs a handle to it so
+        // it can respond to CSI DA / DSR queries from the child (Ink / TUI
+        // apps refuse to draw until those responses arrive).
+        let writer_shared: Arc<Mutex<Option<Box<dyn Write + Send>>>> =
+            Arc::new(Mutex::new(Some(writer)));
+        let writer_for_reader = Arc::clone(&writer_shared);
+        tokio::task::spawn_blocking(move || {
+            read_loop(reader, grid_reader, events_tx_reader, writer_for_reader)
+        });
 
         // Reap the child in a background task so we don't zombie it.
         let child_reaper = Arc::clone(&child);
@@ -163,7 +171,7 @@ impl Session {
                 child,
                 master,
                 grid,
-                writer: Arc::new(Mutex::new(Some(writer))),
+                writer: writer_shared,
                 events_tx,
             },
             events_rx,
@@ -218,6 +226,16 @@ impl Session {
     pub fn grid_contents(&self, rows: Option<u16>) -> String {
         let full = self.with_grid(|parser| parser.screen().contents());
         trim_to_last_rows(&full, rows)
+    }
+
+    /// Feed bytes directly into the vt100 grid **without** going through
+    /// the child's stdin. Used to paint synthetic messages (e.g. "[exit N]"
+    /// after the child dies) so the user isn't left staring at an empty
+    /// pane wondering why nothing happened.
+    pub fn inject_grid_bytes(&self, bytes: &[u8]) {
+        if let Ok(mut g) = self.grid.lock() {
+            g.process(bytes);
+        }
     }
 
     /// Rendered dimensions of the grid — cols, rows. Useful when a caller
@@ -291,10 +309,96 @@ mod trim_tests {
     }
 }
 
+#[cfg(test)]
+mod responder_tests {
+    use super::*;
+    use parking_lot::Mutex as PlMutex;
+
+    // Sink writes into a parking_lot::Mutex<Vec<u8>> shared across the
+    // test — replaces `std::sync::Mutex<Vec<u8>>` because we immediately
+    // touch the guard and don't want the poison-recovery boilerplate.
+    struct Sink(Arc<PlMutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn writer_with_sink() -> (
+        Arc<PlMutex<Vec<u8>>>,
+        Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+    ) {
+        // The outer Mutex must be std::sync to match respond_to_terminal_queries'
+        // signature (chosen for the real writer, which lives in Session).
+        let replies: Arc<PlMutex<Vec<u8>>> = Arc::new(PlMutex::new(Vec::new()));
+        let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(
+            Some(Box::new(Sink(Arc::clone(&replies))) as Box<dyn Write + Send>),
+        ));
+        (replies, writer)
+    }
+
+    #[test]
+    fn da1_query_produces_reply() {
+        let (replies, writer) = writer_with_sink();
+        let grid = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        respond_to_terminal_queries(b"\x1b[c", &grid, &writer);
+        assert_eq!(&*replies.lock(), b"\x1b[?6c");
+    }
+
+    #[test]
+    fn da2_query_produces_reply() {
+        let (replies, writer) = writer_with_sink();
+        let grid = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        respond_to_terminal_queries(b"\x1b[>c", &grid, &writer);
+        assert_eq!(&*replies.lock(), b"\x1b[>0;0;0c");
+    }
+
+    #[test]
+    fn dsr_status_reports_ok() {
+        let (replies, writer) = writer_with_sink();
+        let grid = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        respond_to_terminal_queries(b"\x1b[5n", &grid, &writer);
+        assert_eq!(&*replies.lock(), b"\x1b[0n");
+    }
+
+    #[test]
+    fn dsr_cursor_position_replies_with_current_pos() {
+        let (replies, writer) = writer_with_sink();
+        let grid = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        grid.lock()
+            .expect("grid mutex")
+            .process(b"\x1b[3;5H");
+        respond_to_terminal_queries(b"\x1b[6n", &grid, &writer);
+        assert_eq!(&*replies.lock(), b"\x1b[3;5R");
+    }
+
+    #[test]
+    fn unrelated_bytes_produce_no_reply() {
+        let (replies, writer) = writer_with_sink();
+        let grid = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        respond_to_terminal_queries(b"hello world\x1b[31mred\x1b[0m", &grid, &writer);
+        assert!(replies.lock().is_empty());
+    }
+
+    #[test]
+    fn multiple_queries_in_one_chunk() {
+        let (replies, writer) = writer_with_sink();
+        let grid = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        // DA1 + DSR status back-to-back.
+        respond_to_terminal_queries(b"\x1b[c\x1b[5n", &grid, &writer);
+        assert_eq!(&*replies.lock(), b"\x1b[?6c\x1b[0n");
+    }
+}
+
 fn read_loop(
     mut reader: Box<dyn std::io::Read + Send>,
     grid: Arc<Mutex<vt100::Parser>>,
     tx: mpsc::UnboundedSender<SessionOutput>,
+    writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
 ) {
     // 8 KiB matches ConPTY internal ring size on modern Windows.
     let mut buf = [0u8; 8192];
@@ -305,9 +409,15 @@ fn read_loop(
                 return;
             }
             Ok(n) => {
+                let slice = &buf[..n];
                 if let Ok(mut g) = grid.lock() {
-                    g.process(&buf[..n]);
+                    g.process(slice);
                 }
+                // Terminal-capability queries: many TUI apps (Ink / React
+                // in oh-my-pi, ncurses, prompt-toolkit) block on these
+                // before drawing. `vt100` is display-only and doesn't
+                // synthesize responses, so we do it here.
+                respond_to_terminal_queries(slice, &grid, &writer);
                 if tx.send(SessionOutput::Redraw).is_err() {
                     // Receiver dropped — session dead.
                     return;
@@ -317,6 +427,71 @@ fn read_loop(
                 warn!(error = %e, "pty read loop errored");
                 return;
             }
+        }
+    }
+}
+
+/// Scan a chunk of PTY output for common terminal-capability queries and
+/// write appropriate responses back into the child's stdin. Only the
+/// queries that real-world TUI apps actually block on:
+///
+/// | query                | reply                                      |
+/// |----------------------|--------------------------------------------|
+/// | `ESC[c`  / `ESC[0c`  | `ESC[?6c`   — DA1 (VT102)                  |
+/// | `ESC[>c` / `ESC[>0c` | `ESC[>0;0;0c` — DA2 (unknown terminal)     |
+/// | `ESC[5n`             | `ESC[0n`    — DSR: OK                      |
+/// | `ESC[6n`             | `ESC[<row>;<col>R` — cursor position       |
+///
+/// Any other CSI sequence is left alone; the child either doesn't care or
+/// tolerates silence.
+fn respond_to_terminal_queries(
+    data: &[u8],
+    grid: &Arc<Mutex<vt100::Parser>>,
+    writer: &Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+) {
+    let mut reply: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i + 1 < data.len() {
+        if data[i] != 0x1b || data[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        // Skim to the final byte (`@..~`) that ends a CSI sequence.
+        let start = i;
+        let mut j = i + 2;
+        while j < data.len() && !(0x40..=0x7e).contains(&data[j]) {
+            j += 1;
+        }
+        if j >= data.len() {
+            break;
+        }
+        let seq = &data[start..=j];
+        match seq {
+            b"\x1b[c" | b"\x1b[0c" => reply.extend_from_slice(b"\x1b[?6c"),
+            b"\x1b[>c" | b"\x1b[>0c" => reply.extend_from_slice(b"\x1b[>0;0;0c"),
+            b"\x1b[5n" => reply.extend_from_slice(b"\x1b[0n"),
+            b"\x1b[6n" => {
+                // Cursor position: consult the current vt100 grid state.
+                let (row, col) = if let Ok(g) = grid.lock() {
+                    let (r, c) = g.screen().cursor_position();
+                    (r + 1, c + 1) // vt100 CSI positions are 1-based
+                } else {
+                    (1, 1)
+                };
+                use std::io::Write as _;
+                let _ = write!(&mut reply, "\x1b[{};{}R", row, col);
+            }
+            _ => {}
+        }
+        i = j + 1;
+    }
+    if reply.is_empty() {
+        return;
+    }
+    if let Ok(mut w) = writer.lock() {
+        if let Some(w) = w.as_mut() {
+            let _ = w.write_all(&reply);
+            let _ = w.flush();
         }
     }
 }

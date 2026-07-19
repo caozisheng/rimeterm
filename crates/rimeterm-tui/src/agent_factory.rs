@@ -47,10 +47,36 @@ pub fn spawn_external(
     let (session, mut rx) = Session::spawn(cfg)
         .with_context(|| format!("spawning `{}`", program.display()))?;
 
+    let display_for_log = display_name.clone();
+    // Wire the session's event stream to (a) the app-wide redraw pulse and
+    // (b) a visible in-grid `[exit N]` marker when the child dies. Without
+    // (b) the pane just goes blank and the user can't tell whether their
+    // agent died at spawn, immediately after, or is still starting.
+    let session_for_events = session.clone();
     tokio::spawn(async move {
-        while rx.recv().await.is_some() {
-            if redraw.send(()).is_err() {
-                break;
+        while let Some(evt) = rx.recv().await {
+            match evt {
+                rimeterm_pty::SessionOutput::Redraw => {
+                    if redraw.send(()).is_err() {
+                        break;
+                    }
+                }
+                rimeterm_pty::SessionOutput::Exited { status } => {
+                    tracing::warn!(
+                        agent = display_for_log.as_str(),
+                        status,
+                        "external tool exited"
+                    );
+                    // Paint a visible marker into the vt100 grid. `\r\n` +
+                    // reverse video + reset makes it stand out on any theme.
+                    let msg = format!(
+                        "\r\n\x1b[7m[{} exited: status {}]\x1b[0m\r\n",
+                        display_for_log, status
+                    );
+                    session_for_events.inject_grid_bytes(msg.as_bytes());
+                    let _ = redraw.send(());
+                    break;
+                }
             }
         }
     });
