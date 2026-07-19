@@ -1,0 +1,19 @@
+[package]
+name = "rimectl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI client for the local rimeterm IPC."
+
+[[bin]]
+name = "rimectl"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+rimeterm-ipc = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util"] }
+serde_json = "1"
+anyhow = { workspace = true }

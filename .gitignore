@@ -1,0 +1,20 @@
+# Build output
+/target/
+
+# Rust
+**/*.rs.bk
+Cargo.lock.bak
+
+# Design docs (kept local per repo owner's request; not pushed to public repo)
+/docs/
+
+# IDE / editor scratch
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# rimeterm runtime artefacts that could sneak in from a local run
+/rimeterm-*.log
+*.pid

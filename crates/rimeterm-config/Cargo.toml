@@ -1,0 +1,19 @@
+[package]
+name = "rimeterm-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TOML configuration + XDG/APPDATA path resolution for rimeterm."
+
+[lints]
+workspace = true
+
+[dependencies]
+rimeterm-core = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+directories = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+which = { workspace = true }
+anyhow = { workspace = true }

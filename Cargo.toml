@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rimeterm",
+    "crates/rimeterm-core",
+    "crates/rimeterm-config",
+    "crates/rimeterm-pty",
+    "crates/rimeterm-ipc",
+    "crates/rimectl",
+    "crates/rimeterm-tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+repository = "https://github.com/rimeterm/rimeterm"
+description = "TUI-native terminal built for coding agents."
+
+[workspace.dependencies]
+# workspace-internal
+rimeterm-core   = { path = "crates/rimeterm-core",   version = "0.1.0" }
+rimeterm-config = { path = "crates/rimeterm-config", version = "0.1.0" }
+rimeterm-pty    = { path = "crates/rimeterm-pty",    version = "0.1.0" }
+rimeterm-tui    = { path = "crates/rimeterm-tui",    version = "0.1.0" }
+
+rimeterm-ipc    = { path = "crates/rimeterm-ipc",    version = "0.1.0" }
+# third-party
+tokio         = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "time"] }
+tokio-stream  = { version = "0.1", features = ["sync"] }
+crossterm     = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
+ratatui       = { version = "0.30", default-features = false, features = ["crossterm", "std"] }
+serde         = { version = "1", features = ["derive"] }
+toml          = "0.9"
+vt100         = "0.16"
+portable-pty  = "0.9"
+anyhow        = "1"
+thiserror     = "2"
+bytes         = "1"
+tracing       = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+which         = "8"
+directories   = "6"
+unicode-width = "0.2"
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+needless_pass_by_value = "warn"
+redundant_clone = "warn"

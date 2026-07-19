@@ -1,0 +1,25 @@
+[package]
+name = "rimeterm-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PTY host: portable-pty + vt100 parser + shell detection."
+
+[lints]
+workspace = true
+
+[dependencies]
+rimeterm-core = { workspace = true }
+portable-pty = { workspace = true }
+vt100 = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+which = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+parking_lot = "0.12"

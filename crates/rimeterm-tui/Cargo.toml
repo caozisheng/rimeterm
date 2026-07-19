@@ -1,0 +1,28 @@
+[package]
+name = "rimeterm-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ratatui front-end: renderer, keymap, layout, app-menu."
+
+[lints]
+workspace = true
+
+[dependencies]
+rimeterm-core = { workspace = true }
+rimeterm-config = { workspace = true }
+rimeterm-pty = { workspace = true }
+rimeterm-ipc = { workspace = true }
+serde_json = "1"
+parking_lot = "0.12"
+serde = { workspace = true }
+vt100 = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+regex = "1.10"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+which = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,67 @@
+//! Factory for spawning a fresh shell [`PtyPane`].
+//!
+//! v0.1 (M0) returned the raw per-session receiver; M1 forwards it into a
+//! shared "redraw" signal so the app main loop can `select!` over one channel
+//! regardless of how many sessions exist.
+
+use std::path::PathBuf;
+
+use anyhow::{anyhow, Context, Result};
+use rimeterm_pty::{PtyBackend, Session, SessionConfig, ShellChoice};
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::pty_pane::PtyPane;
+
+/// Result of a successful spawn: the pane and nothing else (the session's
+/// output has been wired directly into the shared redraw signal).
+pub struct ShellSpawn {
+    pub pane: PtyPane,
+}
+
+pub fn spawn_shell(
+    shell: &ShellChoice,
+    cwd: PathBuf,
+    display_name: String,
+    initial_cols: u16,
+    initial_rows: u16,
+    redraw: UnboundedSender<()>,
+) -> Result<ShellSpawn> {
+    let program = shell
+        .path()
+        .ok_or_else(|| anyhow!("no shell resolved; set [core].shell_win / shell_unix"))?
+        .to_path_buf();
+
+    let cfg = SessionConfig {
+        program: program.clone(),
+        args: Vec::new(),
+        cwd: Some(cwd),
+        env: default_env(),
+        cols: initial_cols,
+        rows: initial_rows,
+        backend: PtyBackend::Native,
+    };
+
+    let (session, mut rx) = Session::spawn(cfg)
+        .with_context(|| format!("spawning shell `{}`", program.display()))?;
+
+    // Forwarder: coalesce every SessionOutput into a single redraw pulse.
+    tokio::spawn(async move {
+        while rx.recv().await.is_some() {
+            if redraw.send(()).is_err() {
+                break;
+            }
+        }
+    });
+
+    Ok(ShellSpawn {
+        pane: PtyPane::new(session, display_name),
+    })
+}
+
+fn default_env() -> Vec<(String, String)> {
+    // §6.2 Windows column: force UTF-8; harmless on other OSes.
+    vec![
+        ("PYTHONIOENCODING".into(), "utf-8".into()),
+        ("TERM".into(), "xterm-256color".into()),
+    ]
+}
