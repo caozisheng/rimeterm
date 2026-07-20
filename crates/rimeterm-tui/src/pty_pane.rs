@@ -132,8 +132,10 @@ impl PaneProvider for PtyPane {
         // Cheap poll — no-op when nothing is pending.
         self.tick_resize(Instant::now());
 
-        // Blit vt100 grid cell-by-cell.
-        self.session.with_grid(|parser| {
+        // Blit vt100 grid cell-by-cell. Also snapshot the vt100 cursor
+        // position and visibility while we hold the parser lock — cheap
+        // and avoids a second lookup.
+        let (vt_cursor_row, vt_cursor_col, vt_hide_cursor) = self.session.with_grid(|parser| {
             let screen = parser.screen();
             for row in 0..inner.height {
                 for col in 0..inner.width {
@@ -170,10 +172,25 @@ impl PaneProvider for PtyPane {
                     target.set_style(style);
                 }
             }
+            let (r, c) = screen.cursor_position();
+            (r, c, screen.hide_cursor())
         });
+
+        // Only the focused pane owns the caret. Unfocused shells still
+        // update their vt100 cursor as output arrives, but the OS caret
+        // should stay with whichever pane the user is typing into.
+        // DECTCEM (ESC[?25l) hides the caret regardless of focus.
+        let cursor = translate_cursor(
+            ctx.focused,
+            vt_hide_cursor,
+            inner,
+            vt_cursor_row,
+            vt_cursor_col,
+        );
 
         RenderOutcome {
             request_redraw: false,
+            cursor,
         }
     }
 
@@ -250,6 +267,41 @@ pub(crate) fn inner_rect(outer: Rect) -> Rect {
         width: inset_w,
         height: inset_h,
     }
+}
+
+/// Translate a vt100 grid cursor position into an absolute frame position
+/// suitable for `ratatui::terminal::Frame::set_cursor_position`.
+///
+/// Returns `None` when the caret should NOT be visible:
+/// - the pane is unfocused (only the focused pane owns the OS caret), or
+/// - vt100 says the child hid the caret via DECTCEM (`ESC[?25l`), or
+/// - the cursor position (from a stale grid) landed outside `inner`
+///   after a shrink resize (safety clamp — otherwise ratatui would try
+///   to place the caret past the terminal edge).
+///
+/// `inner` is the pane's rendered rect AFTER the border/title inset. The
+/// vt100 `(row, col)` values are already inner-relative (0-based from
+/// the top-left of the child's viewport).
+///
+/// Pure so we can unit-test focus / hide-cursor / clamp behavior without
+/// spinning up a real PTY.
+pub(crate) fn translate_cursor(
+    focused: bool,
+    hide_cursor: bool,
+    inner: Rect,
+    row: u16,
+    col: u16,
+) -> Option<(u16, u16)> {
+    if !focused || hide_cursor {
+        return None;
+    }
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    if row >= inner.height || col >= inner.width {
+        return None;
+    }
+    Some((inner.x + col, inner.y + row))
 }
 
 /// True when `(x, y)` lies inside `r` (inclusive left/top, exclusive
@@ -490,5 +542,78 @@ mod mouse_tests {
         assert!(!point_in_rect(9, 0, inner)); // top-right border cell
         assert!(!point_in_rect(0, 4, inner)); // bottom-left border cell
         assert!(point_in_rect(1, 1, inner)); // first content cell
+    }
+
+    // --- translate_cursor (focus / hide / clamp) ---
+
+    fn inner_10x5() -> Rect {
+        Rect {
+            x: 3,
+            y: 4,
+            width: 10,
+            height: 5,
+        }
+    }
+
+    #[test]
+    fn cursor_none_when_pane_unfocused() {
+        // Even a normal, visible vt100 cursor should not steal the OS
+        // caret from whichever pane is actually focused.
+        assert_eq!(translate_cursor(false, false, inner_10x5(), 2, 3), None);
+    }
+
+    #[test]
+    fn cursor_none_when_child_hid_it_via_dectcem() {
+        // A curses / TUI child that emits ESC[?25l expects no visible
+        // caret; we honor that even if we're focused.
+        assert_eq!(translate_cursor(true, true, inner_10x5(), 2, 3), None);
+    }
+
+    #[test]
+    fn cursor_maps_grid_pos_to_absolute_frame_pos_when_focused() {
+        // vt100 grid (row=2, col=3) inside an inner rect at (3, 4)
+        // must translate to absolute (x=6, y=6).
+        assert_eq!(
+            translate_cursor(true, false, inner_10x5(), 2, 3),
+            Some((6, 6))
+        );
+    }
+
+    #[test]
+    fn cursor_at_grid_origin_maps_to_inner_origin() {
+        assert_eq!(
+            translate_cursor(true, false, inner_10x5(), 0, 0),
+            Some((3, 4))
+        );
+    }
+
+    #[test]
+    fn cursor_none_when_grid_pos_outside_inner_after_resize() {
+        // Shrunk pane: vt100's grid may still say row=8 for a tick after
+        // resize; clamping to None avoids painting the caret past the
+        // pane's rendered area (which ratatui would translate into the
+        // hint bar / another pane).
+        assert_eq!(translate_cursor(true, false, inner_10x5(), 8, 0), None);
+        assert_eq!(translate_cursor(true, false, inner_10x5(), 0, 20), None);
+    }
+
+    #[test]
+    fn cursor_none_when_inner_rect_collapsed() {
+        // 0-width or 0-height inner rect (mid-teardown / extreme resize)
+        // must not produce a caret position.
+        let collapsed = Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 5,
+        };
+        assert_eq!(translate_cursor(true, false, collapsed, 0, 0), None);
+        let collapsed = Rect {
+            x: 0,
+            y: 0,
+            width: 5,
+            height: 0,
+        };
+        assert_eq!(translate_cursor(true, false, collapsed, 0, 0), None);
     }
 }

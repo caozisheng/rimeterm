@@ -686,9 +686,12 @@ impl App {
         // is dropped at the end of `run`.
         let ipc_shutdown = self.spawn_ipc_server().await;
 
-        guard
-            .terminal
-            .draw(|f| self.draw(f.area(), f.buffer_mut()))?;
+        guard.terminal.draw(|f| {
+            let cursor = self.draw(f.area(), f.buffer_mut());
+            if let Some((x, y)) = cursor {
+                f.set_cursor_position((x, y));
+            }
+        })?;
 
         loop {
             if self.should_quit || self.flags.quit.load(Ordering::Relaxed) {
@@ -715,9 +718,12 @@ impl App {
                 _ = tokio::time::sleep(Duration::from_millis(16)) => {}
             }
 
-            guard
-                .terminal
-                .draw(|f| self.draw(f.area(), f.buffer_mut()))?;
+            guard.terminal.draw(|f| {
+                let cursor = self.draw(f.area(), f.buffer_mut());
+                if let Some((x, y)) = cursor {
+                    f.set_cursor_position((x, y));
+                }
+            })?;
         }
         if let Some(tx) = ipc_shutdown {
             let _ = tx.send(()).await;
@@ -1496,7 +1502,7 @@ impl App {
         }
     }
 
-    fn draw(&mut self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    fn draw(&mut self, area: Rect, buf: &mut ratatui::buffer::Buffer) -> Option<(u16, u16)> {
         let vertical = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1518,6 +1524,10 @@ impl App {
         self.last_dividers = self.tree.dividers(vertical[1]);
         self.last_tab_strips.clear();
         self.last_pane_outer_rects.clear();
+        // Filled by the focused pane's render (see below). Overlays
+        // (menu/palette/picker) override to `None` at the end of draw
+        // so the caret doesn't leak past them.
+        let mut focused_cursor: Option<(u16, u16)> = None;
 
         // Compute the rect for each *tab group cell*, then split off a 1-row
         // tab strip inside each cell. This is simpler than tracking tab strips
@@ -1556,11 +1566,19 @@ impl App {
                 if let Some(active_id) = group.active_pane() {
                     self.last_pane_outer_rects.push((active_id, pane_rect));
                     if let Some(pane) = self.panes.get_mut(active_id) {
+                        let focused = self.focus.focused_pane() == Some(active_id);
                         let ctx = PaneRenderCtx {
-                            focused: self.focus.focused_pane() == Some(active_id),
+                            focused,
                             title_override: None,
                         };
-                        pane.render(pane_rect, buf, &ctx);
+                        let outcome = pane.render(pane_rect, buf, &ctx);
+                        // Only the focused pane's caret request is
+                        // captured — every other pane's `cursor` is
+                        // discarded. Overlays (menu/palette/picker)
+                        // override this at the end of draw().
+                        if focused {
+                            focused_cursor = outcome.cursor;
+                        }
                     }
                 }
             }
@@ -1673,9 +1691,19 @@ impl App {
             crate::picker::render(rect, buf, &self.picker_state);
         }
 
+        // Suppress the caret when any overlay owns the input focus.
+        // Menu/palette/picker draw their own selection markers; a
+        // stray shell caret bleeding through would be confusing.
+        let cursor = if self.menu_state.open || self.palette_state.open || self.picker_state.open {
+            None
+        } else {
+            focused_cursor
+        };
+
         // Snapshot state for IPC consumers (§11). Cheap: reads &self + writes
         // a small owned struct; no PTY I/O.
         self.refresh_snapshot();
+        cursor
     }
 
     /// Apply every pending IPC mutation, sending the outcome on each

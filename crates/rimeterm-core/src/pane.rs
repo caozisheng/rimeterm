@@ -51,6 +51,19 @@ pub struct PaneRenderCtx<'a> {
 pub struct RenderOutcome {
     /// Ask the runloop to schedule another frame ASAP (streaming output, etc).
     pub request_redraw: bool,
+
+    /// Where the terminal's text caret should sit at the end of the frame,
+    /// in ABSOLUTE frame coordinates (not pane-local). `None` = pane doesn't
+    /// want a caret (ratatui hides it by default). Only the currently
+    /// focused pane's value is honored; the kernel discards requests from
+    /// unfocused panes so a shell in the background can't move the caret
+    /// out from under the focused one.
+    ///
+    /// PtyPane producers translate `vt100::Screen::cursor_position()` into
+    /// this rect after adding the pane's inner origin. Providers that
+    /// don't own a caret (PlaceholderPane, native menus) leave this
+    /// `None`.
+    pub cursor: Option<(u16, u16)>,
 }
 
 /// Any renderable region in rimeterm is a `PaneProvider`.
