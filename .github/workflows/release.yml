@@ -20,6 +20,11 @@
 #   * macOS   → `rimeterm-<version>-aarch64-apple-darwin.tar.gz` (Apple Silicon only)
 #   * Windows → `rimeterm-<version>-x86_64-pc-windows-msvc.zip`
 #
+# Installers (v0.1.2+, alongside the archives):
+#   * Windows → `rimeterm-<version>-x86_64.msi`    (cargo-wix, Program Files\rimeterm)
+#   * Linux   → `rimeterm_<version>-1_amd64.deb`   (cargo-deb, /usr/bin)
+#   * macOS   → `rimeterm-<version>-aarch64.pkg`   (pkgbuild, /usr/local/bin, unsigned)
+#
 # On tag pushes `<version>` == the tag minus the leading `v`; on manual
 # dispatch it's the short commit SHA so pre-release artefacts are traceable.
 
@@ -163,6 +168,118 @@ jobs:
         with:
           name: rimeterm-${{ steps.version.outputs.value }}-${{ matrix.target }}
           path: ${{ steps.archive.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      # ─── Installers ─────────────────────────────────────────────
+      # Native installer per OS. Only runs on the matching matrix row;
+      # cargo-wix / cargo-deb / pkgbuild each need slightly different
+      # setup, so we split by target instead of trying a single script.
+
+      - name: Install cargo-wix (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo install cargo-wix --locked --version ^0.3
+
+      - name: Generate WiX template (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        # `--force` regenerates unattended (no prompt). `--eula false`
+        # + `--license false` skip the license dialog pages so the
+        # installer is single-click. GUIDs come from
+        # [package.metadata.wix] in crates/rimeterm/Cargo.toml.
+        run: |
+          set -euo pipefail
+          cd crates/rimeterm
+          cargo wix init --force --license false --eula false
+
+      - name: Build MSI (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        id: msi
+        shell: bash
+        # `--no-build` reuses the release binary we already compiled a
+        # few steps up, saving another 90 s of link time.
+        run: |
+          set -euo pipefail
+          cd crates/rimeterm
+          cargo wix --no-build \
+            --install-version "${{ steps.version.outputs.value }}" \
+            --nocapture \
+            --output "../../rimeterm-${{ steps.version.outputs.value }}-x86_64.msi"
+          ls -la "../../rimeterm-${{ steps.version.outputs.value }}-x86_64.msi"
+          echo "path=rimeterm-${{ steps.version.outputs.value }}-x86_64.msi" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Install cargo-deb (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo install cargo-deb --locked --version ^2
+
+      - name: Build .deb (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        id: deb
+        shell: bash
+        # `--no-build` reuses the already-compiled release binary;
+        # metadata sourced from [package.metadata.deb] in
+        # crates/rimeterm/Cargo.toml (assets, description, etc).
+        run: |
+          set -euo pipefail
+          cargo deb --no-build -p rimeterm -o "rimeterm-${{ steps.version.outputs.value }}_amd64.deb"
+          ls -la "rimeterm-${{ steps.version.outputs.value }}_amd64.deb"
+          echo "path=rimeterm-${{ steps.version.outputs.value }}_amd64.deb" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Build .pkg (macOS)
+        if: matrix.target == 'aarch64-apple-darwin'
+        id: pkg
+        shell: bash
+        # Unsigned pkg — Gatekeeper requires right-click Open on first
+        # launch. Codesign / notarize would need an Apple Developer
+        # account; deferred to a later checkpoint.
+        #
+        # Layout inside the pkg:
+        #   /usr/local/bin/rimeterm
+        #   /usr/local/bin/rimectl
+        #   /usr/local/share/doc/rimeterm/{README,LICENSE,ACKNOWLEDGEMENTS}
+        run: |
+          set -euo pipefail
+          ROOT="pkgroot"
+          mkdir -p "$ROOT/usr/local/bin"
+          mkdir -p "$ROOT/usr/local/share/doc/rimeterm"
+          cp target/${{ matrix.target }}/release/rimeterm "$ROOT/usr/local/bin/"
+          cp target/${{ matrix.target }}/release/rimectl  "$ROOT/usr/local/bin/"
+          cp README.md            "$ROOT/usr/local/share/doc/rimeterm/README"
+          cp LICENSE              "$ROOT/usr/local/share/doc/rimeterm/LICENSE"
+          cp ACKNOWLEDGEMENTS.md  "$ROOT/usr/local/share/doc/rimeterm/ACKNOWLEDGEMENTS"
+          OUT="rimeterm-${{ steps.version.outputs.value }}-aarch64.pkg"
+          pkgbuild \
+            --root "$ROOT" \
+            --identifier "com.rimeterm.app" \
+            --version "${{ steps.version.outputs.value }}" \
+            --install-location "/" \
+            "$OUT"
+          ls -la "$OUT"
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve installer path
+        id: installer
+        shell: bash
+        # Only one of the three installer steps ran (guarded by matrix
+        # target). Collect its output into a single variable so the
+        # upload step has a stable name to reference.
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
+            echo "path=${{ steps.msi.outputs.path }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            echo "path=${{ steps.deb.outputs.path }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
+            echo "path=${{ steps.pkg.outputs.path }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload installer artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rimeterm-${{ steps.version.outputs.value }}-${{ matrix.target }}-installer
+          path: ${{ steps.installer.outputs.path }}
           if-no-files-found: error
           retention-days: 30
 
