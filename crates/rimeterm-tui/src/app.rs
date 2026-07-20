@@ -188,6 +188,24 @@ struct DragState {
     baseline_ratios: Vec<f32>,
 }
 
+/// Which divider the mouse pointer is currently over. Terminals don't let
+/// us swap the OS mouse cursor to a resize icon (no ANSI escape exists),
+/// so we compensate visually: the seam paints bright on hover and the hint
+/// bar shows `↔ drag to resize`. See `App::hovered_divider`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HoveredDivider {
+    pub path: rimeterm_core::layout::SplitPath,
+    pub boundary: usize,
+    /// Axis of the parent split. `Horizontal` = side-by-side panes,
+    /// vertical seam glyph `↔`. `Vertical` = stacked panes, horizontal
+    /// seam glyph `↕`.
+    pub axis: ratatui::layout::Direction,
+    /// The 1-cell-wide rect the seam occupies. Cached so `render` can
+    /// tint it without re-consulting `last_dividers` (which is rebuilt
+    /// every frame from the tree).
+    pub rect: Rect,
+}
+
 /// Which seam a keyboard resize step is aimed at, relative to the focused cell.
 #[derive(Copy, Clone, Debug)]
 enum ResizeTarget {
@@ -300,6 +318,17 @@ pub struct App {
     /// `pane.render` received). Different from `LayoutTree::compute_rects`
     /// output, which returns the full quadrant cell including its tab strip.
     last_pane_outer_rects: Vec<(PaneId, Rect)>,
+    /// Divider under the mouse cursor RIGHT NOW (updated on every
+    /// MouseEventKind::Moved). Painted with a hover highlight and shows a
+    /// `↔ drag to resize` hint in the bottom bar so users know the seam
+    /// is interactive — terminal apps can't change the OS mouse-cursor
+    /// shape, so we compensate visually. Cleared to `None` when the
+    /// pointer leaves any divider rect.
+    ///
+    /// Keyed by `(SplitPath, boundary)` — the same key that identifies
+    /// a divider in `last_dividers`. `Direction` is cached so the
+    /// hint / glyph don't need a second lookup.
+    hovered_divider: Option<HoveredDivider>,
     /// Reverse map from agent PaneId → static registry id (`omp` / `codex`
     /// / `claude` / `pi`). Populated on spawn, consumed by
     /// `persist_agents_state` to write the on-disk file.
@@ -594,6 +623,7 @@ impl App {
             last_dividers: Vec::new(),
             last_tab_strips: Vec::new(),
             last_pane_outer_rects: Vec::new(),
+            hovered_divider: None,
             pane_agent_id: startup_agent_ids.into_iter().collect(),
             active_drag: None,
             default_ratios,
@@ -859,6 +889,24 @@ impl App {
                 self.flush_pending_resizes();
                 return;
             }
+        }
+
+        // --- Move (no button): hover tracking for dividers ---
+        //
+        // Terminals don't expose a hook to change the OS mouse cursor
+        // shape (no ANSI escape covers it), so we mark the seam itself
+        // as interactive: paint it bright and drop `↔ drag to resize`
+        // into the hint bar. Compare-then-set avoids gratuitous
+        // redraws when the pointer slides along the same divider row.
+        if let MouseEventKind::Moved = m.kind {
+            let new_hover = find_hovered_divider(&self.last_dividers, m.column, m.row);
+            if new_hover != self.hovered_divider {
+                self.hovered_divider = new_hover;
+                // Wake the main loop so the seam repaints in the next
+                // frame instead of waiting for the next input event.
+                let _ = self.redraw_tx.send(());
+            }
+            return;
         }
 
         // --- Right Down: open the context menu (never forward to child) ---
@@ -1402,12 +1450,51 @@ impl App {
             }
         }
 
-        // Hint bar: transient hint wins, else default keys line.
-        let hint_text = self
-            .hint
-            .as_ref()
-            .map(|(m, _)| m.clone())
-            .unwrap_or_else(hint_bar_text);
+        // Divider hover overlay (§C16): terminals don't let us change the
+        // OS mouse cursor to a resize glyph, so we tint the seam bright +
+        // bold when the pointer is on it. The seam cells already hold
+        // pane-border glyphs (`│` for vertical splits, `─` for horizontal)
+        // — we just replace their style, keeping the character intact so
+        // the frame stays visually consistent.
+        if let Some(hovered) = &self.hovered_divider {
+            let style = Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD);
+            for y in hovered.rect.y..hovered.rect.y.saturating_add(hovered.rect.height) {
+                for x in hovered.rect.x..hovered.rect.x.saturating_add(hovered.rect.width) {
+                    // Skip cells outside the terminal grid — defensive
+                    // against out-of-window seams after resize.
+                    if x >= area.x.saturating_add(area.width)
+                        || y >= area.y.saturating_add(area.height)
+                    {
+                        continue;
+                    }
+                    buf[(x, y)].set_style(style);
+                }
+            }
+        }
+
+        // Hint bar: divider hover > transient hint > default keys.
+        // Hover wins because terminals can't repaint the mouse pointer;
+        // the hint bar is the only place we can advertise "this seam is
+        // interactive" without stealing focus.
+        let hint_text = if let Some(hovered) = &self.hovered_divider {
+            match hovered.axis {
+                Direction::Horizontal => {
+                    "↔ drag to resize · Ctrl+Alt+R for keyboard resize · right-click for menu"
+                        .to_string()
+                }
+                Direction::Vertical => {
+                    "↕ drag to resize · Ctrl+Alt+R for keyboard resize · right-click for menu"
+                        .to_string()
+                }
+            }
+        } else {
+            self.hint
+                .as_ref()
+                .map(|(m, _)| m.clone())
+                .unwrap_or_else(hint_bar_text)
+        };
         Paragraph::new(Line::from(hint_text))
             .style(Style::default().add_modifier(Modifier::DIM))
             .render(vertical[2], buf);
@@ -3196,6 +3283,26 @@ fn point_in_rect(x: u16, y: u16, r: Rect) -> bool {
     x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
 }
 
+/// Return the [`HoveredDivider`] matching `(col, row)` inside `dividers`,
+/// or `None` if the cursor is off every seam. Pure — no App state — so
+/// it's cheap to call every `MouseEventKind::Moved` (fires roughly once
+/// per pixel of mouse motion) and unit-testable without a live App.
+pub(crate) fn find_hovered_divider(
+    dividers: &[rimeterm_core::layout::Divider],
+    col: u16,
+    row: u16,
+) -> Option<HoveredDivider> {
+    dividers
+        .iter()
+        .find(|d| point_in_rect(col, row, d.visual.rect))
+        .map(|d| HoveredDivider {
+            path: d.path.clone(),
+            boundary: d.boundary,
+            axis: d.visual.axis,
+            rect: d.visual.rect,
+        })
+}
+
 /// Parse the string form of a `TabGroupId` back to a static id. Called
 /// from `run_context_intent` to decode `tab.close:shells:2` style tags.
 fn parse_group_id(s: &str) -> Option<TabGroupId> {
@@ -3685,5 +3792,92 @@ mod tests {
     fn tool_action_args_accept_valid_name() {
         let name = parse_tool_action_args(&wait_args_json(r#"{"name":"gitui"}"#)).unwrap();
         assert_eq!(name, "gitui");
+    }
+
+    // --- find_hovered_divider (C16 hover tracking) ---
+
+    fn mk_divider(
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        axis: Direction,
+    ) -> rimeterm_core::layout::Divider {
+        rimeterm_core::layout::Divider {
+            path: rimeterm_core::layout::SplitPath::root(),
+            boundary: 0,
+            visual: rimeterm_core::layout::DividerRect {
+                axis,
+                rect: Rect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn hovered_divider_none_when_no_dividers() {
+        assert!(find_hovered_divider(&[], 10, 10).is_none());
+    }
+
+    #[test]
+    fn hovered_divider_none_when_outside_all_rects() {
+        // Vertical seam at x=20, rows 5..15.
+        let d = mk_divider(20, 5, 1, 10, Direction::Horizontal);
+        assert!(
+            find_hovered_divider(&[d.clone()], 19, 5).is_none(),
+            "just left"
+        );
+        assert!(
+            find_hovered_divider(&[d.clone()], 21, 5).is_none(),
+            "just right"
+        );
+        assert!(find_hovered_divider(&[d.clone()], 20, 4).is_none(), "above");
+        assert!(
+            find_hovered_divider(&[d], 20, 15).is_none(),
+            "below (row 15 is exclusive)"
+        );
+    }
+
+    #[test]
+    fn hovered_divider_matches_when_inside_rect() {
+        let d = mk_divider(20, 5, 1, 10, Direction::Horizontal);
+        let h = find_hovered_divider(&[d.clone()], 20, 10).expect("should hit");
+        // Same key + axis + rect.
+        assert_eq!(h.axis, Direction::Horizontal);
+        assert_eq!(h.rect, d.visual.rect);
+        assert_eq!(h.boundary, 0);
+    }
+
+    #[test]
+    fn hovered_divider_picks_first_when_rects_overlap() {
+        // Two dividers at the same rect — first-match wins. Real layouts
+        // never produce overlapping seams (dividers live in disjoint
+        // splits), but the function must still be deterministic.
+        let a = mk_divider(10, 5, 1, 10, Direction::Horizontal);
+        let b = mk_divider(10, 5, 1, 10, Direction::Vertical);
+        let h = find_hovered_divider(&[a.clone(), b], 10, 7).unwrap();
+        assert_eq!(h.axis, Direction::Horizontal);
+    }
+
+    #[test]
+    fn hovered_divider_axis_reports_split_direction() {
+        // Horizontal split → vertical seam (side-by-side panes). Vertical
+        // split → horizontal seam (stacked panes). The axis on
+        // HoveredDivider is the parent split direction, which drives the
+        // hint-bar glyph (↔ vs ↕) in draw().
+        let hz = mk_divider(50, 0, 1, 20, Direction::Horizontal);
+        assert_eq!(
+            find_hovered_divider(&[hz], 50, 10).unwrap().axis,
+            Direction::Horizontal
+        );
+        let vt = mk_divider(0, 10, 100, 1, Direction::Vertical);
+        assert_eq!(
+            find_hovered_divider(&[vt], 50, 10).unwrap().axis,
+            Direction::Vertical
+        );
     }
 }
