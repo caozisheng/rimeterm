@@ -59,7 +59,7 @@ pub struct RenderOutcome {
     /// unfocused panes so a shell in the background can't move the caret
     /// out from under the focused one.
     ///
-    /// PtyPane producers translate `vt100::Screen::cursor_position()` into
+    /// PtyPane producers translate `alacritty grid cursor` into
     /// this rect after adding the pane's inner origin. Providers that
     /// don't own a caret (PlaceholderPane, native menus) leave this
     /// `None`.

@@ -2823,7 +2823,7 @@ fn register_commands(
         register(cmds, cmd)?;
     }
 
-    // Read the vt100 grid of any live PTY pane. `args = {pane_id: u64,
+    // Read the alacritty grid of any live PTY pane. `args = {pane_id: u64,
     // rows?: u16}`. Optional `rows` trims to the last N visible lines
     // (capped at 200 to avoid gigantic responses on scrollback-heavy panes).
     {
@@ -3191,7 +3191,7 @@ fn register_commands(
 }
 
 /// Read this many rows off the grid on every poll of
-/// `workspace.pane.wait`. Chosen to cover even oversize terminals; the vt100
+/// `workspace.pane.wait`. Chosen to cover even oversize terminals; the alacritty
 /// grid usually holds ≤ 60 rows, so this is generous.
 const WAIT_READ_ROWS: u16 = 200;
 const WAIT_MAX_TIMEOUT_MS: u64 = 60_000;

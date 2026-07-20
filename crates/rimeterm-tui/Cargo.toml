@@ -16,7 +16,7 @@ rimeterm-ipc = { workspace = true }
 serde_json = "1"
 parking_lot = "0.12"
 serde = { workspace = true }
-vt100 = { workspace = true }
+alacritty_terminal = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
 tokio = { workspace = true }

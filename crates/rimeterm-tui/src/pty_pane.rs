@@ -1,9 +1,9 @@
 //! Single-session PTY pane.
 //!
-//! Wraps [`rimeterm_pty::Session`] and blits its vt100 grid into a ratatui
-//! [`Buffer`]. v0.1 renders cell-by-cell using [`vt100::Screen`] APIs — good
-//! enough for correctness in the M0 skeleton; a later pass batches contiguous
-//! runs of same-style cells for speed.
+//! C17: renderer now walks alacritty's `Term::grid().display_iter()`
+//! and translates `alacritty_terminal::term::cell::Cell` into ratatui
+//! buffer cells. Wide chars, alt-screen swap, and richer color / flag
+//! bitmasks all come for free from the alacritty parser.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
@@ -12,6 +12,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Widget};
 use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
 use rimeterm_pty::{Decision, ResizeThrottle, Session};
+
+use alacritty_terminal::term::TermMode;
+use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::vte::ansi::{Color as AlacColor, NamedColor};
 
 use std::time::Instant;
 
@@ -132,52 +136,60 @@ impl PaneProvider for PtyPane {
         // Cheap poll — no-op when nothing is pending.
         self.tick_resize(Instant::now());
 
-        // Blit vt100 grid cell-by-cell. Also snapshot the vt100 cursor
-        // position and visibility while we hold the parser lock — cheap
-        // and avoids a second lookup.
-        let (vt_cursor_row, vt_cursor_col, vt_hide_cursor) = self.session.with_grid(|parser| {
-            let screen = parser.screen();
-            for row in 0..inner.height {
-                for col in 0..inner.width {
-                    let cell_x = inner.x + col;
-                    let cell_y = inner.y + row;
-                    let Some(cell) = screen.cell(row, col) else {
-                        continue;
-                    };
-                    let target = &mut buf[(cell_x, cell_y)];
-                    let ch = cell.contents();
-                    if ch.is_empty() {
-                        target.set_char(' ');
-                    } else {
-                        // For wide chars we currently write the first codepoint;
-                        // a proper impl would set the second cell to `empty()`.
-                        let first = ch.chars().next().unwrap_or(' ');
-                        target.set_char(first);
-                    }
-                    let mut style = Style::default();
-                    style = apply_vt100_color(style, cell.fgcolor(), true);
-                    style = apply_vt100_color(style, cell.bgcolor(), false);
-                    if cell.bold() {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    if cell.italic() {
-                        style = style.add_modifier(Modifier::ITALIC);
-                    }
-                    if cell.underline() {
-                        style = style.add_modifier(Modifier::UNDERLINED);
-                    }
-                    if cell.inverse() {
-                        style = style.add_modifier(Modifier::REVERSED);
-                    }
-                    target.set_style(style);
+        // Blit alacritty's grid cell-by-cell via `display_iter()`, which
+        // yields the visible viewport in row-major order (Indexed<&Cell>).
+        // While we hold the term lock, snapshot the cursor position +
+        // SHOW_CURSOR mode for the caret handoff to ratatui.
+        //
+        // Wide chars: alacritty stores a wide grapheme's leading cell
+        // with `Flags::WIDE_CHAR` and its trailing half with
+        // `Flags::WIDE_CHAR_SPACER`. Skipping the spacer avoids painting
+        // a phantom character in the second column while still letting
+        // the underlying `set_char` cover both cells visually (ratatui
+        // widens automatically for wide chars written via `set_char`).
+        let (vt_cursor_row, vt_cursor_col, vt_hide_cursor) = self.session.with_term(|term| {
+            let inner_cols = inner.width as usize;
+            let inner_rows = inner.height as usize;
+            for indexed in term.grid().display_iter() {
+                let row = indexed.point.line.0;
+                let col = indexed.point.column.0;
+                // display_iter yields scrollback lines with negative
+                // `.line.0` — clamp to visible viewport (0..inner_h).
+                if row < 0 {
+                    continue;
                 }
+                let row_u = row as usize;
+                if row_u >= inner_rows || col >= inner_cols {
+                    continue;
+                }
+                // Skip the trailing half of a wide char / any leading
+                // spacer — we already painted the leading half.
+                if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                    || indexed.cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                let cell_x = inner.x + col as u16;
+                let cell_y = inner.y + row_u as u16;
+                let target = &mut buf[(cell_x, cell_y)];
+                let ch = indexed.cell.c;
+                // '\0' is alacritty's empty-cell sentinel. Render as
+                // space so the buffer isn't full of holes for ratatui's
+                // diff engine.
+                target.set_char(if ch == '\0' { ' ' } else { ch });
+                target.set_style(alac_cell_style(indexed.cell));
             }
-            let (r, c) = screen.cursor_position();
-            (r, c, screen.hide_cursor())
+            let point = term.grid().cursor.point;
+            let hide = !term.mode().contains(TermMode::SHOW_CURSOR);
+            // alacritty line can be negative for scrollback rows;
+            // clamp for the caret query.
+            let r = point.line.0.max(0) as u16;
+            let c = point.column.0 as u16;
+            (r, c, hide)
         });
 
         // Only the focused pane owns the caret. Unfocused shells still
-        // update their vt100 cursor as output arrives, but the OS caret
+        // update their alacritty cursor as output arrives, but the OS caret
         // should stay with whichever pane the user is typing into.
         // DECTCEM (ESC[?25l) hides the caret regardless of focus.
         let cursor = translate_cursor(
@@ -227,31 +239,86 @@ impl PaneProvider for PtyPane {
     }
 }
 
-fn apply_vt100_color(style: Style, color: vt100::Color, foreground: bool) -> Style {
-    let c = match color {
-        vt100::Color::Default => return style,
-        vt100::Color::Idx(i) => match i {
-            0 => Color::Black,
-            1 => Color::Red,
-            2 => Color::Green,
-            3 => Color::Yellow,
-            4 => Color::Blue,
-            5 => Color::Magenta,
-            6 => Color::Cyan,
-            7 => Color::Gray,
-            8 => Color::DarkGray,
-            9 => Color::LightRed,
-            10 => Color::LightGreen,
-            11 => Color::LightYellow,
-            12 => Color::LightBlue,
-            13 => Color::LightMagenta,
-            14 => Color::LightCyan,
-            15 => Color::White,
-            other => Color::Indexed(other),
+/// Translate an alacritty [`Cell`] into a ratatui [`Style`].
+///
+/// Maps the fg/bg color enum and the flag bitset. Underline variants
+/// collapse to a single `UNDERLINED` modifier (ratatui doesn't
+/// distinguish double / curly / dotted underlines, so we accept the
+/// downgrade rather than silently dropping them).
+fn alac_cell_style(cell: &Cell) -> Style {
+    let mut style = Style::default();
+    if let Some(fg) = alac_color(cell.fg, true) {
+        style = style.fg(fg);
+    }
+    if let Some(bg) = alac_color(cell.bg, false) {
+        style = style.bg(bg);
+    }
+    let f = cell.flags;
+    if f.contains(Flags::BOLD) {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if f.contains(Flags::DIM) {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    if f.contains(Flags::ITALIC) {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if f.intersects(Flags::ALL_UNDERLINES) {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if f.contains(Flags::INVERSE) {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    if f.contains(Flags::STRIKEOUT) {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if f.contains(Flags::HIDDEN) {
+        style = style.add_modifier(Modifier::HIDDEN);
+    }
+    style
+}
+
+/// Translate an alacritty color into a ratatui color. Returns `None`
+/// for `Named(Foreground)` / `Named(Background)` — those are the
+/// "use the terminal default" sentinels and rimeterm has no palette
+/// mapping for them yet (v0.1: let the terminal emulator fill in).
+fn alac_color(color: AlacColor, foreground: bool) -> Option<Color> {
+    Some(match color {
+        AlacColor::Named(NamedColor::Foreground)
+        | AlacColor::Named(NamedColor::DimForeground)
+        | AlacColor::Named(NamedColor::BrightForeground) => {
+            // Foreground defaults inherit from the host terminal; ratatui
+            // renders as Reset when we don't set a color. Only meaningful
+            // for fg because bg defaults are the terminal-clear color.
+            if foreground {
+                return None;
+            }
+            Color::Reset
+        }
+        AlacColor::Named(NamedColor::Background) => return None,
+        AlacColor::Named(named) => match named {
+            NamedColor::Black | NamedColor::DimBlack => Color::Black,
+            NamedColor::Red | NamedColor::DimRed => Color::Red,
+            NamedColor::Green | NamedColor::DimGreen => Color::Green,
+            NamedColor::Yellow | NamedColor::DimYellow => Color::Yellow,
+            NamedColor::Blue | NamedColor::DimBlue => Color::Blue,
+            NamedColor::Magenta | NamedColor::DimMagenta => Color::Magenta,
+            NamedColor::Cyan | NamedColor::DimCyan => Color::Cyan,
+            NamedColor::White | NamedColor::DimWhite => Color::Gray,
+            NamedColor::BrightBlack => Color::DarkGray,
+            NamedColor::BrightRed => Color::LightRed,
+            NamedColor::BrightGreen => Color::LightGreen,
+            NamedColor::BrightYellow => Color::LightYellow,
+            NamedColor::BrightBlue => Color::LightBlue,
+            NamedColor::BrightMagenta => Color::LightMagenta,
+            NamedColor::BrightCyan => Color::LightCyan,
+            NamedColor::BrightWhite => Color::White,
+            // Cursor / underline / etc. — leave to the terminal default.
+            _ => return None,
         },
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
-    };
-    if foreground { style.fg(c) } else { style.bg(c) }
+        AlacColor::Spec(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
+        AlacColor::Indexed(i) => Color::Indexed(i),
+    })
 }
 
 /// Inset the outer pane rect by 1 cell on every side to match the block
@@ -269,18 +336,18 @@ pub(crate) fn inner_rect(outer: Rect) -> Rect {
     }
 }
 
-/// Translate a vt100 grid cursor position into an absolute frame position
+/// Translate a alacritty grid cursor position into an absolute frame position
 /// suitable for `ratatui::terminal::Frame::set_cursor_position`.
 ///
 /// Returns `None` when the caret should NOT be visible:
 /// - the pane is unfocused (only the focused pane owns the OS caret), or
-/// - vt100 says the child hid the caret via DECTCEM (`ESC[?25l`), or
+/// - alacritty says the child hid the caret via DECTCEM (`ESC[?25l`), or
 /// - the cursor position (from a stale grid) landed outside `inner`
 ///   after a shrink resize (safety clamp — otherwise ratatui would try
 ///   to place the caret past the terminal edge).
 ///
 /// `inner` is the pane's rendered rect AFTER the border/title inset. The
-/// vt100 `(row, col)` values are already inner-relative (0-based from
+/// alacritty `(row, col)` values are already inner-relative (0-based from
 /// the top-left of the child's viewport).
 ///
 /// Pure so we can unit-test focus / hide-cursor / clamp behavior without
@@ -557,7 +624,7 @@ mod mouse_tests {
 
     #[test]
     fn cursor_none_when_pane_unfocused() {
-        // Even a normal, visible vt100 cursor should not steal the OS
+        // Even a normal, visible alacritty cursor should not steal the OS
         // caret from whichever pane is actually focused.
         assert_eq!(translate_cursor(false, false, inner_10x5(), 2, 3), None);
     }
@@ -571,7 +638,7 @@ mod mouse_tests {
 
     #[test]
     fn cursor_maps_grid_pos_to_absolute_frame_pos_when_focused() {
-        // vt100 grid (row=2, col=3) inside an inner rect at (3, 4)
+        // alacritty grid (row=2, col=3) inside an inner rect at (3, 4)
         // must translate to absolute (x=6, y=6).
         assert_eq!(
             translate_cursor(true, false, inner_10x5(), 2, 3),
@@ -589,7 +656,7 @@ mod mouse_tests {
 
     #[test]
     fn cursor_none_when_grid_pos_outside_inner_after_resize() {
-        // Shrunk pane: vt100's grid may still say row=8 for a tick after
+        // Shrunk pane: alacritty's grid may still say row=8 for a tick after
         // resize; clamping to None avoids painting the caret past the
         // pane's rendered area (which ratatui would translate into the
         // hint bar / another pane).

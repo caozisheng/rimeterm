@@ -1,7 +1,7 @@
 //! PTY host for rimeterm.
 //!
 //! Wraps [`portable_pty`] (ConPTY on Windows 1809+, openpty on Unix) and feeds
-//! bytes into a [`vt100::Parser`] whose grid drives the PtyPane provider.
+//! bytes into a [`alacritty_terminal::term::Term`] whose grid drives the PtyPane provider.
 //!
 //! v0.1 exposes one [`Session`] with a single spawned child. Multi-shell / tab
 //! groups sit on top in later crates.

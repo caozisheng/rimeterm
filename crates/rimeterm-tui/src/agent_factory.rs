@@ -67,7 +67,7 @@ pub fn spawn_external(
                         status,
                         "external tool exited"
                     );
-                    // Paint a visible marker into the vt100 grid. `\r\n` +
+                    // Paint a visible marker into the alacritty grid. `\r\n` +
                     // reverse video + reset makes it stand out on any theme.
                     let msg = format!(
                         "\r\n\x1b[7m[{} exited: status {}]\x1b[0m\r\n",
