@@ -200,9 +200,12 @@ pub(crate) struct HoveredDivider {
     /// vertical seam glyph `↔`. `Vertical` = stacked panes, horizontal
     /// seam glyph `↕`.
     pub axis: ratatui::layout::Direction,
-    /// The 1-cell-wide rect the seam occupies. Cached so `render` can
-    /// tint it without re-consulting `last_dividers` (which is rebuilt
-    /// every frame from the tree).
+    /// The 1-cell-wide rect the seam occupied AT HOVER TIME. Snapshot
+    /// only — `draw()` re-lookups the current rect from
+    /// `last_dividers` via `(path, boundary)` because ratios can shift
+    /// between the Moved event and the next frame (mid-drag,
+    /// concurrent keyboard resize, terminal resize). Kept here for
+    /// diagnostics and tests.
     pub rect: Rect,
 }
 
@@ -887,6 +890,13 @@ impl App {
                 // §19.12.6: on mouse-up the throttler is bypassed so the
                 // final drag size lands exactly on the PTY.
                 self.flush_pending_resizes();
+                // Clear the hover cache: the seam almost certainly moved
+                // under the cursor during the drag, so any pre-drag
+                // `hovered_divider` is stale. The very next `Moved`
+                // event will re-populate it with the current position.
+                if self.hovered_divider.take().is_some() {
+                    let _ = self.redraw_tx.send(());
+                }
                 return;
             }
         }
@@ -1450,20 +1460,38 @@ impl App {
             }
         }
 
-        // Divider hover overlay (§C16): terminals don't let us change the
-        // OS mouse cursor to a resize glyph, so we tint the seam bright +
-        // bold when the pointer is on it. The seam cells already hold
-        // pane-border glyphs (`│` for vertical splits, `─` for horizontal)
-        // — we just replace their style, keeping the character intact so
-        // the frame stays visually consistent.
-        if let Some(hovered) = &self.hovered_divider {
+        // Divider hover overlay (§C16): terminals don't let us change
+        // the OS mouse cursor to a resize glyph, so we tint the seam
+        // bright + bold when the pointer is on it. The seam cells
+        // already hold pane-border glyphs (`│` for vertical splits, `─`
+        // for horizontal) — we just replace their style, keeping the
+        // character intact so the frame stays visually consistent.
+        //
+        // Two guards:
+        // 1. Skip overlay entirely during an active drag. The drag
+        //    itself is the affordance and `hovered_divider.rect` is
+        //    frozen from the pre-drag hover — painting it during drag
+        //    leaves yellow pollution on cells the seam has already
+        //    moved away from.
+        // 2. Re-lookup the CURRENT rect from `last_dividers` keyed by
+        //    (path, boundary). Ratios change over time (keyboard
+        //    resize, layout reset, terminal resize) and the cached
+        //    rect inside `hovered_divider` is only trustworthy on the
+        //    frame it was recorded. Fresh lookup on every draw keeps
+        //    the overlay in lockstep with reality.
+        let live_hover = live_hover_overlay(
+            self.active_drag.is_some(),
+            self.hovered_divider.as_ref(),
+            &self.last_dividers,
+        );
+        if let Some((seam_rect, _)) = live_hover {
             let style = Style::default()
                 .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD);
-            for y in hovered.rect.y..hovered.rect.y.saturating_add(hovered.rect.height) {
-                for x in hovered.rect.x..hovered.rect.x.saturating_add(hovered.rect.width) {
-                    // Skip cells outside the terminal grid — defensive
-                    // against out-of-window seams after resize.
+            for y in seam_rect.y..seam_rect.y.saturating_add(seam_rect.height) {
+                for x in seam_rect.x..seam_rect.x.saturating_add(seam_rect.width) {
+                    // Defensive: skip cells outside the terminal grid
+                    // (e.g. right after a shrink resize).
                     if x >= area.x.saturating_add(area.width)
                         || y >= area.y.saturating_add(area.height)
                     {
@@ -1474,12 +1502,15 @@ impl App {
             }
         }
 
-        // Hint bar: divider hover > transient hint > default keys.
+        // Hint bar: live divider hover > transient hint > default keys.
         // Hover wins because terminals can't repaint the mouse pointer;
         // the hint bar is the only place we can advertise "this seam is
-        // interactive" without stealing focus.
-        let hint_text = if let Some(hovered) = &self.hovered_divider {
-            match hovered.axis {
+        // interactive" without stealing focus. During an active drag we
+        // fall through to the default hint too (`live_hover` is None),
+        // so mid-drag we see the normal keybind row instead of a stale
+        // "↔ drag to resize" tip.
+        let hint_text = if let Some((_, axis)) = live_hover {
+            match axis {
                 Direction::Horizontal => {
                     "↔ drag to resize · Ctrl+Alt+R for keyboard resize · right-click for menu"
                         .to_string()
@@ -3303,6 +3334,33 @@ pub(crate) fn find_hovered_divider(
         })
 }
 
+/// Resolve the current-frame hover overlay: the seam rect + axis to
+/// paint, or `None` to skip the overlay entirely.
+///
+/// Returns `None` when either:
+/// - `dragging` is true (drag itself is the affordance; painting the
+///   stale hover during drag pollutes cells the seam has already
+///   moved away from), or
+/// - the tracked hover key isn't in `dividers` anymore (rare — happens
+///   right after a layout mutation like `workspace.layout.reset`).
+///
+/// Pure so we can unit-test the "no paint during drag" and "re-lookup
+/// fresh rect" invariants without a live App / PTY.
+pub(crate) fn live_hover_overlay(
+    dragging: bool,
+    hovered: Option<&HoveredDivider>,
+    dividers: &[rimeterm_core::layout::Divider],
+) -> Option<(Rect, ratatui::layout::Direction)> {
+    if dragging {
+        return None;
+    }
+    let hovered = hovered?;
+    dividers
+        .iter()
+        .find(|d| d.path == hovered.path && d.boundary == hovered.boundary)
+        .map(|d| (d.visual.rect, hovered.axis))
+}
+
 /// Parse the string form of a `TabGroupId` back to a static id. Called
 /// from `run_context_intent` to decode `tab.close:shells:2` style tags.
 fn parse_group_id(s: &str) -> Option<TabGroupId> {
@@ -3879,5 +3937,78 @@ mod tests {
             find_hovered_divider(&[vt], 50, 10).unwrap().axis,
             Direction::Vertical
         );
+    }
+
+    // --- live_hover_overlay (drag-safety + freshness) ---
+
+    fn mk_hovered(x: u16, y: u16, w: u16, h: u16, axis: Direction) -> HoveredDivider {
+        HoveredDivider {
+            path: rimeterm_core::layout::SplitPath::root(),
+            boundary: 0,
+            axis,
+            rect: Rect {
+                x,
+                y,
+                width: w,
+                height: h,
+            },
+        }
+    }
+
+    #[test]
+    fn overlay_none_when_dragging_even_with_matching_hover() {
+        // The dragging guard exists precisely because the cached hover
+        // rect is stale mid-drag (seam has moved, but hover state
+        // hasn't been refreshed yet). Returning `None` here suppresses
+        // the yellow-pollution bug where the pre-drag seam cells stay
+        // painted while the actual seam has slid elsewhere.
+        let d = mk_divider(20, 5, 1, 10, Direction::Horizontal);
+        let h = mk_hovered(20, 5, 1, 10, Direction::Horizontal);
+        assert!(live_hover_overlay(true, Some(&h), &[d]).is_none());
+    }
+
+    #[test]
+    fn overlay_none_when_no_hover_tracked() {
+        // Nothing hovered → nothing to paint. Trivial but locks in the
+        // early-return path.
+        let d = mk_divider(20, 5, 1, 10, Direction::Horizontal);
+        assert!(live_hover_overlay(false, None, &[d]).is_none());
+    }
+
+    #[test]
+    fn overlay_uses_fresh_rect_from_dividers_not_cached_snapshot() {
+        // Simulate the "ratios changed between Moved and next frame"
+        // case: hover cache still says (20,5), but the live divider is
+        // now at (30,5). Overlay must paint (30,5), not the stale
+        // (20,5) — otherwise the yellow highlight would trail the
+        // actual seam and pollute normal pane cells.
+        let stale_hover = mk_hovered(20, 5, 1, 10, Direction::Horizontal);
+        let live_divider = mk_divider(30, 5, 1, 10, Direction::Horizontal);
+        let (rect, axis) = live_hover_overlay(false, Some(&stale_hover), &[live_divider]).unwrap();
+        assert_eq!(rect.x, 30, "should read live divider's x, not cached 20");
+        assert_eq!(axis, Direction::Horizontal);
+    }
+
+    #[test]
+    fn overlay_none_when_hovered_divider_disappeared() {
+        // If a layout mutation dropped the divider (e.g.
+        // `workspace.layout.reset` restructured the tree), the hover
+        // key won't match any current divider. Bail — safer than
+        // painting whatever the first divider happens to be.
+        let stale_hover = mk_hovered(20, 5, 1, 10, Direction::Horizontal);
+        let unrelated = rimeterm_core::layout::Divider {
+            path: rimeterm_core::layout::SplitPath::root().push(0),
+            boundary: 0,
+            visual: rimeterm_core::layout::DividerRect {
+                axis: Direction::Vertical,
+                rect: Rect {
+                    x: 0,
+                    y: 15,
+                    width: 40,
+                    height: 1,
+                },
+            },
+        };
+        assert!(live_hover_overlay(false, Some(&stale_hover), &[unrelated]).is_none());
     }
 }
