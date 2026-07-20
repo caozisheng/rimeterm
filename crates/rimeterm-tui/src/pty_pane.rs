@@ -29,9 +29,12 @@ pub struct PtyPane {
 }
 
 impl PtyPane {
-    pub fn new(session: Session, title: impl Into<String>) -> Self {
+    /// Construct with a caller-chosen `PaneId`. Used by the OSC bridge
+    /// (§5.5, C18-D) so the read-loop forwarder can tag broadcast events
+    /// with the same id before the pane is registered.
+    pub fn with_id(id: PaneId, session: Session, title: impl Into<String>) -> Self {
         Self {
-            id: PaneId::next(),
+            id,
             title: title.into(),
             session,
             last_area: Rect::default(),

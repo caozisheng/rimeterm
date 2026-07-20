@@ -29,6 +29,7 @@ pub fn spawn_external(
     initial_cols: u16,
     initial_rows: u16,
     redraw: UnboundedSender<()>,
+    osc_tx: UnboundedSender<(rimeterm_core::pane::PaneId, String)>,
 ) -> Result<ExternalSpawn> {
     let cfg = SessionConfig {
         program: program.clone(),
@@ -47,11 +48,16 @@ pub fn spawn_external(
     let (session, mut rx) =
         Session::spawn(cfg).with_context(|| format!("spawning `{}`", program.display()))?;
 
+    // Mint the PaneId up-front so the forwarder can tag OSC events with
+    // the origin pane. `PtyPane::with_id` reuses the same id below.
+    let pane_id = rimeterm_core::pane::PaneId::next();
+
     let display_for_log = display_name.clone();
-    // Wire the session's event stream to (a) the app-wide redraw pulse and
-    // (b) a visible in-grid `[exit N]` marker when the child dies. Without
-    // (b) the pane just goes blank and the user can't tell whether their
-    // agent died at spawn, immediately after, or is still starting.
+    // Wire the session's event stream to (a) the app-wide redraw pulse,
+    // (b) a visible in-grid `[exit N]` marker when the child dies, and
+    // (c) the OSC 1337 rimeterm bridge (C18-D). Without (b) the pane
+    // just goes blank and the user can't tell whether their agent died
+    // at spawn, immediately after, or is still starting.
     let session_for_events = session.clone();
     tokio::spawn(async move {
         while let Some(evt) = rx.recv().await {
@@ -59,6 +65,12 @@ pub fn spawn_external(
                 rimeterm_pty::SessionOutput::Redraw => {
                     if redraw.send(()).is_err() {
                         break;
+                    }
+                }
+                rimeterm_pty::SessionOutput::OscRimeterm { payload } => {
+                    if osc_tx.send((pane_id, payload)).is_err() {
+                        // OSC receiver went away — still keep the pane
+                        // alive; just stop tagging OSCs.
                     }
                 }
                 rimeterm_pty::SessionOutput::Exited { status } => {
@@ -82,11 +94,12 @@ pub fn spawn_external(
     });
 
     Ok(ExternalSpawn {
-        pane: PtyPane::new(session, display_name),
+        pane: crate::pty_pane::PtyPane::with_id(pane_id, session, display_name),
     })
 }
 
-/// Alias kept for M3 callers.
+/// Alias kept for M3 callers. Forwards to [`spawn_external`] with all
+/// the same params — including the C18-D OSC channel.
 pub fn spawn_agent(
     program: PathBuf,
     args: Vec<String>,
@@ -95,6 +108,7 @@ pub fn spawn_agent(
     initial_cols: u16,
     initial_rows: u16,
     redraw: UnboundedSender<()>,
+    osc_tx: UnboundedSender<(rimeterm_core::pane::PaneId, String)>,
 ) -> Result<ExternalSpawn> {
     spawn_external(
         program,
@@ -104,5 +118,6 @@ pub fn spawn_agent(
         initial_cols,
         initial_rows,
         redraw,
+        osc_tx,
     )
 }

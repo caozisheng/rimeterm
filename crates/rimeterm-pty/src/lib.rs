@@ -8,11 +8,13 @@
 
 pub mod agent_detect;
 pub mod agent_registry;
+pub mod osc_bridge;
 pub mod resize_throttle;
 pub mod session;
 pub mod shell_detect;
 
 pub use agent_detect::{AgentAvailability, ToolAvailability, detect_agent, detect_tool};
+pub use osc_bridge::{OSC_MAX_PAYLOAD_BYTES, OscScanner};
 pub use resize_throttle::{Decision, PLATFORM_RESIZE_DEBOUNCE, ResizeThrottle};
 pub use session::{PtyBackend, Session, SessionConfig, SessionError, SessionOutput};
 pub use shell_detect::{ShellChoice, detect_default_shell};

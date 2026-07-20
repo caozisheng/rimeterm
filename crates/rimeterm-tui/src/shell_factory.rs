@@ -17,7 +17,6 @@ use crate::pty_pane::PtyPane;
 pub struct ShellSpawn {
     pub pane: PtyPane,
 }
-
 pub fn spawn_shell(
     shell: &ShellChoice,
     cwd: PathBuf,
@@ -25,6 +24,7 @@ pub fn spawn_shell(
     initial_cols: u16,
     initial_rows: u16,
     redraw: UnboundedSender<()>,
+    osc_tx: UnboundedSender<(rimeterm_core::pane::PaneId, String)>,
 ) -> Result<ShellSpawn> {
     let program = shell
         .path()
@@ -44,17 +44,32 @@ pub fn spawn_shell(
     let (session, mut rx) =
         Session::spawn(cfg).with_context(|| format!("spawning shell `{}`", program.display()))?;
 
-    // Forwarder: coalesce every SessionOutput into a single redraw pulse.
+    // Mint the PaneId up-front so the forwarder can tag OSC events with
+    // the origin pane. Downstream `PtyPane::with_id` reuses it — no
+    // double-mint.
+    let pane_id = rimeterm_core::pane::PaneId::next();
+
+    // Forwarder: coalesce Redraw / Exited into the app-wide redraw pulse
+    // and route OscRimeterm payloads onto the OSC channel (C18-D).
     tokio::spawn(async move {
-        while rx.recv().await.is_some() {
-            if redraw.send(()).is_err() {
-                break;
+        while let Some(evt) = rx.recv().await {
+            match evt {
+                rimeterm_pty::SessionOutput::OscRimeterm { payload } => {
+                    if osc_tx.send((pane_id, payload)).is_err() {
+                        break;
+                    }
+                }
+                _ => {
+                    if redraw.send(()).is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
 
     Ok(ShellSpawn {
-        pane: PtyPane::new(session, display_name),
+        pane: crate::pty_pane::PtyPane::with_id(pane_id, session, display_name),
     })
 }
 

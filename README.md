@@ -11,7 +11,7 @@ Windows-priority, cross-platform.
 | **CI** | [![CI](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml) Linux · macOS (arm) · Windows |
 | **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · archives (`.tar.gz` / `.zip`) for all targets, plus macOS `.pkg` installer. Windows `.msi` + Linux `.deb` in progress. |
 | **MSRV** | Rust 1.90 (edition 2024) |
-| **Status** | v0.1.2 released (C15 + C16 + C17 + C18-A + spinner fix + native installers); tip at **post-C18-A · spinner 修复**. Retagged v0.1.2 once to fold C18-A and the `expire_pending_spawn` sampling fix in. Follow-up plan in `docs/rimeterm-overall-design.md#15.2` (design doc is local-only) |
+| **Status** | v0.1.2 released (C15 + C16 + C17 + C18-A + C18-B/C/D + spinner fix + native installers); tip at **C18-B/C/D**. Retagged v0.1.2 once to fold C18-A and the `expire_pending_spawn` sampling fix in. Follow-up plan in `docs/rimeterm-overall-design.md#15.2` (design doc is local-only) |
 
 ---
 
@@ -206,6 +206,15 @@ Every command is listed by `rimectl help`. Selected highlights:
   deadline hits. Client-side sugar: `rimectl --wait <regex> --pane <id>
   [--timeout-ms N] [--poll-ms N]` (exits non-zero on timeout, so `&&`
   chains break cleanly).
+- `workspace.layout.reset {group?}` — reset split ratios. No args
+  resets every split and clears `layout.state.toml`. `{"group":"files"|
+  "sysmon"|"agents"|"shells"}` scopes the reset to that group's cell
+  and re-persists other overrides.
+- `file.selected` / `cwd.changed` — PTY plugins emit these through
+  `ESC ] 1337 ; rimeterm ; <json> ST` (or BEL-terminated OSC); rimeterm
+  decodes them and broadcasts `KernelEvent::FileSelected` /
+  `KernelEvent::YaziCwdChanged` with the originating pane id. Unknown
+  event names are ignored for forward compatibility.
 - `tools.install {name}` — shell-out to
   `cargo install --locked <crates…>` for the five-tool registry;
   300 s hard timeout; returns exit code + captured output.
@@ -218,8 +227,10 @@ Every command is listed by `rimectl help`. Selected highlights:
   `$RIMETERM_HOME`).
 - **Project (per repo)**: `<workspace>/.rimeterm/config.toml` — check
   into git so teammates share layout.
-- **State**: `~/.rimeterm/data/workspaces/<hash>/layout.state.toml` (split
-  ratios) and `agents.state.toml` (which agents to reopen).
+- **State**: `~/.rimeterm/data/workspaces/<hash>/layout.state.toml` (only
+  split-ratio overrides that differ from defaults; file is deleted when
+  all splits return to defaults) and `agents.state.toml` (which agents to
+  reopen).
 - **Cache**: `~/.rimeterm/cache/` (Unicode-width probe).
 
 ## Repository layout

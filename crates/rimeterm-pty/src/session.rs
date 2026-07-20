@@ -28,6 +28,8 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::osc_bridge::OscScanner;
+
 /// Which PTY backend to request. On Windows we hardcode ConPTY (§6.2 table).
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub enum PtyBackend {
@@ -70,11 +72,15 @@ pub enum SessionError {
 }
 
 /// Sent from the reader task up to the pane provider each time the grid
-/// mutates. v0.1 just says "grid changed"; a later revision carries a diff.
-#[derive(Debug, Clone, Copy)]
+/// mutates, and once per complete OSC 1337 rimeterm envelope (C18-D).
+/// v0.1 `Redraw` just says "grid changed"; a later revision may carry a
+/// diff. `OscRimeterm` carries the raw JSON payload — decoding into a
+/// `KernelEvent` is the App's job so this crate stays event-agnostic.
+#[derive(Debug, Clone)]
 pub enum SessionOutput {
     Redraw,
     Exited { status: u32 },
+    OscRimeterm { payload: String },
 }
 
 /// Static size struct implementing `alacritty_terminal::grid::Dimensions`.
@@ -584,6 +590,10 @@ fn read_loop(
     // escape sequences across reads). Recreating it per iteration
     // would drop mid-sequence bytes silently.
     let mut processor: Processor = Processor::new();
+    // C18-D: OSC 1337 rimeterm scanner. Runs alongside the alacritty
+    // Processor — non-destructive, sees the same bytes. Cross-chunk
+    // state kept here (see osc_bridge.rs).
+    let mut osc_scanner = OscScanner::new();
     loop {
         match reader.read(&mut buf) {
             Ok(0) => {
@@ -602,6 +612,15 @@ fn read_loop(
                 // synthesize responses at the terminal-emulator layer,
                 // so we do it here from the raw bytes.
                 respond_to_terminal_queries(slice, &term, &writer);
+                // Emit an OscRimeterm event for each `\x1b]1337;rimeterm;<payload>ST`
+                // completed in this chunk. Fire BEFORE Redraw so a subscriber
+                // that mutates state on the OSC (e.g. selects a file) has that
+                // state visible by the next frame.
+                for payload in osc_scanner.feed(slice) {
+                    if tx.send(SessionOutput::OscRimeterm { payload }).is_err() {
+                        return;
+                    }
+                }
                 if tx.send(SessionOutput::Redraw).is_err() {
                     // Receiver dropped — session dead.
                     return;

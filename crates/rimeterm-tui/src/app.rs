@@ -30,7 +30,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use rimeterm_config::Config;
 use rimeterm_core::app_menu::AppMenu;
 use rimeterm_core::command::{Command, CommandRegistry};
-use rimeterm_core::event::EventBus;
+use rimeterm_core::event::{EventBus, KernelEvent};
 use rimeterm_core::focus::FocusManager;
 use rimeterm_core::layout::{LayoutNode, LayoutTree};
 use rimeterm_core::pane::{PaneId, PaneProvider, PaneRenderCtx};
@@ -40,7 +40,7 @@ use rimeterm_core::tabs::{
 };
 use rimeterm_pty::{ShellChoice, detect_default_shell};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::keymap::{Keymap, KeymapOutcome, QUADRANT_COMMANDS, tab_goto_command_id};
 use crate::menu::{
@@ -73,7 +73,6 @@ struct ActionFlags {
     focus_quadrant: AtomicUsize, // 1..=4; 0 = idle.
     settings: AtomicBool,
     resize_toggle: AtomicBool,
-    layout_reset: AtomicBool,
     acknowledgement: AtomicBool,
 }
 
@@ -125,12 +124,48 @@ pub(crate) enum PaneMutation {
     /// dispatch doesn't wait for the new pane id, and the shell handles
     /// its own errors visibly. Used by the placeholder `[I]` shortcut.
     OpenShellAndType { command: String },
+    /// Reset split ratios to their defaults. `group = None` resets every
+    /// split in the tree AND deletes the persisted state file (matches
+    /// pre-C18-B behavior). `group = Some(gid)` resets only the two
+    /// SplitPaths that box the given group's cell (root split + the
+    /// group's column split; see `paths_for_group`) and re-persists the
+    /// remaining ratios so overrides in other groups survive. Ack:
+    /// `Ok(scope)` where `scope = "all"` or the resolved group id;
+    /// `Err("unknown group `<gid>`")` on a bad `gid`.
+    LayoutReset {
+        group: Option<rimeterm_core::TabGroupId>,
+        ack: std::sync::mpsc::SyncSender<Result<String, String>>,
+    },
 }
 
 /// Title of the placeholder pane that seeds the `agents` group on first
 /// launch (see §14 / C14). We match on this string in `new_agent_tab_in`
 /// to auto-close the picker once the first real agent tab lands.
 pub(crate) const AGENT_PICKER_TITLE: &str = "Pick an agent";
+
+/// Error returned by `App::reset_layout_scope` and surfaced by the
+/// `workspace.layout.reset` IPC command. Kept minimal — v0.1 only knows
+/// one failure mode (bad `group`); everything else is best-effort
+/// (missing state file / failed file write get logged and swallowed).
+#[derive(Debug)]
+pub(crate) enum LayoutResetError {
+    UnknownGroup(String),
+}
+
+impl std::fmt::Display for LayoutResetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownGroup(g) => {
+                write!(
+                    f,
+                    "unknown group `{g}` (expected one of: files, sysmon, agents, shells)"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for LayoutResetError {}
 
 /// Result of hit-testing a mouse click against the cached tab-strip rects.
 /// Emitted by [`App::tab_hit`] and consumed by [`App::on_mouse`]; kept as
@@ -368,6 +403,15 @@ pub struct App {
     session_writes:
         Arc<parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>>,
     redraw_rx: mpsc::UnboundedReceiver<()>,
+    /// C18-D: PTY forwarders push `(origin, raw JSON payload)` here every
+    /// time an OSC 1337 rimeterm escape completes on a child's stdout.
+    /// The main loop drains this in `select!`, parses via
+    /// [`decode_osc_rimeterm`], and dispatches to [`event_bus`].
+    osc_rx: mpsc::UnboundedReceiver<(PaneId, String)>,
+    /// Sender clones held by every PTY forwarder task. Kept here so
+    /// mid-runtime factory calls (new_shell_tab_in / new_agent_tab_in)
+    /// can hand a fresh clone to newly-spawned children.
+    osc_tx: mpsc::UnboundedSender<(PaneId, String)>,
     flags: Arc<ActionFlags>,
     should_quit: bool,
     /// Transient status-bar hint (e.g. "Ctrl+T rejected: files is fixed").
@@ -431,6 +475,10 @@ impl App {
         );
 
         let (redraw_tx, redraw_rx) = mpsc::unbounded_channel();
+        // C18-D: OSC 1337 rimeterm bridge. Every PTY forwarder gets a
+        // clone of `osc_tx`; the App main loop drains `osc_rx` and
+        // dispatches decoded payloads to `event_bus`.
+        let (osc_tx, osc_rx) = mpsc::unbounded_channel::<(PaneId, String)>();
         let session_writes: Arc<
             parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
         > = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -455,6 +503,7 @@ impl App {
                 spec,
                 &workspace_root,
                 redraw_tx.clone(),
+                osc_tx.clone(),
                 icon,
                 color,
                 "files",
@@ -477,6 +526,7 @@ impl App {
                 spec,
                 &workspace_root,
                 redraw_tx.clone(),
+                osc_tx.clone(),
                 icon,
                 color,
                 "sysmon",
@@ -497,6 +547,7 @@ impl App {
                 spec,
                 &workspace_root,
                 redraw_tx.clone(),
+                osc_tx.clone(),
             )?;
             agents_members.push(id);
             // Try to map the config spec id back to a registry entry so
@@ -535,6 +586,7 @@ impl App {
                                 &ext_spec,
                                 &workspace_root,
                                 redraw_tx.clone(),
+                                osc_tx.clone(),
                             ) {
                                 Ok(pane_id) => {
                                     agents_members.push(pane_id);
@@ -581,6 +633,7 @@ impl App {
             80,
             24,
             redraw_tx.clone(),
+            osc_tx.clone(),
         )?;
         let first_id = first.pane.id();
         session_writes
@@ -690,6 +743,8 @@ impl App {
             panes,
             redraw_tx,
             redraw_rx,
+            osc_rx,
+            osc_tx,
             flags,
             should_quit: false,
             hint: None,
@@ -745,6 +800,14 @@ impl App {
                 }
                 Some(_) = self.redraw_rx.recv() => {
                     while self.redraw_rx.try_recv().is_ok() {}
+                }
+                Some(event) = self.osc_rx.recv() => {
+                    // `recv()` already consumed the wake-triggering
+                    // message; dispatch it first, then drain the rest.
+                    // Dropping this first tuple would lose every OSC
+                    // event when the channel was previously empty.
+                    self.dispatch_osc_event(event);
+                    self.drain_osc_events();
                 }
                 _ = tokio::time::sleep(Duration::from_millis(16)) => {}
             }
@@ -1752,6 +1815,10 @@ impl App {
                 std::sync::mpsc::SyncSender<Result<u64, String>>,
                 Result<u64, String>,
             ),
+            Str(
+                std::sync::mpsc::SyncSender<Result<String, String>>,
+                Result<String, String>,
+            ),
         }
         let mut acks: Vec<Ack> = Vec::with_capacity(batch.len());
         for mutation in batch {
@@ -1832,6 +1899,10 @@ impl App {
                         }
                     }
                 }
+                PaneMutation::LayoutReset { group, ack } => {
+                    let outcome = self.reset_layout_scope(group).map_err(|e| e.to_string());
+                    acks.push(Ack::Str(ack, outcome));
+                }
             }
         }
         // Publish the post-mutation state THEN wake the waiting clients;
@@ -1844,6 +1915,9 @@ impl App {
                     let _ = tx.send(r);
                 }
                 Ack::U64(tx, r) => {
+                    let _ = tx.send(r);
+                }
+                Ack::Str(tx, r) => {
                     let _ = tx.send(r);
                 }
             }
@@ -1906,9 +1980,6 @@ impl App {
                 "Resize mode: off"
             };
             self.set_hint(msg.into());
-        }
-        if f.layout_reset.swap(false, Ordering::Relaxed) {
-            self.reset_layout();
         }
         if f.settings.swap(false, Ordering::Relaxed) {
             info!("app.settings fired (v0.1 stub: log only)");
@@ -2018,6 +2089,7 @@ impl App {
             80,
             24,
             self.redraw_tx.clone(),
+            self.osc_tx.clone(),
         )?;
         let new_id = spawn.pane.id();
         self.session_writes
@@ -2070,6 +2142,7 @@ impl App {
             &external_spec,
             &self.workspace_root,
             self.redraw_tx.clone(),
+            self.osc_tx.clone(),
         )?;
         self.pane_agent_id.insert(new_id, spec.id);
 
@@ -2321,9 +2394,49 @@ impl App {
         }
     }
 
+    fn kernel_event_from_osc(origin: PaneId, decoded: OscDecoded) -> Option<KernelEvent> {
+        match decoded {
+            OscDecoded::FileSelected { path } => Some(KernelEvent::FileSelected { origin, path }),
+            OscDecoded::YaziCwd { path } => Some(KernelEvent::YaziCwdChanged { origin, path }),
+            OscDecoded::Ignored { .. } => None,
+        }
+    }
+
+    /// Drain decoded-at-the-edge OSC 1337 payloads and broadcast them
+    /// through the kernel EventBus. The PTY scanner is intentionally
+    /// event-model agnostic; this is the sole translation boundary.
+    ///
+    /// Malformed payloads are logged and dropped. Unknown event names
+    /// are ignored by `decode_osc_rimeterm` (forward-compatible), while
+    /// known events always carry the originating PaneId so subscribers
+    /// can distinguish two yazi/shell tabs.
+    fn dispatch_osc_event(&mut self, (origin, payload): (PaneId, String)) {
+        match decode_osc_rimeterm(&payload) {
+            Ok(decoded) => {
+                if let Some(event) = Self::kernel_event_from_osc(origin, decoded) {
+                    self.event_bus.send(event);
+                } else {
+                    debug!(origin = origin.0, "ignored unknown OSC rimeterm event");
+                }
+            }
+            Err(error) => {
+                warn!(origin = origin.0, error = %error, "dropping malformed OSC rimeterm payload");
+            }
+        }
+    }
+
+    /// Drain decoded-at-the-edge OSC 1337 payloads and broadcast them
+    /// through the kernel EventBus. The PTY scanner is intentionally
+    /// event-model agnostic; this is the sole translation boundary.
+    fn drain_osc_events(&mut self) {
+        while let Ok(event) = self.osc_rx.try_recv() {
+            self.dispatch_osc_event(event);
+        }
+    }
     async fn spawn_ipc_server(&self) -> Option<tokio::sync::mpsc::Sender<()>> {
         let pid = std::process::id();
         let commands = std::sync::Arc::clone(&self.commands);
+
         let handler: rimeterm_ipc::Handler =
             std::sync::Arc::new(move |req: rimeterm_ipc::Request| {
                 // Match `req.cmd` against a registered command id. The registry
@@ -2370,17 +2483,38 @@ impl App {
         }
     }
 
-    /// Write the current split ratios to the workspace's layout.state.toml.
+    /// Write the current split ratios to the workspace's `layout.state.toml`
+    /// as a **diff** against `self.default_ratios` (C18-C). If the tree
+    /// is fully at defaults after pruning, the file is DELETED rather
+    /// than left as an empty TOML — a missing file and an all-defaults
+    /// tree are indistinguishable at load time, which is exactly what
+    /// we want (no stale ratios lingering after the code-side default
+    /// changes).
     fn persist_layout(&self) {
         let Some(path) = rimeterm_config::layout_state::workspace_state_file(&self.workspace_root)
         else {
             return;
         };
-        let state = snapshot_persisted_state(&self.tree);
+        let state = snapshot_persisted_state(&self.tree, &self.default_ratios);
+        if state.is_empty() {
+            // Delete-on-empty: `remove_file` errors are non-fatal (file
+            // might already be gone). Log the successful delete so the
+            // startup log shows the "back to defaults" event.
+            match std::fs::remove_file(&path) {
+                Ok(()) => info!(path = %path.display(), "layout state empty; removed file"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(error = %e, "failed to remove empty layout state"),
+            }
+            return;
+        }
         if let Err(e) = state.save_to(&path) {
             warn!(error = %e, "failed to persist layout state");
         } else {
-            info!(path = %path.display(), "persisted layout state");
+            info!(
+                path = %path.display(),
+                diffs = state.splits.len(),
+                "persisted layout state (diff)"
+            );
         }
     }
 
@@ -2414,17 +2548,79 @@ impl App {
         }
     }
 
-    /// Reset every split ratio to defaults and delete the persisted state file.
+    /// Reset every split ratio to defaults and delete the persisted state
+    /// file. Signal-only entrypoint used by the `flags.layout_reset`
+    /// drain — kept for keymap + palette compatibility. `rimectl` and
+    /// context-menu callers should go through
+    /// [`Self::reset_layout_scope`] to get an ack.
     fn reset_layout(&mut self) {
-        for (path, ratios) in self.default_ratios.clone() {
-            let _ = self.tree.set_ratios(&path, ratios);
+        let _ = self.reset_layout_scope(None);
+    }
+
+    /// C18-B: reset scope is either the whole tree (`None`) or the two
+    /// SplitPaths bracketing a single group's cell (`Some(gid)` →
+    /// [`paths_for_group`]). Returns a machine-readable scope tag on
+    /// success (`"all"` or the group id) so IPC callers can echo it back
+    /// to shell scripts.
+    ///
+    /// Persist side-effect:
+    /// - `None` → delete the state file (matches pre-C18-B semantics).
+    /// - `Some(gid)` → re-persist a fresh snapshot so other groups'
+    ///   overrides survive. Combined with C18-C's diff-storage, an
+    ///   all-defaults tree yields an empty file (or none if we later
+    ///   delete-on-empty).
+    fn reset_layout_scope(
+        &mut self,
+        group: Option<rimeterm_core::TabGroupId>,
+    ) -> Result<String, LayoutResetError> {
+        match group {
+            None => {
+                for (path, ratios) in self.default_ratios.clone() {
+                    let _ = self.tree.set_ratios(&path, ratios);
+                }
+                if let Some(path) =
+                    rimeterm_config::layout_state::workspace_state_file(&self.workspace_root)
+                {
+                    let _ = std::fs::remove_file(&path);
+                }
+                self.set_hint("layout reset to defaults (persisted state cleared)".into());
+                Ok("all".to_string())
+            }
+            Some(gid) => {
+                // Only the four builtin groups have a mapping today; any
+                // other id is a user typo / config bug and gets a 400.
+                if self.tree.find_tab_group(gid).is_none() {
+                    return Err(LayoutResetError::UnknownGroup(gid.to_string()));
+                }
+                let paths = paths_for_group(gid);
+                if paths.is_empty() {
+                    return Err(LayoutResetError::UnknownGroup(gid.to_string()));
+                }
+                let mut touched = 0usize;
+                for path in paths {
+                    if let Some(defaults) = self
+                        .default_ratios
+                        .iter()
+                        .find(|(p, _)| p == &path)
+                        .map(|(_, r)| r.clone())
+                    {
+                        if self.tree.set_ratios(&path, defaults).is_ok() {
+                            touched += 1;
+                        }
+                    }
+                }
+                // Rewrite the state file (not delete!) so overrides on
+                // OTHER groups survive.
+                self.persist_layout();
+                self.set_hint(format!(
+                    "layout reset: group `{}` ({} split{})",
+                    gid,
+                    touched,
+                    if touched == 1 { "" } else { "s" }
+                ));
+                Ok(gid.to_string())
+            }
         }
-        if let Some(path) =
-            rimeterm_config::layout_state::workspace_state_file(&self.workspace_root)
-        {
-            let _ = std::fs::remove_file(&path);
-        }
-        self.set_hint("layout reset to defaults (persisted state cleared)".into());
     }
 }
 
@@ -2457,6 +2653,7 @@ fn build_external_pane(
     spec: &rimeterm_config::ExternalToolSpec,
     workspace_root: &std::path::Path,
     redraw: mpsc::UnboundedSender<()>,
+    osc_tx: mpsc::UnboundedSender<(PaneId, String)>,
     icon: &str,
     color: Color,
     kind_label: &str,
@@ -2472,6 +2669,7 @@ fn build_external_pane(
                 80,
                 24,
                 redraw,
+                osc_tx,
             )?;
             let id = spawn.pane.id();
             // Store the cloneable Session handle before we consume the pane
@@ -2532,6 +2730,7 @@ fn build_agent_pane(
     spec: &rimeterm_config::AgentSpec,
     workspace_root: &std::path::Path,
     redraw: mpsc::UnboundedSender<()>,
+    osc_tx: mpsc::UnboundedSender<(PaneId, String)>,
 ) -> Result<PaneId> {
     build_external_pane(
         panes,
@@ -2539,6 +2738,7 @@ fn build_agent_pane(
         spec,
         workspace_root,
         redraw,
+        osc_tx,
         "🤖",
         Color::LightMagenta,
         "agent",
@@ -2712,13 +2912,37 @@ fn register_commands(
         "Ctrl+Alt+R",
         flags.resize_toggle
     );
-    flag_cmd!(
-        cmds,
-        "workspace.layout.reset",
-        "Reset layout ratios",
-        "Restore & clear persisted state",
-        flags.layout_reset
-    );
+    // C18-B: JSON-arg command. Backwards-compat: bare `workspace.layout.reset`
+    // (no args) resets everything, matching the pre-C18-B signal command.
+    // With `{group: "<gid>"}` only that group's SplitPaths are reset and
+    // other groups' overrides in the state file survive.
+    //
+    //   args: {} | null                 → reset everything (all groups)
+    //   args: {group: "files"|"sysmon"|"agents"|"shells"}
+    //                                   → reset only that group
+    //   → {scope: "all"|"<gid>"}
+    {
+        let queue = pending_mutations.clone();
+        let wake = redraw_tx.clone();
+        let cmd = Command {
+            id: "workspace.layout.reset",
+            title: "Reset layout ratios",
+            description: Some("args: {group?: \"files\"|\"sysmon\"|\"agents\"|\"shells\"}"),
+            run: Arc::new(move |args: &serde_json::Value| {
+                let group = parse_layout_reset_args(args)?;
+                let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+                queue
+                    .lock()
+                    .push_back(PaneMutation::LayoutReset { group, ack: ack_tx });
+                let _ = wake.send(());
+                let scope = ack_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|_| "app main loop dropped ack".to_string())??;
+                Ok(serde_json::json!({"scope": scope}))
+            }),
+        };
+        register(cmds, cmd)?;
+    }
 
     // Nine tab-goto commands (Alt+Shift+1..9 shortcuts).
     for (i, id) in crate::keymap::all_tab_goto_ids().iter().enumerate() {
@@ -3379,6 +3603,135 @@ pub(crate) fn parse_focus_args(args: &serde_json::Value) -> Result<u64, String> 
         .ok_or_else(|| "missing `pane_id` (u64)".to_string())
 }
 
+/// Validated `group` for `workspace.layout.reset` (C18-B). `None` args
+/// (`null`, `{}`, or a plain `Value::Null` from the signal-style caller)
+/// map to `Ok(None)` = reset every split. `{group: "<gid>"}` accepts one
+/// of the four builtin ids; anything else 400s early so the mutation
+/// queue never sees a bad id. Split from the closure so every failure
+/// mode is unit-testable without spawning App / PTY.
+pub(crate) fn parse_layout_reset_args(
+    args: &serde_json::Value,
+) -> Result<Option<rimeterm_core::TabGroupId>, String> {
+    // Missing / null / empty object → whole-tree reset.
+    let Some(obj) = args.as_object() else {
+        // `Value::Null` or non-object (e.g. `[]`) — treat as no-args.
+        // Rejecting non-null non-object would break `rimectl` callers
+        // that pass `null` explicitly; be tolerant.
+        if args.is_null() {
+            return Ok(None);
+        }
+        // Everything else IS a caller mistake — reject so `[1,2,3]`
+        // doesn't silently succeed.
+        return Err(format!(
+            "args must be an object or null, got {}",
+            args_type_name(args)
+        ));
+    };
+    let Some(group_val) = obj.get("group") else {
+        return Ok(None);
+    };
+    let group = group_val.as_str().ok_or_else(|| {
+        format!(
+            "`group` must be a string, got {}",
+            args_type_name(group_val)
+        )
+    })?;
+    // Reject empty explicitly — `{group: ""}` is almost certainly a
+    // template-substitution bug, not "no group".
+    if group.is_empty() {
+        return Err("`group` cannot be empty (omit the field for whole-tree reset)".into());
+    }
+    let gid = match group {
+        "files" => rimeterm_core::BUILTIN_FILES,
+        "sysmon" => rimeterm_core::BUILTIN_SYSMON,
+        "agents" => rimeterm_core::BUILTIN_AGENTS,
+        "shells" => rimeterm_core::BUILTIN_SHELLS,
+        other => {
+            return Err(format!(
+                "unknown group `{other}` (expected: files, sysmon, agents, shells)"
+            ));
+        }
+    };
+    Ok(Some(gid))
+}
+
+/// Short type name for a `serde_json::Value` — used in `parse_layout_reset_args`
+/// error messages so the caller sees `array` / `number` etc instead of a
+/// pretty-printed blob. `serde_json` doesn't expose one, so we roll it here.
+fn args_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Decoded outcome of an OSC 1337 rimeterm payload (§5.5, C18-D).
+/// A payload is a UTF-8 JSON envelope like:
+/// ```json
+/// {"event":"file.selected","path":"/tmp/x.md"}
+/// {"event":"cwd.changed","path":"/tmp"}
+/// ```
+///
+/// Unknown event names decode to `Ignored { event }` rather than `Err`
+/// so a child using a newer protocol version doesn't fail loudly on an
+/// older rimeterm — forward-compat matters here since OSC senders can't
+/// negotiate versions.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum OscDecoded {
+    /// yazi cursor moved to a specific file. Maps to
+    /// [`rimeterm_core::KernelEvent::FileSelected`].
+    FileSelected { path: std::path::PathBuf },
+    /// yazi cwd changed. Maps to
+    /// [`rimeterm_core::KernelEvent::YaziCwdChanged`].
+    YaziCwd { path: std::path::PathBuf },
+    /// Payload parsed but the `event` name isn't known to this rimeterm.
+    /// Not an error — forward-compat.
+    Ignored { event: String },
+}
+
+/// Parse a raw OSC 1337 rimeterm payload into a structured [`OscDecoded`].
+/// Errors surface only for **malformed** payloads (invalid JSON, missing
+/// `event`, wrong types); unknown-but-well-formed events become
+/// `Ignored`. Pure so tests exercise the full matrix without a live PTY.
+pub(crate) fn decode_osc_rimeterm(payload: &str) -> Result<OscDecoded, String> {
+    let root: serde_json::Value =
+        serde_json::from_str(payload).map_err(|e| format!("invalid JSON: {e}"))?;
+    let obj = root
+        .as_object()
+        .ok_or_else(|| "payload must be a JSON object".to_string())?;
+    let event = obj
+        .get("event")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing `event` (string)".to_string())?;
+    match event {
+        "file.selected" => {
+            let path = obj
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "file.selected: missing `path` (string)".to_string())?;
+            Ok(OscDecoded::FileSelected {
+                path: std::path::PathBuf::from(path),
+            })
+        }
+        "cwd.changed" => {
+            let path = obj
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "cwd.changed: missing `path` (string)".to_string())?;
+            Ok(OscDecoded::YaziCwd {
+                path: std::path::PathBuf::from(path),
+            })
+        }
+        other => Ok(OscDecoded::Ignored {
+            event: other.to_string(),
+        }),
+    }
+}
+
 /// Which cargo-side action a `tools.*` command triggers. Copy so the
 /// per-registration closure below can capture it by value.
 #[derive(Clone, Copy, Debug)]
@@ -3748,14 +4101,78 @@ fn apply_persisted_state(
     }
 }
 
-/// Snapshot the tree's current ratios into a persistable [`LayoutState`].
-fn snapshot_persisted_state(tree: &LayoutTree) -> rimeterm_config::layout_state::LayoutState {
+/// Snapshot the tree's current ratios into a persistable [`LayoutState`],
+/// **omitting** any split whose ratios are still at their defaults
+/// (C18-C differential storage). The rules are simple by design so a
+/// user can predict the file:
+///
+/// - Path present in `defaults` AND ratios ≈ defaults → **omit**.
+/// - Path present in `defaults` AND ratios differ → **keep**.
+/// - Path not in `defaults` (e.g. a tree the layout evolved into after
+///   persistence) → **keep** (safer than dropping a value we can't
+///   compare).
+///
+/// Consequences: (a) a workspace with no manual resizes yields an empty
+/// map, and `save_to` writes an empty TOML block — the outer
+/// `persist_layout` further collapses that to file deletion. (b) When
+/// the default_ratios in code change (e.g. we adopt a 30/70 default),
+/// old files with 35/65 still round-trip cleanly because those ratios
+/// will now be diffs from the new default.
+///
+/// Pure so tests can drive the prune matrix — including epsilon
+/// tolerance for f32 accumulation — without spawning App / PTY.
+fn snapshot_persisted_state(
+    tree: &LayoutTree,
+    defaults: &[(rimeterm_core::layout::SplitPath, Vec<f32>)],
+) -> rimeterm_config::layout_state::LayoutState {
+    let current = snapshot_all_ratios(tree);
+    let pruned = prune_to_diff(&current, defaults);
     let mut state = rimeterm_config::layout_state::LayoutState::default();
-    for (path, ratios) in snapshot_all_ratios(tree) {
+    for (path, ratios) in pruned {
         let key = rimeterm_config::layout_state::LayoutState::encode_path(&path.0);
         state.splits.insert(key, ratios);
     }
     state
+}
+
+/// Pure helper: retain only entries in `current` whose ratios differ
+/// meaningfully from `defaults`. Returns owned pairs.
+///
+/// **Tolerance**: `RATIO_DIFF_EPS = 1e-4`. `adjust_ratio` re-normalizes
+/// to sum 1.0 and the resize step is in cells (~0.01 fraction of a
+/// 100-cell parent → 0.01 delta), so 1e-4 catches any real user drag
+/// while ignoring f32 drift.
+pub(crate) fn prune_to_diff(
+    current: &[(rimeterm_core::layout::SplitPath, Vec<f32>)],
+    defaults: &[(rimeterm_core::layout::SplitPath, Vec<f32>)],
+) -> Vec<(rimeterm_core::layout::SplitPath, Vec<f32>)> {
+    let mut out = Vec::with_capacity(current.len());
+    for (path, ratios) in current {
+        // Find the default for this exact path.
+        let default_ratios = defaults.iter().find(|(p, _)| p == path).map(|(_, r)| r);
+        let keep = match default_ratios {
+            None => true, // no baseline → keep (see doc)
+            Some(dr) => !ratios_equal_approx(ratios, dr),
+        };
+        if keep {
+            out.push((path.clone(), ratios.clone()));
+        }
+    }
+    out
+}
+
+const RATIO_DIFF_EPS: f32 = 1e-4;
+
+/// Element-wise equality within [`RATIO_DIFF_EPS`]. Different lengths →
+/// not equal (a split that grew a child clearly diverged from the
+/// default and MUST be persisted).
+fn ratios_equal_approx(a: &[f32], b: &[f32]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| (x - y).abs() < RATIO_DIFF_EPS)
 }
 
 fn next_shell_number(members: &[PaneId], panes: &PaneRegistry) -> usize {
@@ -4356,5 +4773,247 @@ mod tests {
             std::time::Duration::from_millis(200),
             Some("$ ")
         ));
+    }
+
+    // --- parse_layout_reset_args (C18-B, workspace.layout.reset) ---
+
+    #[test]
+    fn layout_reset_null_means_whole_tree() {
+        // rimectl passes `Value::Null` when the caller omits --json.
+        assert_eq!(parse_layout_reset_args(&serde_json::Value::Null), Ok(None));
+    }
+
+    #[test]
+    fn layout_reset_empty_object_means_whole_tree() {
+        assert_eq!(parse_layout_reset_args(&serde_json::json!({})), Ok(None));
+    }
+
+    #[test]
+    fn layout_reset_valid_group_ids_all_map() {
+        for (raw, expected) in [
+            ("files", rimeterm_core::BUILTIN_FILES),
+            ("sysmon", rimeterm_core::BUILTIN_SYSMON),
+            ("agents", rimeterm_core::BUILTIN_AGENTS),
+            ("shells", rimeterm_core::BUILTIN_SHELLS),
+        ] {
+            assert_eq!(
+                parse_layout_reset_args(&serde_json::json!({"group": raw})),
+                Ok(Some(expected)),
+                "group `{raw}` failed to map"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_reset_rejects_unknown_group() {
+        let err = parse_layout_reset_args(&serde_json::json!({"group": "nope"})).unwrap_err();
+        assert!(err.contains("unknown group"), "unexpected: {err}");
+        assert!(err.contains("nope"), "unexpected: {err}");
+        // The error surfaces the accepted set so scripts can self-correct.
+        assert!(err.contains("files"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn layout_reset_rejects_empty_group_string() {
+        // Common shell-template bug: `--group $EMPTY` expands to ""
+        // and used to be silently treated as "no group". Now rejected.
+        let err = parse_layout_reset_args(&serde_json::json!({"group": ""})).unwrap_err();
+        assert!(err.contains("empty"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn layout_reset_rejects_non_string_group() {
+        let err = parse_layout_reset_args(&serde_json::json!({"group": 42})).unwrap_err();
+        assert!(err.contains("must be a string"), "unexpected: {err}");
+        assert!(err.contains("number"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn layout_reset_rejects_array_as_args() {
+        // `[]` isn't a valid shape — reject so `[1,2]` doesn't quietly
+        // become "whole-tree reset".
+        let err = parse_layout_reset_args(&serde_json::json!([])).unwrap_err();
+        assert!(err.contains("object or null"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn layout_reset_ignores_unknown_fields() {
+        // Forward-compat: extra fields are silently allowed so we can
+        // add `{scope: "column"}` etc without breaking old clients.
+        assert_eq!(
+            parse_layout_reset_args(&serde_json::json!({"group": "files", "future": "ignored"})),
+            Ok(Some(rimeterm_core::BUILTIN_FILES))
+        );
+    }
+
+    // --- prune_to_diff (C18-C, differential layout.state.toml storage) ---
+
+    fn sp(indices: &[u8]) -> rimeterm_core::layout::SplitPath {
+        rimeterm_core::layout::SplitPath(indices.to_vec())
+    }
+
+    #[test]
+    fn prune_omits_paths_equal_to_defaults() {
+        // Fresh workspace: current == defaults everywhere → nothing to persist.
+        let defaults = vec![
+            (sp(&[]), vec![0.35, 0.65]),
+            (sp(&[0]), vec![0.65, 0.35]),
+            (sp(&[1]), vec![0.55, 0.45]),
+        ];
+        let current = defaults.clone();
+        let pruned = prune_to_diff(&current, &defaults);
+        assert!(pruned.is_empty(), "expected empty diff, got {pruned:?}");
+    }
+
+    #[test]
+    fn prune_keeps_paths_with_changed_ratios() {
+        // User dragged the root seam 35/65 → 45/55.
+        let defaults = vec![(sp(&[]), vec![0.35, 0.65]), (sp(&[0]), vec![0.65, 0.35])];
+        let current = vec![
+            (sp(&[]), vec![0.45, 0.55]),  // moved
+            (sp(&[0]), vec![0.65, 0.35]), // unchanged
+        ];
+        let pruned = prune_to_diff(&current, &defaults);
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].0, sp(&[]));
+        assert_eq!(pruned[0].1, vec![0.45, 0.55]);
+    }
+
+    #[test]
+    fn prune_treats_epsilon_drift_as_equal() {
+        // f32 round-trip through TOML can wobble by ~1e-7. RATIO_DIFF_EPS
+        // is 1e-4 so this MUST be treated as still-at-default.
+        let defaults = vec![(sp(&[]), vec![0.35, 0.65])];
+        let current = vec![(sp(&[]), vec![0.350_000_1, 0.649_999_9])];
+        let pruned = prune_to_diff(&current, &defaults);
+        assert!(
+            pruned.is_empty(),
+            "epsilon drift leaked into diff: {pruned:?}"
+        );
+    }
+
+    #[test]
+    fn prune_keeps_unknown_paths() {
+        // Layout tree evolved (new group added) → current has a path
+        // defaults doesn't. Must persist to preserve the user's changes;
+        // dropping silently would lose data.
+        let defaults = vec![(sp(&[]), vec![0.5, 0.5])];
+        let current = vec![
+            (sp(&[]), vec![0.5, 0.5]),
+            (sp(&[0]), vec![0.4, 0.6]), // unknown to defaults
+        ];
+        let pruned = prune_to_diff(&current, &defaults);
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].0, sp(&[0]));
+    }
+
+    #[test]
+    fn prune_treats_different_lengths_as_changed() {
+        // A split that grew (or shrunk) a child MUST be considered
+        // divergent from the default — element-wise compare would panic
+        // or short-circuit misleadingly.
+        let defaults = vec![(sp(&[]), vec![0.5, 0.5])];
+        let current = vec![(sp(&[]), vec![0.3, 0.3, 0.4])];
+        let pruned = prune_to_diff(&current, &defaults);
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].1.len(), 3);
+    }
+
+    #[test]
+    fn prune_stable_order_matches_input() {
+        // Not strictly a correctness requirement but a nice property:
+        // callers get deterministic file contents run-to-run.
+        let defaults = vec![
+            (sp(&[]), vec![0.5, 0.5]),
+            (sp(&[0]), vec![0.5, 0.5]),
+            (sp(&[1]), vec![0.5, 0.5]),
+        ];
+        let current = vec![
+            (sp(&[]), vec![0.4, 0.6]),
+            (sp(&[0]), vec![0.5, 0.5]),
+            (sp(&[1]), vec![0.7, 0.3]),
+        ];
+        let pruned = prune_to_diff(&current, &defaults);
+        // Must be [root, [1]] in that order, not [[1], root].
+        assert_eq!(pruned.len(), 2);
+        assert_eq!(pruned[0].0, sp(&[]));
+        assert_eq!(pruned[1].0, sp(&[1]));
+    }
+
+    // --- decode_osc_rimeterm (C18-D, OSC 1337 → KernelEvent) ---
+
+    #[test]
+    fn osc_decode_file_selected() {
+        assert_eq!(
+            decode_osc_rimeterm(r#"{"event":"file.selected","path":"/tmp/a.md"}"#),
+            Ok(OscDecoded::FileSelected {
+                path: std::path::PathBuf::from("/tmp/a.md")
+            })
+        );
+    }
+
+    #[test]
+    fn osc_decode_cwd_changed() {
+        assert_eq!(
+            decode_osc_rimeterm(r#"{"event":"cwd.changed","path":"C:\\work"}"#),
+            Ok(OscDecoded::YaziCwd {
+                path: std::path::PathBuf::from("C:\\work")
+            })
+        );
+    }
+
+    #[test]
+    fn osc_decode_unknown_event_is_forward_compatible() {
+        assert_eq!(
+            decode_osc_rimeterm(r#"{"event":"git.commit","sha":"abc"}"#),
+            Ok(OscDecoded::Ignored {
+                event: "git.commit".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn osc_decode_rejects_invalid_json_and_missing_fields() {
+        let err = decode_osc_rimeterm("not json").unwrap_err();
+        assert!(err.contains("invalid JSON"), "unexpected: {err}");
+        let err = decode_osc_rimeterm(r#"{"event":"file.selected"}"#).unwrap_err();
+        assert!(err.contains("missing `path`"), "unexpected: {err}");
+        let err = decode_osc_rimeterm(r#"{"path":"/tmp"}"#).unwrap_err();
+        assert!(err.contains("missing `event`"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn osc_decode_rejects_non_object_payload() {
+        let err = decode_osc_rimeterm("[]").unwrap_err();
+        assert!(err.contains("JSON object"), "unexpected: {err}");
+    }
+
+    #[tokio::test]
+    async fn osc_file_selected_reaches_event_bus_subscriber() {
+        let bus = EventBus::new(8);
+        let mut subscriber = bus.subscribe();
+        let origin = PaneId(77);
+        let decoded =
+            decode_osc_rimeterm(r#"{"event":"file.selected","path":"/tmp/from-yazi.md"}"#).unwrap();
+        let event = App::kernel_event_from_osc(origin, decoded).expect("known event maps");
+        assert_eq!(bus.send(event), 1);
+
+        let received = subscriber.next().await.expect("event arrives").unwrap();
+        match received {
+            KernelEvent::FileSelected {
+                origin: got_origin,
+                path,
+            } => {
+                assert_eq!(got_origin, origin);
+                assert_eq!(path, std::path::PathBuf::from("/tmp/from-yazi.md"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn osc_unknown_event_does_not_map_to_kernel_event() {
+        let decoded = decode_osc_rimeterm(r#"{"event":"future.event"}"#).unwrap();
+        assert!(App::kernel_event_from_osc(PaneId(1), decoded).is_none());
     }
 }
