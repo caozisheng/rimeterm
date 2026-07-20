@@ -176,6 +176,24 @@ jobs:
       # cargo-wix / cargo-deb / pkgbuild each need slightly different
       # setup, so we split by target instead of trying a single script.
 
+      # cargo-wix wraps WiX Toolset v3 (candle.exe / light.exe). The
+      # windows-latest runner has WiX pre-installed at
+      # C:\Program Files (x86)\WiX Toolset v3.14\bin, but it's not on
+      # PATH by default — add it so `cargo wix` can find the binaries.
+      - name: Configure WiX path (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $wixBin = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+          if (-not (Test-Path $wixBin)) {
+            # Fallback: install via chocolatey. GitHub runners already
+            # have choco available.
+            choco install wixtoolset --version=3.14.0 -y --no-progress
+            $wixBin = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+          }
+          echo "$wixBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "WiX bin on PATH: $wixBin"
+
       - name: Install cargo-wix (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo install cargo-wix --locked --version ^0.3
@@ -222,7 +240,7 @@ jobs:
         # crates/rimeterm/Cargo.toml (assets, description, etc).
         run: |
           set -euo pipefail
-          cargo deb --no-build -p rimeterm -o "rimeterm-${{ steps.version.outputs.value }}_amd64.deb"
+          cargo deb --no-build --target "${{ matrix.target }}" -p rimeterm -o "rimeterm-${{ steps.version.outputs.value }}_amd64.deb"
           ls -la "rimeterm-${{ steps.version.outputs.value }}_amd64.deb"
           echo "path=rimeterm-${{ steps.version.outputs.value }}_amd64.deb" \
             >> "$GITHUB_OUTPUT"
