@@ -124,6 +124,19 @@ pub(crate) enum PaneMutation {
 /// to auto-close the picker once the first real agent tab lands.
 pub(crate) const AGENT_PICKER_TITLE: &str = "Pick an agent";
 
+/// Result of hit-testing a mouse click against the cached tab-strip rects.
+/// Emitted by [`App::tab_hit`] and consumed by [`App::on_mouse`]; kept as
+/// an enum (rather than a tuple) so each arm names its intent.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TabStripHit {
+    /// Click on a tab label — activate that tab.
+    Activate { gid: TabGroupId, idx: usize },
+    /// Click on the `×` — close that tab.
+    Close { gid: TabGroupId, idx: usize },
+    /// Click on the `[+]` — dispatch new-tab for that group.
+    Plus { gid: TabGroupId },
+}
+
 /// Snapshot of live workspace state, exposed through
 /// `workspace.snapshot` IPC command. Updated at the end of every frame.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -731,12 +744,12 @@ impl App {
                 self.start_divider_drag(d, m.column, m.row);
                 return;
             }
-            // 2. Tab strip: activate the tab or fire the group's `[+]`.
-            if let Some((gid, idx, is_plus)) = self.tab_hit(m.column, m.row) {
-                if is_plus {
-                    self.new_tab_in(gid);
-                } else {
-                    self.activate_tab(gid, idx);
+            // 2. Tab strip: activate / close / fire the group's `[+]`.
+            if let Some(hit) = self.tab_hit(m.column, m.row) {
+                match hit {
+                    TabStripHit::Activate { gid, idx } => self.activate_tab(gid, idx),
+                    TabStripHit::Close { gid, idx } => self.close_tab_at(gid, idx),
+                    TabStripHit::Plus { gid } => self.new_tab_in(gid),
                 }
                 return;
             }
@@ -816,25 +829,50 @@ impl App {
             .copied()
     }
 
-    /// Test the cached tab-strip hits. Returns `(gid, tab_index, is_plus)`
-    /// where `is_plus` means the user clicked the `[+]` affordance.
-    fn tab_hit(&self, col: u16, row: u16) -> Option<(TabGroupId, usize, bool)> {
+    /// What the user meant by clicking somewhere on a cached tab strip.
+    /// `Activate` = switch to that tab. `Close` = close that tab (same
+    /// semantics as `workspace.pane.close`). `Plus` = new-tab dispatch.
+    fn tab_hit(&self, col: u16, row: u16) -> Option<TabStripHit> {
         for (gid, hits) in &self.last_tab_strips {
             if !point_in_rect(col, row, hits.rect) {
                 continue;
             }
+            // Close hits sit inside the tab rect (last cell of the label
+            // area) — check them BEFORE the activate rect so clicking `×`
+            // doesn't also switch to that tab.
+            for (idx, r) in &hits.closes {
+                if point_in_rect(col, row, *r) {
+                    return Some(TabStripHit::Close { gid: *gid, idx: *idx });
+                }
+            }
             for (idx, r) in &hits.tabs {
                 if point_in_rect(col, row, *r) {
-                    return Some((*gid, *idx, false));
+                    return Some(TabStripHit::Activate { gid: *gid, idx: *idx });
                 }
             }
             if let Some(plus) = hits.plus {
                 if point_in_rect(col, row, plus) {
-                    return Some((*gid, 0, true));
+                    return Some(TabStripHit::Plus { gid: *gid });
                 }
             }
         }
         None
+    }
+
+    /// Close whichever tab the user clicked `×` on. Uses the same policy
+    /// path as `workspace.pane.close` (delegates to `close_pane_by_id`),
+    /// so Open-group last-member protection kicks in identically.
+    fn close_tab_at(&mut self, gid: TabGroupId, idx: usize) {
+        let Some(pane_id) = self
+            .tree
+            .find_tab_group(gid)
+            .and_then(|g| g.members().get(idx).copied())
+        else {
+            return;
+        };
+        if let Err(e) = self.close_pane_by_id(pane_id) {
+            self.set_hint(format!("⛔ {}", e));
+        }
     }
 
     /// Activate tab `idx` inside `gid` and move keyboard focus to its
