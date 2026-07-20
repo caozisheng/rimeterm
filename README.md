@@ -11,7 +11,7 @@ Windows-priority, cross-platform.
 | **CI** | [![CI](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml) Linux · macOS (arm) · Windows |
 | **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · archives (`.tar.gz` / `.zip`) for all targets, plus macOS `.pkg` installer. Windows `.msi` + Linux `.deb` in progress. |
 | **MSRV** | Rust 1.90 (edition 2024) |
-| **Status** | v0.1.2 released (C15 + C16 + C17 + native installers); tip at C17. Follow-up plan in `docs/rimeterm-overall-design.md#15.2` (design doc is local-only) |
+| **Status** | v0.1.2 released (C15 + C16 + C17 + C18-A + spinner fix + native installers); tip at **post-C18-A · spinner 修复**. Retagged v0.1.2 once to fold C18-A and the `expire_pending_spawn` sampling fix in. Follow-up plan in `docs/rimeterm-overall-design.md#15.2` (design doc is local-only) |
 
 ---
 
