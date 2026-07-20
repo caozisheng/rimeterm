@@ -8,6 +8,7 @@ pub mod app;
 pub mod keymap;
 pub mod menu;
 pub mod palette;
+pub mod picker;
 pub mod pane_registry;
 pub mod placeholder_pane;
 pub mod pty_pane;

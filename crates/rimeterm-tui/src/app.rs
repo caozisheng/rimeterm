@@ -256,6 +256,7 @@ pub struct App {
     menu: AppMenu,
     menu_state: MenuState,
     palette_state: PaletteState,
+    picker_state: crate::picker::PickerState,
     commands: std::sync::Arc<CommandRegistry>,
     event_bus: EventBus,
     focus: FocusManager,
@@ -490,6 +491,7 @@ impl App {
             menu: AppMenu::v0_1_default(),
             menu_state: MenuState::default(),
             palette_state: PaletteState::default(),
+            picker_state: crate::picker::PickerState::default(),
             commands: std::sync::Arc::new(commands),
             event_bus,
             focus,
@@ -563,6 +565,18 @@ impl App {
                 MenuKeyOutcome::Run(cmd) => {
                     if let Err(e) = self.commands.run(cmd) {
                         warn!(command = cmd, error = %e, "menu command failed");
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.picker_state.open {
+            match crate::picker::handle_key(&mut self.picker_state, key) {
+                crate::picker::PickerOutcome::Run(cmd) => {
+                    if let Err(e) = self.commands.run(cmd) {
+                        warn!(command = cmd, error = %e, "picker command failed");
                     }
                 }
                 _ => {}
@@ -814,6 +828,14 @@ impl App {
             }
             self.focus.set_focus(pane_id, Some(gid));
         }
+        // Convenience: clicking the "Pick an agent" placeholder pane also
+        // opens the picker so users don't have to hunt for the `[+]`.
+        // Cheap — one HashMap lookup + a string compare.
+        if let Some(pane) = self.panes.get(pane_id) {
+            if pane.title() == AGENT_PICKER_TITLE {
+                self.open_agent_picker();
+            }
+        }
     }
 
     /// Reverse-lookup: which pane sits under `(col, row)` in the last-drawn
@@ -893,20 +915,53 @@ impl App {
         }
     }
 
-    /// Dispatch the `[+]` affordance for `gid`. shells → `workspace.shells.new`
-    /// (same as `Ctrl+T` on that group). agents → open the palette prefilled
-    /// with `agents.pick.` so the user picks which agent to spawn.
+    /// Dispatch the `[+]` affordance for `gid`. shells → spawn a new shell
+    /// immediately (there's only one choice). agents → open the picker
+    /// modal populated with `AGENT_REGISTRY` entries; each row fires the
+    /// corresponding `agents.pick.<id>` command on Enter.
     fn new_tab_in(&mut self, gid: TabGroupId) {
         if gid == BUILTIN_SHELLS {
             if let Err(e) = self.new_shell_tab_in(gid) {
                 self.set_hint(format!("⛔ {}", e));
             }
         } else if gid == BUILTIN_AGENTS {
-            self.palette_state.open();
-            self.palette_state.query = "agents.pick.".to_string();
-            self.palette_state.cursor = 0;
+            self.open_agent_picker();
         }
         // Fixed groups (files/sysmon) have no plus rect in the first place.
+    }
+
+    /// Populate and open the agent picker. Each entry maps to one of the
+    /// four `agents.pick.<id>` commands registered at startup. Rows for
+    /// agents whose binary isn't on PATH are shown greyed out with a
+    /// `(not installed)` note so the user can still see the full menu.
+    fn open_agent_picker(&mut self) {
+        let entries: Vec<crate::picker::PickerEntry> =
+            rimeterm_pty::agent_registry::detect_all()
+                .into_iter()
+                .map(|a| {
+                    let (command, note) = if a.is_available() {
+                        // Registry ids are static so we can match them 1:1
+                        // with the pre-registered `agents.pick.<id>` command.
+                        let cmd: Option<rimeterm_core::command::CommandId> = match a.id {
+                            "omp" => Some("agents.pick.omp"),
+                            "codex" => Some("agents.pick.codex"),
+                            "claude" => Some("agents.pick.claude"),
+                            "pi" => Some("agents.pick.pi"),
+                            _ => None,
+                        };
+                        (cmd, None)
+                    } else {
+                        (None, Some("(not installed)".to_string()))
+                    };
+                    crate::picker::PickerEntry {
+                        label: a.label.to_string(),
+                        note,
+                        command,
+                    }
+                })
+                .collect();
+        self.picker_state
+            .open_with("Pick an agent", entries);
     }
 
     fn mouse_drag(&mut self, col: u16, row: u16) {
@@ -1036,6 +1091,10 @@ impl App {
             let entries = self.command_entries();
             render_palette(rect, buf, &self.palette_state, &entries);
         }
+        if self.picker_state.open {
+            let rect = crate::picker::popup_rect(area, &self.picker_state);
+            crate::picker::render(rect, buf, &self.picker_state);
+        }
 
         // Snapshot state for IPC consumers (§11). Cheap: reads &self + writes
         // a small owned struct; no PTY I/O.
@@ -1152,14 +1211,12 @@ impl App {
         if f.shells_new.swap(false, Ordering::Relaxed) {
             // Ctrl+T is context-sensitive:
             // - focused group = shells → spawn a new shell tab (C1 behavior)
-            // - focused group = agents → open palette pre-filtered to
-            //   `agents.pick.` (C14 picker interjection)
-            // - anywhere else → same "Fixed group" error as before.
+            // - focused group = agents → open the picker dropdown (agents
+            //   have 4 possible providers, so a menu beats an implicit spawn)
+            // - anywhere else → surface a "Fixed group" hint via new_shell_tab.
             let focused = self.focus.focused_group();
             if focused == Some(BUILTIN_AGENTS) {
-                self.palette_state.open();
-                self.palette_state.query = "agents.pick.".to_string();
-                self.palette_state.cursor = 0;
+                self.open_agent_picker();
             } else if let Err(e) = self.new_shell_tab() {
                 self.set_hint(format!("⛔ {}", e));
             }
