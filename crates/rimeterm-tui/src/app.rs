@@ -1133,7 +1133,10 @@ impl App {
     /// picker. Only fired by right-click.
     fn open_context_menu(&mut self, col: u16, row: u16) {
         let mut entries: Vec<crate::picker::PickerEntry> = Vec::new();
-        // Divider hit — layout controls.
+
+        // Divider hit — anchor inside the full pane area so the popup
+        // can appear on either side of the seam without spilling into
+        // the tab strip or hint bar.
         if self
             .last_dividers
             .iter()
@@ -1147,12 +1150,21 @@ impl App {
                 "Reset splits to defaults",
                 "layout.reset",
             ));
-            self.picker_state.open_with("Divider", entries);
+            let anchor = crate::picker::PickerAnchor::Anchored {
+                x: col,
+                y: row,
+                bounds: self.last_pane_area,
+            };
+            self.picker_state
+                .open_with_anchor("Divider", entries, anchor);
             return;
         }
-        // Tab strip hit — same as left-click zones but menu form.
+
+        // Tab strip hit — anchor inside the owning pane's outer rect so
+        // the menu appears attached to that group's cell (not floating
+        // over a neighbour).
         if let Some(hit) = self.tab_hit(col, row) {
-            match hit {
+            let (gid, is_plus_only) = match hit {
                 TabStripHit::Activate { gid, idx } | TabStripHit::Close { gid, idx } => {
                     let is_open = matches!(
                         self.tree.find_tab_group(gid).map(|g| g.policy()),
@@ -1174,20 +1186,33 @@ impl App {
                         ));
                     }
                     push_group_new_entry(&mut entries, gid);
-                    self.picker_state
-                        .open_with(format!("Tab · {}", gid), entries);
-                    return;
+                    (gid, false)
                 }
                 TabStripHit::Plus { gid } => {
                     push_group_new_entry(&mut entries, gid);
-                    self.picker_state
-                        .open_with(format!("Group · {}", gid), entries);
-                    return;
+                    (gid, true)
                 }
-            }
+            };
+            let bounds = self
+                .group_bounds(gid)
+                .unwrap_or(self.last_pane_area);
+            let title = if is_plus_only {
+                format!("Group · {}", gid)
+            } else {
+                format!("Tab · {}", gid)
+            };
+            let anchor = crate::picker::PickerAnchor::Anchored {
+                x: col,
+                y: row,
+                bounds,
+            };
+            self.picker_state.open_with_anchor(title, entries, anchor);
+            return;
         }
-        // Pane hit.
-        if let Some((pane_id, _)) = self.pane_outer_at(col, row) {
+
+        // Pane hit — anchor inside that pane's outer rect so the menu
+        // stays on the shell / yazi / whatever the user right-clicked.
+        if let Some((pane_id, outer_rect)) = self.pane_outer_at(col, row) {
             let owner = self.tree.tab_groups().iter().find_map(|g| {
                 g.members()
                     .iter()
@@ -1216,8 +1241,25 @@ impl App {
                     }
                 }
             }
-            self.picker_state.open_with("Pane", entries);
+            let anchor = crate::picker::PickerAnchor::Anchored {
+                x: col,
+                y: row,
+                bounds: outer_rect,
+            };
+            self.picker_state.open_with_anchor("Pane", entries, anchor);
         }
+    }
+
+    /// The outer rect of `gid`'s active pane, i.e. what the tab strip
+    /// sits above. Used to bound a context menu spawned from clicking
+    /// on that strip. `None` when the group has no live active pane.
+    fn group_bounds(&self, gid: TabGroupId) -> Option<Rect> {
+        let group = self.tree.find_tab_group(gid)?;
+        let active = group.active_pane()?;
+        self.last_pane_outer_rects
+            .iter()
+            .find(|(id, _)| *id == active)
+            .map(|(_, r)| *r)
     }
 
     fn mouse_drag(&mut self, col: u16, row: u16) {

@@ -76,26 +76,60 @@ impl PickerEntry {
     }
 }
 
+/// Where the popup should land on screen. `Centered` is the default (used
+/// by the agent picker on `Ctrl+T`); `Anchored` pins the popup near a
+/// specific `(col, row)` inside a bounding rect, so a right-click context
+/// menu drops next to the click and stays inside the pane it came from.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum PickerAnchor {
+    /// Center on the given draw area (usually the whole terminal rect).
+    #[default]
+    Centered,
+    /// Anchor so the top-left corner sits at `(x, y)`, clipping the popup
+    /// to fit inside `bounds`. The popup grows down-right by default;
+    /// if that would overflow it flips up / left. Used by the right-click
+    /// context menu — `bounds` is typically the clicked pane's outer rect.
+    Anchored {
+        x: u16,
+        y: u16,
+        bounds: Rect,
+    },
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct PickerState {
     pub open: bool,
     pub title: String,
     pub entries: Vec<PickerEntry>,
     pub cursor: usize,
+    pub anchor: PickerAnchor,
 }
 
 impl PickerState {
+    /// Open centered on the screen (default behavior).
     pub fn open_with(&mut self, title: impl Into<String>, entries: Vec<PickerEntry>) {
+        self.open_with_anchor(title, entries, PickerAnchor::Centered);
+    }
+
+    /// Open with an explicit anchor (used by the right-click context menu).
+    pub fn open_with_anchor(
+        &mut self,
+        title: impl Into<String>,
+        entries: Vec<PickerEntry>,
+        anchor: PickerAnchor,
+    ) {
         self.open = true;
         self.title = title.into();
         self.entries = entries;
         self.cursor = first_enabled(&self.entries).unwrap_or(0);
+        self.anchor = anchor;
     }
 
     pub fn close(&mut self) {
         self.open = false;
         self.entries.clear();
         self.cursor = 0;
+        self.anchor = PickerAnchor::Centered;
     }
 
     /// Move cursor by `step` (positive = down, negative = up), skipping
@@ -162,8 +196,14 @@ pub fn handle_key(state: &mut PickerState, key: KeyEvent) -> PickerOutcome {
     }
 }
 
-/// Centered popup sized to fit the entries; caps at a third of the terminal
-/// so it doesn't crowd out the shell/agents panes behind it.
+/// Compute the popup rect. Layout: measure content, clamp to a sensible
+/// max, then place per [`PickerAnchor`]:
+///
+/// - `Centered`: middle of `area`.
+/// - `Anchored { x, y, bounds }`: drop the popup's top-left at `(x + 1,
+///   y + 1)` if it fits under-right of the click; otherwise flip up
+///   and/or left. Always clipped inside `bounds` so a context menu on
+///   the shell pane stays over the shell pane.
 pub fn popup_rect(area: Rect, state: &PickerState) -> Rect {
     use unicode_width::UnicodeWidthStr;
     let content_w = state
@@ -177,18 +217,44 @@ pub fn popup_rect(area: Rect, state: &PickerState) -> Rect {
         .max()
         .unwrap_or(0);
     let title_w = UnicodeWidthStr::width(state.title.as_str()) as u16 + 4;
-    let width = content_w.max(title_w).saturating_add(4).clamp(28, 64);
-    let width = width.min(area.width.saturating_sub(4));
-    let height = ((state.entries.len() as u16) + 2)
-        .clamp(4, 18)
-        .min(area.height.saturating_sub(2));
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect {
-        x,
-        y,
-        width,
-        height,
+    let ideal_w = content_w.max(title_w).saturating_add(4).clamp(28, 64);
+    let ideal_h = ((state.entries.len() as u16) + 2).clamp(4, 18);
+
+    match state.anchor {
+        PickerAnchor::Centered => {
+            let width = ideal_w.min(area.width.saturating_sub(4));
+            let height = ideal_h.min(area.height.saturating_sub(2));
+            let x = area.x + area.width.saturating_sub(width) / 2;
+            let y = area.y + area.height.saturating_sub(height) / 2;
+            Rect { x, y, width, height }
+        }
+        PickerAnchor::Anchored { x: click_x, y: click_y, bounds } => {
+            // Clip max size to the bounding pane; a picker larger than the
+            // pane would look wrong even if it fits the screen.
+            let width = ideal_w.min(bounds.width.saturating_sub(2)).max(4);
+            let height = ideal_h.min(bounds.height.saturating_sub(2)).max(3);
+            let right_edge = bounds.x.saturating_add(bounds.width);
+            let bottom_edge = bounds.y.saturating_add(bounds.height);
+            // Prefer under-right of the click; flip if we'd overflow.
+            let mut x = click_x.saturating_add(1);
+            if x + width > right_edge {
+                // Flip left of the click.
+                x = click_x.saturating_sub(width);
+            }
+            // Final clamp to bounds — covers the case where flipping
+            // still overflows (rare, small pane).
+            let x = x
+                .max(bounds.x)
+                .min(right_edge.saturating_sub(width).max(bounds.x));
+            let mut y = click_y.saturating_add(1);
+            if y + height > bottom_edge {
+                y = click_y.saturating_sub(height);
+            }
+            let y = y
+                .max(bounds.y)
+                .min(bottom_edge.saturating_sub(height).max(bounds.y));
+            Rect { x, y, width, height }
+        }
     }
 }
 
@@ -337,5 +403,93 @@ mod tests {
         s.open_with("T", vec![PickerEntry::command("a", "a")]);
         assert_eq!(handle_key(&mut s, key(KeyCode::Esc)), PickerOutcome::Closed);
         assert!(!s.open);
+    }
+
+    // --- popup_rect anchor placement ---
+
+    fn state_with(anchor: PickerAnchor, entries: usize) -> PickerState {
+        let mut s = PickerState::default();
+        let list: Vec<PickerEntry> = (0..entries)
+            .map(|i| PickerEntry::command(format!("row-{i}"), "cmd.x"))
+            .collect();
+        s.open_with_anchor("T", list, anchor);
+        s
+    }
+
+    #[test]
+    fn centered_anchor_lands_in_middle_of_area() {
+        let s = state_with(PickerAnchor::Centered, 5);
+        let area = Rect { x: 0, y: 0, width: 120, height: 40 };
+        let r = popup_rect(area, &s);
+        assert!(r.x > 20 && r.x < 100, "x={}", r.x);
+        assert!(r.y > 5 && r.y < 30, "y={}", r.y);
+    }
+
+    #[test]
+    fn anchored_drops_down_right_of_click_when_it_fits() {
+        let bounds = Rect { x: 10, y: 5, width: 80, height: 30 };
+        let s = state_with(
+            PickerAnchor::Anchored { x: 20, y: 8, bounds },
+            5,
+        );
+        let area = Rect { x: 0, y: 0, width: 100, height: 40 };
+        let r = popup_rect(area, &s);
+        // Preferred position: (click_x + 1, click_y + 1).
+        assert_eq!(r.x, 21);
+        assert_eq!(r.y, 9);
+        // Still inside bounds.
+        assert!(r.x + r.width <= bounds.x + bounds.width);
+        assert!(r.y + r.height <= bounds.y + bounds.height);
+    }
+
+    #[test]
+    fn anchored_flips_left_when_right_would_overflow() {
+        // Click near right edge — down-right doesn't fit, must flip left.
+        let bounds = Rect { x: 0, y: 0, width: 40, height: 30 };
+        let s = state_with(
+            PickerAnchor::Anchored { x: 38, y: 5, bounds },
+            5,
+        );
+        let area = Rect { x: 0, y: 0, width: 40, height: 30 };
+        let r = popup_rect(area, &s);
+        // The popup's right edge should be inside bounds.
+        assert!(
+            r.x + r.width <= bounds.x + bounds.width,
+            "r.x + r.width = {} > bounds.width = {}",
+            r.x + r.width,
+            bounds.width
+        );
+    }
+
+    #[test]
+    fn anchored_flips_up_when_below_would_overflow() {
+        let bounds = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let s = state_with(
+            PickerAnchor::Anchored { x: 5, y: 18, bounds },
+            5,
+        );
+        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let r = popup_rect(area, &s);
+        assert!(
+            r.y + r.height <= bounds.y + bounds.height,
+            "r.y + r.height = {} > bounds.height = {}",
+            r.y + r.height,
+            bounds.height
+        );
+    }
+
+    #[test]
+    fn anchored_clamps_size_inside_tight_bounds() {
+        // Bounds smaller than the picker's ideal size — width/height should
+        // shrink to fit rather than overflow.
+        let bounds = Rect { x: 0, y: 0, width: 20, height: 6 };
+        let s = state_with(
+            PickerAnchor::Anchored { x: 2, y: 1, bounds },
+            5,
+        );
+        let area = Rect { x: 0, y: 0, width: 20, height: 6 };
+        let r = popup_rect(area, &s);
+        assert!(r.width <= bounds.width);
+        assert!(r.height <= bounds.height);
     }
 }
