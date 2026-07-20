@@ -17,8 +17,7 @@
 # Archive naming (matches Rust target triples so users can `curl` the right
 # one from CI env vars):
 #   * Linux   → `rimeterm-<version>-x86_64-unknown-linux-gnu.tar.gz`
-#   * macOS Intel → `rimeterm-<version>-x86_64-apple-darwin.tar.gz`
-#   * macOS ARM  → `rimeterm-<version>-aarch64-apple-darwin.tar.gz`
+#   * macOS   → `rimeterm-<version>-aarch64-apple-darwin.tar.gz` (Apple Silicon only)
 #   * Windows → `rimeterm-<version>-x86_64-pc-windows-msvc.zip`
 #
 # On tag pushes `<version>` == the tag minus the leading `v`; on manual
@@ -53,10 +52,6 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             shared-key: release-linux
-          - target: x86_64-apple-darwin
-            os: macos-13         # Intel runner — macos-latest is now ARM
-            archive: tar.gz
-            shared-key: release-macos-x86
           - target: aarch64-apple-darwin
             os: macos-latest     # Apple Silicon
             archive: tar.gz

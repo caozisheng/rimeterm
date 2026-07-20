@@ -1,0 +1,13 @@
+# Pins the toolchain used by every developer, CI job, and release build.
+#
+# Version matches `rust-version` in Cargo.toml. Bumping one means bumping
+# both — the CI job for Cargo.toml diffs will surface any mismatch.
+#
+# Why pin at all: we hit CI-only formatting drift (rustfmt 1.8.0 locally
+# vs the runner's older stable) that would recur every few weeks as
+# rustfmt tweaked defaults. Pinning kills the version-skew source class.
+
+[toolchain]
+channel = "1.90"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

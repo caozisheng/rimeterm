@@ -9,7 +9,7 @@ Windows-priority, cross-platform.
 |---|---|
 | **License** | Apache-2.0 · see [`LICENSE`](LICENSE) |
 | **CI** | [![CI](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml) Linux · macOS (arm) · Windows |
-| **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · builds for `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` |
+| **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · builds for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` |
 | **MSRV** | Rust 1.90 (edition 2024) |
 | **Status** | v0.1 — under active development |
 
