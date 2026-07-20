@@ -224,6 +224,37 @@ pub(crate) fn spinner_glyph(elapsed: std::time::Duration) -> &'static str {
     SPINNER_FRAMES[idx]
 }
 
+/// Decide whether the boot-progress spinner has done its job. Split from
+/// `App::expire_pending_spawn` so every branch is unit-testable without
+/// spawning a PTY. The classification rules — in order of precedence:
+///
+/// 1. **Pane vanished** (`grid_sample = None`) → clear. The pane was
+///    closed while its child was still booting; nothing to show.
+/// 2. **Timeout expired** (`elapsed >= PENDING_SPAWN_TIMEOUT`) → clear.
+///    We refuse to nag the hint bar forever if the tool never prints;
+///    the pane keeps running, we just stop shouting about it.
+/// 3. **First real output present** (any non-whitespace char in the
+///    sampled grid) → clear. The tool has responded.
+/// 4. Otherwise → keep spinning.
+///
+/// Rule 3 is why the caller passes the **entire visible viewport**, not
+/// just the tail. Alt-screen TUIs (claude, codex, omp) paint their
+/// banner at the top and leave the bottom blank; a tail-only sample
+/// gave `false` forever and the spinner only cleared on a manual
+/// resize (which forces the child to repaint bottom-to-top).
+pub(crate) fn pending_spawn_should_clear(
+    elapsed: std::time::Duration,
+    grid_sample: Option<&str>,
+) -> bool {
+    let Some(sample) = grid_sample else {
+        return true; // pane vanished
+    };
+    if elapsed >= PENDING_SPAWN_TIMEOUT {
+        return true;
+    }
+    sample.chars().any(|c| !c.is_whitespace())
+}
+
 /// Which divider the mouse pointer is currently over. Terminals don't let
 /// us swap the OS mouse cursor to a resize icon (no ANSI escape exists),
 /// so we compensate visually: the seam paints bright on hover and the hint
@@ -2235,31 +2266,41 @@ impl App {
 
     /// Clear the boot-progress spinner if either the target pane has
     /// produced first output or the timeout deadline hit. Called each
-    /// tick alongside `expire_hint`. Pure enough to test — the decision
-    /// is factored out into `pending_spawn_should_clear`.
+    /// tick alongside `expire_hint`. The classification decision is
+    /// factored out into the pure [`pending_spawn_should_clear`] so tests
+    /// can drive every branch without a live PTY.
+    ///
+    /// **Historic bug fix**: previous versions sampled the LAST four
+    /// rows of the grid via `grid_contents(Some(4))`. Full-screen alt-
+    /// screen TUIs (claude, codex, omp) paint their banner at the top
+    /// and leave the bottom rows blank — so the sample was whitespace
+    /// forever and the spinner only cleared after the user forced a
+    /// re-render (window resize, which triggers the child to repaint
+    /// its whole viewport, at which point the bottom rows finally hold
+    /// a status bar / prompt). We now sample the ENTIRE visible viewport.
     fn expire_pending_spawn(&mut self) {
         let Some(pending) = &self.pending_spawn else {
             return;
         };
-        // Check timeout first — cheap, no PTY read.
-        if pending.started.elapsed() >= PENDING_SPAWN_TIMEOUT {
-            self.pending_spawn = None;
-            return;
-        }
-        // Then check for first output. Snapshot 2 rows from the top of
-        // the target pane's grid; if any non-whitespace byte is there,
-        // the tool has started printing (login prompt, banner, …).
-        let has_output = self
+        // Sample the whole visible viewport (rows = None). Cheap: a
+        // single `parking_lot::Mutex` lock + a String walk sized to
+        // (cols × rows), typically < 20 KiB. Runs at ~60 Hz only while a
+        // spawn is pending — once cleared, the outer `let Some(...)`
+        // returns without touching the mutex.
+        let sample = self
             .session_writes
             .lock()
             .get(&pending.pane_id)
-            .map(|s| {
-                let sample = s.grid_contents(Some(4));
-                sample.chars().any(|c| !c.is_whitespace())
-            })
-            .unwrap_or(true); // pane vanished (closed?) → stop showing spinner
-        if has_output {
+            .map(|s| s.grid_contents(None));
+        if pending_spawn_should_clear(pending.started.elapsed(), sample.as_deref()) {
             self.pending_spawn = None;
+            // Force one more render immediately — without this pulse the
+            // hint bar would keep drawing "Initializing …" until the next
+            // input/timer tick delivers a fresh frame. The 16ms fallback
+            // in the main loop usually saves us, but under a busy tokio
+            // runtime or a starved timer wheel it can take noticeably
+            // longer. Belt-and-braces: pulse once, cost = one channel send.
+            let _ = self.redraw_tx.send(());
         }
     }
 
@@ -4261,5 +4302,62 @@ mod tests {
                 f
             );
         }
+    }
+
+    // --- pending_spawn_should_clear (spawn-progress classification) ---
+
+    #[test]
+    fn spawn_clears_when_pane_vanished() {
+        // Session dropped from session_writes → caller passes None.
+        // Must clear so the spinner doesn't outlive its pane.
+        assert!(pending_spawn_should_clear(
+            std::time::Duration::from_secs(1),
+            None
+        ));
+    }
+
+    #[test]
+    fn spawn_clears_on_timeout_even_without_output() {
+        // Pane still exists (grid = ""), but boot deadline hit — stop nagging.
+        assert!(pending_spawn_should_clear(
+            PENDING_SPAWN_TIMEOUT,
+            Some("")
+        ));
+        assert!(pending_spawn_should_clear(
+            PENDING_SPAWN_TIMEOUT + std::time::Duration::from_secs(1),
+            Some("            \n\n\n")
+        ));
+    }
+
+    #[test]
+    fn spawn_keeps_spinning_before_deadline_and_no_output() {
+        // Fresh spawn + blank grid = the exact state the spinner exists for.
+        assert!(!pending_spawn_should_clear(
+            std::time::Duration::from_millis(500),
+            Some("")
+        ));
+        // Whitespace-only grids (rendered blank rows / cursor at origin
+        // over an empty terminal) MUST NOT count as output — that's the
+        // false-positive we're guarding against.
+        assert!(!pending_spawn_should_clear(
+            std::time::Duration::from_millis(500),
+            Some("   \n   \n   \n")
+        ));
+    }
+
+    #[test]
+    fn spawn_clears_on_any_nonwhitespace_char() {
+        // Regression: the old tail-only sample missed banners at the top
+        // of alt-screen TUIs. Content anywhere in the sample must clear.
+        assert!(pending_spawn_should_clear(
+            std::time::Duration::from_millis(200),
+            // Banner at top, blank tail — the exact shape of a fresh
+            // claude / codex / omp launch.
+            Some("Welcome to omp!\n\n\n\n\n\n\n")
+        ));
+        assert!(pending_spawn_should_clear(
+            std::time::Duration::from_millis(200),
+            Some("$ ")
+        ));
     }
 }
