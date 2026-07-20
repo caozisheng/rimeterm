@@ -193,8 +193,7 @@ rimectl --pid $PID workspace.pane.rename \
   --json "{\"pane_id\": $PANE, \"title\": \"build-runner\"}"
 rimectl --pid $PID workspace.pane.write \
   --json "{\"pane_id\": $PANE, \"text\": \"cargo test\", \"enter\": true}"
-rimectl --pid $PID workspace.pane.wait \
-  --json "{\"pane_id\": $PANE, \"pattern\": \"test result:\", \"timeout_ms\": 60000}"
+rimectl --pid $PID --wait 'test result:' --pane $PANE --timeout-ms 60000
 rimectl --pid $PID workspace.pane.close --json "{\"pane_id\": $PANE}"
 ```
 
@@ -204,7 +203,9 @@ Every command is listed by `rimectl help`. Selected highlights:
   registry: `omp` / `codex` / `claude` / `pi`).
 - `workspace.pane.wait {pane_id, pattern, timeout_ms?<=60000}` —
   server-side regex poll; returns as soon as `pattern` matches or the
-  deadline hits.
+  deadline hits. Client-side sugar: `rimectl --wait <regex> --pane <id>
+  [--timeout-ms N] [--poll-ms N]` (exits non-zero on timeout, so `&&`
+  chains break cleanly).
 - `tools.install {name}` — shell-out to
   `cargo install --locked <crates…>` for the five-tool registry;
   300 s hard timeout; returns exit code + captured output.
