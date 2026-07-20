@@ -1046,6 +1046,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "unicode-width",
  "vt100",
  "which",
 ]

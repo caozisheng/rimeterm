@@ -268,6 +268,14 @@ pub struct App {
     last_pane_area: Rect,
     /// Divider list matching `last_pane_area`. Cached at frame end.
     last_dividers: Vec<rimeterm_core::layout::Divider>,
+    /// Cached tab-strip hit rects per group, populated during `draw`. Used
+    /// by `on_mouse` to route clicks on tab titles / `[+]` back into the
+    /// same commands the keyboard uses. Fresh every frame.
+    last_tab_strips: Vec<(rimeterm_core::tabs::TabGroupId, crate::tab_strip::TabStripHits)>,
+    /// Cached per-pane outer rect (strip-stripped, i.e. the actual rect
+    /// `pane.render` received). Different from `LayoutTree::compute_rects`
+    /// output, which returns the full quadrant cell including its tab strip.
+    last_pane_outer_rects: Vec<(PaneId, Rect)>,
     /// In-progress divider drag. `None` when idle.
     active_drag: Option<DragState>,
     /// Snapshot of default ratios so we can `= / 0` reset.
@@ -484,6 +492,8 @@ impl App {
             session_writes,
             last_pane_area: Rect::default(),
             last_dividers: Vec::new(),
+            last_tab_strips: Vec::new(),
+            last_pane_outer_rects: Vec::new(),
             active_drag: None,
             default_ratios,
             pending_mutations,
@@ -692,6 +702,7 @@ impl App {
     /// 4. Down on empty space (unlikely) — no-op.
     fn on_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+
         // --- Active drag takes precedence ---
         if let MouseEventKind::Drag(MouseButton::Left) = m.kind {
             if self.active_drag.is_some() {
@@ -707,35 +718,34 @@ impl App {
                 return;
             }
         }
-        // --- Down on a divider starts a drag; no pane forwarding ---
+
+        // --- Left Down: dispatch by zone (divider → tab strip → pane) ---
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-            let divider = self
+            // 1. Divider drag.
+            if let Some(d) = self
                 .last_dividers
                 .iter()
                 .find(|d| point_in_rect(m.column, m.row, d.visual.rect))
-                .cloned();
-            if let Some(d) = divider {
+                .cloned()
+            {
                 self.start_divider_drag(d, m.column, m.row);
                 return;
             }
-            // Not a divider → focus the pane, then also forward the Down.
+            // 2. Tab strip: activate the tab or fire the group's `[+]`.
+            if let Some((gid, idx, is_plus)) = self.tab_hit(m.column, m.row) {
+                if is_plus {
+                    self.new_tab_in(gid);
+                } else {
+                    self.activate_tab(gid, idx);
+                }
+                return;
+            }
+            // 3. Fell into a pane rect: focus + forward the Down.
             self.focus_pane_at(m.column, m.row);
         }
-        // --- Everything else: forward to the pane under the cursor ---
-        // For Down we already set focus above; Drag/Up/Scroll all use the
-        // pane at the current coord (or the focused pane for Up if it left
-        // the pane rect). Precise SGR forwarding requires the pane's outer
-        // rect, which we can rebuild from compute_rects.
-        let Some(pane_id) = self.pane_at(m.column, m.row) else {
-            return;
-        };
-        let Some(outer_rect) = self
-            .tree
-            .compute_rects(self.last_pane_area)
-            .into_iter()
-            .find(|(id, _)| *id == pane_id)
-            .map(|(_, r)| r)
-        else {
+
+        // --- Drag / Up / Scroll on a pane rect: forward as SGR to child ---
+        let Some((pane_id, outer_rect)) = self.pane_outer_at(m.column, m.row) else {
             return;
         };
         if let Some(pane) = self.panes.get_mut(pane_id) {
@@ -771,9 +781,12 @@ impl App {
     }
 
     /// Focus the pane under `(col, row)` and activate its tab within the
-    /// owning group. Silent no-op if the click missed every pane.
+    /// owning group. Silent no-op if the click missed every pane. Uses
+    /// the strip-stripped `last_pane_outer_rects` cache — so a click on
+    /// the tab strip is NOT treated as a pane click (the tab hit path
+    /// in `on_mouse` runs first).
     fn focus_pane_at(&mut self, col: u16, row: u16) {
-        let Some(pane_id) = self.pane_at(col, row) else {
+        let Some((pane_id, _)) = self.pane_outer_at(col, row) else {
             return;
         };
         let owner = self.tree.tab_groups().iter().find_map(|g| {
@@ -791,13 +804,71 @@ impl App {
     }
 
     /// Reverse-lookup: which pane sits under `(col, row)` in the last-drawn
-    /// pane area? Returns `None` if outside the pane area (e.g. status bar).
-    fn pane_at(&self, col: u16, row: u16) -> Option<PaneId> {
-        if !point_in_rect(col, row, self.last_pane_area) {
-            return None;
+    /// pane area? Uses the per-frame `last_pane_outer_rects` cache built by
+    /// `draw`, which stores the actual `pane_rect` each provider was handed
+    /// (i.e. the quadrant cell **minus** its 1-row tab strip). Returns the
+    /// pane id together with that outer rect so callers can forward the
+    /// event without recomputing geometry.
+    fn pane_outer_at(&self, col: u16, row: u16) -> Option<(PaneId, Rect)> {
+        self.last_pane_outer_rects
+            .iter()
+            .find(|(_, r)| point_in_rect(col, row, *r))
+            .copied()
+    }
+
+    /// Test the cached tab-strip hits. Returns `(gid, tab_index, is_plus)`
+    /// where `is_plus` means the user clicked the `[+]` affordance.
+    fn tab_hit(&self, col: u16, row: u16) -> Option<(TabGroupId, usize, bool)> {
+        for (gid, hits) in &self.last_tab_strips {
+            if !point_in_rect(col, row, hits.rect) {
+                continue;
+            }
+            for (idx, r) in &hits.tabs {
+                if point_in_rect(col, row, *r) {
+                    return Some((*gid, *idx, false));
+                }
+            }
+            if let Some(plus) = hits.plus {
+                if point_in_rect(col, row, plus) {
+                    return Some((*gid, 0, true));
+                }
+            }
         }
-        let rects = self.tree.compute_rects(self.last_pane_area);
-        resolve_pane_at(&rects, col, row)
+        None
+    }
+
+    /// Activate tab `idx` inside `gid` and move keyboard focus to its
+    /// active pane. Silent no-op if the group or index is stale (racing
+    /// with a `pane.close` from IPC, say).
+    fn activate_tab(&mut self, gid: TabGroupId, idx: usize) {
+        let pane_id = match self.tree.find_tab_group_mut(gid) {
+            Some(group) => {
+                if group.goto(idx).is_err() {
+                    return;
+                }
+                group.active_pane()
+            }
+            None => return,
+        };
+        if let Some(pane_id) = pane_id {
+            self.focus.set_focus(pane_id, Some(gid));
+        }
+    }
+
+    /// Dispatch the `[+]` affordance for `gid`. shells → `workspace.shells.new`
+    /// (same as `Ctrl+T` on that group). agents → open the palette prefilled
+    /// with `agents.pick.` so the user picks which agent to spawn.
+    fn new_tab_in(&mut self, gid: TabGroupId) {
+        if gid == BUILTIN_SHELLS {
+            if let Err(e) = self.new_shell_tab_in(gid) {
+                self.set_hint(format!("⛔ {}", e));
+            }
+        } else if gid == BUILTIN_AGENTS {
+            self.palette_state.open();
+            self.palette_state.query = "agents.pick.".to_string();
+            self.palette_state.cursor = 0;
+        }
+        // Fixed groups (files/sysmon) have no plus rect in the first place.
     }
 
     fn mouse_drag(&mut self, col: u16, row: u16) {
@@ -858,6 +929,8 @@ impl App {
         // rects the user is looking at.
         self.last_pane_area = vertical[1];
         self.last_dividers = self.tree.dividers(vertical[1]);
+        self.last_tab_strips.clear();
+        self.last_pane_outer_rects.clear();
 
         // Compute the rect for each *tab group cell*, then split off a 1-row
         // tab strip inside each cell. This is simpler than tracking tab strips
@@ -890,8 +963,11 @@ impl App {
                             .unwrap_or_else(|| "(gone)".into())
                     })
                     .collect();
+                let hits = crate::tab_strip::hit_rects(strip_rect, group, &titles);
+                self.last_tab_strips.push((gid, hits));
                 render_tab_strip(strip_rect, buf, group, &titles);
                 if let Some(active_id) = group.active_pane() {
+                    self.last_pane_outer_rects.push((active_id, pane_rect));
                     if let Some(pane) = self.panes.get_mut(active_id) {
                         let ctx = PaneRenderCtx {
                             focused: self.focus.focused_pane() == Some(active_id),
@@ -2593,23 +2669,6 @@ fn split_parent_rect(
     matches!(node, LayoutNode::Split { .. }).then_some(area)
 }
 
-/// Reverse hit-test: given `(pane_id, rect)` pairs from `compute_rects`
-/// (parent-before-children order), return the smallest / deepest pane
-/// whose rect contains `(col, row)`. Pure so unit tests can drive it
-/// without an `App` or a live PTY.
-pub(crate) fn resolve_pane_at(
-    rects: &[(PaneId, Rect)],
-    col: u16,
-    row: u16,
-) -> Option<PaneId> {
-    for (id, rect) in rects.iter().rev() {
-        if point_in_rect(col, row, *rect) {
-            return Some(*id);
-        }
-    }
-    None
-}
-
 /// Compute the min-size floor (as a fraction of parent extent) per child of
 /// the split at `path`. v0.1 hardcodes the design-doc §19.8 defaults; a later
 /// milestone reads them from config.
@@ -3044,41 +3103,5 @@ mod tests {
     fn tool_action_args_accept_valid_name() {
         let name = parse_tool_action_args(&wait_args_json(r#"{"name":"gitui"}"#)).unwrap();
         assert_eq!(name, "gitui");
-    }
-
-    // --- resolve_pane_at (mouse hit-test) ---
-
-    #[test]
-    fn resolve_pane_at_returns_deepest_match() {
-        let parent = PaneId::next();
-        let leaf = PaneId::next();
-        // Parent covers 0..40 × 0..20; leaf covers the top-left 20×10 corner.
-        // compute_rects yields parent BEFORE leaf.
-        let rects = vec![
-            (parent, Rect { x: 0, y: 0, width: 40, height: 20 }),
-            (leaf,   Rect { x: 0, y: 0, width: 20, height: 10 }),
-        ];
-        // Inside the leaf ⇒ leaf wins even though parent also contains the point.
-        assert_eq!(resolve_pane_at(&rects, 5, 5), Some(leaf));
-        // Right of the leaf but still inside parent ⇒ parent.
-        assert_eq!(resolve_pane_at(&rects, 30, 5), Some(parent));
-        // Outside everything ⇒ None.
-        assert_eq!(resolve_pane_at(&rects, 100, 100), None);
-    }
-
-    #[test]
-    fn resolve_pane_at_empty_list_is_none() {
-        assert_eq!(resolve_pane_at(&[], 3, 3), None);
-    }
-
-    #[test]
-    fn resolve_pane_at_edge_of_rect_is_inside() {
-        // (0,0) is inside a rect starting at (0,0); (width,height) is not.
-        let p = PaneId::next();
-        let rects = vec![(p, Rect { x: 0, y: 0, width: 4, height: 3 })];
-        assert_eq!(resolve_pane_at(&rects, 0, 0), Some(p));
-        assert_eq!(resolve_pane_at(&rects, 3, 2), Some(p));
-        assert_eq!(resolve_pane_at(&rects, 4, 2), None); // width exclusive
-        assert_eq!(resolve_pane_at(&rects, 3, 3), None); // height exclusive
     }
 }
