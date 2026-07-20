@@ -188,6 +188,42 @@ struct DragState {
     baseline_ratios: Vec<f32>,
 }
 
+/// In-flight agent / external-tool spawn currently booting its PTY. Some
+/// coding agents (claude, codex) take multiple seconds to write their
+/// first prompt to the pty, and until then the pane looks blank — users
+/// reasonably assume "hung". `PendingSpawn` drives a hint-bar spinner
+/// that reads `⣷ Initializing Claude Code…  (2.1s)` so it's obvious the
+/// tool is starting.
+///
+/// Cleared when either:
+/// - the target pane's grid contains any non-whitespace byte (real first
+///   output — the tool responded), or
+/// - `PENDING_SPAWN_TIMEOUT` elapses (defensive: if the tool never
+///   prints, don't lock the hint bar forever).
+#[derive(Debug, Clone)]
+pub(crate) struct PendingSpawn {
+    pub label: String,
+    pub pane_id: PaneId,
+    pub started: Instant,
+}
+
+/// Deadline after which we stop showing the spinner even if the tool
+/// hasn't printed anything. Not a kill switch — the pane keeps running,
+/// we just stop nagging the hint bar.
+pub(crate) const PENDING_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Braille dot spinner. One frame per ~100ms of elapsed time so the
+/// animation feels alive without being distracting. 8 frames cycles
+/// through the standard Unicode block.
+pub(crate) const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠇"];
+
+/// Pick a spinner glyph for the given elapsed duration. Pure so tests
+/// can lock the cycle shape.
+pub(crate) fn spinner_glyph(elapsed: std::time::Duration) -> &'static str {
+    let idx = (elapsed.as_millis() / 100) as usize % SPINNER_FRAMES.len();
+    SPINNER_FRAMES[idx]
+}
+
 /// Which divider the mouse pointer is currently over. Terminals don't let
 /// us swap the OS mouse cursor to a resize icon (no ANSI escape exists),
 /// so we compensate visually: the seam paints bright on hover and the hint
@@ -332,6 +368,13 @@ pub struct App {
     /// a divider in `last_dividers`. `Direction` is cached so the
     /// hint / glyph don't need a second lookup.
     hovered_divider: Option<HoveredDivider>,
+    /// Populated the moment an agent / external-tool spawn is queued
+    /// (via `PaneMutation::OpenAgent`). Drives a hint-bar spinner
+    /// (`⣷ Initializing …`) so the user knows the terminal isn't
+    /// hung while claude/codex/etc take seconds to boot their PTY.
+    /// Cleared when the target pane produces first output or after
+    /// `PENDING_SPAWN_TIMEOUT`.
+    pending_spawn: Option<PendingSpawn>,
     /// Reverse map from agent PaneId → static registry id (`omp` / `codex`
     /// / `claude` / `pi`). Populated on spawn, consumed by
     /// `persist_agents_state` to write the on-disk file.
@@ -627,6 +670,7 @@ impl App {
             last_tab_strips: Vec::new(),
             last_pane_outer_rects: Vec::new(),
             hovered_divider: None,
+            pending_spawn: None,
             pane_agent_id: startup_agent_ids.into_iter().collect(),
             active_drag: None,
             default_ratios,
@@ -654,6 +698,7 @@ impl App {
             self.drain_mutations();
             self.drain_flags();
             self.expire_hint();
+            self.expire_pending_spawn();
 
             tokio::select! {
                 Some(evt) = input.next() => {
@@ -1563,15 +1608,35 @@ impl App {
             }
         }
 
-        // Hint bar: live divider hover > transient hint > default keys.
-        // Hover wins because terminals can't repaint the mouse pointer;
-        // the hint bar is the only place we can advertise "this seam is
-        // interactive" without stealing focus. During an active drag we
-        // fall through to the default hint too (`live_hover` is None),
-        // so mid-drag we see the normal keybind row instead of a stale
-        // "↔ drag to resize" tip.
-        let hint_text = if let Some((_, axis)) = live_hover {
-            match axis {
+        // Hint bar precedence (highest → lowest):
+        //   1. `pending_spawn`  — spawn spinner. Highest priority
+        //      because the user JUST pressed Enter on a picker row and
+        //      needs immediate feedback the terminal isn't hung.
+        //   2. Live divider hover — the pointer is on a seam and there's
+        //      no way to change the OS cursor from a terminal, so we
+        //      commandeer the hint bar as the affordance channel.
+        //   3. Transient `self.hint` — set_hint() messages, ~3s TTL.
+        //   4. Default keybind row.
+        //
+        // Style also stacks: pending_spawn renders bright (not DIM) so
+        // it clearly reads as "something's happening"; everything else
+        // stays dim.
+        let (hint_text, hint_style) = if let Some(pending) = &self.pending_spawn {
+            let elapsed = pending.started.elapsed();
+            let text = format!(
+                "{} Initializing {}…  ({:.1}s)",
+                spinner_glyph(elapsed),
+                pending.label,
+                elapsed.as_secs_f32(),
+            );
+            (
+                text,
+                Style::default()
+                    .fg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if let Some((_, axis)) = live_hover {
+            let text = match axis {
                 Direction::Horizontal => {
                     "↔ drag to resize · Ctrl+Alt+R for keyboard resize · right-click for menu"
                         .to_string()
@@ -1580,15 +1645,18 @@ impl App {
                     "↕ drag to resize · Ctrl+Alt+R for keyboard resize · right-click for menu"
                         .to_string()
                 }
-            }
+            };
+            (text, Style::default().add_modifier(Modifier::DIM))
         } else {
-            self.hint
+            let text = self
+                .hint
                 .as_ref()
                 .map(|(m, _)| m.clone())
-                .unwrap_or_else(hint_bar_text)
+                .unwrap_or_else(hint_bar_text);
+            (text, Style::default().add_modifier(Modifier::DIM))
         };
         Paragraph::new(Line::from(hint_text))
-            .style(Style::default().add_modifier(Modifier::DIM))
+            .style(hint_style)
             .render(vertical[2], buf);
 
         if self.menu_state.open {
@@ -1651,10 +1719,26 @@ impl App {
                     acks.push(Ack::U64(ack, outcome));
                 }
                 PaneMutation::OpenAgent { spec, ack } => {
+                    // Grab the label BEFORE moving `spec` into the mutation
+                    // call so we can attach it to the hint-bar spinner if
+                    // the spawn succeeds. `spec` is a `&'static AgentSpec`
+                    // so `.label` is Copy on the &str reference.
+                    let label = spec.label;
                     let outcome = self
                         .new_agent_tab_in(BUILTIN_AGENTS, spec)
                         .map(|id| id.0)
                         .map_err(|e| e.to_string());
+                    if let Ok(pane_id_num) = outcome {
+                        // Coding-agent CLIs take multiple seconds to
+                        // print their first prompt. Show a hint-bar
+                        // spinner until output arrives; cleared in
+                        // `expire_pending_spawn`.
+                        self.pending_spawn = Some(PendingSpawn {
+                            label: label.to_string(),
+                            pane_id: PaneId(pane_id_num),
+                            started: Instant::now(),
+                        });
+                    }
                     acks.push(Ack::U64(ack, outcome));
                 }
                 PaneMutation::Rename {
@@ -2128,6 +2212,36 @@ impl App {
             if t.elapsed() > Duration::from_secs(3) {
                 self.hint = None;
             }
+        }
+    }
+
+    /// Clear the boot-progress spinner if either the target pane has
+    /// produced first output or the timeout deadline hit. Called each
+    /// tick alongside `expire_hint`. Pure enough to test — the decision
+    /// is factored out into `pending_spawn_should_clear`.
+    fn expire_pending_spawn(&mut self) {
+        let Some(pending) = &self.pending_spawn else {
+            return;
+        };
+        // Check timeout first — cheap, no PTY read.
+        if pending.started.elapsed() >= PENDING_SPAWN_TIMEOUT {
+            self.pending_spawn = None;
+            return;
+        }
+        // Then check for first output. Snapshot 2 rows from the top of
+        // the target pane's grid; if any non-whitespace byte is there,
+        // the tool has started printing (login prompt, banner, …).
+        let has_output = self
+            .session_writes
+            .lock()
+            .get(&pending.pane_id)
+            .map(|s| {
+                let sample = s.grid_contents(Some(4));
+                sample.chars().any(|c| !c.is_whitespace())
+            })
+            .unwrap_or(true); // pane vanished (closed?) → stop showing spinner
+        if has_output {
+            self.pending_spawn = None;
         }
     }
 
@@ -4087,5 +4201,47 @@ mod tests {
             },
         };
         assert!(live_hover_overlay(false, Some(&stale_hover), &[unrelated]).is_none());
+    }
+
+    // --- spinner_glyph (spawn-progress animation) ---
+
+    #[test]
+    fn spinner_cycles_every_100ms() {
+        use std::time::Duration;
+        assert_eq!(spinner_glyph(Duration::from_millis(0)), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_glyph(Duration::from_millis(99)), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_glyph(Duration::from_millis(100)), SPINNER_FRAMES[1]);
+        assert_eq!(spinner_glyph(Duration::from_millis(200)), SPINNER_FRAMES[2]);
+        assert_eq!(spinner_glyph(Duration::from_millis(700)), SPINNER_FRAMES[7]);
+    }
+
+    #[test]
+    fn spinner_wraps_at_frame_count() {
+        use std::time::Duration;
+        // 8 frames × 100ms = one full cycle at 800ms.
+        assert_eq!(spinner_glyph(Duration::from_millis(800)), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_glyph(Duration::from_millis(900)), SPINNER_FRAMES[1]);
+        // Longer waits still yield a valid glyph — modulo, no panic.
+        assert_eq!(
+            spinner_glyph(Duration::from_secs(60)),
+            SPINNER_FRAMES[(60_000 / 100) % SPINNER_FRAMES.len()]
+        );
+    }
+
+    #[test]
+    fn spinner_frames_are_all_single_grapheme_and_nonempty() {
+        // Locks the invariant the render path depends on: hint bar
+        // width math assumes one displayable column per frame. If a
+        // future change slips a multi-char string in here, the width
+        // clamp in the paragraph render would misalign.
+        for f in SPINNER_FRAMES {
+            assert!(!f.is_empty(), "empty spinner frame");
+            assert_eq!(
+                f.chars().count(),
+                1,
+                "spinner frame `{}` must be a single scalar",
+                f
+            );
+        }
     }
 }
