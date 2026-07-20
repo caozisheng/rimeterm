@@ -6,6 +6,7 @@
 use std::io::{self, Stdout};
 
 use anyhow::Result;
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -27,7 +28,17 @@ impl TerminalGuard {
     pub fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        // BlinkingBlock: DEC "\x1b[1 q". Alt-screen entry can reset the
+        // caret to steady on some terminals (Windows Terminal in
+        // particular), so we request the blink explicitly. Restored to
+        // DefaultUserShape on Drop so the user's shell keeps whatever
+        // caret they had before rimeterm started.
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            SetCursorStyle::BlinkingBlock,
+        )?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
@@ -37,13 +48,17 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Best-effort restore; log if something goes sideways but never panic
-        // during unwind.
-        if let Err(e) = disable_raw_mode() {
-            tracing::warn!(error = %e, "disable_raw_mode failed on shutdown");
-        }
+        // during unwind. Order matters: reset the caret shape FIRST so the
+        // user's shell doesn't inherit the blinking block we set on enter.
         let mut stdout = io::stdout();
+        if let Err(e) = execute!(stdout, SetCursorStyle::DefaultUserShape) {
+            tracing::warn!(error = %e, "SetCursorStyle reset failed on shutdown");
+        }
         if let Err(e) = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture) {
             tracing::warn!(error = %e, "LeaveAlternateScreen failed on shutdown");
+        }
+        if let Err(e) = disable_raw_mode() {
+            tracing::warn!(error = %e, "disable_raw_mode failed on shutdown");
         }
     }
 }

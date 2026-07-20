@@ -1223,57 +1223,47 @@ impl App {
     ///   `resize.toggle`
     ///   `layout.reset`
     fn run_context_intent(&mut self, intent: &str) {
-        // Agent picker rows emit `agents.pick.<agent_id>` where
-        // <agent_id> is a registry id. Match against
-        // AGENT_REGISTRY so we can produce a `&'static str` for
-        // `CommandRegistry::run` (its API is static-only). ~20-entry
-        // scan; no allocations.
+        // Picker rows for the agents quadrant emit
+        // `agents.pick.<agent_id>` intents (see `open_agent_picker`).
+        // We DO NOT dispatch through `commands.run("agents.pick.<id>")`
+        // here: that closure calls `ack_rx.recv_timeout(5s)` which
+        // would deadlock because we ARE the main loop — nothing else
+        // can drain the mutation while this thread is blocked. Instead
+        // we perform the spawn inline (same code the drain would take)
+        // so the user sees the "Initializing …" spinner immediately.
+        //
+        // The registered `agents.pick.<id>` Command survives for IPC
+        // consumers (rimectl / MCP), where the closure runs on a
+        // spawn_blocking task and the ack channel works fine.
         if let Some(agent_id) = intent.strip_prefix("agents.pick.") {
-            let static_cmd_id: Option<&'static str> = rimeterm_pty::agent_registry::AGENT_REGISTRY
+            let spec_opt = rimeterm_pty::agent_registry::AGENT_REGISTRY
                 .iter()
-                .find(|spec| spec.id == agent_id)
-                .map(|spec| {
-                    // Use the same concat! macro shape as
-                    // register_commands so the lookup key matches.
-                    // Match must be exhaustive — the registry test
-                    // locks the id set.
-                    match spec.id {
-                        "antigravity" => "agents.pick.antigravity",
-                        "claude" => "agents.pick.claude",
-                        "codebuddy" => "agents.pick.codebuddy",
-                        "codex" => "agents.pick.codex",
-                        "copilot" => "agents.pick.copilot",
-                        "cursor" => "agents.pick.cursor",
-                        "gemini" => "agents.pick.gemini",
-                        "hermes" => "agents.pick.hermes",
-                        "kimi" => "agents.pick.kimi",
-                        "kiro" => "agents.pick.kiro",
-                        "omp" => "agents.pick.omp",
-                        "openclaw" => "agents.pick.openclaw",
-                        "opencode" => "agents.pick.opencode",
-                        "pi" => "agents.pick.pi",
-                        "qoder" => "agents.pick.qoder",
-                        "qwen" => "agents.pick.qwen",
-                        // Registry has an id we don't have a static
-                        // command for — someone added an entry
-                        // without a corresponding agent_pick_cmd!
-                        // call. Surfaced as a UI hint rather than a
-                        // panic so the picker stays usable.
-                        _ => "",
-                    }
-                })
-                .filter(|s| !s.is_empty());
-            match static_cmd_id {
-                Some(cmd) => {
-                    if let Err(e) = self.commands.run(cmd) {
-                        warn!(command = cmd, error = %e, "picker agent command failed");
+                .find(|s| s.id == agent_id);
+            match spec_opt {
+                Some(spec) => {
+                    let label = spec.label;
+                    match self.new_agent_tab_in(BUILTIN_AGENTS, spec) {
+                        Ok(pane_id) => {
+                            // Same spinner setup the drain arm uses —
+                            // hint bar shows `⣷ Initializing X…` until
+                            // the tool prints its first byte.
+                            self.pending_spawn = Some(PendingSpawn {
+                                label: label.to_string(),
+                                pane_id,
+                                started: Instant::now(),
+                            });
+                            // Kick the loop so the spinner paints on
+                            // the very next frame instead of waiting
+                            // for the next input event.
+                            let _ = self.redraw_tx.send(());
+                        }
+                        Err(e) => {
+                            self.set_hint(format!("⛔ open {}: {}", label, e));
+                        }
                     }
                 }
                 None => {
-                    self.set_hint(format!(
-                        "⛔ agent `{}` isn't registered (missing agent_pick_cmd!?)",
-                        agent_id
-                    ));
+                    self.set_hint(format!("⛔ unknown agent id `{}`", agent_id));
                 }
             }
             return;
