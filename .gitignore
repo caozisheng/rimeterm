@@ -18,3 +18,6 @@ Thumbs.db
 # rimeterm runtime artefacts that could sneak in from a local run
 /rimeterm-*.log
 *.pid
+
+# Icon source (multi-res .ico is generated from this and shipped in-tree).
+/rimeterm-icon.png
