@@ -34,23 +34,25 @@ pub struct AgentSpec {
     pub install_hint: &'static str,
 }
 
-/// The four canonical coding agents rimeterm supports out of the box.
+/// The coding agents rimeterm knows how to embed out of the box.
 ///
-/// Order is picker-order; put the ones we expect users to install first.
+/// **Order is alphabetical (case-insensitive by label)**; the picker
+/// walks this slice top-to-bottom. Missing binaries appear greyed with
+/// their install hint so the full menu stays visible even before the
+/// user has installed any agent.
+///
+/// **Adding a new agent**: append a new `AgentSpec` here in alphabetical
+/// position AND add one `agent_pick_cmd!` macro call in
+/// `crates/rimeterm-tui/src/app.rs` (same id literal) so the picker has
+/// a command to dispatch. The `registry_alphabetical` test locks the
+/// ordering.
 pub const AGENT_REGISTRY: &[AgentSpec] = &[
     AgentSpec {
-        id: "omp",
-        label: "Oh-my-pi",
-        binary: "omp",
-        argv: &["omp"],
-        install_hint: "Install: https://github.com/anthropics/oh-my-pi",
-    },
-    AgentSpec {
-        id: "codex",
-        label: "Codex CLI",
-        binary: "codex",
-        argv: &["codex"],
-        install_hint: "Install: `npm i -g @openai/codex-cli`",
+        id: "antigravity",
+        label: "Antigravity",
+        binary: "antigravity",
+        argv: &["antigravity"],
+        install_hint: "Install: `curl -fsSL https://antigravity.google/cli/install.sh | bash`",
     },
     AgentSpec {
         id: "claude",
@@ -60,11 +62,104 @@ pub const AGENT_REGISTRY: &[AgentSpec] = &[
         install_hint: "Install: `npm i -g @anthropic-ai/claude-code`",
     },
     AgentSpec {
+        id: "codebuddy",
+        label: "CodeBuddy",
+        binary: "codebuddy",
+        argv: &["codebuddy"],
+        install_hint: "Install: `npm i -g @tencent-ai/codebuddy-code`",
+    },
+    AgentSpec {
+        id: "codex",
+        label: "Codex",
+        binary: "codex",
+        argv: &["codex"],
+        install_hint: "Install: `npm i -g @openai/codex-cli`",
+    },
+    AgentSpec {
+        id: "copilot",
+        label: "Copilot",
+        binary: "copilot",
+        argv: &["copilot"],
+        install_hint: "Install: `brew install copilot-cli` or `curl -fsSL https://gh.io/copilot-install | bash`",
+    },
+    AgentSpec {
+        id: "cursor",
+        label: "Cursor",
+        // Cursor ships two binaries — `cursor` is the desktop editor,
+        // `cursor-agent` is the CLI agent. We probe the CLI one.
+        binary: "cursor-agent",
+        argv: &["cursor-agent"],
+        install_hint: "Install: `curl https://cursor.com/install -fsS | bash`",
+    },
+    AgentSpec {
+        id: "gemini",
+        label: "Gemini CLI",
+        binary: "gemini",
+        argv: &["gemini"],
+        install_hint: "Install: `npm i -g @google/gemini-cli` (superseded by Antigravity CLI)",
+    },
+    AgentSpec {
+        id: "hermes",
+        label: "Hermes",
+        binary: "hermes",
+        argv: &["hermes"],
+        install_hint: "Install: https://github.com/NousResearch/hermes-agent",
+    },
+    AgentSpec {
+        id: "kimi",
+        label: "Kimi",
+        binary: "kimi",
+        argv: &["kimi"],
+        install_hint: "Install: `npm i -g @moonshot-ai/kimi-code`",
+    },
+    AgentSpec {
+        id: "kiro",
+        label: "Kiro CLI",
+        binary: "kiro-cli",
+        argv: &["kiro-cli"],
+        install_hint: "Install: https://kiro.dev/docs/cli/installation",
+    },
+    AgentSpec {
+        id: "omp",
+        label: "Oh-My-Pi",
+        binary: "omp",
+        argv: &["omp"],
+        install_hint: "Install: https://github.com/anthropics/oh-my-pi",
+    },
+    AgentSpec {
+        id: "openclaw",
+        label: "OpenClaw",
+        binary: "openclaw",
+        argv: &["openclaw"],
+        install_hint: "Install: `curl -fsSL https://openclaw.ai/install.sh | bash`",
+    },
+    AgentSpec {
+        id: "opencode",
+        label: "OpenCode",
+        binary: "opencode",
+        argv: &["opencode"],
+        install_hint: "Install: `npm i -g opencode-ai`",
+    },
+    AgentSpec {
         id: "pi",
         label: "Pi",
         binary: "pi",
         argv: &["pi"],
         install_hint: "Install: https://github.com/inflection-ai/pi",
+    },
+    AgentSpec {
+        id: "qoder",
+        label: "Qoder",
+        binary: "qoder",
+        argv: &["qoder"],
+        install_hint: "Install: `curl -fsSL https://qoder.com/install | bash`",
+    },
+    AgentSpec {
+        id: "qwen",
+        label: "Qwen Code",
+        binary: "qwen",
+        argv: &["qwen"],
+        install_hint: "Install: `npm i -g @qwen-code/qwen-code`",
     },
 ];
 
@@ -115,9 +210,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_four_agents() {
+    fn registry_has_sixteen_agents_in_alphabetical_order() {
+        // Locks BOTH the count and the case-insensitive label ordering
+        // so a new agent can't silently break the picker's sort. If
+        // adding an agent, insert its `AgentSpec` in the right slot AND
+        // append its id here.
         let ids: Vec<&str> = AGENT_REGISTRY.iter().map(|s| s.id).collect();
-        assert_eq!(ids, vec!["omp", "codex", "claude", "pi"]);
+        assert_eq!(
+            ids,
+            vec![
+                "antigravity",
+                "claude",
+                "codebuddy",
+                "codex",
+                "copilot",
+                "cursor",
+                "gemini",
+                "hermes",
+                "kimi",
+                "kiro",
+                "omp",
+                "openclaw",
+                "opencode",
+                "pi",
+                "qoder",
+                "qwen",
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_labels_are_case_insensitively_alphabetical() {
+        // Guard the human-facing ordering separately: labels don't
+        // always sort the same as ids (e.g. "Kiro CLI" vs id "kiro",
+        // or "Oh-My-Pi" vs id "omp"), so a pure id sort could still
+        // yield an out-of-order picker.
+        let labels: Vec<String> = AGENT_REGISTRY
+            .iter()
+            .map(|s| s.label.to_lowercase())
+            .collect();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        assert_eq!(labels, sorted, "AGENT_REGISTRY labels must be alphabetical");
+    }
+
+    #[test]
+    fn registry_ids_are_unique() {
+        // Duplicate ids would make `find` ambiguous and let one row
+        // shadow another silently in the picker.
+        let mut ids: Vec<&str> = AGENT_REGISTRY.iter().map(|s| s.id).collect();
+        let dupes_would_show_here = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            dupes_would_show_here,
+            "AGENT_REGISTRY ids must be unique"
+        );
     }
 
     #[test]

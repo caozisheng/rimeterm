@@ -1115,27 +1115,33 @@ impl App {
     /// agents whose binary isn't on PATH are shown greyed out with a
     /// `(not installed)` note so the user can still see the full menu.
     fn open_agent_picker(&mut self) {
+        // AGENT_REGISTRY is already alphabetical (see the
+        // `registry_labels_are_case_insensitively_alphabetical` test);
+        // walk it in order so the picker mirrors the registry.
+        //
+        // For each detected row:
+        // - installed → intent = `agents.pick.<id>` (dispatched by
+        //   `run_context_intent`, which runs the same command palette
+        //   entry registered in `register_commands`)
+        // - missing → disabled row with `(not installed)` note so the
+        //   user still sees the option and its install hint via the
+        //   placeholder pane / palette description
+        //
+        // Using `Intent` (not `Command`) lets us keep the CommandId as
+        // `&'static str` while still binding to a runtime-shaped id;
+        // the intent string carries the agent id, the arm below looks
+        // it up in the registry.
         let entries: Vec<crate::picker::PickerEntry> = rimeterm_pty::agent_registry::detect_all()
             .into_iter()
             .map(|a| {
                 if a.is_available() {
-                    let cmd: Option<rimeterm_core::command::CommandId> = match a.id {
-                        "omp" => Some("agents.pick.omp"),
-                        "codex" => Some("agents.pick.codex"),
-                        "claude" => Some("agents.pick.claude"),
-                        "pi" => Some("agents.pick.pi"),
-                        _ => None,
-                    };
-                    match cmd {
-                        Some(c) => crate::picker::PickerEntry::command(a.label, c),
-                        None => crate::picker::PickerEntry::disabled(a.label, "(unknown)"),
-                    }
+                    crate::picker::PickerEntry::intent(a.label, format!("agents.pick.{}", a.id))
                 } else {
                     crate::picker::PickerEntry::disabled(a.label, "(not installed)")
                 }
             })
             .collect();
-        self.picker_state.open_with("Pick an agent", entries);
+        self.picker_state.open_with(AGENT_PICKER_TITLE, entries);
     }
 
     /// Dispatch whatever the picker just returned. Command actions go
@@ -1166,6 +1172,61 @@ impl App {
     ///   `resize.toggle`
     ///   `layout.reset`
     fn run_context_intent(&mut self, intent: &str) {
+        // Agent picker rows emit `agents.pick.<agent_id>` where
+        // <agent_id> is a registry id. Match against
+        // AGENT_REGISTRY so we can produce a `&'static str` for
+        // `CommandRegistry::run` (its API is static-only). ~20-entry
+        // scan; no allocations.
+        if let Some(agent_id) = intent.strip_prefix("agents.pick.") {
+            let static_cmd_id: Option<&'static str> = rimeterm_pty::agent_registry::AGENT_REGISTRY
+                .iter()
+                .find(|spec| spec.id == agent_id)
+                .map(|spec| {
+                    // Use the same concat! macro shape as
+                    // register_commands so the lookup key matches.
+                    // Match must be exhaustive — the registry test
+                    // locks the id set.
+                    match spec.id {
+                        "antigravity" => "agents.pick.antigravity",
+                        "claude" => "agents.pick.claude",
+                        "codebuddy" => "agents.pick.codebuddy",
+                        "codex" => "agents.pick.codex",
+                        "copilot" => "agents.pick.copilot",
+                        "cursor" => "agents.pick.cursor",
+                        "gemini" => "agents.pick.gemini",
+                        "hermes" => "agents.pick.hermes",
+                        "kimi" => "agents.pick.kimi",
+                        "kiro" => "agents.pick.kiro",
+                        "omp" => "agents.pick.omp",
+                        "openclaw" => "agents.pick.openclaw",
+                        "opencode" => "agents.pick.opencode",
+                        "pi" => "agents.pick.pi",
+                        "qoder" => "agents.pick.qoder",
+                        "qwen" => "agents.pick.qwen",
+                        // Registry has an id we don't have a static
+                        // command for — someone added an entry
+                        // without a corresponding agent_pick_cmd!
+                        // call. Surfaced as a UI hint rather than a
+                        // panic so the picker stays usable.
+                        _ => "",
+                    }
+                })
+                .filter(|s| !s.is_empty());
+            match static_cmd_id {
+                Some(cmd) => {
+                    if let Err(e) = self.commands.run(cmd) {
+                        warn!(command = cmd, error = %e, "picker agent command failed");
+                    }
+                }
+                None => {
+                    self.set_hint(format!(
+                        "⛔ agent `{}` isn't registered (missing agent_pick_cmd!?)",
+                        agent_id
+                    ));
+                }
+            }
+            return;
+        }
         let mut parts = intent.split(':');
         match parts.next() {
             Some("tab.activate") => {
@@ -2923,20 +2984,26 @@ fn register_commands(
         register(cmds, cmd)?;
     }
 
-    // `agents.pick.<id>` — one command per registry entry (static literals
-    // so we don't need to synthesize `&'static str`s at runtime, keeping
-    // both allocations and the `rs-box-leak` rule happy).
+    // `agents.pick.<id>` — one command per registry entry (static
+    // literals so we don't need to synthesize `&'static str`s at
+    // runtime, keeping both allocations and the `rs-box-leak` rule
+    // happy). The macro takes only the agent id + label; it concats
+    // the `agents.pick.` / `Open agent: ` prefixes internally so
+    // adding a new agent is one line here + one row in
+    // AGENT_REGISTRY.
     macro_rules! agent_pick_cmd {
-        ($cmds:ident, $id:expr, $title:expr, $agent_id:literal) => {{
+        ($cmds:ident, $agent_id:literal, $label:literal) => {{
             let queue = pending_mutations.clone();
             let wake = redraw_tx.clone();
             let cmd = Command {
-                id: $id,
-                title: $title,
+                id: concat!("agents.pick.", $agent_id),
+                title: concat!("Open agent: ", $label),
                 description: Some("spawn this agent in the agents quadrant"),
                 run: Arc::new(move |_args: &serde_json::Value| {
-                    // find() is guaranteed to return Some because the id is a
-                    // compile-time literal that matches a registry entry.
+                    // find() is guaranteed to return Some because the
+                    // id is a compile-time literal that matches a
+                    // registry entry (locked by the sixteen-agents
+                    // test in rimeterm_pty::agent_registry).
                     let spec = rimeterm_pty::agent_registry::find($agent_id)
                         .expect("registry entry present");
                     let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
@@ -2958,15 +3025,25 @@ fn register_commands(
             register($cmds, cmd)?;
         }};
     }
-    agent_pick_cmd!(cmds, "agents.pick.omp", "Open agent: Oh-my-pi", "omp");
-    agent_pick_cmd!(cmds, "agents.pick.codex", "Open agent: Codex CLI", "codex");
-    agent_pick_cmd!(
-        cmds,
-        "agents.pick.claude",
-        "Open agent: Claude Code",
-        "claude"
-    );
-    agent_pick_cmd!(cmds, "agents.pick.pi", "Open agent: Pi", "pi");
+    // Order here matches AGENT_REGISTRY (alphabetical by label,
+    // case-insensitive). Any drift is caught by the registry test +
+    // the palette rendering (palette sorts by title anyway).
+    agent_pick_cmd!(cmds, "antigravity", "Antigravity");
+    agent_pick_cmd!(cmds, "claude", "Claude Code");
+    agent_pick_cmd!(cmds, "codebuddy", "CodeBuddy");
+    agent_pick_cmd!(cmds, "codex", "Codex");
+    agent_pick_cmd!(cmds, "copilot", "Copilot");
+    agent_pick_cmd!(cmds, "cursor", "Cursor");
+    agent_pick_cmd!(cmds, "gemini", "Gemini CLI");
+    agent_pick_cmd!(cmds, "hermes", "Hermes");
+    agent_pick_cmd!(cmds, "kimi", "Kimi");
+    agent_pick_cmd!(cmds, "kiro", "Kiro CLI");
+    agent_pick_cmd!(cmds, "omp", "Oh-My-Pi");
+    agent_pick_cmd!(cmds, "openclaw", "OpenClaw");
+    agent_pick_cmd!(cmds, "opencode", "OpenCode");
+    agent_pick_cmd!(cmds, "pi", "Pi");
+    agent_pick_cmd!(cmds, "qoder", "Qoder");
+    agent_pick_cmd!(cmds, "qwen", "Qwen Code");
 
     Ok(())
 }
