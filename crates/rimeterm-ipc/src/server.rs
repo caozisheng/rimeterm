@@ -107,10 +107,17 @@ where
     let (rd, mut wr) = tokio::io::split(stream);
     let mut reader = BufReader::new(rd);
     let mut line = String::new();
+    // `handler` is sync (see `Handler` type). Some commands block for
+    // seconds (e.g. `workspace.pane.wait`), so run them on the blocking
+    // pool instead of pinning a tokio worker. `spawn_blocking` panicking
+    // would be a real bug — surface it as an internal-error response.
     let response = match reader.read_line(&mut line).await {
         Ok(0) => Response::err("empty request"),
         Ok(_) => match serde_json::from_str::<Request>(line.trim_end()) {
-            Ok(req) => handler(req),
+            Ok(req) => match tokio::task::spawn_blocking(move || handler(req)).await {
+                Ok(resp) => resp,
+                Err(e) => Response::err(format!("handler panicked: {e}")),
+            },
             Err(e) => Response::err(format!("invalid JSON: {e}")),
         },
         Err(e) => Response::err(format!("read error: {e}")),
