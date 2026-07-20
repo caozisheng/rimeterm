@@ -704,36 +704,72 @@ impl App {
     }
 
     fn mouse_down(&mut self, col: u16, row: u16) {
-        // Find a divider whose 1-cell rect contains the click.
-        let hit = self
+        // 1. Divider first — dragging beats focus so the user can grab a
+        // seam that overlaps a pane's border area without stealing focus.
+        if let Some(divider) = self
             .last_dividers
             .iter()
             .find(|d| point_in_rect(col, row, d.visual.rect))
-            .cloned();
-        let Some(divider) = hit else {
+            .cloned()
+        {
+            let Some(parent_rect) =
+                split_parent_rect(&self.tree, self.last_pane_area, &divider.path)
+            else {
+                return;
+            };
+            let axis = divider.visual.axis;
+            let (origin, extent) = match axis {
+                Direction::Horizontal => (col, parent_rect.width),
+                Direction::Vertical => (row, parent_rect.height),
+            };
+            let baseline_ratios = self
+                .tree
+                .ratios_at(&divider.path)
+                .unwrap_or_default();
+            self.active_drag = Some(DragState {
+                path: divider.path,
+                boundary: divider.boundary,
+                axis,
+                origin_axis_coord: origin,
+                parent_extent: extent,
+                baseline_ratios,
+            });
             return;
-        };
-        // Capture the parent-split extent so drag deltas convert to ratios.
-        let Some(parent_rect) = split_parent_rect(&self.tree, self.last_pane_area, &divider.path) else {
-            return;
-        };
-        let axis = divider.visual.axis;
-        let (origin, extent) = match axis {
-            Direction::Horizontal => (col, parent_rect.width),
-            Direction::Vertical => (row, parent_rect.height),
-        };
-        let baseline_ratios = self
-            .tree
-            .ratios_at(&divider.path)
-            .unwrap_or_default();
-        self.active_drag = Some(DragState {
-            path: divider.path,
-            boundary: divider.boundary,
-            axis,
-            origin_axis_coord: origin,
-            parent_extent: extent,
-            baseline_ratios,
-        });
+        }
+
+        // 2. Pane hit-test — walk `last_pane_area` back to the (pane_id, rect)
+        // list the last draw produced. First match wins; the walker returns
+        // children after parents so leaf rects are the tightest hits.
+        if let Some(pane_id) = self.pane_at(col, row) {
+            // Find the owning tab group so the click also activates that
+            // pane's tab within its group (`agents` might have multiple).
+            let owner = self
+                .tree
+                .tab_groups()
+                .iter()
+                .find_map(|g| {
+                    g.members()
+                        .iter()
+                        .position(|m| *m == pane_id)
+                        .map(|idx| (g.id(), idx))
+                });
+            if let Some((gid, idx)) = owner {
+                if let Some(group) = self.tree.find_tab_group_mut(gid) {
+                    let _ = group.goto(idx);
+                }
+                self.focus.set_focus(pane_id, Some(gid));
+            }
+        }
+    }
+
+    /// Reverse-lookup: which pane sits under `(col, row)` in the last-drawn
+    /// pane area? Returns `None` if outside the pane area (e.g. status bar).
+    fn pane_at(&self, col: u16, row: u16) -> Option<PaneId> {
+        if !point_in_rect(col, row, self.last_pane_area) {
+            return None;
+        }
+        let rects = self.tree.compute_rects(self.last_pane_area);
+        resolve_pane_at(&rects, col, row)
     }
 
     fn mouse_drag(&mut self, col: u16, row: u16) {
@@ -2529,6 +2565,23 @@ fn split_parent_rect(
     matches!(node, LayoutNode::Split { .. }).then_some(area)
 }
 
+/// Reverse hit-test: given `(pane_id, rect)` pairs from `compute_rects`
+/// (parent-before-children order), return the smallest / deepest pane
+/// whose rect contains `(col, row)`. Pure so unit tests can drive it
+/// without an `App` or a live PTY.
+pub(crate) fn resolve_pane_at(
+    rects: &[(PaneId, Rect)],
+    col: u16,
+    row: u16,
+) -> Option<PaneId> {
+    for (id, rect) in rects.iter().rev() {
+        if point_in_rect(col, row, *rect) {
+            return Some(*id);
+        }
+    }
+    None
+}
+
 /// Compute the min-size floor (as a fraction of parent extent) per child of
 /// the split at `path`. v0.1 hardcodes the design-doc §19.8 defaults; a later
 /// milestone reads them from config.
@@ -2963,5 +3016,41 @@ mod tests {
     fn tool_action_args_accept_valid_name() {
         let name = parse_tool_action_args(&wait_args_json(r#"{"name":"gitui"}"#)).unwrap();
         assert_eq!(name, "gitui");
+    }
+
+    // --- resolve_pane_at (mouse hit-test) ---
+
+    #[test]
+    fn resolve_pane_at_returns_deepest_match() {
+        let parent = PaneId::next();
+        let leaf = PaneId::next();
+        // Parent covers 0..40 × 0..20; leaf covers the top-left 20×10 corner.
+        // compute_rects yields parent BEFORE leaf.
+        let rects = vec![
+            (parent, Rect { x: 0, y: 0, width: 40, height: 20 }),
+            (leaf,   Rect { x: 0, y: 0, width: 20, height: 10 }),
+        ];
+        // Inside the leaf ⇒ leaf wins even though parent also contains the point.
+        assert_eq!(resolve_pane_at(&rects, 5, 5), Some(leaf));
+        // Right of the leaf but still inside parent ⇒ parent.
+        assert_eq!(resolve_pane_at(&rects, 30, 5), Some(parent));
+        // Outside everything ⇒ None.
+        assert_eq!(resolve_pane_at(&rects, 100, 100), None);
+    }
+
+    #[test]
+    fn resolve_pane_at_empty_list_is_none() {
+        assert_eq!(resolve_pane_at(&[], 3, 3), None);
+    }
+
+    #[test]
+    fn resolve_pane_at_edge_of_rect_is_inside() {
+        // (0,0) is inside a rect starting at (0,0); (width,height) is not.
+        let p = PaneId::next();
+        let rects = vec![(p, Rect { x: 0, y: 0, width: 4, height: 3 })];
+        assert_eq!(resolve_pane_at(&rects, 0, 0), Some(p));
+        assert_eq!(resolve_pane_at(&rects, 3, 2), Some(p));
+        assert_eq!(resolve_pane_at(&rects, 4, 2), None); // width exclusive
+        assert_eq!(resolve_pane_at(&rects, 3, 3), None); // height exclusive
     }
 }

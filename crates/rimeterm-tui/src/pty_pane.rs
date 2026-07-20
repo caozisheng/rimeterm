@@ -89,12 +89,24 @@ impl PaneProvider for PtyPane {
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &PaneRenderCtx) -> RenderOutcome {
-        // Draw a thin bordered block so users can see focus at a glance.
-        let title = format!(" 🐚 {} ", self.title);
-        let mut block = Block::default().title(title).borders(Borders::ALL);
-        if ctx.focused {
-            block = block.border_style(Style::default().fg(Color::LightCyan));
-        }
+        // Focus visuals: focused = bright cyan + bold + `▶ …` title marker
+        // so it also reads in monochrome / low-contrast terminals; unfocused
+        // = dim grey. `LightCyan` alone was hard to see on dark themes.
+        let marker = if ctx.focused { "▶ " } else { "  " };
+        let title = format!(" {}🐚 {} ", marker, self.title);
+        let border_style = if ctx.focused {
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM)
+        };
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(border_style);
         let inner = block.inner(area);
         block.render(area, buf);
 

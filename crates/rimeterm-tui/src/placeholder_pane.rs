@@ -60,13 +60,22 @@ impl PaneProvider for PlaceholderPane {
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &PaneRenderCtx) -> RenderOutcome {
-        let heading = format!(" {} {} ", self.icon, self.title);
-        let mut block = Block::default().title(heading).borders(Borders::ALL);
-        if ctx.focused {
-            block = block.border_style(Style::default().fg(self.color));
+        // Focus visuals: match PtyPane — focused = bright + bold + `▶` marker,
+        // unfocused = dim grey. Placeholder-specific `self.color` still tints
+        // the border on focus so different tools stay visually distinct.
+        let marker = if ctx.focused { "▶ " } else { "  " };
+        let heading = format!(" {}{} {} ", marker, self.icon, self.title);
+        let border_style = if ctx.focused {
+            Style::default().fg(self.color).add_modifier(Modifier::BOLD)
         } else {
-            block = block.border_style(Style::default().add_modifier(Modifier::DIM));
-        }
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM)
+        };
+        let block = Block::default()
+            .title(heading)
+            .borders(Borders::ALL)
+            .border_style(border_style);
         let inner = block.inner(area);
         block.render(area, buf);
 
