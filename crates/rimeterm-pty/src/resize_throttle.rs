@@ -86,10 +86,11 @@ impl ResizeThrottle {
         // If we already had a pending change to the same size, keep the
         // *original* timestamp so a stable size flushes as soon as the window
         // expires. Only bump on genuine size changes.
-        if let Some(p) = self.pending {
-            if p.cols == cols && p.rows == rows {
-                return;
-            }
+        if let Some(p) = self.pending
+            && p.cols == cols
+            && p.rows == rows
+        {
+            return;
         }
         self.pending = Some(Pending {
             cols,
@@ -166,7 +167,10 @@ mod tests {
         assert_eq!(r.poll(t + Duration::from_millis(50)), Decision::Wait);
         assert_eq!(
             r.poll(t + Duration::from_millis(100)),
-            Decision::Apply { cols: 120, rows: 34 }
+            Decision::Apply {
+                cols: 120,
+                rows: 34
+            }
         );
         // After apply, nothing pending.
         assert_eq!(r.poll(t + Duration::from_millis(200)), Decision::Idle);
@@ -194,7 +198,10 @@ mod tests {
         // 130 ms after the second request — flushes to the *newest* size.
         assert_eq!(
             r.poll(t + Duration::from_millis(150)),
-            Decision::Apply { cols: 120, rows: 34 }
+            Decision::Apply {
+                cols: 120,
+                rows: 34
+            }
         );
     }
 
@@ -218,7 +225,10 @@ mod tests {
         r.request(120, 34, t + Duration::from_millis(60));
         assert_eq!(
             r.poll(t + Duration::from_millis(85)),
-            Decision::Apply { cols: 120, rows: 34 }
+            Decision::Apply {
+                cols: 120,
+                rows: 34
+            }
         );
     }
 }

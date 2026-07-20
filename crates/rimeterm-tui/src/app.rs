@@ -16,11 +16,11 @@
 //! a `PlaceholderPane` labeled with the group's active tab.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use crossterm::event::{Event, EventStream, KeyEvent, KeyEventKind};
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -35,20 +35,23 @@ use rimeterm_core::focus::FocusManager;
 use rimeterm_core::layout::{LayoutNode, LayoutTree};
 use rimeterm_core::pane::{PaneId, PaneProvider, PaneRenderCtx};
 use rimeterm_core::tabs::{
-    MembersPolicy, PaneKind, TabGroup, TabGroupId, BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS,
-    BUILTIN_SYSMON,
+    BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS, BUILTIN_SYSMON, MembersPolicy, PaneKind,
+    TabGroup, TabGroupId,
 };
-use rimeterm_pty::{detect_default_shell, ShellChoice};
+use rimeterm_pty::{ShellChoice, detect_default_shell};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::keymap::{tab_goto_command_id, Keymap, KeymapOutcome, QUADRANT_COMMANDS};
-use crate::menu::{handle_key as menu_key, popup_rect as menu_rect, render as render_menu, MenuKeyOutcome, MenuState};
-use crate::pane_registry::PaneRegistry;
-use crate::palette::{
-    handle_key as palette_key, popup_rect as palette_rect, render as render_palette, CommandEntry,
-    PaletteOutcome, PaletteState,
+use crate::keymap::{Keymap, KeymapOutcome, QUADRANT_COMMANDS, tab_goto_command_id};
+use crate::menu::{
+    MenuKeyOutcome, MenuState, handle_key as menu_key, popup_rect as menu_rect,
+    render as render_menu,
 };
+use crate::palette::{
+    CommandEntry, PaletteOutcome, PaletteState, handle_key as palette_key,
+    popup_rect as palette_rect, render as render_palette,
+};
+use crate::pane_registry::PaneRegistry;
 use crate::placeholder_pane::PlaceholderPane;
 use crate::shell_factory::spawn_shell;
 use crate::status_bar::render as render_status_bar;
@@ -65,8 +68,8 @@ struct ActionFlags {
     shells_close: AtomicBool,
     tab_next: AtomicBool,
     tab_prev: AtomicBool,
-    tab_goto: AtomicUsize, // 1..=9 = goto; 0 = idle.
-    focus_dir: AtomicUsize, // 1=left 2=right 3=up 4=down; 0 = idle.
+    tab_goto: AtomicUsize,       // 1..=9 = goto; 0 = idle.
+    focus_dir: AtomicUsize,      // 1=left 2=right 3=up 4=down; 0 = idle.
     focus_quadrant: AtomicUsize, // 1..=4; 0 = idle.
     settings: AtomicBool,
     resize_toggle: AtomicBool,
@@ -206,9 +209,7 @@ fn resize_target_for_group(
     use rimeterm_core::layout::SplitPath;
     use rimeterm_core::{BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS, BUILTIN_SYSMON};
     match (gid, target) {
-        (g, ResizeTarget::Horizontal) if g == BUILTIN_FILES => {
-            Some((SplitPath::root(), 0, 0, 1.0))
-        }
+        (g, ResizeTarget::Horizontal) if g == BUILTIN_FILES => Some((SplitPath::root(), 0, 0, 1.0)),
         (g, ResizeTarget::Horizontal) if g == BUILTIN_SYSMON => {
             Some((SplitPath::root(), 0, 0, 1.0))
         }
@@ -271,7 +272,8 @@ pub struct App {
     snapshot: Arc<parking_lot::RwLock<WorkspaceSnapshot>>,
     /// Live PTY sessions keyed by pane id. Cloneable so IPC handlers can
     /// share write access without holding App mutably.
-    session_writes: Arc<parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>>,
+    session_writes:
+        Arc<parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>>,
     redraw_rx: mpsc::UnboundedReceiver<()>,
     flags: Arc<ActionFlags>,
     should_quit: bool,
@@ -285,7 +287,10 @@ pub struct App {
     /// Cached tab-strip hit rects per group, populated during `draw`. Used
     /// by `on_mouse` to route clicks on tab titles / `[+]` back into the
     /// same commands the keyboard uses. Fresh every frame.
-    last_tab_strips: Vec<(rimeterm_core::tabs::TabGroupId, crate::tab_strip::TabStripHits)>,
+    last_tab_strips: Vec<(
+        rimeterm_core::tabs::TabGroupId,
+        crate::tab_strip::TabStripHits,
+    )>,
     /// Cached per-pane outer rect (strip-stripped, i.e. the actual rect
     /// `pane.render` received). Different from `LayoutTree::compute_rects`
     /// output, which returns the full quadrant cell including its tab strip.
@@ -311,8 +316,9 @@ impl App {
         );
 
         let (redraw_tx, redraw_rx) = mpsc::unbounded_channel();
-        let session_writes: Arc<parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>> =
-            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let session_writes: Arc<
+            parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
+        > = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
         // Everything except the shells group is a Placeholder until later
         // milestones bring in the real PTY / native providers.
@@ -382,12 +388,7 @@ impl App {
         // lands (see `new_agent_tab_in`).
         if agents_members.is_empty() {
             let hint = format_agent_picker_hint();
-            let picker = PlaceholderPane::new(
-                AGENT_PICKER_TITLE,
-                hint,
-                "🤖",
-                Color::LightMagenta,
-            );
+            let picker = PlaceholderPane::new(AGENT_PICKER_TITLE, hint, "🤖", Color::LightMagenta);
             let id = picker.id();
             panes.insert(Box::new(picker));
             agents_members.push(id);
@@ -409,8 +410,18 @@ impl App {
         panes.insert(Box::new(first.pane));
 
         // Groups.
-        let files = TabGroup::new(BUILTIN_FILES, files_members, MembersPolicy::Fixed, PaneKind::Files);
-        let sysmon = TabGroup::new(BUILTIN_SYSMON, sysmon_members, MembersPolicy::Fixed, PaneKind::Sysmon);
+        let files = TabGroup::new(
+            BUILTIN_FILES,
+            files_members,
+            MembersPolicy::Fixed,
+            PaneKind::Files,
+        );
+        let sysmon = TabGroup::new(
+            BUILTIN_SYSMON,
+            sysmon_members,
+            MembersPolicy::Fixed,
+            PaneKind::Sysmon,
+        );
         let agents = TabGroup::new(
             BUILTIN_AGENTS,
             agents_members,
@@ -447,7 +458,9 @@ impl App {
         let default_ratios = snapshot_all_ratios(&tree);
 
         // Restore any previously persisted ratios for this workspace.
-        if let Some(state_path) = rimeterm_config::layout_state::workspace_state_file(&workspace_root) {
+        if let Some(state_path) =
+            rimeterm_config::layout_state::workspace_state_file(&workspace_root)
+        {
             match rimeterm_config::layout_state::LayoutState::load_or_default(&state_path) {
                 Ok(state) if !state.is_empty() => {
                     apply_persisted_state(&mut tree, &state);
@@ -470,9 +483,8 @@ impl App {
 
         let flags = Arc::new(ActionFlags::default());
         let snapshot = Arc::new(parking_lot::RwLock::new(WorkspaceSnapshot::default()));
-        let pending_mutations: Arc<
-            parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>,
-        > = Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
+        let pending_mutations: Arc<parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
         let mut commands = CommandRegistry::new();
         register_commands(
             &mut commands,
@@ -523,7 +535,9 @@ impl App {
         // is dropped at the end of `run`.
         let ipc_shutdown = self.spawn_ipc_server().await;
 
-        guard.terminal.draw(|f| self.draw(f.area(), f.buffer_mut()))?;
+        guard
+            .terminal
+            .draw(|f| self.draw(f.area(), f.buffer_mut()))?;
 
         loop {
             if self.should_quit || self.flags.quit.load(Ordering::Relaxed) {
@@ -644,7 +658,9 @@ impl App {
             }
             _ => {}
         }
-        let big = key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+        let big = key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::SHIFT);
         let step_cells: i32 = if big { 5 } else { 1 };
         let (target, sign) = match key.code {
             KeyCode::Char('h') | KeyCode::Char('H') => (ResizeTarget::Horizontal, -1),
@@ -679,7 +695,10 @@ impl App {
         }
         let delta_ratio = adjust_sign * cells as f32 / extent as f32;
         let floors = min_size_floors(&self.tree, &path, extent);
-        match self.tree.adjust_ratio(&path, boundary, delta_ratio, &floors) {
+        match self
+            .tree
+            .adjust_ratio(&path, boundary, delta_ratio, &floors)
+        {
             Ok(()) => {}
             Err(rimeterm_core::layout::RatioError::BelowMinSize) => {
                 self.set_hint("⛔ at minimum size".into());
@@ -787,9 +806,7 @@ impl App {
     /// Start a divider drag from an already-hit `d`. Called by `on_mouse`
     /// after it has confirmed the click lands on a seam.
     fn start_divider_drag(&mut self, d: rimeterm_core::layout::Divider, col: u16, row: u16) {
-        let Some(parent_rect) =
-            split_parent_rect(&self.tree, self.last_pane_area, &d.path)
-        else {
+        let Some(parent_rect) = split_parent_rect(&self.tree, self.last_pane_area, &d.path) else {
             return;
         };
         let axis = d.visual.axis;
@@ -797,10 +814,7 @@ impl App {
             Direction::Horizontal => (col, parent_rect.width),
             Direction::Vertical => (row, parent_rect.height),
         };
-        let baseline_ratios = self
-            .tree
-            .ratios_at(&d.path)
-            .unwrap_or_default();
+        let baseline_ratios = self.tree.ratios_at(&d.path).unwrap_or_default();
         self.active_drag = Some(DragState {
             path: d.path,
             boundary: d.boundary,
@@ -868,12 +882,18 @@ impl App {
             // doesn't also switch to that tab.
             for (idx, r) in &hits.closes {
                 if point_in_rect(col, row, *r) {
-                    return Some(TabStripHit::Close { gid: *gid, idx: *idx });
+                    return Some(TabStripHit::Close {
+                        gid: *gid,
+                        idx: *idx,
+                    });
                 }
             }
             for (idx, r) in &hits.tabs {
                 if point_in_rect(col, row, *r) {
-                    return Some(TabStripHit::Activate { gid: *gid, idx: *idx });
+                    return Some(TabStripHit::Activate {
+                        gid: *gid,
+                        idx: *idx,
+                    });
                 }
             }
             if let Some(plus) = hits.plus {
@@ -939,27 +959,26 @@ impl App {
     /// agents whose binary isn't on PATH are shown greyed out with a
     /// `(not installed)` note so the user can still see the full menu.
     fn open_agent_picker(&mut self) {
-        let entries: Vec<crate::picker::PickerEntry> =
-            rimeterm_pty::agent_registry::detect_all()
-                .into_iter()
-                .map(|a| {
-                    if a.is_available() {
-                        let cmd: Option<rimeterm_core::command::CommandId> = match a.id {
-                            "omp" => Some("agents.pick.omp"),
-                            "codex" => Some("agents.pick.codex"),
-                            "claude" => Some("agents.pick.claude"),
-                            "pi" => Some("agents.pick.pi"),
-                            _ => None,
-                        };
-                        match cmd {
-                            Some(c) => crate::picker::PickerEntry::command(a.label, c),
-                            None => crate::picker::PickerEntry::disabled(a.label, "(unknown)"),
-                        }
-                    } else {
-                        crate::picker::PickerEntry::disabled(a.label, "(not installed)")
+        let entries: Vec<crate::picker::PickerEntry> = rimeterm_pty::agent_registry::detect_all()
+            .into_iter()
+            .map(|a| {
+                if a.is_available() {
+                    let cmd: Option<rimeterm_core::command::CommandId> = match a.id {
+                        "omp" => Some("agents.pick.omp"),
+                        "codex" => Some("agents.pick.codex"),
+                        "claude" => Some("agents.pick.claude"),
+                        "pi" => Some("agents.pick.pi"),
+                        _ => None,
+                    };
+                    match cmd {
+                        Some(c) => crate::picker::PickerEntry::command(a.label, c),
+                        None => crate::picker::PickerEntry::disabled(a.label, "(unknown)"),
                     }
-                })
-                .collect();
+                } else {
+                    crate::picker::PickerEntry::disabled(a.label, "(not installed)")
+                }
+            })
+            .collect();
         self.picker_state.open_with("Pick an agent", entries);
     }
 
@@ -1016,8 +1035,7 @@ impl App {
                 }
             }
             Some("pane.focus") => {
-                if let Some(pane_id) =
-                    parts.next().and_then(|s| s.parse::<u64>().ok()).map(PaneId)
+                if let Some(pane_id) = parts.next().and_then(|s| s.parse::<u64>().ok()).map(PaneId)
                 {
                     let owner = self.tree.tab_groups().iter().find_map(|g| {
                         g.members()
@@ -1092,12 +1110,14 @@ impl App {
                         ));
                     }
                     push_group_new_entry(&mut entries, gid);
-                    self.picker_state.open_with(format!("Tab · {}", gid), entries);
+                    self.picker_state
+                        .open_with(format!("Tab · {}", gid), entries);
                     return;
                 }
                 TabStripHit::Plus { gid } => {
                     push_group_new_entry(&mut entries, gid);
-                    self.picker_state.open_with(format!("Group · {}", gid), entries);
+                    self.picker_state
+                        .open_with(format!("Group · {}", gid), entries);
                     return;
                 }
             }
@@ -1179,7 +1199,7 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1), // status
-                Constraint::Min(1),    // pane area (each group's rect gets an internal tab strip row)
+                Constraint::Min(1), // pane area (each group's rect gets an internal tab strip row)
                 Constraint::Length(1), // hint bar
             ])
             .split(area);
@@ -1290,16 +1310,20 @@ impl App {
         // mutation applies but BEFORE any ack fires. Otherwise the caller
         // races us to `workspace.snapshot` and reads pre-mutation state.
         enum Ack {
-            Unit(std::sync::mpsc::SyncSender<Result<(), String>>, Result<(), String>),
-            U64(std::sync::mpsc::SyncSender<Result<u64, String>>, Result<u64, String>),
+            Unit(
+                std::sync::mpsc::SyncSender<Result<(), String>>,
+                Result<(), String>,
+            ),
+            U64(
+                std::sync::mpsc::SyncSender<Result<u64, String>>,
+                Result<u64, String>,
+            ),
         }
         let mut acks: Vec<Ack> = Vec::with_capacity(batch.len());
         for mutation in batch {
             match mutation {
                 PaneMutation::Close { pane_id, ack } => {
-                    let outcome = self
-                        .close_pane_by_id(pane_id)
-                        .map_err(|e| e.to_string());
+                    let outcome = self.close_pane_by_id(pane_id).map_err(|e| e.to_string());
                     acks.push(Ack::Unit(ack, outcome));
                 }
                 PaneMutation::OpenShell { ack } => {
@@ -1327,9 +1351,7 @@ impl App {
                     acks.push(Ack::Unit(ack, outcome));
                 }
                 PaneMutation::Focus { pane_id, ack } => {
-                    let outcome = self
-                        .focus_pane_by_id(pane_id)
-                        .map_err(|e| e.to_string());
+                    let outcome = self.focus_pane_by_id(pane_id).map_err(|e| e.to_string());
                     acks.push(Ack::Unit(ack, outcome));
                 }
             }
@@ -1525,10 +1547,7 @@ impl App {
             .insert(new_id, spawn.pane.session().clone());
         self.panes.insert(Box::new(spawn.pane));
 
-        let group = self
-            .tree
-            .find_tab_group_mut(gid)
-            .expect("group present");
+        let group = self.tree.find_tab_group_mut(gid).expect("group present");
         group
             .try_add(new_id, PaneKind::Shell)
             .map_err(|e| anyhow!("policy rejected new tab: {e}"))?;
@@ -1579,10 +1598,7 @@ impl App {
         // first-launch, remove it so the new agent tab is the sole (and
         // active) entry. TabGroup::try_close refuses to remove the last
         // member without `force`, so add first then close.
-        let group = self
-            .tree
-            .find_tab_group_mut(gid)
-            .expect("group present");
+        let group = self.tree.find_tab_group_mut(gid).expect("group present");
         group
             .try_add(new_id, PaneKind::AgentChat)
             .map_err(|e| anyhow!("policy rejected new agent tab: {e}"))?;
@@ -1653,9 +1669,7 @@ impl App {
             MembersPolicy::Fixed => return Err(anyhow!("{} is fixed; cannot close tabs", gid)),
             MembersPolicy::Open { .. } => {}
         }
-        let removed = group
-            .try_close(idx, false)
-            .map_err(|e| anyhow!("{e}"))?;
+        let removed = group.try_close(idx, false).map_err(|e| anyhow!("{e}"))?;
         drop_pane(&mut self.panes, removed);
         self.session_writes.lock().remove(&removed);
         if let Some(group) = self.tree.find_tab_group(gid) {
@@ -1782,25 +1796,21 @@ impl App {
     async fn spawn_ipc_server(&self) -> Option<tokio::sync::mpsc::Sender<()>> {
         let pid = std::process::id();
         let commands = std::sync::Arc::clone(&self.commands);
-        let handler: rimeterm_ipc::Handler = std::sync::Arc::new(move |req: rimeterm_ipc::Request| {
-            // Match `req.cmd` against a registered command id. The registry
-            // keys are `&'static str` literals so the lookup is a simple
-            // linear scan; the command set stays tiny (<50 entries in M6).
-            let matched: Option<&'static str> = commands
-                .iter()
-                .find(|c| c.id == req.cmd)
-                .map(|c| c.id);
-            let Some(id) = matched else {
-                return rimeterm_ipc::Response::err(format!(
-                    "unknown command `{}`",
-                    req.cmd
-                ));
-            };
-            match commands.run_with(id, &req.args) {
-                Ok(result) => rimeterm_ipc::Response::success(result),
-                Err(e) => rimeterm_ipc::Response::err(e.to_string()),
-            }
-        });
+        let handler: rimeterm_ipc::Handler =
+            std::sync::Arc::new(move |req: rimeterm_ipc::Request| {
+                // Match `req.cmd` against a registered command id. The registry
+                // keys are `&'static str` literals so the lookup is a simple
+                // linear scan; the command set stays tiny (<50 entries in M6).
+                let matched: Option<&'static str> =
+                    commands.iter().find(|c| c.id == req.cmd).map(|c| c.id);
+                let Some(id) = matched else {
+                    return rimeterm_ipc::Response::err(format!("unknown command `{}`", req.cmd));
+                };
+                match commands.run_with(id, &req.args) {
+                    Ok(result) => rimeterm_ipc::Response::success(result),
+                    Err(e) => rimeterm_ipc::Response::err(e.to_string()),
+                }
+            });
         match rimeterm_ipc::spawn(pid, handler).await {
             Ok(tx) => {
                 if let Some(ep) = rimeterm_ipc::endpoint_display_for_pid(pid) {
@@ -1851,7 +1861,9 @@ impl App {
         for (path, ratios) in self.default_ratios.clone() {
             let _ = self.tree.set_ratios(&path, ratios);
         }
-        if let Some(path) = rimeterm_config::layout_state::workspace_state_file(&self.workspace_root) {
+        if let Some(path) =
+            rimeterm_config::layout_state::workspace_state_file(&self.workspace_root)
+        {
             let _ = std::fs::remove_file(&path);
         }
         self.set_hint("layout reset to defaults (persisted state cleared)".into());
@@ -1874,7 +1886,6 @@ fn pick_shell(config: &Config) -> Result<ShellChoice> {
         Ok(choice)
     }
 }
-
 
 /// Insert either a real spawned external PTY (if `spec.command[0]` is on
 /// PATH) or a styled placeholder pane telling the user how to install it.
@@ -1930,12 +1941,8 @@ fn build_external_pane(
                 Some(hint) => format!("not installed — {}", hint),
                 None => format!("not installed — `{}` not on PATH", probed),
             };
-            let pane = PlaceholderPane::new(
-                spec.id.clone(),
-                subtitle,
-                icon.to_owned(),
-                Color::DarkGray,
-            );
+            let pane =
+                PlaceholderPane::new(spec.id.clone(), subtitle, icon.to_owned(), Color::DarkGray);
             let _ = color; // reserved for future available-pane border color
             let id = pane.id();
             panes.insert(Box::new(pane));
@@ -2029,18 +2036,16 @@ fn neighbor_group(from: TabGroupId, dir: usize) -> Option<TabGroupId> {
         (4, g) if g == BUILTIN_AGENTS => BUILTIN_SHELLS,
         _ => same,
     };
-    if out == from {
-        None
-    } else {
-        Some(out)
-    }
+    if out == from { None } else { Some(out) }
 }
 
 fn register_commands(
     cmds: &mut CommandRegistry,
     flags: Arc<ActionFlags>,
     snapshot: Arc<parking_lot::RwLock<WorkspaceSnapshot>>,
-    session_writes: Arc<parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>>,
+    session_writes: Arc<
+        parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
+    >,
     pending_mutations: Arc<parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>>,
     redraw_tx: mpsc::UnboundedSender<()>,
 ) -> Result<()> {
@@ -2063,17 +2068,83 @@ fn register_commands(
         }};
     }
 
-    flag_cmd!(cmds, "app.quit", "Quit rimeterm", "Kill sessions and exit", flags.quit);
-    flag_cmd!(cmds, "app.menu.toggle", "Toggle app menu", "F10 / Alt+M", flags.menu_toggle);
-    flag_cmd!(cmds, "app.palette.open", "Open command palette", "Ctrl+Shift+P", flags.palette_toggle);
-    flag_cmd!(cmds, "app.settings", "Open Settings", "Edit rimeterm config", flags.settings);
-    flag_cmd!(cmds, "app.acknowledgement", "Acknowledgement", "Show ACKNOWLEDGEMENTS.md", flags.acknowledgement);
-    flag_cmd!(cmds, "workspace.tab.next", "Next tab in group", "Alt+]", flags.tab_next);
-    flag_cmd!(cmds, "workspace.tab.prev", "Previous tab in group", "Alt+[", flags.tab_prev);
-    flag_cmd!(cmds, "workspace.shells.new", "New shell tab", "Ctrl+T", flags.shells_new);
-    flag_cmd!(cmds, "workspace.shells.close", "Close shell tab", "Ctrl+W", flags.shells_close);
-    flag_cmd!(cmds, "app.resize.toggle", "Toggle Resize mode", "Ctrl+Alt+R", flags.resize_toggle);
-    flag_cmd!(cmds, "workspace.layout.reset", "Reset layout ratios", "Restore & clear persisted state", flags.layout_reset);
+    flag_cmd!(
+        cmds,
+        "app.quit",
+        "Quit rimeterm",
+        "Kill sessions and exit",
+        flags.quit
+    );
+    flag_cmd!(
+        cmds,
+        "app.menu.toggle",
+        "Toggle app menu",
+        "F10 / Alt+M",
+        flags.menu_toggle
+    );
+    flag_cmd!(
+        cmds,
+        "app.palette.open",
+        "Open command palette",
+        "Ctrl+Shift+P",
+        flags.palette_toggle
+    );
+    flag_cmd!(
+        cmds,
+        "app.settings",
+        "Open Settings",
+        "Edit rimeterm config",
+        flags.settings
+    );
+    flag_cmd!(
+        cmds,
+        "app.acknowledgement",
+        "Acknowledgement",
+        "Show ACKNOWLEDGEMENTS.md",
+        flags.acknowledgement
+    );
+    flag_cmd!(
+        cmds,
+        "workspace.tab.next",
+        "Next tab in group",
+        "Alt+]",
+        flags.tab_next
+    );
+    flag_cmd!(
+        cmds,
+        "workspace.tab.prev",
+        "Previous tab in group",
+        "Alt+[",
+        flags.tab_prev
+    );
+    flag_cmd!(
+        cmds,
+        "workspace.shells.new",
+        "New shell tab",
+        "Ctrl+T",
+        flags.shells_new
+    );
+    flag_cmd!(
+        cmds,
+        "workspace.shells.close",
+        "Close shell tab",
+        "Ctrl+W",
+        flags.shells_close
+    );
+    flag_cmd!(
+        cmds,
+        "app.resize.toggle",
+        "Toggle Resize mode",
+        "Ctrl+Alt+R",
+        flags.resize_toggle
+    );
+    flag_cmd!(
+        cmds,
+        "workspace.layout.reset",
+        "Reset layout ratios",
+        "Restore & clear persisted state",
+        flags.layout_reset
+    );
 
     // Nine tab-goto commands (Alt+Shift+1..9 shortcuts).
     for (i, id) in crate::keymap::all_tab_goto_ids().iter().enumerate() {
@@ -2085,9 +2156,7 @@ fn register_commands(
                 *id,
                 title,
                 Some("Alt+Shift+<N>"),
-                Arc::new(move || {
-                    f.tab_goto.store((i + 1) as usize, Ordering::Relaxed)
-                }),
+                Arc::new(move || f.tab_goto.store((i + 1) as usize, Ordering::Relaxed)),
             ),
         )?;
     }
@@ -2123,7 +2192,8 @@ fn register_commands(
                 title,
                 Some("Alt+<N>"),
                 Arc::new(move || {
-                    f.focus_quadrant.store((idx + 1) as usize, Ordering::Relaxed)
+                    f.focus_quadrant
+                        .store((idx + 1) as usize, Ordering::Relaxed)
                 }),
             ),
         )?;
@@ -2192,27 +2262,18 @@ fn register_commands(
                     return Err("`text` must not be empty".into());
                 }
                 if text.len() > MAX_BYTES {
-                    return Err(format!(
-                        "`text` is {} bytes; max {}",
-                        text.len(),
-                        MAX_BYTES
-                    ));
+                    return Err(format!("`text` is {} bytes; max {}", text.len(), MAX_BYTES));
                 }
-                let enter = args
-                    .get("enter")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let enter = args.get("enter").and_then(|v| v.as_bool()).unwrap_or(false);
                 let mut payload = text.as_bytes().to_vec();
                 if enter {
                     payload.push(b'\r');
                 }
                 let pane_id = PaneId(pane_id_num);
                 let session = sw.lock().get(&pane_id).cloned();
-                let session = session
-                    .ok_or_else(|| format!("no live PTY for pane {}", pane_id_num))?;
-                session
-                    .write(&payload)
-                    .map_err(|e| format!("write: {e}"))?;
+                let session =
+                    session.ok_or_else(|| format!("no live PTY for pane {}", pane_id_num))?;
+                session.write(&payload).map_err(|e| format!("write: {e}"))?;
                 Ok(serde_json::json!({"bytes_written": payload.len()}))
             }),
         };
@@ -2235,23 +2296,20 @@ fn register_commands(
                     .and_then(|v| v.as_u64())
                     .ok_or_else(|| "missing `pane_id` (u64)".to_string())?;
                 let rows = match args.get("rows") {
-                    Some(v) => Some(
-                        v.as_u64()
-                            .ok_or_else(|| "`rows` must be u64".to_string())?,
-                    ),
+                    Some(v) => Some(v.as_u64().ok_or_else(|| "`rows` must be u64".to_string())?),
                     None => None,
                 };
                 let rows = match rows {
                     Some(n) if n > MAX_ROWS => {
-                        return Err(format!("rows {} > cap {}", n, MAX_ROWS))
+                        return Err(format!("rows {} > cap {}", n, MAX_ROWS));
                     }
                     Some(n) => Some(n as u16),
                     None => None,
                 };
                 let pane_id = PaneId(pane_id_num);
                 let session = sw.lock().get(&pane_id).cloned();
-                let session = session
-                    .ok_or_else(|| format!("no live PTY for pane {}", pane_id_num))?;
+                let session =
+                    session.ok_or_else(|| format!("no live PTY for pane {}", pane_id_num))?;
                 let contents = session.grid_contents(rows);
                 let rows_captured = contents.lines().count();
                 Ok(serde_json::json!({
@@ -2276,15 +2334,15 @@ fn register_commands(
         let cmd = Command {
             id: "workspace.pane.wait",
             title: "Wait until a regex matches a pane's output",
-            description: Some(
-                "args: {pane_id, pattern, timeout_ms?<=60000, poll_ms?[25..=1000]}",
-            ),
+            description: Some("args: {pane_id, pattern, timeout_ms?<=60000, poll_ms?[25..=1000]}"),
             run: Arc::new(move |args: &serde_json::Value| {
                 let parsed = parse_wait_args(args)?;
                 let pane_id = PaneId(parsed.pane_id);
-                let session = sw.lock().get(&pane_id).cloned().ok_or_else(|| {
-                    format!("no live PTY for pane {}", parsed.pane_id)
-                })?;
+                let session = sw
+                    .lock()
+                    .get(&pane_id)
+                    .cloned()
+                    .ok_or_else(|| format!("no live PTY for pane {}", parsed.pane_id))?;
                 let start = std::time::Instant::now();
                 let deadline = start + std::time::Duration::from_millis(parsed.timeout_ms);
                 let poll = std::time::Duration::from_millis(parsed.poll_ms);
@@ -2363,10 +2421,7 @@ fn register_commands(
                 let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
                 let mutation = match kind {
                     OpenKind::Shell => PaneMutation::OpenShell { ack: ack_tx },
-                    OpenKind::Agent(spec) => PaneMutation::OpenAgent {
-                        spec,
-                        ack: ack_tx,
-                    },
+                    OpenKind::Agent(spec) => PaneMutation::OpenAgent { spec, ack: ack_tx },
                 };
                 queue.lock().push_back(mutation);
                 let _ = wake.send(());
@@ -2463,7 +2518,9 @@ fn register_commands(
         let cmd = Command {
             id: "tools.list",
             title: "List rimeterm-managed external tools",
-            description: Some("no args; returns detected path + install source for each of the five TUI tools"),
+            description: Some(
+                "no args; returns detected path + install source for each of the five TUI tools",
+            ),
             run: Arc::new(move |_args: &serde_json::Value| {
                 let detected = rimeterm_config::tools::detect_all();
                 Ok(serde_json::json!({ "tools": detected }))
@@ -2478,9 +2535,21 @@ fn register_commands(
     // keeps ticking (multi-thread runtime). Streaming into a live pane is
     // C14+ (needs new pane kind).
     for (action_kind, ipc_id, ipc_title) in [
-        (ToolAction::Install, "tools.install", "Install a tool via cargo install --locked"),
-        (ToolAction::Upgrade, "tools.upgrade", "Upgrade a tool via cargo install --locked --force"),
-        (ToolAction::Uninstall, "tools.uninstall", "Uninstall a cargo-installed tool"),
+        (
+            ToolAction::Install,
+            "tools.install",
+            "Install a tool via cargo install --locked",
+        ),
+        (
+            ToolAction::Upgrade,
+            "tools.upgrade",
+            "Upgrade a tool via cargo install --locked --force",
+        ),
+        (
+            ToolAction::Uninstall,
+            "tools.uninstall",
+            "Uninstall a cargo-installed tool",
+        ),
     ] {
         let cmd = Command {
             id: ipc_id,
@@ -2549,10 +2618,15 @@ fn register_commands(
             register($cmds, cmd)?;
         }};
     }
-    agent_pick_cmd!(cmds, "agents.pick.omp",    "Open agent: Oh-my-pi",    "omp");
-    agent_pick_cmd!(cmds, "agents.pick.codex",  "Open agent: Codex CLI",   "codex");
-    agent_pick_cmd!(cmds, "agents.pick.claude", "Open agent: Claude Code", "claude");
-    agent_pick_cmd!(cmds, "agents.pick.pi",     "Open agent: Pi",          "pi");
+    agent_pick_cmd!(cmds, "agents.pick.omp", "Open agent: Oh-my-pi", "omp");
+    agent_pick_cmd!(cmds, "agents.pick.codex", "Open agent: Codex CLI", "codex");
+    agent_pick_cmd!(
+        cmds,
+        "agents.pick.claude",
+        "Open agent: Claude Code",
+        "claude"
+    );
+    agent_pick_cmd!(cmds, "agents.pick.pi", "Open agent: Pi", "pi");
 
     Ok(())
 }
@@ -2677,9 +2751,7 @@ pub(crate) const RENAME_TITLE_MAX: usize = 64;
 /// strings, strings > `RENAME_TITLE_MAX` chars, and titles containing any
 /// control character (`'\n'`, `'\r'`, `'\t'`, etc.) because those break
 /// the tab strip.
-pub(crate) fn parse_rename_args(
-    args: &serde_json::Value,
-) -> Result<(u64, String), String> {
+pub(crate) fn parse_rename_args(args: &serde_json::Value) -> Result<(u64, String), String> {
     let pane_id = args
         .get("pane_id")
         .and_then(|v| v.as_u64())
@@ -2999,11 +3071,13 @@ fn min_size_floors(
 }
 
 /// Take a snapshot of every split's ratios keyed by path so we can `= / 0` reset.
-fn snapshot_all_ratios(
-    tree: &LayoutTree,
-) -> Vec<(rimeterm_core::layout::SplitPath, Vec<f32>)> {
+fn snapshot_all_ratios(tree: &LayoutTree) -> Vec<(rimeterm_core::layout::SplitPath, Vec<f32>)> {
     let mut out = Vec::new();
-    walk_snapshot(tree.root(), rimeterm_core::layout::SplitPath::root(), &mut out);
+    walk_snapshot(
+        tree.root(),
+        rimeterm_core::layout::SplitPath::root(),
+        &mut out,
+    );
     out
 }
 
@@ -3025,7 +3099,10 @@ fn walk_snapshot(
 
 /// Overwrite the tree's ratios from a persisted [`LayoutState`]. Missing paths
 /// keep their defaults; unknown paths in the state file are silently skipped.
-fn apply_persisted_state(tree: &mut LayoutTree, state: &rimeterm_config::layout_state::LayoutState) {
+fn apply_persisted_state(
+    tree: &mut LayoutTree,
+    state: &rimeterm_config::layout_state::LayoutState,
+) {
     for (key, ratios) in &state.splits {
         let path = rimeterm_core::layout::SplitPath(
             rimeterm_config::layout_state::LayoutState::decode_path(key),
@@ -3035,9 +3112,7 @@ fn apply_persisted_state(tree: &mut LayoutTree, state: &rimeterm_config::layout_
 }
 
 /// Snapshot the tree's current ratios into a persistable [`LayoutState`].
-fn snapshot_persisted_state(
-    tree: &LayoutTree,
-) -> rimeterm_config::layout_state::LayoutState {
+fn snapshot_persisted_state(tree: &LayoutTree) -> rimeterm_config::layout_state::LayoutState {
     let mut state = rimeterm_config::layout_state::LayoutState::default();
     for (path, ratios) in snapshot_all_ratios(tree) {
         let key = rimeterm_config::layout_state::LayoutState::encode_path(&path.0);
@@ -3201,10 +3276,7 @@ mod tests {
 
     #[test]
     fn wait_args_reject_bad_regex() {
-        let err = parse_wait_args(&wait_args_json(
-            r#"{"pane_id":10,"pattern":"("}"#,
-        ))
-        .unwrap_err();
+        let err = parse_wait_args(&wait_args_json(r#"{"pane_id":10,"pattern":"("}"#)).unwrap_err();
         assert!(err.contains("invalid regex"), "err was {err:?}");
     }
 
@@ -3229,10 +3301,8 @@ mod tests {
 
     #[test]
     fn wait_args_defaults_when_omitted() {
-        let args = parse_wait_args(&wait_args_json(
-            r#"{"pane_id":10,"pattern":"^done$"}"#,
-        ))
-        .unwrap();
+        let args =
+            parse_wait_args(&wait_args_json(r#"{"pane_id":10,"pattern":"^done$"}"#)).unwrap();
         assert_eq!(args.pane_id, 10);
         assert_eq!(args.timeout_ms, WAIT_DEFAULT_TIMEOUT_MS);
         assert_eq!(args.poll_ms, WAIT_DEFAULT_POLL_MS);
@@ -3260,8 +3330,7 @@ mod tests {
 
     #[test]
     fn close_args_reject_wrong_type() {
-        let err = parse_close_args(&wait_args_json(r#"{"pane_id":"nope"}"#))
-            .unwrap_err();
+        let err = parse_close_args(&wait_args_json(r#"{"pane_id":"nope"}"#)).unwrap_err();
         assert!(err.contains("pane_id"), "err was {err:?}");
     }
 
@@ -3295,8 +3364,7 @@ mod tests {
 
     #[test]
     fn open_args_accept_registered_agent() {
-        let kind =
-            parse_open_args(&wait_args_json(r#"{"kind":"agent:codex"}"#)).unwrap();
+        let kind = parse_open_args(&wait_args_json(r#"{"kind":"agent:codex"}"#)).unwrap();
         match kind {
             OpenKind::Agent(spec) => assert_eq!(spec.id, "codex"),
             OpenKind::Shell => panic!("expected agent kind"),
@@ -3305,11 +3373,9 @@ mod tests {
 
     #[test]
     fn open_args_reject_unknown_agent() {
-        let err = parse_open_args(&wait_args_json(r#"{"kind":"agent:nope"}"#))
-            .unwrap_err();
+        let err = parse_open_args(&wait_args_json(r#"{"kind":"agent:nope"}"#)).unwrap_err();
         assert!(err.contains("unknown agent"), "err was {err:?}");
     }
-
 
     // --- workspace.pane.rename input validation ---
 
@@ -3327,19 +3393,14 @@ mod tests {
 
     #[test]
     fn rename_args_reject_empty_title() {
-        let err = parse_rename_args(&wait_args_json(
-            r#"{"pane_id":10,"title":""}"#,
-        ))
-        .unwrap_err();
+        let err = parse_rename_args(&wait_args_json(r#"{"pane_id":10,"title":""}"#)).unwrap_err();
         assert!(err.contains("empty"), "err was {err:?}");
     }
 
     #[test]
     fn rename_args_reject_control_char() {
-        let err = parse_rename_args(&wait_args_json(
-            r#"{"pane_id":10,"title":"foo\nbar"}"#,
-        ))
-        .unwrap_err();
+        let err =
+            parse_rename_args(&wait_args_json(r#"{"pane_id":10,"title":"foo\nbar"}"#)).unwrap_err();
         assert!(err.contains("control char"), "err was {err:?}");
     }
 
@@ -3364,10 +3425,9 @@ mod tests {
 
     #[test]
     fn rename_args_accept_unicode() {
-        let (_, title) = parse_rename_args(&wait_args_json(
-            r#"{"pane_id": 3, "title": "构建-runner"}"#,
-        ))
-        .unwrap();
+        let (_, title) =
+            parse_rename_args(&wait_args_json(r#"{"pane_id": 3, "title": "构建-runner"}"#))
+                .unwrap();
         assert_eq!(title, "构建-runner");
     }
 

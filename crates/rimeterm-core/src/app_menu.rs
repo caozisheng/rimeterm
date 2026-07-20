@@ -74,6 +74,9 @@ mod tests {
         assert_eq!(menu.items[0].id, "app.settings");
         assert_eq!(menu.items[1].id, "app.acknowledgement");
         assert_eq!(menu.items[2].id, "app.quit");
-        assert!(menu.items[2].separator_before, "Quit sits under a separator");
+        assert!(
+            menu.items[2].separator_before,
+            "Quit sits under a separator"
+        );
     }
 }

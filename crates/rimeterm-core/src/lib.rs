@@ -26,6 +26,6 @@ pub use focus::FocusManager;
 pub use layout::{LayoutNode, LayoutTree};
 pub use pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
 pub use tabs::{
-    MembersPolicy, PaneKind, PolicyError, TabGroup, TabGroupId, BUILTIN_AGENTS, BUILTIN_FILES,
-    BUILTIN_SHELLS, BUILTIN_SYSMON,
+    BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS, BUILTIN_SYSMON, MembersPolicy, PaneKind,
+    PolicyError, TabGroup, TabGroupId,
 };

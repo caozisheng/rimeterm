@@ -29,7 +29,9 @@ pub fn detect_tool(argv: &[String]) -> ToolAvailability {
     };
     match which::which(cmd) {
         Ok(path) => ToolAvailability::Available(path),
-        Err(_) => ToolAvailability::Missing { probed: cmd.clone() },
+        Err(_) => ToolAvailability::Missing {
+            probed: cmd.clone(),
+        },
     }
 }
 

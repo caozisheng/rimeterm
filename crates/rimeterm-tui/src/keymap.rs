@@ -80,14 +80,10 @@ impl Keymap {
         // Tab cycling — accept both bindings so at least one works on every
         // terminal setup. Ctrl+PageUp/Down come through even on terminals
         // that swallow the Alt modifier on `[` / `]`.
-        if matches!(key.code, KeyCode::PageUp)
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+        if matches!(key.code, KeyCode::PageUp) && key.modifiers.contains(KeyModifiers::CONTROL) {
             return KeymapOutcome::Run("workspace.tab.prev");
         }
-        if matches!(key.code, KeyCode::PageDown)
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+        if matches!(key.code, KeyCode::PageDown) && key.modifiers.contains(KeyModifiers::CONTROL) {
             return KeymapOutcome::Run("workspace.tab.next");
         }
         // All Alt-modifier bindings share one block for clarity.
@@ -148,7 +144,6 @@ fn digit_1_to_9(c: char) -> Option<usize> {
         _ => None,
     }
 }
-
 
 /// Map Alt+1..4 to the four quadrant focus commands. Returns `None` for other
 /// characters so the caller can fall through.

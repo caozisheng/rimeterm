@@ -44,8 +44,8 @@ pub fn spawn_external(
         backend: PtyBackend::Native,
     };
 
-    let (session, mut rx) = Session::spawn(cfg)
-        .with_context(|| format!("spawning `{}`", program.display()))?;
+    let (session, mut rx) =
+        Session::spawn(cfg).with_context(|| format!("spawning `{}`", program.display()))?;
 
     let display_for_log = display_name.clone();
     // Wire the session's event stream to (a) the app-wide redraw pulse and
@@ -96,5 +96,13 @@ pub fn spawn_agent(
     initial_rows: u16,
     redraw: UnboundedSender<()>,
 ) -> Result<ExternalSpawn> {
-    spawn_external(program, args, cwd, display_name, initial_cols, initial_rows, redraw)
+    spawn_external(
+        program,
+        args,
+        cwd,
+        display_name,
+        initial_cols,
+        initial_rows,
+        redraw,
+    )
 }

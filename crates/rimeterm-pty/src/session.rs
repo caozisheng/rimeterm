@@ -12,7 +12,7 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -82,6 +82,7 @@ pub struct Session {
 impl Session {
     /// Spawn a child under a fresh PTY. Returns the session plus a receiver
     /// that streams [`SessionOutput`] to the pane provider.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn spawn(
         cfg: SessionConfig,
     ) -> Result<(Self, mpsc::UnboundedReceiver<SessionOutput>), SessionError> {
@@ -93,7 +94,7 @@ impl Session {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| SessionError::OpenPty(anyhow::Error::from(e)))?;
+            .map_err(SessionError::OpenPty)?;
 
         let mut builder = CommandBuilder::new(cfg.program.clone());
         for arg in &cfg.args {
@@ -106,23 +107,21 @@ impl Session {
             builder.env(k, v);
         }
 
-        let child = pair.slave.spawn_command(builder).map_err(|source| {
-            SessionError::Spawn {
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .map_err(|source| SessionError::Spawn {
                 program: cfg.program.display().to_string(),
-                source: anyhow::Error::from(source),
-            }
-        })?;
+                source,
+            })?;
 
         // Slave end is now owned by the child; drop it locally to release resources.
         drop(pair.slave);
 
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| SessionError::Spawn {
-                program: cfg.program.display().to_string(),
-                source: anyhow::Error::from(e),
-            })?;
+        let writer = pair.master.take_writer().map_err(|e| SessionError::Spawn {
+            program: cfg.program.display().to_string(),
+            source: e,
+        })?;
 
         let grid = Arc::new(Mutex::new(vt100::Parser::new(cfg.rows, cfg.cols, 5000)));
         let child = Arc::new(Mutex::new(child));
@@ -137,7 +136,7 @@ impl Session {
             .try_clone_reader()
             .map_err(|e| SessionError::Spawn {
                 program: cfg.program.display().to_string(),
-                source: anyhow::Error::from(e),
+                source: e,
             })?;
         let grid_reader = Arc::clone(&grid);
         let events_tx_reader = events_tx.clone();
@@ -208,7 +207,7 @@ impl Session {
             })
             .map_err(|e| SessionError::Spawn {
                 program: "resize".into(),
-                source: anyhow::Error::from(e),
+                source: e,
             })?;
         Ok(())
     }
@@ -328,16 +327,15 @@ mod responder_tests {
         }
     }
 
-    fn writer_with_sink() -> (
-        Arc<PlMutex<Vec<u8>>>,
-        Arc<Mutex<Option<Box<dyn Write + Send>>>>,
-    ) {
+    type SharedWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
+    fn writer_with_sink() -> (Arc<PlMutex<Vec<u8>>>, SharedWriter) {
         // The outer Mutex must be std::sync to match respond_to_terminal_queries'
         // signature (chosen for the real writer, which lives in Session).
         let replies: Arc<PlMutex<Vec<u8>>> = Arc::new(PlMutex::new(Vec::new()));
-        let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(
-            Some(Box::new(Sink(Arc::clone(&replies))) as Box<dyn Write + Send>),
-        ));
+        let writer: SharedWriter = Arc::new(Mutex::new(Some(
+            Box::new(Sink(Arc::clone(&replies))) as Box<dyn Write + Send>
+        )));
         (replies, writer)
     }
 
@@ -369,9 +367,7 @@ mod responder_tests {
     fn dsr_cursor_position_replies_with_current_pos() {
         let (replies, writer) = writer_with_sink();
         let grid = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
-        grid.lock()
-            .expect("grid mutex")
-            .process(b"\x1b[3;5H");
+        grid.lock().expect("grid mutex").process(b"\x1b[3;5H");
         respond_to_terminal_queries(b"\x1b[6n", &grid, &writer);
         assert_eq!(&*replies.lock(), b"\x1b[3;5R");
     }
@@ -394,6 +390,7 @@ mod responder_tests {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn read_loop(
     mut reader: Box<dyn std::io::Read + Send>,
     grid: Arc<Mutex<vt100::Parser>>,
@@ -488,10 +485,10 @@ fn respond_to_terminal_queries(
     if reply.is_empty() {
         return;
     }
-    if let Ok(mut w) = writer.lock() {
-        if let Some(w) = w.as_mut() {
-            let _ = w.write_all(&reply);
-            let _ = w.flush();
-        }
+    if let Ok(mut w) = writer.lock()
+        && let Some(w) = w.as_mut()
+    {
+        let _ = w.write_all(&reply);
+        let _ = w.flush();
     }
 }

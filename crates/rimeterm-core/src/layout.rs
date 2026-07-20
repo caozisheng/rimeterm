@@ -128,7 +128,7 @@ impl LayoutTree {
     /// to call this once per frame after layout, and cache within the frame.
     pub fn dividers(&self, area: Rect) -> Vec<Divider> {
         let mut out = Vec::new();
-        collect_dividers(&self.root, area, SplitPath::root(), &mut out);
+        collect_dividers(&self.root, area, &SplitPath::root(), &mut out);
         out
     }
 
@@ -239,7 +239,6 @@ fn check_unique(node: &LayoutNode, seen: &mut HashSet<PaneId>) -> Result<(), Lay
     Ok(())
 }
 
-
 /// Stable identifier of a Split node, encoded as the sequence of child-indexes
 /// leading from the root. Cheap to clone (small vec) and stable across
 /// re-renders as long as the tree structure doesn't mutate.
@@ -314,17 +313,15 @@ fn walk(node: &LayoutNode, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
     }
 }
 
-fn find_tab_group<'a>(node: &'a LayoutNode, id: TabGroupId) -> Option<&'a TabGroup> {
+fn find_tab_group(node: &LayoutNode, id: TabGroupId) -> Option<&TabGroup> {
     match node {
         LayoutNode::Tabs(g) if g.id() == id => Some(g),
-        LayoutNode::Split { children, .. } => {
-            children.iter().find_map(|c| find_tab_group(c, id))
-        }
+        LayoutNode::Split { children, .. } => children.iter().find_map(|c| find_tab_group(c, id)),
         _ => None,
     }
 }
 
-fn find_tab_group_mut<'a>(node: &'a mut LayoutNode, id: TabGroupId) -> Option<&'a mut TabGroup> {
+fn find_tab_group_mut(node: &mut LayoutNode, id: TabGroupId) -> Option<&mut TabGroup> {
     match node {
         LayoutNode::Tabs(g) if g.id() == id => Some(g),
         LayoutNode::Split { children, .. } => {
@@ -359,10 +356,7 @@ fn find_split<'a>(node: &'a LayoutNode, path: &SplitPath) -> Option<&'a LayoutNo
     Some(cursor)
 }
 
-fn find_split_mut<'a>(
-    node: &'a mut LayoutNode,
-    path: &SplitPath,
-) -> Option<&'a mut LayoutNode> {
+fn find_split_mut<'a>(node: &'a mut LayoutNode, path: &SplitPath) -> Option<&'a mut LayoutNode> {
     let mut cursor = node;
     for &step in &path.0 {
         cursor = match cursor {
@@ -376,7 +370,7 @@ fn find_split_mut<'a>(
 /// Walk the tree and emit one [`Divider`] for each seam we can see in `area`.
 /// The 1-cell rect follows the ratatui `Layout::split` computation so hit
 /// tests line up exactly with what the user clicked on.
-fn collect_dividers(node: &LayoutNode, area: Rect, path: SplitPath, out: &mut Vec<Divider>) {
+fn collect_dividers(node: &LayoutNode, area: Rect, path: &SplitPath, out: &mut Vec<Divider>) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -424,7 +418,7 @@ fn collect_dividers(node: &LayoutNode, area: Rect, path: SplitPath, out: &mut Ve
         }
         for (idx, child) in children.iter().enumerate() {
             let child_path = path.clone().push(idx as u8);
-            collect_dividers(child, rects[idx], child_path, out);
+            collect_dividers(child, rects[idx], &child_path, out);
         }
     }
 }

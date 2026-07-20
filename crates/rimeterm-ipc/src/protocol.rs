@@ -8,7 +8,7 @@
 //! - Each direction: one JSON object per `\n`.
 //! - Request:  `{"cmd": "<command-id>", "args": {...}}`
 //! - Response: `{"ok": true, "result": <any>}` or
-//!             `{"ok": false, "error": "<message>"}`
+//!   `{"ok": false, "error": "<message>"}`
 //!
 //! Only one request/response pair per connection in v1 (the simplest slice
 //! that unblocks tooling). A future version can keep the connection alive.

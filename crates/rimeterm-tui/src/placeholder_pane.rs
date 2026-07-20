@@ -82,9 +82,7 @@ impl PaneProvider for PlaceholderPane {
         let body = vec![
             Line::from(Span::styled(
                 self.subtitle.as_str(),
-                Style::default()
-                    .fg(self.color)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(self.color).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(

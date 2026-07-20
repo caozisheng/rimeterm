@@ -90,12 +90,21 @@ pub fn hit_rects(area: Rect, group: &TabGroup, titles: &[String]) -> TabStripHit
     // Prefix " ┤ " — 3 columns.
     let mut x = area.x.saturating_add(3);
     let mut tabs = Vec::with_capacity(titles.len());
-    let mut closes: Vec<(usize, Rect)> = Vec::with_capacity(if closable { titles.len() } else { 0 });
+    let mut closes: Vec<(usize, Rect)> =
+        Vec::with_capacity(if closable { titles.len() } else { 0 });
     for (idx, title) in titles.iter().enumerate() {
         let label_w = UnicodeWidthStr::width(title.as_str()) as u16 + 2;
         let w = label_w.min(end_x.saturating_sub(x));
         if w > 0 {
-            tabs.push((idx, Rect { x, y, width: w, height: h }));
+            tabs.push((
+                idx,
+                Rect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                },
+            ));
         }
         x = x.saturating_add(label_w);
         // Close affordance " × " = "×" (1 col) then " " (1 col). We treat
@@ -106,7 +115,12 @@ pub fn hit_rects(area: Rect, group: &TabGroup, titles: &[String]) -> TabStripHit
             if end_x.saturating_sub(x) >= 1 {
                 closes.push((
                     idx,
-                    Rect { x, y, width: 1, height: h },
+                    Rect {
+                        x,
+                        y,
+                        width: 1,
+                        height: h,
+                    },
                 ));
             }
             x = x.saturating_add(2); // "×" + " "
@@ -122,14 +136,24 @@ pub fn hit_rects(area: Rect, group: &TabGroup, titles: &[String]) -> TabStripHit
         // " [+]" — 4 columns.
         let w = 4u16.min(end_x.saturating_sub(x));
         if w > 0 {
-            Some(Rect { x, y, width: w, height: h })
+            Some(Rect {
+                x,
+                y,
+                width: w,
+                height: h,
+            })
         } else {
             None
         }
     } else {
         None
     };
-    TabStripHits { rect: area, tabs, closes, plus }
+    TabStripHits {
+        rect: area,
+        tabs,
+        closes,
+        plus,
+    }
 }
 
 #[cfg(test)]
@@ -170,30 +194,95 @@ mod tests {
         //  Suffix " ├" at 36..38. Plus " [+]" at 38..42.
         let (g, titles) = open_group(&["shell-1", "shell-2"]);
         let h = hit_rects(
-            Rect { x: 10, y: 3, width: 60, height: 1 },
+            Rect {
+                x: 10,
+                y: 3,
+                width: 60,
+                height: 1,
+            },
             &g,
             &titles,
         );
         assert_eq!(h.rect.x, 10);
         assert_eq!(h.tabs.len(), 2);
-        assert_eq!(h.tabs[0], (0, Rect { x: 13, y: 3, width: 9, height: 1 }));
-        assert_eq!(h.tabs[1], (1, Rect { x: 25, y: 3, width: 9, height: 1 }));
+        assert_eq!(
+            h.tabs[0],
+            (
+                0,
+                Rect {
+                    x: 13,
+                    y: 3,
+                    width: 9,
+                    height: 1
+                }
+            )
+        );
+        assert_eq!(
+            h.tabs[1],
+            (
+                1,
+                Rect {
+                    x: 25,
+                    y: 3,
+                    width: 9,
+                    height: 1
+                }
+            )
+        );
         assert_eq!(h.closes.len(), 2);
-        assert_eq!(h.closes[0], (0, Rect { x: 22, y: 3, width: 1, height: 1 }));
-        assert_eq!(h.closes[1], (1, Rect { x: 34, y: 3, width: 1, height: 1 }));
-        assert_eq!(h.plus, Some(Rect { x: 38, y: 3, width: 4, height: 1 }));
+        assert_eq!(
+            h.closes[0],
+            (
+                0,
+                Rect {
+                    x: 22,
+                    y: 3,
+                    width: 1,
+                    height: 1
+                }
+            )
+        );
+        assert_eq!(
+            h.closes[1],
+            (
+                1,
+                Rect {
+                    x: 34,
+                    y: 3,
+                    width: 1,
+                    height: 1
+                }
+            )
+        );
+        assert_eq!(
+            h.plus,
+            Some(Rect {
+                x: 38,
+                y: 3,
+                width: 4,
+                height: 1
+            })
+        );
     }
 
     #[test]
     fn fixed_group_has_no_plus_or_close_affordance() {
         let (g, titles) = fixed_group(&["yazi", "gitui"]);
         let h = hit_rects(
-            Rect { x: 0, y: 0, width: 60, height: 1 },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 60,
+                height: 1,
+            },
             &g,
             &titles,
         );
         assert!(h.plus.is_none());
-        assert!(h.closes.is_empty(), "fixed groups never expose close affordances");
+        assert!(
+            h.closes.is_empty(),
+            "fixed groups never expose close affordances"
+        );
         assert_eq!(h.tabs.len(), 2);
     }
 
@@ -201,21 +290,47 @@ mod tests {
     fn cjk_titles_use_display_width_not_byte_len() {
         let (g, titles) = open_group(&["构建"]); // 2 CJK chars = 4 columns
         let h = hit_rects(
-            Rect { x: 0, y: 0, width: 60, height: 1 },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 60,
+                height: 1,
+            },
             &g,
             &titles,
         );
         // Prefix 0..3, label " 构建 " = 4 + 2 = 6 cols at 3..9.
-        assert_eq!(h.tabs[0].1, Rect { x: 3, y: 0, width: 6, height: 1 });
+        assert_eq!(
+            h.tabs[0].1,
+            Rect {
+                x: 3,
+                y: 0,
+                width: 6,
+                height: 1
+            }
+        );
         // Close "×" at column 9 (right after the label, before the trailing " ").
-        assert_eq!(h.closes[0].1, Rect { x: 9, y: 0, width: 1, height: 1 });
+        assert_eq!(
+            h.closes[0].1,
+            Rect {
+                x: 9,
+                y: 0,
+                width: 1,
+                height: 1
+            }
+        );
     }
 
     #[test]
     fn narrow_area_clips_tab_rects() {
         let (g, titles) = open_group(&["long-title-here"]);
         let h = hit_rects(
-            Rect { x: 0, y: 0, width: 8, height: 1 },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 1,
+            },
             &g,
             &titles,
         );

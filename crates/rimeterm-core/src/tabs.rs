@@ -189,7 +189,10 @@ impl TabGroup {
             MembersPolicy::Fixed => Err(PolicyError::GroupIsFixed(self.id)),
             MembersPolicy::Open { max } => {
                 if self.members.len() >= max {
-                    return Err(PolicyError::Full { group: self.id, max });
+                    return Err(PolicyError::Full {
+                        group: self.id,
+                        max,
+                    });
                 }
                 if kind != self.kind {
                     return Err(PolicyError::WrongKind {

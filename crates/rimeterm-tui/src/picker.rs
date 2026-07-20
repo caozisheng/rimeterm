@@ -171,11 +171,7 @@ pub fn popup_rect(area: Rect, state: &PickerState) -> Rect {
         .iter()
         .map(|e| {
             let label = UnicodeWidthStr::width(e.label.as_str()) as u16;
-            let note = e
-                .note
-                .as_deref()
-                .map(UnicodeWidthStr::width)
-                .unwrap_or(0) as u16;
+            let note = e.note.as_deref().map(UnicodeWidthStr::width).unwrap_or(0) as u16;
             label + if note > 0 { note + 3 } else { 0 }
         })
         .max()
@@ -188,7 +184,12 @@ pub fn popup_rect(area: Rect, state: &PickerState) -> Rect {
         .min(area.height.saturating_sub(2));
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect { x, y, width, height }
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 pub fn render(area: Rect, buf: &mut Buffer, state: &PickerState) {
@@ -276,13 +277,25 @@ mod tests {
         );
         assert_eq!(s.cursor, 0);
         s.step(1);
-        assert!(matches!(s.selected_action(), Some(PickerAction::Command("b"))));
+        assert!(matches!(
+            s.selected_action(),
+            Some(PickerAction::Command("b"))
+        ));
         s.step(1);
-        assert!(matches!(s.selected_action(), Some(PickerAction::Command("c"))));
+        assert!(matches!(
+            s.selected_action(),
+            Some(PickerAction::Command("c"))
+        ));
         s.step(1);
-        assert!(matches!(s.selected_action(), Some(PickerAction::Command("a"))));
+        assert!(matches!(
+            s.selected_action(),
+            Some(PickerAction::Command("a"))
+        ));
         s.step(-1);
-        assert!(matches!(s.selected_action(), Some(PickerAction::Command("c"))));
+        assert!(matches!(
+            s.selected_action(),
+            Some(PickerAction::Command("c"))
+        ));
     }
 
     #[test]
@@ -299,10 +312,7 @@ mod tests {
     #[test]
     fn enter_on_intent_row_returns_run_intent() {
         let mut s = PickerState::default();
-        s.open_with(
-            "T",
-            vec![PickerEntry::intent("close this", "tab.close:42")],
-        );
+        s.open_with("T", vec![PickerEntry::intent("close this", "tab.close:42")]);
         match handle_key(&mut s, key(KeyCode::Enter)) {
             PickerOutcome::Run(PickerAction::Intent(s)) => assert_eq!(s, "tab.close:42"),
             other => panic!("expected Intent, got {other:?}"),
@@ -314,7 +324,10 @@ mod tests {
     fn enter_on_disabled_is_noop() {
         let mut s = PickerState::default();
         s.open_with("T", vec![PickerEntry::disabled("a", "n/a")]);
-        assert_eq!(handle_key(&mut s, key(KeyCode::Enter)), PickerOutcome::Consumed);
+        assert_eq!(
+            handle_key(&mut s, key(KeyCode::Enter)),
+            PickerOutcome::Consumed
+        );
         assert!(s.open);
     }
 

@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::protocol::{encode_response, Request, Response};
+use crate::protocol::{Request, Response, encode_response};
 
 /// A boxed handler the server calls for each request. Returning an owned
 /// [`Response`] keeps the handler `Send + Sync + 'static` friendly and lets
@@ -29,15 +29,14 @@ pub async fn spawn(pid: u32, handler: Handler) -> Result<mpsc::Sender<()>> {
     #[cfg(unix)]
     {
         use tokio::net::UnixListener;
-        let path = crate::endpoint::socket_for_pid(pid)
-            .context("resolving IPC socket path")?;
+        let path = crate::endpoint::socket_for_pid(pid).context("resolving IPC socket path")?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
         // Best-effort cleanup of a stale socket from a previous crashed run.
         let _ = tokio::fs::remove_file(&path).await;
-        let listener = UnixListener::bind(&path)
-            .with_context(|| format!("bind {}", path.display()))?;
+        let listener =
+            UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -58,8 +57,7 @@ pub async fn spawn(pid: u32, handler: Handler) -> Result<mpsc::Sender<()>> {
     #[cfg(windows)]
     {
         use tokio::net::windows::named_pipe::ServerOptions;
-        let pipe_name = crate::endpoint::pipe_name_for_pid(pid)
-            .context("resolving pipe name")?;
+        let pipe_name = crate::endpoint::pipe_name_for_pid(pid).context("resolving pipe name")?;
         tokio::spawn(async move {
             loop {
                 // Every connection gets its own instance (§ NamedPipe basics).

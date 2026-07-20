@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rimeterm_ipc::{send_once, spawn, Handler, Request, Response};
+use rimeterm_ipc::{Handler, Request, Response, send_once, spawn};
 
 fn synth_pid(offset: u32) -> u32 {
     std::process::id().wrapping_add(offset)
@@ -43,10 +43,7 @@ async fn known_command_round_trips() {
     };
     let resp = send_once(pid, &req).await.expect("send_once");
     assert!(resp.ok, "expected ok, got {resp:?}");
-    assert_eq!(
-        resp.result,
-        Some(serde_json::json!({"cmd": "test.echo"}))
-    );
+    assert_eq!(resp.result, Some(serde_json::json!({"cmd": "test.echo"})));
     assert!(called.load(Ordering::Relaxed), "handler was invoked");
 
     // Shut the server down.

@@ -87,7 +87,8 @@ pub fn handle_key(state: &mut MenuState, menu: &AppMenu, key: KeyEvent) -> MenuK
 pub fn popup_rect(anchor: Rect, menu: &AppMenu) -> Rect {
     // Fixed width sized to fit "≡ rimeterm" heading + longest item ("Acknowledgement" + hint).
     let width: u16 = 34;
-    let inner_rows = menu.items.len() as u16 + menu.items.iter().filter(|i| i.separator_before).count() as u16;
+    let inner_rows =
+        menu.items.len() as u16 + menu.items.iter().filter(|i| i.separator_before).count() as u16;
     let height: u16 = inner_rows + 2 /* borders */;
     let x = anchor.x.saturating_add(0);
     let y = anchor.y.saturating_add(1); // right under the status bar
@@ -107,9 +108,7 @@ pub fn render(area: Rect, buf: &mut Buffer, state: &MenuState, menu: &AppMenu) {
     }
 
     Clear.render(area, buf);
-    let block = Block::default()
-        .title(" ≡ rimeterm ")
-        .borders(Borders::ALL);
+    let block = Block::default().title(" ≡ rimeterm ").borders(Borders::ALL);
     let inner = block.inner(area);
     block.render(area, buf);
 

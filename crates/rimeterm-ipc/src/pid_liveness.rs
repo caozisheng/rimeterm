@@ -60,9 +60,7 @@ fn probe_impl(pid: u32) -> PidLiveness {
 #[cfg(windows)]
 fn probe_impl(pid: u32) -> PidLiveness {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     // SAFETY: OpenProcess is a well-defined WinAPI call; we always close the
     // handle if we get one. Returns null on failure.
     unsafe {

@@ -5,9 +5,7 @@
 //! enough for correctness in the M0 skeleton; a later pass batches contiguous
 //! runs of same-style cells for speed.
 
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -236,11 +234,7 @@ fn apply_vt100_color(style: Style, color: vt100::Color, foreground: bool) -> Sty
         },
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     };
-    if foreground {
-        style.fg(c)
-    } else {
-        style.bg(c)
-    }
+    if foreground { style.fg(c) } else { style.bg(c) }
 }
 
 /// Inset the outer pane rect by 1 cell on every side to match the block
@@ -261,10 +255,7 @@ pub(crate) fn inner_rect(outer: Rect) -> Rect {
 /// True when `(x, y)` lies inside `r` (inclusive left/top, exclusive
 /// right/bottom, matching everywhere else in the app).
 pub(crate) fn point_in_rect(x: u16, y: u16, r: Rect) -> bool {
-    x >= r.x
-        && x < r.x.saturating_add(r.width)
-        && y >= r.y
-        && y < r.y.saturating_add(r.height)
+    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
 }
 
 /// Encode a crossterm `MouseEvent` as an xterm SGR mouse sequence
@@ -366,18 +357,41 @@ mod mouse_tests {
     use super::*;
 
     fn ev(kind: MouseEventKind, x: u16, y: u16, mods: KeyModifiers) -> MouseEvent {
-        MouseEvent { kind, column: x, row: y, modifiers: mods }
+        MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: mods,
+        }
     }
 
     #[test]
     fn inner_rect_insets_by_1_on_each_side() {
-        let r = inner_rect(Rect { x: 5, y: 4, width: 20, height: 10 });
-        assert_eq!(r, Rect { x: 6, y: 5, width: 18, height: 8 });
+        let r = inner_rect(Rect {
+            x: 5,
+            y: 4,
+            width: 20,
+            height: 10,
+        });
+        assert_eq!(
+            r,
+            Rect {
+                x: 6,
+                y: 5,
+                width: 18,
+                height: 8
+            }
+        );
     }
 
     #[test]
     fn inner_rect_saturates_on_tiny_outer() {
-        let r = inner_rect(Rect { x: 0, y: 0, width: 1, height: 1 });
+        let r = inner_rect(Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        });
         assert_eq!(r.width, 0);
         assert_eq!(r.height, 0);
     }
@@ -420,10 +434,8 @@ mod mouse_tests {
 
     #[test]
     fn sgr_scroll_wheel_uses_64_65() {
-        let up = encode_sgr_mouse(MouseEventKind::ScrollUp, KeyModifiers::NONE, 3, 4)
-            .unwrap();
-        let down = encode_sgr_mouse(MouseEventKind::ScrollDown, KeyModifiers::NONE, 3, 4)
-            .unwrap();
+        let up = encode_sgr_mouse(MouseEventKind::ScrollUp, KeyModifiers::NONE, 3, 4).unwrap();
+        let down = encode_sgr_mouse(MouseEventKind::ScrollDown, KeyModifiers::NONE, 3, 4).unwrap();
         assert_eq!(up, b"\x1b[<64;3;4M");
         assert_eq!(down, b"\x1b[<65;3;4M");
     }
@@ -443,14 +455,17 @@ mod mouse_tests {
 
     #[test]
     fn sgr_moved_without_button_is_dropped() {
-        assert!(
-            encode_sgr_mouse(MouseEventKind::Moved, KeyModifiers::NONE, 1, 1).is_none()
-        );
+        assert!(encode_sgr_mouse(MouseEventKind::Moved, KeyModifiers::NONE, 1, 1).is_none());
     }
 
     #[test]
     fn point_in_rect_edges() {
-        let r = Rect { x: 5, y: 5, width: 3, height: 2 };
+        let r = Rect {
+            x: 5,
+            y: 5,
+            width: 3,
+            height: 2,
+        };
         assert!(point_in_rect(5, 5, r));
         assert!(point_in_rect(7, 6, r));
         assert!(!point_in_rect(8, 6, r)); // width exclusive
@@ -464,7 +479,12 @@ mod mouse_tests {
         // We can't easily construct a live PtyPane in a unit test, but the
         // border-check lives in inner_rect + point_in_rect which the above
         // tests cover. This test just documents the intent.
-        let outer = Rect { x: 0, y: 0, width: 10, height: 5 };
+        let outer = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 5,
+        };
         let inner = inner_rect(outer);
         assert!(!point_in_rect(0, 0, inner)); // top-left border cell
         assert!(!point_in_rect(9, 0, inner)); // top-right border cell

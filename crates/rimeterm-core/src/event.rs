@@ -20,7 +20,11 @@ pub enum KernelEvent {
     YaziCwdChanged { origin: PaneId, path: PathBuf },
 
     /// A shell tab reported its `$PWD` via OSC 7. Broadcast, no side effects.
-    ShellCwdChanged { origin: PaneId, tab_id: String, path: PathBuf },
+    ShellCwdChanged {
+        origin: PaneId,
+        tab_id: String,
+        path: PathBuf,
+    },
 
     /// yazi cursor landed on a file (§19.3-B trigger source).
     FileSelected { origin: PaneId, path: PathBuf },

@@ -13,8 +13,8 @@
 
 use std::process::ExitCode;
 
-use anyhow::{anyhow, bail, Context, Result};
-use rimeterm_ipc::{discover_latest_pid, send_once, Request};
+use anyhow::{Context, Result, anyhow, bail};
+use rimeterm_ipc::{Request, discover_latest_pid, send_once};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -120,8 +120,7 @@ async fn list_endpoints() -> Result<()> {
         let Ok(pid) = stem.parse::<u32>() else {
             continue;
         };
-        let ep = rimeterm_ipc::endpoint_display_for_pid(pid)
-            .unwrap_or_else(|| "(unknown)".into());
+        let ep = rimeterm_ipc::endpoint_display_for_pid(pid).unwrap_or_else(|| "(unknown)".into());
         println!("pid={} endpoint={}", pid, ep);
     }
     Ok(())

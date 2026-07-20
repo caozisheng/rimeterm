@@ -26,10 +26,10 @@ use std::path::PathBuf;
 /// Returns `None` only when neither `RIMETERM_HOME` nor `$HOME` can be
 /// resolved (rare — headless CI without HOME).
 pub fn home() -> Option<PathBuf> {
-    if let Ok(env_home) = std::env::var("RIMETERM_HOME") {
-        if !env_home.is_empty() {
-            return Some(PathBuf::from(env_home));
-        }
+    if let Ok(env_home) = std::env::var("RIMETERM_HOME")
+        && !env_home.is_empty()
+    {
+        return Some(PathBuf::from(env_home));
     }
     directories::UserDirs::new().map(|u| u.home_dir().join(".rimeterm"))
 }
@@ -72,14 +72,8 @@ mod tests {
             config_file(),
             Some(PathBuf::from("/tmp/rimeterm-test/config.toml"))
         );
-        assert_eq!(
-            data_dir(),
-            Some(PathBuf::from("/tmp/rimeterm-test/data"))
-        );
-        assert_eq!(
-            cache_dir(),
-            Some(PathBuf::from("/tmp/rimeterm-test/cache"))
-        );
+        assert_eq!(data_dir(), Some(PathBuf::from("/tmp/rimeterm-test/data")));
+        assert_eq!(cache_dir(), Some(PathBuf::from("/tmp/rimeterm-test/cache")));
         match prev {
             Some(v) => unsafe { std::env::set_var("RIMETERM_HOME", v) },
             None => unsafe { std::env::remove_var("RIMETERM_HOME") },

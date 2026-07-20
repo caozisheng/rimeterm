@@ -158,15 +158,17 @@ pub fn render(area: Rect, buf: &mut Buffer, state: &PaletteState, entries: &[Com
         return;
     }
     Clear.render(area, buf);
-    let block = Block::default()
-        .title(" ⌘ palette ")
-        .borders(Borders::ALL);
+    let block = Block::default().title(" ⌘ palette ").borders(Borders::ALL);
     let inner = block.inner(area);
     block.render(area, buf);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
         .split(inner);
 
     // Query line.

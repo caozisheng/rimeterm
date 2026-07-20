@@ -1,0 +1,127 @@
+# Release builds — produce distributable Windows binaries.
+#
+# Trigger:
+#   * push of a tag matching `v*` (e.g. `v0.1.0`, `v0.2.0-rc.1`) creates a
+#     GitHub Release and uploads the zipped binaries as assets.
+#   * `workflow_dispatch` builds the same artefacts without publishing a
+#     Release (uploaded as a run artefact only), useful for testing the
+#     packaging pipeline itself.
+#
+# What lands in the zip:
+#   * `rimeterm.exe` (icon embedded — see `crates/rimeterm/build.rs`)
+#   * `rimectl.exe`
+#   * `LICENSE`
+#   * `README.md`
+#   * `ACKNOWLEDGEMENTS.md`
+#
+# Zip name: `rimeterm-<version>-x86_64-pc-windows-msvc.zip`. On tag pushes
+# `<version>` == the tag minus the leading `v`; on manual dispatch it's the
+# short commit SHA so pre-release artefacts are traceable.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  windows-x86_64:
+    name: Package · x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Print toolchain
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows
+
+      - name: Resolve version string
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # `refs/tags/v0.1.0` -> `0.1.0`
+            VERSION="${GITHUB_REF##refs/tags/v}"
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
+          echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building version: ${VERSION}"
+
+      # We build both binaries in one cargo invocation so incremental
+      # linking + rustc's parallel codegen share work across them.
+      - name: Cargo build --release (rimeterm + rimectl)
+        run: cargo build --release --workspace --bins --target x86_64-pc-windows-msvc
+
+      - name: Stage payload
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="staging/rimeterm-${{ steps.version.outputs.value }}-x86_64-pc-windows-msvc"
+          mkdir -p "${STAGE}"
+          cp target/x86_64-pc-windows-msvc/release/rimeterm.exe "${STAGE}/"
+          cp target/x86_64-pc-windows-msvc/release/rimectl.exe  "${STAGE}/"
+          cp LICENSE          "${STAGE}/"
+          cp README.md        "${STAGE}/"
+          cp ACKNOWLEDGEMENTS.md "${STAGE}/"
+          echo "dir=${STAGE}" >> "$GITHUB_OUTPUT"
+          echo "Payload:"
+          ls -la "${STAGE}"
+
+      - name: Create zip
+        id: zip
+        shell: pwsh
+        # PowerShell's Compress-Archive is the standard-issue Windows zipper;
+        # bash on the runner ships without `zip` in the default image.
+        run: |
+          $stage = "${{ steps.stage.outputs.dir }}"
+          $name  = Split-Path -Leaf $stage
+          $out   = "$name.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $out -Force
+          "path=$out" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Get-Item $out | Format-List Name,Length
+
+      - name: Upload build artefact (workflow_dispatch or debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rimeterm-${{ steps.version.outputs.value }}-x86_64-pc-windows-msvc
+          path: ${{ steps.zip.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      # Only publish a GitHub Release when the trigger is a real version tag.
+      # `softprops/action-gh-release` creates the release (if missing) and
+      # attaches the zip as an asset. It's idempotent per file name.
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.zip.outputs.path }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

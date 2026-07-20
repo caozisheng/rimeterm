@@ -37,6 +37,7 @@ fn session_config_is_clone() {
         rows: 24,
         backend: PtyBackend::Native,
     };
+    #[allow(clippy::redundant_clone)] // this test exists to verify Clone compiles
     let _clone = _cfg.clone();
 }
 

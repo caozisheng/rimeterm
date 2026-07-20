@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rimeterm_pty::{PtyBackend, Session, SessionConfig, ShellChoice};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -41,8 +41,8 @@ pub fn spawn_shell(
         backend: PtyBackend::Native,
     };
 
-    let (session, mut rx) = Session::spawn(cfg)
-        .with_context(|| format!("spawning shell `{}`", program.display()))?;
+    let (session, mut rx) =
+        Session::spawn(cfg).with_context(|| format!("spawning shell `{}`", program.display()))?;
 
     // Forwarder: coalesce every SessionOutput into a single redraw pulse.
     tokio::spawn(async move {

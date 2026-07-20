@@ -9,8 +9,8 @@
 //! ui theme name). Rest of the schema in the design doc lands as later crates
 //! come online.
 
-pub mod paths;
 pub mod layout_state;
+pub mod paths;
 pub mod tools;
 
 use std::path::Path;
@@ -18,7 +18,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// Root config type. Everything is optional / defaulted so partial configs load.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     pub core: CoreConfig,
@@ -26,18 +26,6 @@ pub struct Config {
     pub agents: AgentsConfig,
     pub files: FilesConfig,
     pub sysmon: SysmonConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            core: CoreConfig::default(),
-            ui: UiConfig::default(),
-            agents: AgentsConfig::default(),
-            files: FilesConfig::default(),
-            sysmon: SysmonConfig::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -279,7 +267,14 @@ mod tests {
             .iter()
             .map(|s| s.command[0].clone())
             .collect();
-        assert_eq!(cmds, vec!["btm".to_string(), "bandwhich".to_string(), "trip".to_string()]);
+        assert_eq!(
+            cmds,
+            vec![
+                "btm".to_string(),
+                "bandwhich".to_string(),
+                "trip".to_string()
+            ]
+        );
     }
 
     #[test]

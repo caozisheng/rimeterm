@@ -25,9 +25,8 @@ pub type CommandFn = Arc<dyn Fn() + Send + Sync + 'static>;
 /// New-style closure form (M7+): takes JSON args, returns a JSON result or a
 /// human-readable error. Callers wanting the old zero-arg shape can wrap a
 /// [`CommandFn`] via [`Command::signal`].
-pub type CommandFnV2 = Arc<
-    dyn Fn(&serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync + 'static,
->;
+pub type CommandFnV2 =
+    Arc<dyn Fn(&serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct Command {

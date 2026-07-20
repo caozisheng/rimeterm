@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::protocol::{encode_request, Request, Response};
+use crate::protocol::{Request, Response, encode_request};
 
 /// Connect + send + await one response. Blocks (asynchronously) on the round
 /// trip and returns whatever the server writes back.
@@ -14,8 +14,7 @@ pub async fn send_once(pid: u32, req: &Request) -> Result<Response> {
     #[cfg(unix)]
     {
         use tokio::net::UnixStream;
-        let path = crate::endpoint::socket_for_pid(pid)
-            .context("resolving IPC socket path")?;
+        let path = crate::endpoint::socket_for_pid(pid).context("resolving IPC socket path")?;
         let stream = UnixStream::connect(&path)
             .await
             .with_context(|| format!("connect {}", path.display()))?;
@@ -24,8 +23,7 @@ pub async fn send_once(pid: u32, req: &Request) -> Result<Response> {
     #[cfg(windows)]
     {
         use tokio::net::windows::named_pipe::ClientOptions;
-        let pipe = crate::endpoint::pipe_name_for_pid(pid)
-            .context("resolving pipe name")?;
+        let pipe = crate::endpoint::pipe_name_for_pid(pid).context("resolving pipe name")?;
         // Small retry loop — the server may accept-race between drops.
         let mut attempts = 0;
         let stream = loop {
@@ -61,15 +59,11 @@ where
     wr.shutdown().await.ok();
     let mut reader = BufReader::new(rd);
     let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("read response")?;
+    reader.read_line(&mut line).await.context("read response")?;
     if line.is_empty() {
         anyhow::bail!("server closed connection without responding");
     }
-    let resp: Response = serde_json::from_str(line.trim_end())
-        .context("decode response")?;
+    let resp: Response = serde_json::from_str(line.trim_end()).context("decode response")?;
     Ok(resp)
 }
 
