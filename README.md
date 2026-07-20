@@ -9,10 +9,8 @@ plugin-hosted, Windows-priority.
 
 ## Status
 
-<details open>
-<summary>📸 Screenshot</summary>
-<img width="3795" height="2029" alt="image" src="[https://github.com/user-attachments/assets/116bf358-e8bb-4b0a-a3dd-c553a5a86222](https://github.com/user-attachments/assets/86b621bb-0c33-4ad7-a211-298da39ce7df)" />
-</details>
+<img width="2796" height="1664" alt="image" src="https://github.com/user-attachments/assets/b80c8187-797f-4d0f-8593-40ce609bb5a1" />
+
 
 ## Build
 
