@@ -9,8 +9,8 @@
 //! ui theme name). Rest of the schema in the design doc lands as later crates
 //! come online.
 
-pub mod layout_state;
 pub mod agents_state;
+pub mod layout_state;
 pub mod paths;
 pub mod tools;
 

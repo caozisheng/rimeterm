@@ -89,11 +89,7 @@ pub enum PickerAnchor {
     /// to fit inside `bounds`. The popup grows down-right by default;
     /// if that would overflow it flips up / left. Used by the right-click
     /// context menu — `bounds` is typically the clicked pane's outer rect.
-    Anchored {
-        x: u16,
-        y: u16,
-        bounds: Rect,
-    },
+    Anchored { x: u16, y: u16, bounds: Rect },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -226,9 +222,18 @@ pub fn popup_rect(area: Rect, state: &PickerState) -> Rect {
             let height = ideal_h.min(area.height.saturating_sub(2));
             let x = area.x + area.width.saturating_sub(width) / 2;
             let y = area.y + area.height.saturating_sub(height) / 2;
-            Rect { x, y, width, height }
+            Rect {
+                x,
+                y,
+                width,
+                height,
+            }
         }
-        PickerAnchor::Anchored { x: click_x, y: click_y, bounds } => {
+        PickerAnchor::Anchored {
+            x: click_x,
+            y: click_y,
+            bounds,
+        } => {
             // Clip max size to the bounding pane; a picker larger than the
             // pane would look wrong even if it fits the screen.
             let width = ideal_w.min(bounds.width.saturating_sub(2)).max(4);
@@ -253,7 +258,12 @@ pub fn popup_rect(area: Rect, state: &PickerState) -> Rect {
             let y = y
                 .max(bounds.y)
                 .min(bottom_edge.saturating_sub(height).max(bounds.y));
-            Rect { x, y, width, height }
+            Rect {
+                x,
+                y,
+                width,
+                height,
+            }
         }
     }
 }
@@ -419,7 +429,12 @@ mod tests {
     #[test]
     fn centered_anchor_lands_in_middle_of_area() {
         let s = state_with(PickerAnchor::Centered, 5);
-        let area = Rect { x: 0, y: 0, width: 120, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
         let r = popup_rect(area, &s);
         assert!(r.x > 20 && r.x < 100, "x={}", r.x);
         assert!(r.y > 5 && r.y < 30, "y={}", r.y);
@@ -427,12 +442,26 @@ mod tests {
 
     #[test]
     fn anchored_drops_down_right_of_click_when_it_fits() {
-        let bounds = Rect { x: 10, y: 5, width: 80, height: 30 };
+        let bounds = Rect {
+            x: 10,
+            y: 5,
+            width: 80,
+            height: 30,
+        };
         let s = state_with(
-            PickerAnchor::Anchored { x: 20, y: 8, bounds },
+            PickerAnchor::Anchored {
+                x: 20,
+                y: 8,
+                bounds,
+            },
             5,
         );
-        let area = Rect { x: 0, y: 0, width: 100, height: 40 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
         let r = popup_rect(area, &s);
         // Preferred position: (click_x + 1, click_y + 1).
         assert_eq!(r.x, 21);
@@ -445,12 +474,26 @@ mod tests {
     #[test]
     fn anchored_flips_left_when_right_would_overflow() {
         // Click near right edge — down-right doesn't fit, must flip left.
-        let bounds = Rect { x: 0, y: 0, width: 40, height: 30 };
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 30,
+        };
         let s = state_with(
-            PickerAnchor::Anchored { x: 38, y: 5, bounds },
+            PickerAnchor::Anchored {
+                x: 38,
+                y: 5,
+                bounds,
+            },
             5,
         );
-        let area = Rect { x: 0, y: 0, width: 40, height: 30 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 30,
+        };
         let r = popup_rect(area, &s);
         // The popup's right edge should be inside bounds.
         assert!(
@@ -463,12 +506,26 @@ mod tests {
 
     #[test]
     fn anchored_flips_up_when_below_would_overflow() {
-        let bounds = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
         let s = state_with(
-            PickerAnchor::Anchored { x: 5, y: 18, bounds },
+            PickerAnchor::Anchored {
+                x: 5,
+                y: 18,
+                bounds,
+            },
             5,
         );
-        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
         let r = popup_rect(area, &s);
         assert!(
             r.y + r.height <= bounds.y + bounds.height,
@@ -482,12 +539,19 @@ mod tests {
     fn anchored_clamps_size_inside_tight_bounds() {
         // Bounds smaller than the picker's ideal size — width/height should
         // shrink to fit rather than overflow.
-        let bounds = Rect { x: 0, y: 0, width: 20, height: 6 };
-        let s = state_with(
-            PickerAnchor::Anchored { x: 2, y: 1, bounds },
-            5,
-        );
-        let area = Rect { x: 0, y: 0, width: 20, height: 6 };
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 6,
+        };
+        let s = state_with(PickerAnchor::Anchored { x: 2, y: 1, bounds }, 5);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 6,
+        };
         let r = popup_rect(area, &s);
         assert!(r.width <= bounds.width);
         assert!(r.height <= bounds.height);

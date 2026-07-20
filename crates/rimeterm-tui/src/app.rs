@@ -408,7 +408,10 @@ impl App {
                     Ok(state) => {
                         for id in &state.tabs {
                             let Some(spec) = rimeterm_pty::agent_registry::find(id) else {
-                                tracing::warn!(agent_id = id.as_str(), "persisted agent id no longer in registry — skipping");
+                                tracing::warn!(
+                                    agent_id = id.as_str(),
+                                    "persisted agent id no longer in registry — skipping"
+                                );
                                 continue;
                             };
                             let ext_spec = rimeterm_config::AgentSpec {
@@ -428,7 +431,9 @@ impl App {
                                     agents_members.push(pane_id);
                                     startup_agent_ids.push((pane_id, spec.id));
                                 }
-                                Err(e) => tracing::warn!(agent_id = id.as_str(), error = %e, "failed to restore persisted agent tab"),
+                                Err(e) => {
+                                    tracing::warn!(agent_id = id.as_str(), error = %e, "failed to restore persisted agent tab")
+                                }
                             }
                         }
                         if !agents_members.is_empty() {
@@ -439,7 +444,9 @@ impl App {
                             );
                         }
                     }
-                    Err(e) => tracing::warn!(path = %state_path.display(), error = %e, "failed to load agents state"),
+                    Err(e) => {
+                        tracing::warn!(path = %state_path.display(), error = %e, "failed to load agents state")
+                    }
                 }
             }
         }
@@ -1193,9 +1200,7 @@ impl App {
                     (gid, true)
                 }
             };
-            let bounds = self
-                .group_bounds(gid)
-                .unwrap_or(self.last_pane_area);
+            let bounds = self.group_bounds(gid).unwrap_or(self.last_pane_area);
             let title = if is_plus_only {
                 format!("Group · {}", gid)
             } else {
@@ -1976,8 +1981,7 @@ impl App {
     /// `${data_dir}/workspaces/<hash>/agents.state.toml`. Silent on
     /// error — the next launch just won't restore, no user harm.
     fn persist_agents_state(&self) {
-        let Some(path) =
-            rimeterm_config::agents_state::workspace_state_file(&self.workspace_root)
+        let Some(path) = rimeterm_config::agents_state::workspace_state_file(&self.workspace_root)
         else {
             return;
         };
