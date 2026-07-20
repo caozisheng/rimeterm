@@ -1,10 +1,15 @@
 //! Modal picker overlay — a short list of labeled choices bound to
-//! command ids. Simpler than the command palette: no fuzzy filter, no
-//! description column, no scrolling above ~20 entries. Reused by:
+//! either a registered command id **or** a caller-defined "intent" string
+//! that the app matches on. Simpler than the command palette: no fuzzy
+//! filter, no description column, no scrolling above ~20 entries.
 //!
-//! - `[+]` on the agents tab strip (choose which agent to spawn),
-//! - clicks on the "Pick an agent" placeholder pane,
-//! - right-click context menus (§ item 2/3).
+//! Two entry points into rimeterm today:
+//!
+//! - `[+]` on the agents tab strip / Ctrl+T on agents / click on the
+//!   "Pick an agent" placeholder → agent-registry-driven dropdown.
+//! - Right-click on anything → context menu (mix of Command + Intent
+//!   entries so the same menu can call registered commands AND perform
+//!   click-target-specific actions).
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
@@ -14,6 +19,24 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use rimeterm_core::command::CommandId;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerAction {
+    /// Fire a registered command from the CommandRegistry by id.
+    Command(CommandId),
+    /// Trigger a caller-defined intent — the picker consumer (App) matches
+    /// on the string. Kept as `String` so the picker module stays free of
+    /// App-specific types.
+    Intent(String),
+    /// Disabled row — cursor skips it, renders dim.
+    Disabled,
+}
+
+impl PickerAction {
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, PickerAction::Disabled)
+    }
+}
+
 /// One row in the picker.
 #[derive(Debug, Clone)]
 pub struct PickerEntry {
@@ -21,9 +44,36 @@ pub struct PickerEntry {
     pub label: String,
     /// Optional grey right-aligned annotation (e.g. `not installed`).
     pub note: Option<String>,
-    /// The command id fired when the user hits Enter on this row.
-    /// `None` disables the row (renders dim, cursor skips it).
-    pub command: Option<CommandId>,
+    /// What Enter does on this row.
+    pub action: PickerAction,
+}
+
+impl PickerEntry {
+    pub fn command(label: impl Into<String>, cmd: CommandId) -> Self {
+        Self {
+            label: label.into(),
+            note: None,
+            action: PickerAction::Command(cmd),
+        }
+    }
+    pub fn intent(label: impl Into<String>, intent: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            note: None,
+            action: PickerAction::Intent(intent.into()),
+        }
+    }
+    pub fn disabled(label: impl Into<String>, note: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            note: Some(note.into()),
+            action: PickerAction::Disabled,
+        }
+    }
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -39,7 +89,6 @@ impl PickerState {
         self.open = true;
         self.title = title.into();
         self.entries = entries;
-        // Land the cursor on the first enabled row.
         self.cursor = first_enabled(&self.entries).unwrap_or(0);
     }
 
@@ -59,29 +108,32 @@ impl PickerState {
         let mut idx = self.cursor;
         for _ in 0..n {
             idx = ((idx as isize + step).rem_euclid(n as isize)) as usize;
-            if self.entries[idx].command.is_some() {
+            if self.entries[idx].action.is_enabled() {
                 self.cursor = idx;
                 return;
             }
         }
-        // All disabled — leave cursor where it was.
     }
 
-    /// Return the command id at the cursor if enabled.
-    pub fn selected_command(&self) -> Option<CommandId> {
-        self.entries.get(self.cursor).and_then(|e| e.command)
+    /// Snapshot the action at the cursor (cloned so callers can drive App
+    /// state changes without holding a picker borrow).
+    pub fn selected_action(&self) -> Option<PickerAction> {
+        self.entries
+            .get(self.cursor)
+            .map(|e| e.action.clone())
+            .filter(|a| a.is_enabled())
     }
 }
 
 fn first_enabled(entries: &[PickerEntry]) -> Option<usize> {
-    entries.iter().position(|e| e.command.is_some())
+    entries.iter().position(|e| e.action.is_enabled())
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PickerOutcome {
     Consumed,
     Closed,
-    Run(CommandId),
+    Run(PickerAction),
 }
 
 pub fn handle_key(state: &mut PickerState, key: KeyEvent) -> PickerOutcome {
@@ -99,9 +151,9 @@ pub fn handle_key(state: &mut PickerState, key: KeyEvent) -> PickerOutcome {
             PickerOutcome::Consumed
         }
         KeyCode::Enter => {
-            if let Some(cmd) = state.selected_command() {
+            if let Some(action) = state.selected_action() {
                 state.close();
-                PickerOutcome::Run(cmd)
+                PickerOutcome::Run(action)
             } else {
                 PickerOutcome::Consumed
             }
@@ -161,8 +213,12 @@ pub fn render(area: Rect, buf: &mut Buffer, state: &PickerState) {
             height: 1,
         };
         let mut spans: Vec<Span<'_>> = Vec::new();
-        let prefix = if idx == state.cursor { "▶ " } else { "  " };
-        let base_style = if entry.command.is_none() {
+        let prefix = if idx == state.cursor && entry.action.is_enabled() {
+            "▶ "
+        } else {
+            "  "
+        };
+        let base_style = if !entry.action.is_enabled() {
             disabled
         } else if idx == state.cursor {
             selected
@@ -187,24 +243,23 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn entry(label: &str, cmd: Option<CommandId>) -> PickerEntry {
-        PickerEntry { label: label.into(), note: None, command: cmd }
-    }
-
     #[test]
     fn open_with_lands_cursor_on_first_enabled() {
         let mut s = PickerState::default();
         s.open_with(
             "T",
             vec![
-                entry("disabled-1", None),
-                entry("disabled-2", None),
-                entry("live-1", Some("app.quit")),
-                entry("live-2", Some("app.settings")),
+                PickerEntry::disabled("disabled-1", "n/a"),
+                PickerEntry::disabled("disabled-2", "n/a"),
+                PickerEntry::command("live-1", "app.quit"),
+                PickerEntry::command("live-2", "app.settings"),
             ],
         );
         assert_eq!(s.cursor, 2);
-        assert_eq!(s.selected_command(), Some("app.quit"));
+        assert!(matches!(
+            s.selected_action(),
+            Some(PickerAction::Command("app.quit"))
+        ));
     }
 
     #[test]
@@ -213,35 +268,52 @@ mod tests {
         s.open_with(
             "T",
             vec![
-                entry("a", Some("a")),
-                entry("dead", None),
-                entry("b", Some("b")),
-                entry("c", Some("c")),
+                PickerEntry::command("a", "a"),
+                PickerEntry::disabled("dead", "n/a"),
+                PickerEntry::command("b", "b"),
+                PickerEntry::command("c", "c"),
             ],
         );
         assert_eq!(s.cursor, 0);
-        s.step(1); // → skip 'dead', land on 'b'
-        assert_eq!(s.selected_command(), Some("b"));
-        s.step(1); // → 'c'
-        assert_eq!(s.selected_command(), Some("c"));
-        s.step(1); // → wrap to 'a'
-        assert_eq!(s.selected_command(), Some("a"));
-        s.step(-1); // → wrap backwards to 'c'
-        assert_eq!(s.selected_command(), Some("c"));
+        s.step(1);
+        assert!(matches!(s.selected_action(), Some(PickerAction::Command("b"))));
+        s.step(1);
+        assert!(matches!(s.selected_action(), Some(PickerAction::Command("c"))));
+        s.step(1);
+        assert!(matches!(s.selected_action(), Some(PickerAction::Command("a"))));
+        s.step(-1);
+        assert!(matches!(s.selected_action(), Some(PickerAction::Command("c"))));
     }
 
     #[test]
-    fn enter_on_enabled_returns_run() {
+    fn enter_on_command_row_returns_run() {
         let mut s = PickerState::default();
-        s.open_with("T", vec![entry("a", Some("cmd.a"))]);
-        assert_eq!(handle_key(&mut s, key(KeyCode::Enter)), PickerOutcome::Run("cmd.a"));
+        s.open_with("T", vec![PickerEntry::command("a", "cmd.a")]);
+        assert_eq!(
+            handle_key(&mut s, key(KeyCode::Enter)),
+            PickerOutcome::Run(PickerAction::Command("cmd.a"))
+        );
+        assert!(!s.open);
+    }
+
+    #[test]
+    fn enter_on_intent_row_returns_run_intent() {
+        let mut s = PickerState::default();
+        s.open_with(
+            "T",
+            vec![PickerEntry::intent("close this", "tab.close:42")],
+        );
+        match handle_key(&mut s, key(KeyCode::Enter)) {
+            PickerOutcome::Run(PickerAction::Intent(s)) => assert_eq!(s, "tab.close:42"),
+            other => panic!("expected Intent, got {other:?}"),
+        }
         assert!(!s.open);
     }
 
     #[test]
     fn enter_on_disabled_is_noop() {
         let mut s = PickerState::default();
-        s.open_with("T", vec![entry("a", None)]);
+        s.open_with("T", vec![PickerEntry::disabled("a", "n/a")]);
         assert_eq!(handle_key(&mut s, key(KeyCode::Enter)), PickerOutcome::Consumed);
         assert!(s.open);
     }
@@ -249,7 +321,7 @@ mod tests {
     #[test]
     fn esc_closes() {
         let mut s = PickerState::default();
-        s.open_with("T", vec![entry("a", Some("a"))]);
+        s.open_with("T", vec![PickerEntry::command("a", "a")]);
         assert_eq!(handle_key(&mut s, key(KeyCode::Esc)), PickerOutcome::Closed);
         assert!(!s.open);
     }

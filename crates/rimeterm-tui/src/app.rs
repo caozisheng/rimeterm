@@ -574,10 +574,8 @@ impl App {
 
         if self.picker_state.open {
             match crate::picker::handle_key(&mut self.picker_state, key) {
-                crate::picker::PickerOutcome::Run(cmd) => {
-                    if let Err(e) = self.commands.run(cmd) {
-                        warn!(command = cmd, error = %e, "picker command failed");
-                    }
+                crate::picker::PickerOutcome::Run(action) => {
+                    self.run_picker_action(action);
                 }
                 _ => {}
             }
@@ -744,6 +742,12 @@ impl App {
                 self.flush_pending_resizes();
                 return;
             }
+        }
+
+        // --- Right Down: open the context menu (never forward to child) ---
+        if let MouseEventKind::Down(MouseButton::Right) = m.kind {
+            self.open_context_menu(m.column, m.row);
+            return;
         }
 
         // --- Left Down: dispatch by zone (divider → tab strip → pane) ---
@@ -939,9 +943,7 @@ impl App {
             rimeterm_pty::agent_registry::detect_all()
                 .into_iter()
                 .map(|a| {
-                    let (command, note) = if a.is_available() {
-                        // Registry ids are static so we can match them 1:1
-                        // with the pre-registered `agents.pick.<id>` command.
+                    if a.is_available() {
                         let cmd: Option<rimeterm_core::command::CommandId> = match a.id {
                             "omp" => Some("agents.pick.omp"),
                             "codex" => Some("agents.pick.codex"),
@@ -949,19 +951,189 @@ impl App {
                             "pi" => Some("agents.pick.pi"),
                             _ => None,
                         };
-                        (cmd, None)
+                        match cmd {
+                            Some(c) => crate::picker::PickerEntry::command(a.label, c),
+                            None => crate::picker::PickerEntry::disabled(a.label, "(unknown)"),
+                        }
                     } else {
-                        (None, Some("(not installed)".to_string()))
-                    };
-                    crate::picker::PickerEntry {
-                        label: a.label.to_string(),
-                        note,
-                        command,
+                        crate::picker::PickerEntry::disabled(a.label, "(not installed)")
                     }
                 })
                 .collect();
-        self.picker_state
-            .open_with("Pick an agent", entries);
+        self.picker_state.open_with("Pick an agent", entries);
+    }
+
+    /// Dispatch whatever the picker just returned. Command actions go
+    /// through the CommandRegistry; Intent actions carry a string tag we
+    /// parse here (`tab.close:<gid>:<idx>`, `tab.activate:<gid>:<idx>`,
+    /// `pane.new_shell`, `pane.open_agent_picker`, …) — kept as strings
+    /// so the picker module doesn't need to know about App types.
+    fn run_picker_action(&mut self, action: crate::picker::PickerAction) {
+        match action {
+            crate::picker::PickerAction::Command(cmd) => {
+                if let Err(e) = self.commands.run(cmd) {
+                    warn!(command = cmd, error = %e, "picker command failed");
+                }
+            }
+            crate::picker::PickerAction::Intent(intent) => {
+                self.run_context_intent(&intent);
+            }
+            crate::picker::PickerAction::Disabled => {}
+        }
+    }
+
+    /// Parse and dispatch a context-menu intent string. Format:
+    ///   `tab.activate:<group>:<idx>`
+    ///   `tab.close:<group>:<idx>`
+    ///   `agents.pick`
+    ///   `shells.new`
+    ///   `pane.focus:<pane_id>`
+    ///   `resize.toggle`
+    ///   `layout.reset`
+    fn run_context_intent(&mut self, intent: &str) {
+        let mut parts = intent.split(':');
+        match parts.next() {
+            Some("tab.activate") => {
+                if let (Some(gid), Some(idx)) = (
+                    parts.next().and_then(parse_group_id),
+                    parts.next().and_then(|s| s.parse::<usize>().ok()),
+                ) {
+                    self.activate_tab(gid, idx);
+                }
+            }
+            Some("tab.close") => {
+                if let (Some(gid), Some(idx)) = (
+                    parts.next().and_then(parse_group_id),
+                    parts.next().and_then(|s| s.parse::<usize>().ok()),
+                ) {
+                    self.close_tab_at(gid, idx);
+                }
+            }
+            Some("agents.pick") => self.open_agent_picker(),
+            Some("shells.new") => {
+                if let Err(e) = self.new_shell_tab_in(BUILTIN_SHELLS) {
+                    self.set_hint(format!("⛔ {}", e));
+                }
+            }
+            Some("pane.focus") => {
+                if let Some(pane_id) =
+                    parts.next().and_then(|s| s.parse::<u64>().ok()).map(PaneId)
+                {
+                    let owner = self.tree.tab_groups().iter().find_map(|g| {
+                        g.members()
+                            .iter()
+                            .position(|m| *m == pane_id)
+                            .map(|idx| (g.id(), idx))
+                    });
+                    if let Some((gid, idx)) = owner {
+                        if let Some(group) = self.tree.find_tab_group_mut(gid) {
+                            let _ = group.goto(idx);
+                        }
+                        self.focus.set_focus(pane_id, Some(gid));
+                    }
+                }
+            }
+            Some("resize.toggle") => {
+                self.resize_mode = !self.resize_mode;
+                let msg = if self.resize_mode {
+                    "Resize mode: H/L/K/J adjust · Shift = ×5 · = restore · Esc/Enter exit"
+                } else {
+                    "Resize mode: off"
+                };
+                self.set_hint(msg.into());
+            }
+            Some("layout.reset") => self.reset_layout(),
+            _ => {}
+        }
+    }
+
+    /// Build a context menu for the cell at `(col, row)` and open it as a
+    /// picker. Only fired by right-click.
+    fn open_context_menu(&mut self, col: u16, row: u16) {
+        let mut entries: Vec<crate::picker::PickerEntry> = Vec::new();
+        // Divider hit — layout controls.
+        if self
+            .last_dividers
+            .iter()
+            .any(|d| point_in_rect(col, row, d.visual.rect))
+        {
+            entries.push(crate::picker::PickerEntry::intent(
+                "Toggle Resize mode",
+                "resize.toggle",
+            ));
+            entries.push(crate::picker::PickerEntry::intent(
+                "Reset splits to defaults",
+                "layout.reset",
+            ));
+            self.picker_state.open_with("Divider", entries);
+            return;
+        }
+        // Tab strip hit — same as left-click zones but menu form.
+        if let Some(hit) = self.tab_hit(col, row) {
+            match hit {
+                TabStripHit::Activate { gid, idx } | TabStripHit::Close { gid, idx } => {
+                    let is_open = matches!(
+                        self.tree.find_tab_group(gid).map(|g| g.policy()),
+                        Some(rimeterm_core::tabs::MembersPolicy::Open { .. })
+                    );
+                    entries.push(crate::picker::PickerEntry::intent(
+                        "Activate this tab",
+                        format!("tab.activate:{}:{}", gid, idx),
+                    ));
+                    if is_open {
+                        entries.push(crate::picker::PickerEntry::intent(
+                            "Close this tab",
+                            format!("tab.close:{}:{}", gid, idx),
+                        ));
+                    } else {
+                        entries.push(crate::picker::PickerEntry::disabled(
+                            "Close this tab",
+                            "(fixed group)",
+                        ));
+                    }
+                    push_group_new_entry(&mut entries, gid);
+                    self.picker_state.open_with(format!("Tab · {}", gid), entries);
+                    return;
+                }
+                TabStripHit::Plus { gid } => {
+                    push_group_new_entry(&mut entries, gid);
+                    self.picker_state.open_with(format!("Group · {}", gid), entries);
+                    return;
+                }
+            }
+        }
+        // Pane hit.
+        if let Some((pane_id, _)) = self.pane_outer_at(col, row) {
+            let owner = self.tree.tab_groups().iter().find_map(|g| {
+                g.members()
+                    .iter()
+                    .position(|m| *m == pane_id)
+                    .map(|i| (g.id(), i, g.policy()))
+            });
+            entries.push(crate::picker::PickerEntry::intent(
+                "Focus this pane",
+                format!("pane.focus:{}", pane_id.0),
+            ));
+            if let Some((gid, idx, policy)) = owner {
+                if matches!(policy, rimeterm_core::tabs::MembersPolicy::Open { .. }) {
+                    entries.push(crate::picker::PickerEntry::intent(
+                        "Close this tab",
+                        format!("tab.close:{}:{}", gid, idx),
+                    ));
+                    push_group_new_entry(&mut entries, gid);
+                }
+                // Placeholder-specific: quick access to agent picker.
+                if let Some(pane) = self.panes.get(pane_id) {
+                    if pane.title() == AGENT_PICKER_TITLE {
+                        entries.push(crate::picker::PickerEntry::intent(
+                            "Pick an agent…",
+                            "agents.pick",
+                        ));
+                    }
+                }
+            }
+            self.picker_state.open_with("Pane", entries);
+        }
     }
 
     fn mouse_drag(&mut self, col: u16, row: u16) {
@@ -2728,6 +2900,39 @@ fn hint_bar_text() -> String {
 
 fn point_in_rect(x: u16, y: u16, r: Rect) -> bool {
     x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
+}
+
+/// Parse the string form of a `TabGroupId` back to a static id. Called
+/// from `run_context_intent` to decode `tab.close:shells:2` style tags.
+fn parse_group_id(s: &str) -> Option<TabGroupId> {
+    match s {
+        "files" => Some(BUILTIN_FILES),
+        "sysmon" => Some(BUILTIN_SYSMON),
+        "agents" => Some(BUILTIN_AGENTS),
+        "shells" => Some(BUILTIN_SHELLS),
+        _ => None,
+    }
+}
+
+/// Append the group-specific "new" entry (context menu builder helper).
+/// Fixed groups get a disabled row explaining why.
+fn push_group_new_entry(entries: &mut Vec<crate::picker::PickerEntry>, gid: TabGroupId) {
+    if gid == BUILTIN_SHELLS {
+        entries.push(crate::picker::PickerEntry::intent(
+            "New shell tab",
+            "shells.new",
+        ));
+    } else if gid == BUILTIN_AGENTS {
+        entries.push(crate::picker::PickerEntry::intent(
+            "Open agent picker…",
+            "agents.pick",
+        ));
+    } else {
+        entries.push(crate::picker::PickerEntry::disabled(
+            "New tab",
+            "(fixed group)",
+        ));
+    }
 }
 
 /// Compute the rect the *parent split* at `path` occupies inside `pane_area`.
