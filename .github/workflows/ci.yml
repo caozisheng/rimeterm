@@ -56,9 +56,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (stable, pinned to rust-version)
-        uses: dtolnay/rust-toolchain@stable
+      # Pinned to the same channel as rust-toolchain.toml (which governs
+      # local dev). One source of truth per environment; both files
+      # updated together on a rustc bump.
+      - name: Install Rust toolchain (pinned to 1.90)
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.90"
           components: rustfmt, clippy
 
       - name: Print toolchain
