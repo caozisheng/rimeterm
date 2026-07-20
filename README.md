@@ -37,10 +37,9 @@ Excerpt from the internal design contract (§0):
    are kernel-level concepts, not overlays.
 2. **One process, many surfaces** — every pane shares the same render /
    event / config / keymap system.
-3. **Hot-pluggable = no belief** — any pane (including the default five
-   `yazi` / `gitui` / `bottom` / `bandwhich` / `trippy`) can be disabled,
-   replaced, or reloaded. The kernel knows nothing about them beyond a
-   contract.
+3. **Hot-pluggable = no belief** — any pane (including the default four
+   `yazi` / `gitui` / `bottom` / `trippy`) can be disabled, replaced, or
+   reloaded. The kernel knows nothing about them beyond a contract.
 4. **Correctness > performance > polish** — millisecond response is the
    floor, not the pitch.
 5. **Windows first-class** — ConPTY, path encoding, keybindings, Nerd
@@ -53,9 +52,9 @@ Excerpt from the internal design contract (§0):
    `which::which` first; user-installed via `winget` / `scoop` / `brew` /
    `apt` always wins. Missing tools fall back to a placeholder pane with
    an install hint. The convenience `cargo install --locked <crate>`
-   channel exists for `yazi` / `gitui` / `bottom` / `bandwhich` / `trippy`
-   (all `crates.io` crates) so users on platforms without a system
-   package manager have a one-command path.
+   channel exists for `yazi` / `gitui` / `bottom` / `trippy` (all
+   `crates.io` crates) so users on platforms without a system package
+   manager have a one-command path.
 8. **ratatui components first** — every widget already in ratatui or
    maintained third-party crates (`nucleo-matcher`, `ratatui-image`, …)
    MUST be reused before writing a new one.
@@ -63,9 +62,8 @@ Excerpt from the internal design contract (§0):
 ## Feature snapshot
 
 - **Four-quadrant layout** — `files` (yazi/gitui) · `sysmon`
-  (bottom/bandwhich/trippy) · `agents` (dropdown-picked) · `shells`
-  (pwsh / bash / fish; multi-tab). Every quadrant has an internal tab
-  strip.
+  (bottom/trippy) · `agents` (dropdown-picked) · `shells` (pwsh / bash /
+  fish; multi-tab). Every quadrant has an internal tab strip.
 - **Draggable dividers** with min-size floors; keyboard resize mode
   (`Ctrl+Alt+R`). Layout ratios persist per-workspace to
   `~/.rimeterm/data/workspaces/<hash>/layout.state.toml`.
@@ -128,13 +126,18 @@ cargo install --path crates/rimectl  --bin rimectl
 rimeterm doesn't bundle any of these. Install what you use; the rest
 gets a placeholder pane with the install hint.
 
-| tool | binary | one-liner (crates.io convenience install) |
-|---|---|---|
-| yazi (file manager) | `yazi` | `cargo install --locked yazi-fm yazi-cli` |
-| gitui | `gitui` | `cargo install --locked gitui` |
-| bottom (sysmon) | `btm` | `cargo install --locked bottom` |
-| bandwhich (bandwidth) | `bandwhich` | `cargo install --locked bandwhich` — needs admin / `cap_net_raw` |
-| trippy (traceroute) | `trip` | `cargo install --locked trippy` |
+| tool | binary | Windows | macOS | Linux | Cargo (universal) |
+|---|---|---|---|---|---|
+| yazi (file manager) | `yazi` | `winget install sxyazi.yazi` | `brew install yazi` | see [install docs] | `cargo install --locked yazi-fm yazi-cli` |
+| gitui | `gitui` | `winget install StephanDilly.gitui` | `brew install gitui` | `sudo pacman -S gitui` (Arch) | `cargo install --locked gitui` |
+| bottom (sysmon) | `btm` | `winget install Clement.bottom` | `brew install bottom` | `sudo apt install bottom` (Debian) | `cargo install --locked bottom` |
+| trippy (traceroute) | `trip` | `winget install FujiApple.Trippy` | `brew install trippy` | `sudo pacman -S trippy` (Arch) | `cargo install --locked trippy` — needs Npcap on Windows / `CAP_NET_RAW` on Linux |
+
+[install docs]: https://yazi-rs.github.io/docs/installation
+
+**In-app shortcut**: on a placeholder pane (tool not installed), press
+`[I]` to open a fresh shell tab with `cargo install --locked <crate>`
+pre-typed — review and hit Enter to run.
 
 Agents live off `npm` / `pip` / binary releases — see
 `rimectl agents.list` for install hints per entry.
@@ -260,8 +263,8 @@ Standing on shoulders. Non-exhaustive:
 - **[crossterm]** — event / raw-mode / colour backend used by both
   ratatui and our input router.
 - **[winresource]** — the build-time icon embedder.
-- **[yazi], [gitui], [bottom], [bandwhich], [trippy]** — the TUI tools
-  rimeterm hosts by default.
+- **[yazi], [gitui], [bottom], [trippy]** — the TUI tools rimeterm hosts
+  by default.
 - **[Oh-my-pi], [Codex CLI], [Claude Code], [Pi]** — the coding agents
   the picker knows about.
 - **[wezterm]** — where `portable-pty` (and a lot of terminal-behavior
@@ -278,7 +281,6 @@ licenses.
 [yazi]: https://github.com/sxyazi/yazi
 [gitui]: https://github.com/gitui-org/gitui
 [bottom]: https://github.com/ClementTsang/bottom
-[bandwhich]: https://github.com/imsnif/bandwhich
 [trippy]: https://github.com/fujiapple852/trippy
 [Oh-my-pi]: https://github.com/inflection-ai/oh-my-pi
 [Codex CLI]: https://github.com/openai/codex

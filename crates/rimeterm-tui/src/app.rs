@@ -120,6 +120,11 @@ pub(crate) enum PaneMutation {
         pane_id: PaneId,
         ack: std::sync::mpsc::SyncSender<Result<(), String>>,
     },
+    /// Open a new shell tab and immediately type `command` into it (no
+    /// Enter — the user reviews + confirms). Fire-and-forget: keymap
+    /// dispatch doesn't wait for the new pane id, and the shell handles
+    /// its own errors visibly. Used by the placeholder `[I]` shortcut.
+    OpenShellAndType { command: String },
 }
 
 /// Title of the placeholder pane that seeds the `agents` group on first
@@ -353,12 +358,10 @@ impl App {
         let mut sysmon_members = Vec::new();
         for spec in &config.sysmon.tabs {
             let icon = match spec.id.as_str() {
-                "bandwhich" => "📶",
                 "trippy" => "🛰",
                 _ => "📊",
             };
             let color = match spec.id.as_str() {
-                "bandwhich" => Color::Yellow,
                 "trippy" => Color::Blue,
                 _ => Color::Magenta,
             };
@@ -697,6 +700,30 @@ impl App {
         }
 
         if let Some(id) = self.focus.focused_pane() {
+            // Placeholder pane [I] shortcut: if the focused pane advertises
+            // an install command (via PaneProvider::install_command) and
+            // the user pressed a plain `i` / `I`, open a fresh shell tab
+            // with the command pre-typed for them to review + Enter.
+            //
+            // Skip modifiers (Ctrl+I, Alt+I, …) so a script binding those
+            // to something else still works. `KeyModifiers::SHIFT` for `I`
+            // is inherent to that keycode on some terminals — accept both.
+            use crossterm::event::{KeyCode, KeyModifiers};
+            let plain_i = matches!(key.code, KeyCode::Char('i') | KeyCode::Char('I'))
+                && (key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT);
+            if plain_i {
+                if let Some(pane) = self.panes.get(id) {
+                    if let Some(cmd) = pane.install_command() {
+                        let cmd = cmd.to_string();
+                        self.set_hint(format!("⚙ opening install shell: {}", cmd));
+                        self.pending_mutations
+                            .lock()
+                            .push_back(PaneMutation::OpenShellAndType { command: cmd });
+                        let _ = self.redraw_tx.send(());
+                        return;
+                    }
+                }
+            }
             if let Some(pane) = self.panes.get_mut(id) {
                 let _ = pane.on_key(key);
             }
@@ -1465,6 +1492,34 @@ impl App {
                     let outcome = self.focus_pane_by_id(pane_id).map_err(|e| e.to_string());
                     acks.push(Ack::Unit(ack, outcome));
                 }
+                PaneMutation::OpenShellAndType { command } => {
+                    match self.new_shell_tab_in(BUILTIN_SHELLS) {
+                        Ok(new_id) => {
+                            // Type the command straight into the fresh
+                            // shell. NO Enter — the user reviews and hits
+                            // Enter themselves (the whole point of routing
+                            // through a shell instead of Command::spawn).
+                            let session = self.session_writes.lock().get(&new_id).cloned();
+                            if let Some(session) = session {
+                                if let Err(e) = session.write(command.as_bytes()) {
+                                    tracing::warn!(
+                                        pane_id = new_id.0,
+                                        error = %e,
+                                        "failed to inject install command"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    pane_id = new_id.0,
+                                    "new shell has no session_writes entry (race?)"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            self.set_hint(format!("⛔ install shortcut: {}", e));
+                        }
+                    }
+                }
             }
         }
         // Publish the post-mutation state THEN wake the waiting clients;
@@ -2088,12 +2143,28 @@ fn build_external_pane(
                 missing = probed.as_str(),
                 "external tool not installed; showing placeholder"
             );
+            // Stack: bold "not installed" heading, blank line, then the
+            // multi-line InstallHint block. `PlaceholderPane` splits on
+            // '\n' and left-aligns the rest.
             let subtitle = match spec.install_hint.as_deref() {
-                Some(hint) => format!("not installed — {}", hint),
-                None => format!("not installed — `{}` not on PATH", probed),
+                Some(hint) if !hint.is_empty() => {
+                    format!("not installed — `{}` not on PATH\n\n{}", probed, hint)
+                }
+                _ => format!("not installed — `{}` not on PATH", probed),
             };
-            let pane =
+            // Try to find a matching tools registry entry so we can offer
+            // one-key install via `[I]`. Registry membership is what
+            // enables `tools.install <name>` too, so this stays consistent.
+            let mut pane =
                 PlaceholderPane::new(spec.id.clone(), subtitle, icon.to_owned(), Color::DarkGray);
+            if let Some(reg) = rimeterm_config::tools::find(&spec.id) {
+                // Cross-platform default: `cargo install --locked <crate...>`.
+                // Users on Windows / macOS see the multi-path hint on-screen
+                // and can pick a different one manually; `[I]` just picks
+                // the guaranteed-to-work path.
+                let cmd = format!("cargo install --locked {}", reg.crates.join(" "));
+                pane = pane.with_install_command(cmd);
+            }
             let _ = color; // reserved for future available-pane border color
             let id = pane.id();
             panes.insert(Box::new(pane));

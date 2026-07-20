@@ -10,6 +10,7 @@
 //! come online.
 
 pub mod agents_state;
+pub mod install_hint;
 pub mod layout_state;
 pub mod paths;
 pub mod tools;
@@ -129,6 +130,7 @@ pub struct FilesConfig {
 
 impl Default for FilesConfig {
     fn default() -> Self {
+        use crate::install_hint::InstallHint;
         Self {
             tabs: vec![
                 ExternalToolSpec {
@@ -136,7 +138,15 @@ impl Default for FilesConfig {
                     label: "yazi".into(),
                     command: vec!["yazi".into()],
                     install_hint: Some(
-                        "Install yazi: https://yazi-rs.github.io/docs/installation".into(),
+                        InstallHint {
+                            winget: Some("winget install sxyazi.yazi"),
+                            scoop: Some("scoop install yazi"),
+                            brew: Some("brew install yazi"),
+                            linux: Some("see https://yazi-rs.github.io/docs/installation"),
+                            cargo: Some("cargo install --locked yazi-fm yazi-cli"),
+                            note: Some("optional image preview needs ImageMagick / ffmpeg"),
+                        }
+                        .to_string(),
                     ),
                 },
                 ExternalToolSpec {
@@ -144,7 +154,15 @@ impl Default for FilesConfig {
                     label: "gitui".into(),
                     command: vec!["gitui".into()],
                     install_hint: Some(
-                        "Install gitui: https://github.com/gitui-org/gitui#installation".into(),
+                        InstallHint {
+                            winget: Some("winget install StephanDilly.gitui"),
+                            scoop: Some("scoop install gitui"),
+                            brew: Some("brew install gitui"),
+                            linux: Some("sudo pacman -S gitui (Arch); see repo for other distros"),
+                            cargo: Some("cargo install --locked gitui"),
+                            note: None,
+                        }
+                        .to_string(),
                     ),
                 },
             ],
@@ -152,7 +170,7 @@ impl Default for FilesConfig {
     }
 }
 
-/// Sysmon quadrant (`bottom`, `bandwhich`, `trippy`, …). Fixed tab-group.
+/// Sysmon quadrant (`bottom`, `trippy`, …). Fixed tab-group.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SysmonConfig {
@@ -161,6 +179,7 @@ pub struct SysmonConfig {
 
 impl Default for SysmonConfig {
     fn default() -> Self {
+        use crate::install_hint::InstallHint;
         Self {
             tabs: vec![
                 ExternalToolSpec {
@@ -169,16 +188,15 @@ impl Default for SysmonConfig {
                     // `bottom` ships as `btm` on all platforms.
                     command: vec!["btm".into()],
                     install_hint: Some(
-                        "Install bottom: `cargo install bottom` (or brew / winget)".into(),
-                    ),
-                },
-                ExternalToolSpec {
-                    id: "bandwhich".into(),
-                    label: "bandwhich".into(),
-                    command: vec!["bandwhich".into()],
-                    install_hint: Some(
-                        "Install bandwhich: `cargo install bandwhich` (needs Npcap on Windows)"
-                            .into(),
+                        InstallHint {
+                            winget: Some("winget install Clement.bottom"),
+                            scoop:  Some("scoop install bottom"),
+                            brew:   Some("brew install bottom"),
+                            linux:  Some("sudo apt install bottom (Debian); sudo dnf install bottom (Fedora)"),
+                            cargo:  Some("cargo install --locked bottom"),
+                            note:   None,
+                        }
+                        .to_string(),
                     ),
                 },
                 ExternalToolSpec {
@@ -187,7 +205,15 @@ impl Default for SysmonConfig {
                     // `trippy` ships as `trip` on all platforms.
                     command: vec!["trip".into()],
                     install_hint: Some(
-                        "Install trippy: `cargo install trippy` (needs Npcap on Windows)".into(),
+                        InstallHint {
+                            winget: Some("winget install FujiApple.Trippy"),
+                            scoop:  None,
+                            brew:   Some("brew install trippy"),
+                            linux:  Some("sudo pacman -S trippy (Arch); see repo for other distros"),
+                            cargo:  Some("cargo install --locked trippy"),
+                            note:   Some("Windows needs Npcap; Linux needs CAP_NET_RAW or sudo"),
+                        }
+                        .to_string(),
                     ),
                 },
             ],
@@ -262,20 +288,15 @@ mod tests {
     }
 
     #[test]
-    fn default_sysmon_config_has_five_column_tools() {
+    fn default_sysmon_config_has_bottom_and_trippy() {
         let cmds: Vec<_> = SysmonConfig::default()
             .tabs
             .iter()
             .map(|s| s.command[0].clone())
             .collect();
-        assert_eq!(
-            cmds,
-            vec![
-                "btm".to_string(),
-                "bandwhich".to_string(),
-                "trip".to_string()
-            ]
-        );
+        // bandwhich dropped in C13 — winget has no bandwhich package
+        // and needing Npcap on Windows makes it hostile to install.
+        assert_eq!(cmds, vec!["btm".to_string(), "trip".to_string()]);
     }
 
     #[test]

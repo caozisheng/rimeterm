@@ -33,9 +33,9 @@ will be added as new subsystems come online.
 
 - [yazi](https://github.com/sxyazi/yazi), [gitui](https://github.com/gitui-org/gitui),
   [bottom](https://github.com/ClementTsang/bottom),
-  [bandwhich](https://github.com/imsnif/bandwhich),
-  [trippy](https://github.com/fujiapple852/trippy) — for the "default plugin" trio
-  we plan to ship with M2.
+  [trippy](https://github.com/fujiapple852/trippy) — the "default four"
+  TUI tools rimeterm hosts by default (probed at startup; falls back to
+  an install-hint placeholder pane).
 
 ## Terminal / TUI design lineage
 

@@ -118,4 +118,17 @@ pub trait PaneProvider: Send + 'static {
     /// immediately. NativePane providers keep the default no-op; PtyPane
     /// overrides to flush the pending size to the underlying pseudo-console.
     fn flush_pending_resize(&mut self) {}
+
+    /// When this pane represents a missing external tool and offers a
+    /// one-key install shortcut (`[I]`), return the command to run in a
+    /// fresh shell tab. `None` means the pane is not installable and
+    /// `[I]` should fall through to the normal keymap.
+    ///
+    /// The command MUST be a single shell line (no embedded newlines);
+    /// the App will type it into a new shell tab AS IF the user typed it,
+    /// so they can review / edit before hitting Enter. Rimeterm never
+    /// auto-executes install commands — the user always confirms with Enter.
+    fn install_command(&self) -> Option<&str> {
+        None
+    }
 }

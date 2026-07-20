@@ -1,6 +1,6 @@
-//! **§9.4 Tools Registry** — canonical description of the TUI five-piece
-//! set (`yazi`, `gitui`, `bottom`, `bandwhich`, `trippy`) as
-//! **crates.io-installable** external tools.
+//! **§9.4 Tools Registry** — canonical description of the TUI four-piece
+//! set (`yazi`, `gitui`, `bottom`, `trippy`) as **crates.io-installable**
+//! external tools.
 //!
 //! Design principle 7 (see `docs/rimeterm-overall-design.md`):
 //! - **detection is layered**: user's `$PATH` beats anything rimeterm knows;
@@ -33,10 +33,17 @@ pub struct ToolSpec {
     pub hint: &'static str,
 }
 
-/// The five canonical PTY-plugin tools rimeterm boots into by default.
+/// The four canonical PTY-plugin tools rimeterm boots into by default.
 ///
 /// Order matters — `tools.list` returns them in this order so scripts get a
 /// stable index.
+///
+/// **`bandwhich` dropped in C13**: winget has no package, Windows requires
+/// Npcap, and the tool needs `admin`/`cap_net_raw` to run. The friction was
+/// hostile enough that Windows-first rimeterm shipped it as a permanent
+/// placeholder. Users who want bandwhich still get it via their system
+/// package manager or `cargo install --locked bandwhich`; rimeterm just
+/// doesn't reserve a tab for it anymore.
 pub const TOOL_REGISTRY: &[ToolSpec] = &[
     ToolSpec {
         name: "yazi",
@@ -55,12 +62,6 @@ pub const TOOL_REGISTRY: &[ToolSpec] = &[
         binary: "btm",
         crates: &["bottom"],
         hint: "brew/scoop install bottom, or `cargo install --locked bottom`",
-    },
-    ToolSpec {
-        name: "bandwhich",
-        binary: "bandwhich",
-        crates: &["bandwhich"],
-        hint: "brew/scoop install bandwhich (needs admin/cap_net_raw), or `cargo install --locked bandwhich`",
     },
     ToolSpec {
         name: "trippy",
@@ -165,15 +166,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_all_five_tools() {
+    fn registry_has_all_four_tools() {
         // Deliberately hard-coded — if this fails, someone shipped a change
         // that either dropped a tool or added a new one without updating
         // this assertion (and, presumably, the design doc §9.4 table).
+        // bandwhich dropped in C13 — see module docstring.
         let names: Vec<&str> = TOOL_REGISTRY.iter().map(|s| s.name).collect();
-        assert_eq!(
-            names,
-            vec!["yazi", "gitui", "bottom", "bandwhich", "trippy"]
-        );
+        assert_eq!(names, vec!["yazi", "gitui", "bottom", "trippy"]);
     }
 
     #[test]
