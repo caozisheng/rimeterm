@@ -19,7 +19,18 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 which = { workspace = true }
 serde = { workspace = true }
+# C16: alacritty_terminal is staged behind the `alac` feature so cargo will
+# fetch and lock the dependency (giving the migration branch a stable target)
+# without wiring it into the current vt100-based Session. Building without
+# the feature keeps behavior identical.
+alacritty_terminal = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 parking_lot = "0.12"
+
+[features]
+default = []
+# Opt-in for the WIP alacritty_terminal migration (C16). Currently the crate
+# is only pulled in as a dep; no code paths reference it yet.
+alac = ["dep:alacritty_terminal"]

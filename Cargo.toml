@@ -34,6 +34,7 @@ ratatui       = { version = "0.30", default-features = false, features = ["cross
 serde         = { version = "1", features = ["derive"] }
 toml          = "0.9"
 vt100         = "0.16"
+alacritty_terminal = "0.26" # C16: staged migration target from vt100 — not wired in yet
 portable-pty  = "0.9"
 anyhow        = "1"
 thiserror     = "2"
