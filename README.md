@@ -11,7 +11,7 @@ Windows-priority, cross-platform.
 | **CI** | [![CI](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml) Linux · macOS (arm) · Windows |
 | **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · builds for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` |
 | **MSRV** | Rust 1.90 (edition 2024) |
-| **Status** | v0.1.0 released; tip at implementation checkpoint C16. Follow-up plan in [`docs/rimeterm-overall-design.md#15.2`](docs/rimeterm-overall-design.md) |
+| **Status** | v0.1.1 released (C15 + C16); tip at implementation checkpoint C16. Follow-up plan in `docs/rimeterm-overall-design.md#15.2` (design doc is local-only) |
 
 ---
 
