@@ -194,12 +194,19 @@ jobs:
           echo "$wixBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           Write-Host "WiX bin on PATH: $wixBin"
 
+      # NOTE: msi + deb installer chains are marked continue-on-error
+      # so a broken cargo-tool integration doesn't block the release.
+      # The archives + macOS pkg still ship; msi / deb come back in a
+      # follow-up commit once we chase down the tooling regression.
+
       - name: Install cargo-wix (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
+        continue-on-error: true
         run: cargo install cargo-wix --locked --version ^0.3
 
       - name: Generate WiX template (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
+        continue-on-error: true
         shell: bash
         # `--force` regenerates unattended (no prompt). `--eula false`
         # + `--license false` skip the license dialog pages so the
@@ -212,6 +219,7 @@ jobs:
 
       - name: Build MSI (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
+        continue-on-error: true
         id: msi
         shell: bash
         # `--no-build` reuses the release binary we already compiled a
@@ -229,10 +237,12 @@ jobs:
 
       - name: Install cargo-deb (Linux)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
+        continue-on-error: true
         run: cargo install cargo-deb --locked --version ^2
 
       - name: Build .deb (Linux)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
+        continue-on-error: true
         id: deb
         shell: bash
         # `--no-build` reuses the already-compiled release binary;
@@ -294,6 +304,10 @@ jobs:
           fi
 
       - name: Upload installer artefact
+        # Skip when no installer path was produced (msi / deb steps
+        # currently marked continue-on-error; missing output = we
+        # deliberately let it fail without failing the whole matrix).
+        if: steps.installer.outputs.path != ''
         uses: actions/upload-artifact@v4
         with:
           name: rimeterm-${{ steps.version.outputs.value }}-${{ matrix.target }}-installer
