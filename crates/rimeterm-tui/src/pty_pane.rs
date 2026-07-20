@@ -113,10 +113,19 @@ impl PaneProvider for PtyPane {
         // Request a resize through the throttler (§19.12.6). Actual PTY
         // resize happens either when `tick_resize` sees the idle window
         // elapse, or when the app forces a flush on mouse-up.
+        //
+        // Special case: the very first render bypasses the throttle so the
+        // child sees the correct size before its splash frame — Ink apps
+        // (oh-my-pi, opencode) render their layout once at spawn and don't
+        // reflow well from an 80x24 start.
         if inner != self.last_area {
             if inner.width >= 2 && inner.height >= 1 {
+                let first_render = self.last_area == Rect::default();
                 self.resize
                     .request(inner.width.max(2), inner.height.max(1), Instant::now());
+                if first_render {
+                    self.flush_resize_now();
+                }
             }
             self.last_area = inner;
         }
