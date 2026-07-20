@@ -111,9 +111,11 @@ fn parse_cli(argv: &[String]) -> Result<CliAction, String> {
         let a = argv[i].as_str();
         match a {
             "--pid" => {
-                pid = Some(take_val(argv, &mut i, "--pid")?.parse().map_err(|e| {
-                    format!("--pid needs an unsigned integer: {e}")
-                })?);
+                pid = Some(
+                    take_val(argv, &mut i, "--pid")?
+                        .parse()
+                        .map_err(|e| format!("--pid needs an unsigned integer: {e}"))?,
+                );
             }
             "--json" => {
                 json = Some(take_val(argv, &mut i, "--json")?);
@@ -122,9 +124,11 @@ fn parse_cli(argv: &[String]) -> Result<CliAction, String> {
                 wait_pattern = Some(take_val(argv, &mut i, "--wait")?);
             }
             "--pane" => {
-                pane = Some(take_val(argv, &mut i, "--pane")?.parse().map_err(|e| {
-                    format!("--pane needs a u64 pane id: {e}")
-                })?);
+                pane = Some(
+                    take_val(argv, &mut i, "--pane")?
+                        .parse()
+                        .map_err(|e| format!("--pane needs a u64 pane id: {e}"))?,
+                );
             }
             "--timeout-ms" => {
                 timeout_ms = Some(
@@ -161,8 +165,7 @@ fn parse_cli(argv: &[String]) -> Result<CliAction, String> {
         }
         if json.is_some() {
             return Err(
-                "--wait and --json are mutually exclusive; --wait builds the JSON for you"
-                    .into(),
+                "--wait and --json are mutually exclusive; --wait builds the JSON for you".into(),
             );
         }
         let pane_id = pane.ok_or_else(|| "--wait requires --pane <id>".to_string())?;
@@ -444,10 +447,7 @@ mod tests {
     #[test]
     fn missing_command_is_a_helpful_error() {
         let err = parse_cli(&argv(&[])).unwrap_err();
-        assert!(
-            err.contains("no command specified"),
-            "unexpected: {err}"
-        );
+        assert!(err.contains("no command specified"), "unexpected: {err}");
     }
 
     #[test]
@@ -508,15 +508,15 @@ mod tests {
             "workspace.snapshot",
         ]))
         .unwrap_err();
-        assert!(err.contains("--wait cannot be combined"), "unexpected: {err}");
+        assert!(
+            err.contains("--wait cannot be combined"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
     fn wait_cannot_combine_with_json() {
-        let err = parse_cli(&argv(&[
-            "--wait", "x", "--pane", "1", "--json", "{}",
-        ]))
-        .unwrap_err();
+        let err = parse_cli(&argv(&["--wait", "x", "--pane", "1", "--json", "{}"])).unwrap_err();
         assert!(err.contains("mutually exclusive"), "unexpected: {err}");
     }
 
@@ -525,7 +525,10 @@ mod tests {
         // `--pane` alone without `--wait` is a mistake; catch it early
         // instead of silently ignoring like the old parser would.
         let err = parse_cli(&argv(&["workspace.snapshot", "--pane", "1"])).unwrap_err();
-        assert!(err.contains("--pane only valid with --wait"), "unexpected: {err}");
+        assert!(
+            err.contains("--pane only valid with --wait"),
+            "unexpected: {err}"
+        );
 
         let err = parse_cli(&argv(&["workspace.snapshot", "--timeout-ms", "1000"])).unwrap_err();
         assert!(
@@ -542,9 +545,19 @@ mod tests {
 
     #[test]
     fn flag_missing_value_reports_flag_name() {
-        for flag in ["--wait", "--pane", "--pid", "--json", "--timeout-ms", "--poll-ms"] {
+        for flag in [
+            "--wait",
+            "--pane",
+            "--pid",
+            "--json",
+            "--timeout-ms",
+            "--poll-ms",
+        ] {
             let err = parse_cli(&argv(&[flag])).unwrap_err();
-            assert!(err.contains(flag), "flag `{flag}` err didn't mention it: {err}");
+            assert!(
+                err.contains(flag),
+                "flag `{flag}` err didn't mention it: {err}"
+            );
         }
     }
 
@@ -558,7 +571,15 @@ mod tests {
     fn numeric_flag_bad_value_rejected() {
         let err = parse_cli(&argv(&["--wait", "x", "--pane", "not-a-number"])).unwrap_err();
         assert!(err.contains("--pane"), "unexpected: {err}");
-        let err = parse_cli(&argv(&["--wait", "x", "--pane", "1", "--timeout-ms", "abc"])).unwrap_err();
+        let err = parse_cli(&argv(&[
+            "--wait",
+            "x",
+            "--pane",
+            "1",
+            "--timeout-ms",
+            "abc",
+        ]))
+        .unwrap_err();
         assert!(err.contains("--timeout-ms"), "unexpected: {err}");
     }
 

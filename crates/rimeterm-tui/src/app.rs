@@ -4319,10 +4319,7 @@ mod tests {
     #[test]
     fn spawn_clears_on_timeout_even_without_output() {
         // Pane still exists (grid = ""), but boot deadline hit — stop nagging.
-        assert!(pending_spawn_should_clear(
-            PENDING_SPAWN_TIMEOUT,
-            Some("")
-        ));
+        assert!(pending_spawn_should_clear(PENDING_SPAWN_TIMEOUT, Some("")));
         assert!(pending_spawn_should_clear(
             PENDING_SPAWN_TIMEOUT + std::time::Duration::from_secs(1),
             Some("            \n\n\n")
