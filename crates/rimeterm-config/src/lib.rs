@@ -10,6 +10,7 @@
 //! come online.
 
 pub mod layout_state;
+pub mod agents_state;
 pub mod paths;
 pub mod tools;
 

@@ -295,6 +295,10 @@ pub struct App {
     /// `pane.render` received). Different from `LayoutTree::compute_rects`
     /// output, which returns the full quadrant cell including its tab strip.
     last_pane_outer_rects: Vec<(PaneId, Rect)>,
+    /// Reverse map from agent PaneId → static registry id (`omp` / `codex`
+    /// / `claude` / `pi`). Populated on spawn, consumed by
+    /// `persist_agents_state` to write the on-disk file.
+    pane_agent_id: std::collections::HashMap<PaneId, &'static str>,
     /// In-progress divider drag. `None` when idle.
     active_drag: Option<DragState>,
     /// Snapshot of default ratios so we can `= / 0` reset.
@@ -370,7 +374,13 @@ impl App {
             )?;
             sysmon_members.push(id);
         }
+
         let mut agents_members = Vec::new();
+        // (pane_id, static registry id) for each agent tab we spawn during
+        // startup — either from config or from the persisted state file.
+        // Handed into App::pane_agent_id below so `persist_agents_state`
+        // can rebuild the on-disk list correctly across restarts.
+        let mut startup_agent_ids: Vec<(PaneId, &'static str)> = Vec::new();
         for spec in &config.agents.tabs {
             let id = build_agent_pane(
                 &mut panes,
@@ -380,12 +390,65 @@ impl App {
                 redraw_tx.clone(),
             )?;
             agents_members.push(id);
+            // Try to map the config spec id back to a registry entry so
+            // we can persist it. Config-only specs (rare) get skipped.
+            if let Some(reg) = rimeterm_pty::agent_registry::find(&spec.id) {
+                startup_agent_ids.push((id, reg.id));
+            }
         }
 
-        // §14 C14: agents group starts empty by default. Seed a picker
-        // placeholder so TabGroup::new's non-empty invariant holds; the
-        // placeholder is auto-closed the first time a real agent tab
-        // lands (see `new_agent_tab_in`).
+        // Persisted picks from previous sessions (see §14 / C-current).
+        // Each id is looked up in AGENT_REGISTRY; unknown / renamed ids
+        // are skipped silently rather than crashing the workspace.
+        if agents_members.is_empty() {
+            if let Some(state_path) =
+                rimeterm_config::agents_state::workspace_state_file(&workspace_root)
+            {
+                match rimeterm_config::agents_state::AgentsState::load_or_default(&state_path) {
+                    Ok(state) => {
+                        for id in &state.tabs {
+                            let Some(spec) = rimeterm_pty::agent_registry::find(id) else {
+                                tracing::warn!(agent_id = id.as_str(), "persisted agent id no longer in registry — skipping");
+                                continue;
+                            };
+                            let ext_spec = rimeterm_config::AgentSpec {
+                                id: spec.id.to_string(),
+                                label: spec.label.to_string(),
+                                command: spec.argv.iter().map(|s| s.to_string()).collect(),
+                                install_hint: Some(spec.install_hint.to_string()),
+                            };
+                            match build_agent_pane(
+                                &mut panes,
+                                &session_writes,
+                                &ext_spec,
+                                &workspace_root,
+                                redraw_tx.clone(),
+                            ) {
+                                Ok(pane_id) => {
+                                    agents_members.push(pane_id);
+                                    startup_agent_ids.push((pane_id, spec.id));
+                                }
+                                Err(e) => tracing::warn!(agent_id = id.as_str(), error = %e, "failed to restore persisted agent tab"),
+                            }
+                        }
+                        if !agents_members.is_empty() {
+                            tracing::info!(
+                                path = %state_path.display(),
+                                count = agents_members.len(),
+                                "restored persisted agent tabs"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(path = %state_path.display(), error = %e, "failed to load agents state"),
+                }
+            }
+        }
+
+        // §14 C14: agents group starts with a picker placeholder when
+        // no config tabs and no persisted state produced a real member.
+        // TabGroup::new asserts non-empty on construction; the
+        // placeholder is auto-closed the first time a real agent lands
+        // (see `new_agent_tab_in`).
         if agents_members.is_empty() {
             let hint = format_agent_picker_hint();
             let picker = PlaceholderPane::new(AGENT_PICKER_TITLE, hint, "🤖", Color::LightMagenta);
@@ -521,6 +584,7 @@ impl App {
             last_dividers: Vec::new(),
             last_tab_strips: Vec::new(),
             last_pane_outer_rects: Vec::new(),
+            pane_agent_id: startup_agent_ids.into_iter().collect(),
             active_drag: None,
             default_ratios,
             pending_mutations,
@@ -1593,6 +1657,7 @@ impl App {
             &self.workspace_root,
             self.redraw_tx.clone(),
         )?;
+        self.pane_agent_id.insert(new_id, spec.id);
 
         // If the group is still holding the picker-placeholder from
         // first-launch, remove it so the new agent tab is the sole (and
@@ -1623,6 +1688,7 @@ impl App {
             }
         }
         self.focus.set_focus(new_id, Some(gid));
+        self.persist_agents_state();
         Ok(new_id)
     }
 
@@ -1672,10 +1738,18 @@ impl App {
         let removed = group.try_close(idx, false).map_err(|e| anyhow!("{e}"))?;
         drop_pane(&mut self.panes, removed);
         self.session_writes.lock().remove(&removed);
+        // Clean the reverse lookup + persist if we just changed the
+        // agents quadrant. Persisting is idempotent + cheap (single
+        // TOML file, few bytes) so we do it unconditionally on any
+        // agents-group mutation rather than trying to gate it further.
+        let was_agent = self.pane_agent_id.remove(&removed).is_some();
         if let Some(group) = self.tree.find_tab_group(gid) {
             if let Some(id) = group.active_pane() {
                 self.focus.set_focus(id, Some(gid));
             }
+        }
+        if was_agent || gid == BUILTIN_AGENTS {
+            self.persist_agents_state();
         }
         Ok(())
     }
@@ -1853,6 +1927,37 @@ impl App {
             warn!(error = %e, "failed to persist layout state");
         } else {
             info!(path = %path.display(), "persisted layout state");
+        }
+    }
+
+    /// Write the current agents-quadrant tab list to
+    /// `${data_dir}/workspaces/<hash>/agents.state.toml`. Silent on
+    /// error — the next launch just won't restore, no user harm.
+    fn persist_agents_state(&self) {
+        let Some(path) =
+            rimeterm_config::agents_state::workspace_state_file(&self.workspace_root)
+        else {
+            return;
+        };
+        // Walk the agents group in tab order so on-disk order matches
+        // on-screen order. Placeholder panes (no entry in pane_agent_id)
+        // are skipped — persisting the picker itself would defeat the
+        // whole restore contract.
+        let tabs: Vec<String> = self
+            .tree
+            .find_tab_group(BUILTIN_AGENTS)
+            .map(|g| {
+                g.members()
+                    .iter()
+                    .filter_map(|pid| self.pane_agent_id.get(pid).map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let state = rimeterm_config::agents_state::AgentsState { tabs };
+        if let Err(e) = state.save_to(&path) {
+            warn!(error = %e, "failed to persist agents state");
+        } else {
+            info!(path = %path.display(), count = state.tabs.len(), "persisted agents state");
         }
     }
 
