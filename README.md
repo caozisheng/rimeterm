@@ -9,45 +9,10 @@ plugin-hosted, Windows-priority.
 
 ## Status
 
-**C14 agent picker — empty by default, dropdown on `Ctrl+T`** — the
-`agents` quadrant starts truly empty on first launch. Pressing `Ctrl+T`
-inside it opens the command palette pre-filtered to `agents.pick.`, so
-you get a live dropdown of coding agents rimeterm just probed on your
-`$PATH`. Nothing is spawned until you pick one — matches the interjection
-intent exactly.
-
-```
-PID=$(rimectl --list-endpoints | tail -1 | grep -oP 'pid=\K\d+')
-
-# Which agents are actually installed?
-rimectl --pid $PID agents.list \
-  | jq -r '.result.agents[] | "\(.id)\t\(.detected_path // "-")"'
-
-# Pick one from the terminal side of the same interface:
-rimectl --pid $PID workspace.pane.open --json '{"kind":"agent:codex"}'
-
-# Unknown ids give a structured error listing the valid ones.
-rimectl --pid $PID workspace.pane.open --json '{"kind":"agent:nope"}'
-```
-
-**Also in C14 (path layout interjection):** everything user-writable now
-lives under **`~/.rimeterm/`** — `config.toml`, `data/run/*.pid`
-lockfiles, future caches all sit in a single dot-dir instead of the old
-`%APPDATA%\rimeterm\` / `$XDG_CONFIG_HOME` / `~/Library/…` split. Repo
-scope stays at `<workspace>/.rimeterm/config.toml`. `$RIMETERM_HOME`
-overrides the root for CI or multi-profile setups.
-
-Everything C7–C13 keeps working: `workspace.snapshot` / `.pane.write` /
-`.pane.output` / `.pane.wait` / `.pane.open` (now `shell` OR
-`agent:<id>`) / `.pane.close` / `.pane.rename` / `.pane.focus`;
-`tools.list` / `.install` / `.upgrade` / `.uninstall`; new
-`agents.list` and four `agents.pick.<id>` palette commands.
-
-**Coming next (C15 candidates):** Settings → Tools/Agents panel
-(surface the two registries in a ratatui `List`) · OSC 1337 bridge
-(§5.5) · `layout.state.toml` differential storage · `viewer` pane
-landing as yazi previewer proxy · deeper agent integration (`@`-mention
-cross-tab, approval flow, tool calls).
+<details open>
+<summary>📸 Screenshot</summary>
+<img width="3795" height="2029" alt="image" src="[https://github.com/user-attachments/assets/116bf358-e8bb-4b0a-a3dd-c553a5a86222](https://github.com/user-attachments/assets/86b621bb-0c33-4ad7-a211-298da39ce7df)" />
+</details>
 
 ## Build
 
