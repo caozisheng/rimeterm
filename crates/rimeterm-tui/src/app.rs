@@ -682,83 +682,111 @@ impl App {
 
     /// Handle a mouse event (§19.12: draggable dividers).
     ///
-    /// The only mouse interaction M3 supports is dragging a divider between
-    /// two sibling panes. Any other event passes through silently.
+    /// Route a mouse event. Priority:
+    /// 1. Active divider drag (from a prior Down on a seam) — resize the layout.
+    /// 2. Down / Up / Drag / Scroll on a pane rect — forward to that pane's
+    ///    `PaneProvider::on_mouse` (PtyPane translates to SGR mouse
+    ///    sequences and writes into the child's stdin, so yazi / omp get
+    ///    click, scroll, drag-select natively).
+    /// 3. Down on a bare divider (no pane hit) — start a drag.
+    /// 4. Down on empty space (unlikely) — no-op.
     fn on_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
-        match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.mouse_down(m.column, m.row);
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
+        // --- Active drag takes precedence ---
+        if let MouseEventKind::Drag(MouseButton::Left) = m.kind {
+            if self.active_drag.is_some() {
                 self.mouse_drag(m.column, m.row);
+                return;
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                self.active_drag = None;
-                // §19.12.6: on mouse-up the throttler is bypassed so the final
-                // drag size lands exactly on the PTY.
+        }
+        if let MouseEventKind::Up(MouseButton::Left) = m.kind {
+            if self.active_drag.take().is_some() {
+                // §19.12.6: on mouse-up the throttler is bypassed so the
+                // final drag size lands exactly on the PTY.
                 self.flush_pending_resizes();
+                return;
             }
-            _ => {}
+        }
+        // --- Down on a divider starts a drag; no pane forwarding ---
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            let divider = self
+                .last_dividers
+                .iter()
+                .find(|d| point_in_rect(m.column, m.row, d.visual.rect))
+                .cloned();
+            if let Some(d) = divider {
+                self.start_divider_drag(d, m.column, m.row);
+                return;
+            }
+            // Not a divider → focus the pane, then also forward the Down.
+            self.focus_pane_at(m.column, m.row);
+        }
+        // --- Everything else: forward to the pane under the cursor ---
+        // For Down we already set focus above; Drag/Up/Scroll all use the
+        // pane at the current coord (or the focused pane for Up if it left
+        // the pane rect). Precise SGR forwarding requires the pane's outer
+        // rect, which we can rebuild from compute_rects.
+        let Some(pane_id) = self.pane_at(m.column, m.row) else {
+            return;
+        };
+        let Some(outer_rect) = self
+            .tree
+            .compute_rects(self.last_pane_area)
+            .into_iter()
+            .find(|(id, _)| *id == pane_id)
+            .map(|(_, r)| r)
+        else {
+            return;
+        };
+        if let Some(pane) = self.panes.get_mut(pane_id) {
+            let _ = pane.on_mouse(m, outer_rect);
         }
     }
 
-    fn mouse_down(&mut self, col: u16, row: u16) {
-        // 1. Divider first — dragging beats focus so the user can grab a
-        // seam that overlaps a pane's border area without stealing focus.
-        if let Some(divider) = self
-            .last_dividers
-            .iter()
-            .find(|d| point_in_rect(col, row, d.visual.rect))
-            .cloned()
-        {
-            let Some(parent_rect) =
-                split_parent_rect(&self.tree, self.last_pane_area, &divider.path)
-            else {
-                return;
-            };
-            let axis = divider.visual.axis;
-            let (origin, extent) = match axis {
-                Direction::Horizontal => (col, parent_rect.width),
-                Direction::Vertical => (row, parent_rect.height),
-            };
-            let baseline_ratios = self
-                .tree
-                .ratios_at(&divider.path)
-                .unwrap_or_default();
-            self.active_drag = Some(DragState {
-                path: divider.path,
-                boundary: divider.boundary,
-                axis,
-                origin_axis_coord: origin,
-                parent_extent: extent,
-                baseline_ratios,
-            });
+    /// Start a divider drag from an already-hit `d`. Called by `on_mouse`
+    /// after it has confirmed the click lands on a seam.
+    fn start_divider_drag(&mut self, d: rimeterm_core::layout::Divider, col: u16, row: u16) {
+        let Some(parent_rect) =
+            split_parent_rect(&self.tree, self.last_pane_area, &d.path)
+        else {
             return;
-        }
+        };
+        let axis = d.visual.axis;
+        let (origin, extent) = match axis {
+            Direction::Horizontal => (col, parent_rect.width),
+            Direction::Vertical => (row, parent_rect.height),
+        };
+        let baseline_ratios = self
+            .tree
+            .ratios_at(&d.path)
+            .unwrap_or_default();
+        self.active_drag = Some(DragState {
+            path: d.path,
+            boundary: d.boundary,
+            axis,
+            origin_axis_coord: origin,
+            parent_extent: extent,
+            baseline_ratios,
+        });
+    }
 
-        // 2. Pane hit-test — walk `last_pane_area` back to the (pane_id, rect)
-        // list the last draw produced. First match wins; the walker returns
-        // children after parents so leaf rects are the tightest hits.
-        if let Some(pane_id) = self.pane_at(col, row) {
-            // Find the owning tab group so the click also activates that
-            // pane's tab within its group (`agents` might have multiple).
-            let owner = self
-                .tree
-                .tab_groups()
+    /// Focus the pane under `(col, row)` and activate its tab within the
+    /// owning group. Silent no-op if the click missed every pane.
+    fn focus_pane_at(&mut self, col: u16, row: u16) {
+        let Some(pane_id) = self.pane_at(col, row) else {
+            return;
+        };
+        let owner = self.tree.tab_groups().iter().find_map(|g| {
+            g.members()
                 .iter()
-                .find_map(|g| {
-                    g.members()
-                        .iter()
-                        .position(|m| *m == pane_id)
-                        .map(|idx| (g.id(), idx))
-                });
-            if let Some((gid, idx)) = owner {
-                if let Some(group) = self.tree.find_tab_group_mut(gid) {
-                    let _ = group.goto(idx);
-                }
-                self.focus.set_focus(pane_id, Some(gid));
+                .position(|m| *m == pane_id)
+                .map(|idx| (g.id(), idx))
+        });
+        if let Some((gid, idx)) = owner {
+            if let Some(group) = self.tree.find_tab_group_mut(gid) {
+                let _ = group.goto(idx);
             }
+            self.focus.set_focus(pane_id, Some(gid));
         }
     }
 

@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -92,6 +92,20 @@ pub trait PaneProvider: Send + 'static {
     /// forwards to global keymap fallbacks.
     fn on_key(&mut self, key: KeyEvent) -> bool {
         let _ = key;
+        false
+    }
+
+    /// Deliver a mouse event that hit inside this pane's outer rect. The
+    /// event coordinates are still in **absolute terminal cells**; the
+    /// provider is responsible for translating relative to `outer_rect`
+    /// and clipping out its own border.
+    ///
+    /// Return `true` if the event was consumed (e.g. forwarded to a PTY
+    /// child as an SGR mouse sequence). Providers with no interest keep
+    /// the default no-op and let the app main loop apply its own fallback
+    /// (e.g. focus + tab activation on left-click).
+    fn on_mouse(&mut self, ev: MouseEvent, outer_rect: Rect) -> bool {
+        let _ = (ev, outer_rect);
         false
     }
 

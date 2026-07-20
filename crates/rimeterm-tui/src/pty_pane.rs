@@ -5,7 +5,9 @@
 //! enough for correctness in the M0 skeleton; a later pass batches contiguous
 //! runs of same-style cells for speed.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -189,6 +191,25 @@ impl PaneProvider for PtyPane {
             false
         }
     }
+
+    fn on_mouse(&mut self, ev: MouseEvent, outer_rect: Rect) -> bool {
+        // Border occupies 1 cell on every side; clicks on the border are
+        // not forwarded to the child (users are targeting the pane frame,
+        // typically to grab focus).
+        let inner = inner_rect(outer_rect);
+        if !point_in_rect(ev.column, ev.row, inner) {
+            return false;
+        }
+        // xterm SGR mouse expects **1-based, inside-content** coordinates.
+        let x = ev.column - inner.x + 1;
+        let y = ev.row - inner.y + 1;
+        if let Some(bytes) = encode_sgr_mouse(ev.kind, ev.modifiers, x, y) {
+            let _ = self.session.write(&bytes);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn apply_vt100_color(style: Style, color: vt100::Color, foreground: bool) -> Style {
@@ -220,6 +241,81 @@ fn apply_vt100_color(style: Style, color: vt100::Color, foreground: bool) -> Sty
     } else {
         style.bg(c)
     }
+}
+
+/// Inset the outer pane rect by 1 cell on every side to match the block
+/// border we draw in `render`. `saturating_sub` guards against absurdly
+/// small rects (e.g. 0×0 during teardown) so the returned rect is always
+/// well-formed.
+pub(crate) fn inner_rect(outer: Rect) -> Rect {
+    let inset_w = outer.width.saturating_sub(2);
+    let inset_h = outer.height.saturating_sub(2);
+    Rect {
+        x: outer.x.saturating_add(1),
+        y: outer.y.saturating_add(1),
+        width: inset_w,
+        height: inset_h,
+    }
+}
+
+/// True when `(x, y)` lies inside `r` (inclusive left/top, exclusive
+/// right/bottom, matching everywhere else in the app).
+pub(crate) fn point_in_rect(x: u16, y: u16, r: Rect) -> bool {
+    x >= r.x
+        && x < r.x.saturating_add(r.width)
+        && y >= r.y
+        && y < r.y.saturating_add(r.height)
+}
+
+/// Encode a crossterm `MouseEvent` as an xterm SGR mouse sequence
+/// (`ESC[<button;X;YM` for press/motion, `ESC[<button;X;Ym` for release).
+/// `x` / `y` are **1-based pane-local content coordinates**.
+///
+/// SGR button byte layout (xterm ctlseqs):
+///   bits 0..1 = button (0=left, 1=middle, 2=right, 3=release/motion)
+///   bit  2    = shift    (+4)
+///   bit  3    = meta/alt (+8)
+///   bit  4    = ctrl     (+16)
+///   bit  5    = motion   (+32)
+///   bit  6    = wheel    (+64)      (buttons 64=up, 65=down)
+///
+/// Returns `None` for events we don't forward (e.g. `Moved` without a
+/// held button — most apps ignore those and floods add up).
+pub(crate) fn encode_sgr_mouse(
+    kind: MouseEventKind,
+    mods: KeyModifiers,
+    x: u16,
+    y: u16,
+) -> Option<Vec<u8>> {
+    let (mut button, is_release) = match kind {
+        MouseEventKind::Down(b) => (button_code(b)?, false),
+        MouseEventKind::Up(b) => (button_code(b)?, true),
+        MouseEventKind::Drag(b) => (button_code(b)? | 0b0010_0000, false), // +motion
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+        MouseEventKind::Moved => return None,
+    };
+    if mods.contains(KeyModifiers::SHIFT) {
+        button |= 0b0000_0100;
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        button |= 0b0000_1000;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        button |= 0b0001_0000;
+    }
+    let final_char = if is_release { 'm' } else { 'M' };
+    Some(format!("\x1b[<{};{};{}{}", button, x, y, final_char).into_bytes())
+}
+
+fn button_code(b: MouseButton) -> Option<u8> {
+    Some(match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    })
 }
 
 /// Translate a `crossterm::KeyEvent` into raw bytes for the pty.
@@ -263,4 +359,116 @@ fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
         _ => return None,
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod mouse_tests {
+    use super::*;
+
+    fn ev(kind: MouseEventKind, x: u16, y: u16, mods: KeyModifiers) -> MouseEvent {
+        MouseEvent { kind, column: x, row: y, modifiers: mods }
+    }
+
+    #[test]
+    fn inner_rect_insets_by_1_on_each_side() {
+        let r = inner_rect(Rect { x: 5, y: 4, width: 20, height: 10 });
+        assert_eq!(r, Rect { x: 6, y: 5, width: 18, height: 8 });
+    }
+
+    #[test]
+    fn inner_rect_saturates_on_tiny_outer() {
+        let r = inner_rect(Rect { x: 0, y: 0, width: 1, height: 1 });
+        assert_eq!(r.width, 0);
+        assert_eq!(r.height, 0);
+    }
+
+    #[test]
+    fn sgr_left_press_at_1_1_encodes_correctly() {
+        let bytes = encode_sgr_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[<0;1;1M");
+    }
+
+    #[test]
+    fn sgr_right_release_encodes_lowercase_m() {
+        let bytes = encode_sgr_mouse(
+            MouseEventKind::Up(MouseButton::Right),
+            KeyModifiers::NONE,
+            10,
+            20,
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[<2;10;20m");
+    }
+
+    #[test]
+    fn sgr_drag_sets_motion_bit() {
+        let bytes = encode_sgr_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            KeyModifiers::NONE,
+            5,
+            7,
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[<32;5;7M"); // 0 (left) | 32 (motion)
+    }
+
+    #[test]
+    fn sgr_scroll_wheel_uses_64_65() {
+        let up = encode_sgr_mouse(MouseEventKind::ScrollUp, KeyModifiers::NONE, 3, 4)
+            .unwrap();
+        let down = encode_sgr_mouse(MouseEventKind::ScrollDown, KeyModifiers::NONE, 3, 4)
+            .unwrap();
+        assert_eq!(up, b"\x1b[<64;3;4M");
+        assert_eq!(down, b"\x1b[<65;3;4M");
+    }
+
+    #[test]
+    fn sgr_shift_ctrl_alt_modifiers_add_bits() {
+        let bytes = encode_sgr_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+            1,
+            1,
+        )
+        .unwrap();
+        // 0 (left) | 4 (shift) | 8 (alt) | 16 (ctrl) = 28
+        assert_eq!(bytes, b"\x1b[<28;1;1M");
+    }
+
+    #[test]
+    fn sgr_moved_without_button_is_dropped() {
+        assert!(
+            encode_sgr_mouse(MouseEventKind::Moved, KeyModifiers::NONE, 1, 1).is_none()
+        );
+    }
+
+    #[test]
+    fn point_in_rect_edges() {
+        let r = Rect { x: 5, y: 5, width: 3, height: 2 };
+        assert!(point_in_rect(5, 5, r));
+        assert!(point_in_rect(7, 6, r));
+        assert!(!point_in_rect(8, 6, r)); // width exclusive
+        assert!(!point_in_rect(7, 7, r)); // height exclusive
+        assert!(!point_in_rect(4, 5, r));
+    }
+
+    #[test]
+    fn on_mouse_ignores_clicks_on_border() {
+        // ev.column/row on the border cells should NOT produce forwarded bytes.
+        // We can't easily construct a live PtyPane in a unit test, but the
+        // border-check lives in inner_rect + point_in_rect which the above
+        // tests cover. This test just documents the intent.
+        let outer = Rect { x: 0, y: 0, width: 10, height: 5 };
+        let inner = inner_rect(outer);
+        assert!(!point_in_rect(0, 0, inner)); // top-left border cell
+        assert!(!point_in_rect(9, 0, inner)); // top-right border cell
+        assert!(!point_in_rect(0, 4, inner)); // bottom-left border cell
+        assert!(point_in_rect(1, 1, inner)); // first content cell
+    }
 }
