@@ -1,22 +1,28 @@
-# Release builds — produce distributable Windows binaries.
+# Release builds — produce distributable binaries for all three OSes.
 #
 # Trigger:
 #   * push of a tag matching `v*` (e.g. `v0.1.0`, `v0.2.0-rc.1`) creates a
-#     GitHub Release and uploads the zipped binaries as assets.
+#     GitHub Release and uploads all per-platform archives as assets.
 #   * `workflow_dispatch` builds the same artefacts without publishing a
-#     Release (uploaded as a run artefact only), useful for testing the
+#     Release (uploaded as run artefacts only), useful for testing the
 #     packaging pipeline itself.
 #
-# What lands in the zip:
-#   * `rimeterm.exe` (icon embedded — see `crates/rimeterm/build.rs`)
-#   * `rimectl.exe`
+# Payload per archive:
+#   * `rimeterm` (+ `.exe` on Windows; icon embedded via winresource)
+#   * `rimectl`
 #   * `LICENSE`
 #   * `README.md`
 #   * `ACKNOWLEDGEMENTS.md`
 #
-# Zip name: `rimeterm-<version>-x86_64-pc-windows-msvc.zip`. On tag pushes
-# `<version>` == the tag minus the leading `v`; on manual dispatch it's the
-# short commit SHA so pre-release artefacts are traceable.
+# Archive naming (matches Rust target triples so users can `curl` the right
+# one from CI env vars):
+#   * Linux   → `rimeterm-<version>-x86_64-unknown-linux-gnu.tar.gz`
+#   * macOS Intel → `rimeterm-<version>-x86_64-apple-darwin.tar.gz`
+#   * macOS ARM  → `rimeterm-<version>-aarch64-apple-darwin.tar.gz`
+#   * Windows → `rimeterm-<version>-x86_64-pc-windows-msvc.zip`
+#
+# On tag pushes `<version>` == the tag minus the leading `v`; on manual
+# dispatch it's the short commit SHA so pre-release artefacts are traceable.
 
 name: Release
 
@@ -34,10 +40,31 @@ env:
   RUST_BACKTRACE: short
 
 jobs:
-  windows-x86_64:
-    name: Package · x86_64-pc-windows-msvc
-    runs-on: windows-latest
+  build:
+    name: Package · ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            shared-key: release-linux
+          - target: x86_64-apple-darwin
+            os: macos-13         # Intel runner — macos-latest is now ARM
+            archive: tar.gz
+            shared-key: release-macos-x86
+          - target: aarch64-apple-darwin
+            os: macos-latest     # Apple Silicon
+            archive: tar.gz
+            shared-key: release-macos-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            shared-key: release-windows
 
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +72,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
 
       - name: Print toolchain
         shell: bash
@@ -56,7 +83,7 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-windows
+          shared-key: ${{ matrix.shared-key }}
 
       - name: Resolve version string
         id: version
@@ -72,56 +99,101 @@ jobs:
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building version: ${VERSION}"
 
-      # We build both binaries in one cargo invocation so incremental
-      # linking + rustc's parallel codegen share work across them.
+      # One cargo invocation so incremental linking + parallel codegen share
+      # work across both binaries.
       - name: Cargo build --release (rimeterm + rimectl)
-        run: cargo build --release --workspace --bins --target x86_64-pc-windows-msvc
+        run: cargo build --release --workspace --bins --target ${{ matrix.target }}
 
       - name: Stage payload
         id: stage
         shell: bash
         run: |
           set -euo pipefail
-          STAGE="staging/rimeterm-${{ steps.version.outputs.value }}-x86_64-pc-windows-msvc"
+          NAME="rimeterm-${{ steps.version.outputs.value }}-${{ matrix.target }}"
+          STAGE="staging/${NAME}"
           mkdir -p "${STAGE}"
-          cp target/x86_64-pc-windows-msvc/release/rimeterm.exe "${STAGE}/"
-          cp target/x86_64-pc-windows-msvc/release/rimectl.exe  "${STAGE}/"
-          cp LICENSE          "${STAGE}/"
-          cp README.md        "${STAGE}/"
-          cp ACKNOWLEDGEMENTS.md "${STAGE}/"
-          echo "dir=${STAGE}" >> "$GITHUB_OUTPUT"
+          EXT=""
+          if [[ "${{ matrix.target }}" == *windows* ]]; then EXT=".exe"; fi
+          cp "target/${{ matrix.target }}/release/rimeterm${EXT}" "${STAGE}/"
+          cp "target/${{ matrix.target }}/release/rimectl${EXT}"  "${STAGE}/"
+          cp LICENSE README.md ACKNOWLEDGEMENTS.md "${STAGE}/"
+          echo "dir=${STAGE}"   >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}"   >> "$GITHUB_OUTPUT"
           echo "Payload:"
           ls -la "${STAGE}"
 
-      - name: Create zip
+      # `zip` (Windows) and `tar` (Unix) get different tools — split via
+      # matrix.archive rather than shell-detection heuristics.
+      - name: Create zip (Windows)
+        if: matrix.archive == 'zip'
         id: zip
         shell: pwsh
-        # PowerShell's Compress-Archive is the standard-issue Windows zipper;
-        # bash on the runner ships without `zip` in the default image.
         run: |
           $stage = "${{ steps.stage.outputs.dir }}"
-          $name  = Split-Path -Leaf $stage
+          $name  = "${{ steps.stage.outputs.name }}"
           $out   = "$name.zip"
           Compress-Archive -Path "$stage/*" -DestinationPath $out -Force
           "path=$out" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           Get-Item $out | Format-List Name,Length
 
-      - name: Upload build artefact (workflow_dispatch or debug)
+      - name: Create tar.gz (Unix)
+        if: matrix.archive == 'tar.gz'
+        id: tar
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.stage.outputs.name }}"
+          OUT="${NAME}.tar.gz"
+          # -C staging/ + bare NAME keeps the archive contents rooted under
+          # the payload dir (`rimeterm-<ver>-<target>/…`), not `staging/`.
+          tar -C staging -czf "${OUT}" "${NAME}"
+          echo "path=${OUT}" >> "$GITHUB_OUTPUT"
+          ls -la "${OUT}"
+
+      - name: Resolve archive path
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            echo "path=${{ steps.zip.outputs.path }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=${{ steps.tar.outputs.path }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload build artefact
         uses: actions/upload-artifact@v4
         with:
-          name: rimeterm-${{ steps.version.outputs.value }}-x86_64-pc-windows-msvc
-          path: ${{ steps.zip.outputs.path }}
+          name: rimeterm-${{ steps.version.outputs.value }}-${{ matrix.target }}
+          path: ${{ steps.archive.outputs.path }}
           if-no-files-found: error
           retention-days: 30
 
-      # Only publish a GitHub Release when the trigger is a real version tag.
-      # `softprops/action-gh-release` creates the release (if missing) and
-      # attaches the zip as an asset. It's idempotent per file name.
+  # Aggregation job — only runs on real tag pushes. Downloads every build
+  # matrix artefact and attaches them to a single GitHub Release.
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List collected artefacts
+        run: |
+          find dist -type f | sort
+
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.zip.outputs.path }}
+          # download-artifact restores each build's zip/tarball inside its
+          # own subdir under `dist/`; softprops accepts glob.
+          files: dist/**/*
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}

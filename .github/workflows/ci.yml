@@ -1,14 +1,13 @@
 # Continuous integration — runs on every push and pull request.
 #
-# Windows-first per project convention (see docs §5 / README): we only
-# gate on Windows for now. Linux / macOS runners land in a later revision
-# once we've smoke-tested cross-platform behavior (portable-pty / crossterm
-# are cross-platform but our CSI-DA responder + resize handling have only
-# been exercised on ConPTY so far).
+# Cross-platform matrix (Linux / macOS / Windows). Same fmt + clippy + test
+# steps on all three so any OS-specific regression (path handling, PTY,
+# terminal capabilities) is caught before merge.
 #
 # Cache strategy: `Swatinem/rust-cache` restores $CARGO_HOME/registry +
-# target dir keyed on Cargo.lock, so warm CI runs finish in ~1-2 min
-# instead of ~15.
+# target dir keyed on Cargo.lock, so warm CI runs finish in ~1–2 min
+# instead of ~15. The cache is keyed **per matrix row** (`shared-key`
+# includes the OS) — a Linux target dir would be useless on Windows.
 
 name: CI
 
@@ -33,17 +32,30 @@ env:
   RUSTFLAGS: ""
 
 jobs:
-  windows:
-    name: Windows · fmt + clippy + test
-    runs-on: windows-latest
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+
+    strategy:
+      # One row failing shouldn't abort the others — we want the full
+      # cross-platform picture on each PR.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux · fmt + clippy + test
+            os: ubuntu-latest
+            shared-key: ci-linux
+          - name: macOS · fmt + clippy + test
+            os: macos-latest       # Apple Silicon runner (default since 2024)
+            shared-key: ci-macos
+          - name: Windows · fmt + clippy + test
+            os: windows-latest
+            shared-key: ci-windows
 
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned to Cargo.toml's `rust-version`. `dtolnay/rust-toolchain` is
-      # the maintained action; installing an explicit version keeps this
-      # job reproducible across GitHub-runner upgrades.
       - name: Install Rust toolchain (stable, pinned to rust-version)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -60,15 +72,16 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          # Include Cargo.lock in the key so a dependency bump busts cache.
-          shared-key: ci-windows
+          shared-key: ${{ matrix.shared-key }}
 
+      # fmt is host-agnostic; run it on every matrix row so a fmt drift
+      # committed from any platform is caught wherever CI runs first.
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
 
       - name: cargo clippy --workspace --all-targets --all-features
-        # Gate on the `correctness` group only. Everything else remains
-        # a local-only warning (see the env block above).
+        # Gate only on the `correctness` group. Everything else stays a
+        # local-only warning — see the env block above.
         run: cargo clippy --workspace --all-targets --all-features -- -D clippy::correctness
 
       - name: cargo test --workspace --all-features
