@@ -11,7 +11,7 @@ Windows-priority, cross-platform.
 | **CI** | [![CI](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml) Linux · macOS (arm) · Windows |
 | **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · archives (`.tar.gz` / `.zip`) for all targets, plus macOS `.pkg` installer. Windows `.msi` + Linux `.deb` in progress. |
 | **MSRV** | Rust 1.90 (edition 2024) |
-| **Status** | v0.1.2 released (C15 + C16 + C17 + C18-A + C18-B/C/D + spinner fix + native installers); tip at **C18-B/C/D**. Retagged v0.1.2 once to fold C18-A and the `expire_pending_spawn` sampling fix in. **Next: C21.5** (essentials `yazi`/`gitui`/`bottom` bundled in release + `~/.rimeterm/plugins/` for on-demand extensions — design in `docs/plans/2026-07-21-managed-bin-directory-design.md`). Follow-up plan in `docs/rimeterm-overall-design.md#15.2` (design doc is local-only) |
+| **Status** | v0.1.3 released (C19 Settings overlay + C20 Alt+V Viewer + C21.5 essentials/plugins split — bundled yazi/gitui/bottom in the release archive, `~/.rimeterm/{bin,plugins}` managed dirs, materialized Yazi bridge). Design docs live in `docs/rimeterm-overall-design.md` (local-only) |
 
 ---
 
