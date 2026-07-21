@@ -231,31 +231,52 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo install cargo-wix --locked --version ^0.3
 
+      - name: Debug MSI layout (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        # Prove where cargo-wix will look. LGHT0103 keeps re-firing so
+        # let's stop guessing and dump the actual on-disk state.
+        run: |
+          set -eu
+          echo "=== PWD (workspace root) ==="
+          pwd
+          echo
+          echo "=== workspace root ==="
+          ls -la
+          echo
+          echo "=== crates/rimeterm ==="
+          ls -la crates/rimeterm
+          echo
+          echo "=== crates/rimeterm/wix ==="
+          ls -la crates/rimeterm/wix
+          echo
+          echo "=== crates/rimeterm/essentials-staging (if any) ==="
+          ls -la crates/rimeterm/essentials-staging || echo "MISSING"
+          echo
+          echo "=== target/${{ matrix.target }}/release (bins) ==="
+          ls -la "target/${{ matrix.target }}/release" | head -20 || echo "MISSING"
+
       - name: Build MSI (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         id: msi
         shell: bash
-        # We ship `crates/rimeterm/wix/main.wxs` in-tree (C21.5), so no
-        # `cargo wix init` step: our authored wxs bundles the
-        # essentials/ sibling, appends the install dir to MACHINE
-        # PATH, and drops a Start-menu shortcut. `--no-build` reuses
-        # the release binary already compiled above.
-        #
-        # essentials-staging/ was populated earlier by
-        # fetch-essentials.mjs at `crates/rimeterm/essentials-staging/`
-        # so both cargo-wix `<File Source="essentials-staging/…">` and
-        # cargo-deb assets resolve relative to the crate dir cleanly.
+        # Ships crates/rimeterm/wix/main.wxs in-tree (C21.5). Uses
+        # candle preprocessor variables `$(var.EssentialsDir)` and
+        # `$(var.WorkspaceRoot)` to reach outside the wxs directory,
+        # because light.exe's own path resolution (relative to wxs or
+        # bindir, depending on version) has burned us twice — being
+        # explicit with absolute paths kills that class of bug.
         run: |
           set -euo pipefail
-          # Point cargo-wix at the actual release binary dir. The
-          # earlier `cargo build --target ${matrix.target} --release`
-          # step wrote to `target/${matrix.target}/release/`; without
-          # this override cargo-wix defaults to `target/release/` and
-          # light.exe (WiX linker) reports LGHT0103 file-not-found.
-          # `--target-bin-dir` was added in cargo-wix 0.3.
+          WSROOT="$(pwd -W 2>/dev/null || pwd)"
+          ESSENTIALS="${WSROOT}/crates/rimeterm/essentials-staging"
+          echo "WSROOT=${WSROOT}"
+          echo "ESSENTIALS=${ESSENTIALS}"
           cargo wix --no-build \
             --package rimeterm \
             --target-bin-dir "target/${{ matrix.target }}/release" \
+            -C "-dEssentialsDir=${ESSENTIALS}" \
+            -C "-dWorkspaceRoot=${WSROOT}" \
             --install-version "${{ steps.version.outputs.value }}" \
             --nocapture \
             --output "rimeterm-${{ steps.version.outputs.value }}-x86_64.msi"

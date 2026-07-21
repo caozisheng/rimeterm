@@ -81,19 +81,19 @@
                     <Component Id="LicenseDoc" Guid="3EC46085-01B1-604E-D2D9-9F8D6F0F3C42" Win64="yes">
                         <File Id="LicenseFile"
                               Name="LICENSE"
-                              Source="..\..\LICENSE"
+                              Source="$(var.WorkspaceRoot)\LICENSE"
                               KeyPath="yes" />
                     </Component>
                     <Component Id="ReadmeDoc" Guid="4FD57196-02C2-715F-E3EA-A09E7F0F4D53" Win64="yes">
                         <File Id="ReadmeFile"
                               Name="README.md"
-                              Source="..\..\README.md"
+                              Source="$(var.WorkspaceRoot)\README.md"
                               KeyPath="yes" />
                     </Component>
                     <Component Id="AckDoc" Guid="50E682A7-13D3-8260-F4FB-B1AF8F0F5E64" Win64="yes">
                         <File Id="AckFile"
                               Name="ACKNOWLEDGEMENTS.md"
-                              Source="..\..\ACKNOWLEDGEMENTS.md"
+                              Source="$(var.WorkspaceRoot)\ACKNOWLEDGEMENTS.md"
                               KeyPath="yes" />
                     </Component>
 
@@ -102,31 +102,31 @@
                         <Component Id="YaziExe" Guid="61F793B8-24E4-9371-05FC-C2C09F0F6F75" Win64="yes">
                             <File Id="YaziExeFile"
                                   Name="yazi.exe"
-                                  Source="..\essentials-staging\yazi.exe"
+                                  Source="$(var.EssentialsDir)\yazi.exe"
                                   KeyPath="yes" />
                         </Component>
                         <Component Id="YaExe" Guid="7208A4C9-35F5-A482-1607-D3D1AF0F8086" Win64="yes">
                             <File Id="YaExeFile"
                                   Name="ya.exe"
-                                  Source="..\essentials-staging\ya.exe"
+                                  Source="$(var.EssentialsDir)\ya.exe"
                                   KeyPath="yes" />
                         </Component>
                         <Component Id="GituiExe" Guid="8319B5DA-4606-B593-2718-E4E2BF0F9197" Win64="yes">
                             <File Id="GituiExeFile"
                                   Name="gitui.exe"
-                                  Source="..\essentials-staging\gitui.exe"
+                                  Source="$(var.EssentialsDir)\gitui.exe"
                                   KeyPath="yes" />
                         </Component>
                         <Component Id="BtmExe" Guid="942AC6EB-5717-C6A4-3829-F5F3CF0FA2A8" Win64="yes">
                             <File Id="BtmExeFile"
                                   Name="btm.exe"
-                                  Source="..\essentials-staging\btm.exe"
+                                  Source="$(var.EssentialsDir)\btm.exe"
                                   KeyPath="yes" />
                         </Component>
                         <Component Id="VersionsToml" Guid="A53BD7FC-6828-D7B5-493A-06040DFF00B9" Win64="yes">
                             <File Id="VersionsFile"
                                   Name="VERSIONS.toml"
-                                  Source="..\essentials-staging\VERSIONS.toml"
+                                  Source="$(var.EssentialsDir)\VERSIONS.toml"
                                   KeyPath="yes" />
                         </Component>
                     </Directory>
