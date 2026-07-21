@@ -3,6 +3,7 @@ name = "rimeterm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "Terminal built for coding agents."
 default-run = "rimeterm"
 build = "build.rs"

@@ -3,6 +3,7 @@ name = "rimeterm-pty"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "PTY host: portable-pty + alacritty_terminal parser + shell detection."
 
 [lints]

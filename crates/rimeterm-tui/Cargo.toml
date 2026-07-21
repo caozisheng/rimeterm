@@ -3,6 +3,7 @@ name = "rimeterm-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "ratatui front-end: renderer, keymap, layout, app-menu."
 
 [lints]

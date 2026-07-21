@@ -3,6 +3,7 @@ name = "rimeterm-config"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "TOML configuration + XDG/APPDATA path resolution for rimeterm."
 
 [lints]

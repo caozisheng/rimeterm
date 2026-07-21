@@ -3,6 +3,7 @@ name = "rimeterm-ipc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "Local IPC for rimeterm: line-delimited JSON over named pipe (Windows) or Unix domain socket."
 
 [lints]

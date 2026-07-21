@@ -3,6 +3,7 @@ name = "rimectl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "CLI client for the local rimeterm IPC."
 
 [[bin]]
