@@ -124,19 +124,77 @@ Excerpt from the internal design contract (§0):
 
 ### From a release
 
-Grab the archive for your platform from the [latest release]:
+Every archive at [latest release] contains:
 
-```bash
-# Linux / macOS
-tar -xzf rimeterm-<version>-<target-triple>.tar.gz
-sudo install rimeterm-*/rimeterm rimeterm-*/rimectl /usr/local/bin/
-
-# Windows (PowerShell)
-Expand-Archive rimeterm-<version>-x86_64-pc-windows-msvc.zip -DestinationPath $env:LOCALAPPDATA\rimeterm
-# then add that dir to PATH
+```
+rimeterm-<version>-<target>/
+├── rimeterm(.exe)
+├── rimectl(.exe)
+├── essentials/            ← prebuilt yazi + ya + gitui + btm + VERSIONS.toml
+├── LICENSE
+├── README.md
+└── ACKNOWLEDGEMENTS.md
 ```
 
-[latest release]: https://github.com/caozisheng/rimeterm/releases/latest
+**The `essentials/` folder MUST sit next to `rimeterm(.exe)`** — first
+launch reads it via `env::current_exe()` and copies the bundled
+binaries into `~/.rimeterm/bin/`. Copying only `rimeterm` to
+`/usr/local/bin/` skips essentials extraction and Yazi / gitui / bottom
+will show placeholder panes instead of spawning.
+
+#### Windows (PowerShell)
+
+```powershell
+$dst = "$env:LOCALAPPDATA\Programs\rimeterm"
+New-Item -ItemType Directory -Force -Path $dst | Out-Null
+Expand-Archive rimeterm-<version>-x86_64-pc-windows-msvc.zip -DestinationPath $dst -Force
+# Add to PATH so `rimeterm` / `rimectl` are launchable from any shell:
+$path = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($path -notlike "*$dst*") {
+    [Environment]::SetEnvironmentVariable("Path", "$path;$dst\rimeterm-<version>-x86_64-pc-windows-msvc", "User")
+}
+
+# One-time yazi MIME-detection prereq (Git for Windows ships file.exe):
+winget install --id Git.Git
+```
+
+Restart your terminal so `PATH` refreshes, then run `rimeterm`.
+
+#### macOS / Linux
+
+```bash
+# Extract to a directory rimeterm can call home. NOT /usr/local/bin/
+# — the whole folder must live together.
+tar -xzf rimeterm-<version>-<triple>.tar.gz -C ~/.local/opt/
+
+# Put the launcher (not the folder) on PATH via symlinks that preserve
+# the sibling essentials/ folder:
+dir=~/.local/opt/rimeterm-<version>-<triple>
+ln -sf "$dir/rimeterm" ~/.local/bin/rimeterm
+ln -sf "$dir/rimectl"  ~/.local/bin/rimectl
+```
+
+`env::current_exe()` follows the symlinks back to `$dir/rimeterm`, so
+the essentials sibling stays reachable.
+
+#### Native installers (`.msi` / `.deb` / `.pkg`)
+
+`v0.1.3` installer packages (Windows `.msi`, Linux `.deb`, macOS
+`.pkg`) drop only `rimeterm(.exe)` + `rimectl(.exe)` into system paths
+(`C:\Program Files\rimeterm\`, `/usr/bin/`, `/usr/local/bin/`
+respectively). **They do not include the bundled essentials yet** — a
+known gap being tracked separately from C21.5.
+
+On first launch, rimeterm silently falls back to `$PATH` for
+yazi/gitui/bottom, so if you already have them installed globally
+(`winget install sxyazi.yazi` / `brew install yazi gitui bottom` /
+`apt install yazi gitui bottom`) everything works. Otherwise:
+
+- Grab the matching `.tar.gz` / `.zip` too and copy just its
+  `essentials/` folder next to the installed `rimeterm` binary, or
+- Run `node bootstrap-essentials.mjs` in a checkout to fetch the pins
+  and copy them yourself, or
+- Just use the archive install path above and skip the installer.
 
 ### From source
 
