@@ -274,9 +274,19 @@ jobs:
         # `--no-build` reuses the already-compiled release binary;
         # metadata sourced from [package.metadata.deb] in
         # crates/rimeterm/Cargo.toml (assets, description, etc).
+        #
+        # cargo-deb resolves every asset path relative to the crate
+        # dir. The essentials-staging tree already sits there (Fetch
+        # step above), but the workspace-root docs (README/LICENSE/
+        # ACKNOWLEDGEMENTS) need a symlink stub — cheaper and less
+        # intrusive than copying, and unwound at the end of the step.
         run: |
           set -euo pipefail
+          ln -sf ../../README.md            crates/rimeterm/README.md
+          ln -sf ../../LICENSE              crates/rimeterm/LICENSE
+          ln -sf ../../ACKNOWLEDGEMENTS.md  crates/rimeterm/ACKNOWLEDGEMENTS.md
           cargo deb --no-build --target "${{ matrix.target }}" -p rimeterm -o "rimeterm-${{ steps.version.outputs.value }}_amd64.deb"
+          rm -f crates/rimeterm/README.md crates/rimeterm/LICENSE crates/rimeterm/ACKNOWLEDGEMENTS.md
           ls -la "rimeterm-${{ steps.version.outputs.value }}_amd64.deb"
           echo "path=rimeterm-${{ steps.version.outputs.value }}_amd64.deb" \
             >> "$GITHUB_OUTPUT"

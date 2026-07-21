@@ -81,19 +81,19 @@
                     <Component Id="LicenseDoc" Guid="3EC46085-01B1-604E-D2D9-9F8D6F0F3C42" Win64="yes">
                         <File Id="LicenseFile"
                               Name="LICENSE"
-                              Source="LICENSE"
+                              Source="..\..\LICENSE"
                               KeyPath="yes" />
                     </Component>
                     <Component Id="ReadmeDoc" Guid="4FD57196-02C2-715F-E3EA-A09E7F0F4D53" Win64="yes">
                         <File Id="ReadmeFile"
                               Name="README.md"
-                              Source="README.md"
+                              Source="..\..\README.md"
                               KeyPath="yes" />
                     </Component>
                     <Component Id="AckDoc" Guid="50E682A7-13D3-8260-F4FB-B1AF8F0F5E64" Win64="yes">
                         <File Id="AckFile"
                               Name="ACKNOWLEDGEMENTS.md"
-                              Source="ACKNOWLEDGEMENTS.md"
+                              Source="..\..\ACKNOWLEDGEMENTS.md"
                               KeyPath="yes" />
                     </Component>
 
