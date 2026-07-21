@@ -166,22 +166,44 @@ async function sha256(file) {
 }
 
 async function extract(archive, dest, ext) {
-  // `tar` handles all three formats cross-platform: Windows 10+ ships
-  // libarchive-based tar.exe in System32; macOS/Linux use bsdtar/GNU
-  // tar. All three understand `.zip` when invoked with plain `-xf`.
+  // Pick a tar binary that (a) understands the format and (b) parses
+  // Windows drive-letter paths as file paths, not `hostname:path`.
+  //
+  // - Windows runners have Git-for-Windows tar first on PATH; it's
+  //   GNU tar and (i) can't read `.zip`, (ii) treats `C:\...` as an
+  //   SSH host because of the colon. `%WINDIR%\System32\tar.exe` is
+  //   bsdtar, fixes both.
+  // - Linux runners have GNU tar; it handles tar.gz / tar.xz fine but
+  //   can't read `.zip`, so route zip through `unzip` (preinstalled).
+  // - macOS runners have bsdtar as `tar`; it handles everything.
+  if (ext === "zip") {
+    if (process.platform === "win32") {
+      await run(win32Tar(), ["-xf", archive, "-C", dest]);
+    } else {
+      await run("unzip", ["-q", "-o", archive, "-d", dest]);
+    }
+    return;
+  }
   const args =
-    ext === "zip"
-      ? ["-xf", archive, "-C", dest]
-      : ext === "tar.gz"
-        ? ["-xzf", archive, "-C", dest]
-        : ext === "tar.xz"
-          ? ["-xJf", archive, "-C", dest]
-          : null;
+    ext === "tar.gz"
+      ? ["-xzf", archive, "-C", dest]
+      : ext === "tar.xz"
+        ? ["-xJf", archive, "-C", dest]
+        : null;
   if (!args) {
     console.error(`unsupported ext: ${ext}`);
     process.exit(5);
   }
-  await run("tar", args);
+  const bin = process.platform === "win32" ? win32Tar() : "tar";
+  await run(bin, args);
+}
+
+function win32Tar() {
+  return path.join(
+    process.env.SystemRoot ?? "C:\\Windows",
+    "System32",
+    "tar.exe",
+  );
 }
 
 function run(cmd, args) {
