@@ -1,0 +1,29 @@
+#!/bin/sh
+# postinst — cargo-deb copies this into DEBIAN/postinst inside the .deb.
+# Debian policy fires it as `postinst configure` on install/upgrade.
+#
+# We host the real binaries + essentials sibling under /usr/lib/rimeterm/
+# so `env::current_exe()?.parent()?.join("essentials")` at first
+# launch resolves next to the actual executable. /usr/bin/{rimeterm,
+# rimectl} are symlinks — Rust's env::current_exe() follows them back
+# to /usr/lib/rimeterm/ so the sibling stays reachable.
+
+set -e
+
+case "$1" in
+    configure)
+        # `ln -sfn` handles both first install and re-install (upgrade)
+        # atomically: if the symlink already points somewhere else we
+        # overwrite it; if a real file sits there we replace it too.
+        ln -sfn /usr/lib/rimeterm/rimeterm /usr/bin/rimeterm
+        ln -sfn /usr/lib/rimeterm/rimectl  /usr/bin/rimectl
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

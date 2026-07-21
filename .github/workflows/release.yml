@@ -7,12 +7,11 @@
 #     Release (uploaded as run artefacts only), useful for testing the
 #     packaging pipeline itself.
 #
-# Payload per archive:
+# Payload per archive (C21.5):
 #   * `rimeterm` (+ `.exe` on Windows; icon embedded via winresource)
 #   * `rimectl`
-#   * `LICENSE`
-#   * `README.md`
-#   * `ACKNOWLEDGEMENTS.md`
+#   * `essentials/`  ← pinned yazi + ya + gitui + btm + VERSIONS.toml
+#   * `LICENSE`, `README.md`, `ACKNOWLEDGEMENTS.md`
 #
 # Archive naming (matches Rust target triples so users can `curl` the right
 # one from CI env vars):
@@ -20,10 +19,17 @@
 #   * macOS   → `rimeterm-<version>-aarch64-apple-darwin.tar.gz` (Apple Silicon only)
 #   * Windows → `rimeterm-<version>-x86_64-pc-windows-msvc.zip`
 #
-# Installers (v0.1.2+, alongside the archives):
-#   * Windows → `rimeterm-<version>-x86_64.msi`    (cargo-wix, Program Files\rimeterm)
-#   * Linux   → `rimeterm_<version>-1_amd64.deb`   (cargo-deb, /usr/bin)
-#   * macOS   → `rimeterm-<version>-aarch64.pkg`   (pkgbuild, /usr/local/bin, unsigned)
+# Installers (v0.1.3+, alongside the archives, all bundling essentials):
+#   * Windows → `rimeterm-<version>-x86_64.msi`
+#                 cargo-wix with in-tree wix/main.wxs, %ProgramFiles%\rimeterm
+#                 auto-appended to MACHINE PATH, Start-menu shortcut.
+#   * Linux   → `rimeterm-<version>_amd64.deb`
+#                 cargo-deb with debian/{postinst,prerm}, payload at
+#                 /usr/lib/rimeterm/, symlinks in /usr/bin/.
+#   * macOS   → `rimeterm-<version>-aarch64.pkg`
+#                 pkgbuild + postinstall symlink, payload at
+#                 /usr/local/lib/rimeterm/, symlinks in /usr/local/bin/.
+#                 Unsigned — Gatekeeper right-click Open on first launch.
 #
 # On tag pushes `<version>` == the tag minus the leading `v`; on manual
 # dispatch it's the short commit SHA so pre-release artefacts are traceable.
@@ -211,55 +217,45 @@ jobs:
           echo "$wixBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           Write-Host "WiX bin on PATH: $wixBin"
 
-      # NOTE: msi + deb installer chains are marked continue-on-error
-      # so a broken cargo-tool integration doesn't block the release.
-      # The archives + macOS pkg still ship; msi / deb come back in a
-      # follow-up commit once we chase down the tooling regression.
+      # Installers used to be marked continue-on-error while the
+      # metadata was in flux. C21.5 pinned real wxs / deb layouts, so
+      # they're now must-pass — a broken installer fails the release.
 
       - name: Install cargo-wix (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        continue-on-error: true
         run: cargo install cargo-wix --locked --version ^0.3
-
-      - name: Generate WiX template (Windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        continue-on-error: true
-        shell: bash
-        # `--force` regenerates unattended (no prompt). `--eula false`
-        # + `--license false` skip the license dialog pages so the
-        # installer is single-click. GUIDs come from
-        # [package.metadata.wix] in crates/rimeterm/Cargo.toml.
-        run: |
-          set -euo pipefail
-          cd crates/rimeterm
-          cargo wix init --force --license false --eula false
 
       - name: Build MSI (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
-        continue-on-error: true
         id: msi
         shell: bash
-        # `--no-build` reuses the release binary we already compiled a
-        # few steps up, saving another 90 s of link time.
+        # We ship `crates/rimeterm/wix/main.wxs` in-tree (C21.5), so no
+        # `cargo wix init` step: our authored wxs bundles the
+        # essentials/ sibling, appends the install dir to MACHINE
+        # PATH, and drops a Start-menu shortcut. `--no-build` reuses
+        # the release binary already compiled above.
+        #
+        # essentials-staging/ was populated earlier by
+        # fetch-essentials.mjs; the wxs `<File Source="essentials-staging/…">`
+        # references relative to the workspace root, and cargo-wix
+        # spawns candle.exe from that directory.
         run: |
           set -euo pipefail
-          cd crates/rimeterm
           cargo wix --no-build \
+            --package rimeterm \
             --install-version "${{ steps.version.outputs.value }}" \
             --nocapture \
-            --output "../../rimeterm-${{ steps.version.outputs.value }}-x86_64.msi"
-          ls -la "../../rimeterm-${{ steps.version.outputs.value }}-x86_64.msi"
+            --output "rimeterm-${{ steps.version.outputs.value }}-x86_64.msi"
+          ls -la "rimeterm-${{ steps.version.outputs.value }}-x86_64.msi"
           echo "path=rimeterm-${{ steps.version.outputs.value }}-x86_64.msi" \
             >> "$GITHUB_OUTPUT"
 
       - name: Install cargo-deb (Linux)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        continue-on-error: true
         run: cargo install cargo-deb --locked --version ^2
 
       - name: Build .deb (Linux)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        continue-on-error: true
         id: deb
         shell: bash
         # `--no-build` reuses the already-compiled release binary;
@@ -280,23 +276,48 @@ jobs:
         # launch. Codesign / notarize would need an Apple Developer
         # account; deferred to a later checkpoint.
         #
-        # Layout inside the pkg:
-        #   /usr/local/bin/rimeterm
-        #   /usr/local/bin/rimectl
+        # Layout inside the pkg (C21.5):
+        #   /usr/local/lib/rimeterm/rimeterm
+        #   /usr/local/lib/rimeterm/rimectl
+        #   /usr/local/lib/rimeterm/essentials/{yazi,ya,gitui,btm,VERSIONS.toml}
         #   /usr/local/share/doc/rimeterm/{README,LICENSE,ACKNOWLEDGEMENTS}
+        #
+        # postinstall symlinks /usr/local/bin/{rimeterm,rimectl} →
+        # /usr/local/lib/rimeterm/. `env::current_exe()` on macOS
+        # follows symlinks so `parent()?.join("essentials")` still
+        # finds the bundled tools next to the real binary.
         run: |
           set -euo pipefail
           ROOT="pkgroot"
-          mkdir -p "$ROOT/usr/local/bin"
+          SCRIPTS="pkgscripts"
+          mkdir -p "$ROOT/usr/local/lib/rimeterm/essentials"
           mkdir -p "$ROOT/usr/local/share/doc/rimeterm"
-          cp target/${{ matrix.target }}/release/rimeterm "$ROOT/usr/local/bin/"
-          cp target/${{ matrix.target }}/release/rimectl  "$ROOT/usr/local/bin/"
+          mkdir -p "$SCRIPTS"
+
+          cp target/${{ matrix.target }}/release/rimeterm "$ROOT/usr/local/lib/rimeterm/"
+          cp target/${{ matrix.target }}/release/rimectl  "$ROOT/usr/local/lib/rimeterm/"
+          cp -R essentials-staging/. "$ROOT/usr/local/lib/rimeterm/essentials/"
           cp README.md            "$ROOT/usr/local/share/doc/rimeterm/README"
           cp LICENSE              "$ROOT/usr/local/share/doc/rimeterm/LICENSE"
           cp ACKNOWLEDGEMENTS.md  "$ROOT/usr/local/share/doc/rimeterm/ACKNOWLEDGEMENTS"
+
+          cat > "$SCRIPTS/postinstall" <<'EOF'
+          #!/bin/sh
+          set -e
+          mkdir -p /usr/local/bin
+          # `ln -sf` on Darwin: -F forces removal of an existing symlink
+          # or file before creating the new one. -h prevents following
+          # existing symlinks (idempotent across upgrades).
+          ln -sfh /usr/local/lib/rimeterm/rimeterm /usr/local/bin/rimeterm
+          ln -sfh /usr/local/lib/rimeterm/rimectl  /usr/local/bin/rimectl
+          exit 0
+          EOF
+          chmod +x "$SCRIPTS/postinstall"
+
           OUT="rimeterm-${{ steps.version.outputs.value }}-aarch64.pkg"
           pkgbuild \
             --root "$ROOT" \
+            --scripts "$SCRIPTS" \
             --identifier "com.rimeterm.app" \
             --version "${{ steps.version.outputs.value }}" \
             --install-location "/" \

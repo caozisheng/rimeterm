@@ -1,0 +1,28 @@
+#!/bin/sh
+# prerm — cargo-deb copies this into DEBIAN/prerm inside the .deb.
+# Fired on `apt remove rimeterm` and just before an upgrade replaces
+# the package payload. Clean up the symlinks we own in /usr/bin/ so
+# `apt purge` leaves nothing behind.
+
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        # `rm -f` is safe when the symlink is already gone.
+        # Only touch a symlink; if someone replaced the symlink with a
+        # different file, leave it alone.
+        for f in /usr/bin/rimeterm /usr/bin/rimectl; do
+            if [ -L "$f" ]; then
+                rm -f "$f"
+            fi
+        done
+        ;;
+    failed-upgrade)
+        ;;
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="windows-1252"?>
+<!--
+  rimeterm .msi installer (WiX Toolset v3.14).
+
+  Layout under `%ProgramFiles%\rimeterm\`:
+    rimeterm.exe
+    rimectl.exe
+    essentials\             <- prebuilt yazi/gitui/bottom (see release CI)
+        yazi.exe
+        ya.exe
+        gitui.exe
+        btm.exe
+        VERSIONS.toml
+    LICENSE, ACKNOWLEDGEMENTS.md, README.md
+
+  On install:
+    - copies the whole tree under `%ProgramFiles%\rimeterm\`
+    - appends `%ProgramFiles%\rimeterm` to the MACHINE `PATH` so both
+      binaries are launchable from any shell
+    - creates a Start-menu shortcut to rimeterm.exe
+
+  On uninstall:
+    - removes the tree AND the PATH entry.
+
+  The upgrade-guid / path-guid stay stable across versions so newer
+  MSIs cleanly replace older ones (major upgrade).
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+
+    <Product
+        Id="*"
+        Name="rimeterm"
+        UpgradeCode="8FB03D2E-7F51-4C9E-9A11-D0A8B3C4E5F6"
+        Manufacturer="rimeterm authors"
+        Language="1033"
+        Codepage="1252"
+        Version="$(var.Version)">
+
+        <Package Id="*"
+                 Keywords="Installer"
+                 Description="rimeterm TUI terminal"
+                 Manufacturer="rimeterm authors"
+                 InstallerVersion="450"
+                 Languages="1033"
+                 Compressed="yes"
+                 InstallScope="perMachine"
+                 SummaryCodepage="1252" />
+
+        <MajorUpgrade
+            Schedule="afterInstallInitialize"
+            DowngradeErrorMessage="A newer version of rimeterm is already installed. Setup will exit." />
+
+        <Media Id="1" Cabinet="rimeterm.cab" EmbedCab="yes" />
+
+        <Property Id="DiskPrompt" Value="rimeterm Installation" />
+        <Property Id="ARPCONTACT" Value="rimeterm authors" />
+        <Property Id="ARPHELPLINK" Value="https://github.com/caozisheng/rimeterm" />
+        <Property Id="ARPURLINFOABOUT" Value="https://github.com/caozisheng/rimeterm" />
+        <Property Id="ARPNOMODIFY" Value="1" />
+        <Property Id="ARPNOREPAIR" Value="1" />
+
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="ProgramFiles64Folder">
+                <Directory Id="APPLICATIONFOLDER" Name="rimeterm">
+                    <!-- Binaries -->
+                    <Component Id="RimetermExe" Guid="1CA24E63-DE9A-4E2C-B0B7-7F6B4E9E1A20" Win64="yes">
+                        <File Id="RimetermExeFile"
+                              Name="rimeterm.exe"
+                              Source="$(var.CargoTargetBinDir)\rimeterm.exe"
+                              KeyPath="yes" />
+                    </Component>
+                    <Component Id="RimectlExe" Guid="2DB35F74-EFA0-5F3D-C1C8-8F7C5F0F2B31" Win64="yes">
+                        <File Id="RimectlExeFile"
+                              Name="rimectl.exe"
+                              Source="$(var.CargoTargetBinDir)\rimectl.exe"
+                              KeyPath="yes" />
+                    </Component>
+
+                    <!-- Docs -->
+                    <Component Id="LicenseDoc" Guid="3EC46085-01B1-604E-D2D9-9F8D6F0F3C42" Win64="yes">
+                        <File Id="LicenseFile"
+                              Name="LICENSE"
+                              Source="LICENSE"
+                              KeyPath="yes" />
+                    </Component>
+                    <Component Id="ReadmeDoc" Guid="4FD57196-02C2-715F-E3EA-A09E7F0F4D53" Win64="yes">
+                        <File Id="ReadmeFile"
+                              Name="README.md"
+                              Source="README.md"
+                              KeyPath="yes" />
+                    </Component>
+                    <Component Id="AckDoc" Guid="50E682A7-13D3-8260-F4FB-B1AF8F0F5E64" Win64="yes">
+                        <File Id="AckFile"
+                              Name="ACKNOWLEDGEMENTS.md"
+                              Source="ACKNOWLEDGEMENTS.md"
+                              KeyPath="yes" />
+                    </Component>
+
+                    <!-- Bundled essentials sibling -->
+                    <Directory Id="EssentialsDir" Name="essentials">
+                        <Component Id="YaziExe" Guid="61F793B8-24E4-9371-05FC-C2C09F0F6F75" Win64="yes">
+                            <File Id="YaziExeFile"
+                                  Name="yazi.exe"
+                                  Source="essentials-staging\yazi.exe"
+                                  KeyPath="yes" />
+                        </Component>
+                        <Component Id="YaExe" Guid="7208A4C9-35F5-A482-1607-D3D1AF0F8086" Win64="yes">
+                            <File Id="YaExeFile"
+                                  Name="ya.exe"
+                                  Source="essentials-staging\ya.exe"
+                                  KeyPath="yes" />
+                        </Component>
+                        <Component Id="GituiExe" Guid="8319B5DA-4606-B593-2718-E4E2BF0F9197" Win64="yes">
+                            <File Id="GituiExeFile"
+                                  Name="gitui.exe"
+                                  Source="essentials-staging\gitui.exe"
+                                  KeyPath="yes" />
+                        </Component>
+                        <Component Id="BtmExe" Guid="942AC6EB-5717-C6A4-3829-F5F3CF0FA2A8" Win64="yes">
+                            <File Id="BtmExeFile"
+                                  Name="btm.exe"
+                                  Source="essentials-staging\btm.exe"
+                                  KeyPath="yes" />
+                        </Component>
+                        <Component Id="VersionsToml" Guid="A53BD7FC-6828-D7B5-493A-06040DFF00B9" Win64="yes">
+                            <File Id="VersionsFile"
+                                  Name="VERSIONS.toml"
+                                  Source="essentials-staging\VERSIONS.toml"
+                                  KeyPath="yes" />
+                        </Component>
+                    </Directory>
+
+                    <!-- Add APPLICATIONFOLDER to MACHINE PATH. The
+                         `System=yes` writes to HKLM\...\Environment,
+                         which is what makes the entry visible to all
+                         users + all new shells. -->
+                    <Component Id="PathEntry" Guid="B64CE80D-793A-E8C6-5A4B-17150DFFB1CA" Win64="yes">
+                        <CreateFolder />
+                        <Environment Id="RimetermPath"
+                                     Name="PATH"
+                                     Value="[APPLICATIONFOLDER]"
+                                     Permanent="no"
+                                     Part="last"
+                                     Action="set"
+                                     System="yes" />
+                    </Component>
+                </Directory>
+            </Directory>
+
+            <Directory Id="ProgramMenuFolder">
+                <Directory Id="ApplicationProgramsFolder" Name="rimeterm">
+                    <Component Id="StartMenuShortcut"
+                               Guid="C75DF91E-8A4B-F9D7-6B5C-28260DFFC2DB"
+                               Win64="yes">
+                        <Shortcut Id="RimetermStartMenuShortcut"
+                                  Name="rimeterm"
+                                  Description="TUI terminal for coding agents"
+                                  Target="[APPLICATIONFOLDER]rimeterm.exe"
+                                  WorkingDirectory="APPLICATIONFOLDER" />
+                        <RemoveFolder Id="RemoveApplicationProgramsFolder"
+                                      Directory="ApplicationProgramsFolder"
+                                      On="uninstall" />
+                        <RegistryValue Root="HKCU"
+                                       Key="Software\rimeterm"
+                                       Name="StartMenuShortcut"
+                                       Type="integer"
+                                       Value="1"
+                                       KeyPath="yes" />
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature Id="Complete" Level="1" Title="rimeterm" Description="rimeterm + essentials">
+            <ComponentRef Id="RimetermExe" />
+            <ComponentRef Id="RimectlExe" />
+            <ComponentRef Id="YaziExe" />
+            <ComponentRef Id="YaExe" />
+            <ComponentRef Id="GituiExe" />
+            <ComponentRef Id="BtmExe" />
+            <ComponentRef Id="VersionsToml" />
+            <ComponentRef Id="LicenseDoc" />
+            <ComponentRef Id="ReadmeDoc" />
+            <ComponentRef Id="AckDoc" />
+            <ComponentRef Id="PathEntry" />
+            <ComponentRef Id="StartMenuShortcut" />
+        </Feature>
+
+    </Product>
+</Wix>

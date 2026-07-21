@@ -30,19 +30,24 @@ tracing-subscriber = { workspace = true }
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
-# Linux .deb metadata used by `cargo-deb`. Only the fields not already
-# derivable from [package] need to be listed. `assets` explicitly lists
-# both binaries so cargo-deb doesn't miss `rimectl` (it defaults to
-# `[[bin]].name` == package name → only picks up `rimeterm`).
-#
-# Depends on nothing — rimeterm is statically linked apart from libc.
+# Linux .deb metadata used by `cargo-deb`. C21.5: binaries + essentials
+# live under /usr/lib/rimeterm/ so `env::current_exe()?.parent()?
+# .join("essentials")` at first launch finds the bundled yazi/gitui/btm.
+# /usr/bin/{rimeterm,rimectl} are symlinks created by the postinst
+# maintainer script (which cargo-deb picks up from `maintainer-scripts`).
 [package.metadata.deb]
 maintainer = "cjzzz <zisheng.cao@protonmail.com>"
 section = "utils"
 priority = "optional"
+maintainer-scripts = "debian/"
 assets = [
-    ["target/release/rimeterm", "usr/bin/", "755"],
-    ["target/release/rimectl",  "usr/bin/", "755"],
+    ["target/release/rimeterm", "usr/lib/rimeterm/rimeterm", "755"],
+    ["target/release/rimectl",  "usr/lib/rimeterm/rimectl",  "755"],
+    ["essentials-staging/yazi",  "usr/lib/rimeterm/essentials/yazi",  "755"],
+    ["essentials-staging/ya",    "usr/lib/rimeterm/essentials/ya",    "755"],
+    ["essentials-staging/gitui", "usr/lib/rimeterm/essentials/gitui", "755"],
+    ["essentials-staging/btm",   "usr/lib/rimeterm/essentials/btm",   "755"],
+    ["essentials-staging/VERSIONS.toml", "usr/lib/rimeterm/essentials/VERSIONS.toml", "644"],
     ["README.md",               "usr/share/doc/rimeterm/README",         "644"],
     ["LICENSE",                 "usr/share/doc/rimeterm/copyright",      "644"],
     ["ACKNOWLEDGEMENTS.md",     "usr/share/doc/rimeterm/ACKNOWLEDGEMENTS","644"],
@@ -50,7 +55,9 @@ assets = [
 extended-description = """\
 A TUI terminal built for coding agents (Claude Code, Codex, Cursor,
 Gemini CLI, and others). Ratatui front-end, portable-pty backend,
-alacritty_terminal VT parser.
+alacritty_terminal VT parser. Bundles yazi/gitui/bottom in
+/usr/lib/rimeterm/essentials/ so first launch works with no extra
+installs.
 """
 
 # Windows .msi metadata used by `cargo-wix`. The default main.wxs

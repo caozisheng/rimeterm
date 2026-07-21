@@ -9,7 +9,7 @@ Windows-priority, cross-platform.
 |---|---|
 | **License** | Apache-2.0 · see [`LICENSE`](LICENSE) |
 | **CI** | [![CI](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml) Linux · macOS (arm) · Windows |
-| **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · archives (`.tar.gz` / `.zip`) for all targets, plus macOS `.pkg` installer. Windows `.msi` + Linux `.deb` in progress. |
+| **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · archives (`.tar.gz` / `.zip`) for every target plus native installers (`.msi` / `.deb` / `.pkg`), all bundling the essentials sibling. |
 | **MSRV** | Rust 1.90 (edition 2024) |
 | **Status** | v0.1.3 released (C19 Settings overlay + C20 Alt+V Viewer + C21.5 essentials/plugins split — bundled yazi/gitui/bottom in the release archive, `~/.rimeterm/{bin,plugins}` managed dirs, materialized Yazi bridge). Design docs live in `docs/rimeterm-overall-design.md` (local-only) |
 
@@ -179,22 +179,30 @@ the essentials sibling stays reachable.
 
 #### Native installers (`.msi` / `.deb` / `.pkg`)
 
-`v0.1.3` installer packages (Windows `.msi`, Linux `.deb`, macOS
-`.pkg`) drop only `rimeterm(.exe)` + `rimectl(.exe)` into system paths
-(`C:\Program Files\rimeterm\`, `/usr/bin/`, `/usr/local/bin/`
-respectively). **They do not include the bundled essentials yet** — a
-known gap being tracked separately from C21.5.
+All three installers bundle the essentials sibling (`yazi` / `gitui`
+/ `bottom`) alongside the two rimeterm binaries, so a fresh install
+has the same feature set as extracting the archive.
 
-On first launch, rimeterm silently falls back to `$PATH` for
-yazi/gitui/bottom, so if you already have them installed globally
-(`winget install sxyazi.yazi` / `brew install yazi gitui bottom` /
-`apt install yazi gitui bottom`) everything works. Otherwise:
+**Windows (`.msi`)** — `winget install` friendly (once submitted).
+Drops everything under `C:\Program Files\rimeterm\` and adds that dir
+to MACHINE `PATH`. A Start-menu shortcut launches `rimeterm.exe`.
 
-- Grab the matching `.tar.gz` / `.zip` too and copy just its
-  `essentials/` folder next to the installed `rimeterm` binary, or
-- Run `node bootstrap-essentials.mjs` in a checkout to fetch the pins
-  and copy them yourself, or
-- Just use the archive install path above and skip the installer.
+```powershell
+msiexec /i rimeterm-<version>-x86_64.msi /qb
+# then, in a new shell:
+rimeterm
+```
+
+**Linux (`.deb`)** — `apt install ./rimeterm-<version>_amd64.deb`.
+Payload lands at `/usr/lib/rimeterm/`; postinst symlinks
+`/usr/bin/rimeterm` and `/usr/bin/rimectl` back to those files so
+they're on the system `PATH`. `env::current_exe()` follows the
+symlinks and finds the essentials sibling automatically.
+
+**macOS (`.pkg`)** — right-click Open on first launch (unsigned).
+Payload at `/usr/local/lib/rimeterm/`; postinstall symlinks
+`/usr/local/bin/rimeterm` and `/usr/local/bin/rimectl`. Same
+symlink-then-current_exe trick.
 
 ### From source
 
