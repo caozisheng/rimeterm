@@ -1,0 +1,11 @@
+# Seeded by rimeterm on first launch. Safe to edit; rimeterm never
+# overwrites this file. Delete `~/.rimeterm/yazi/package.toml` to re-seed
+# it on next start.
+#
+# `ya pkg add <owner>/<repo>:<sub>` installs plugins listed here into
+# `~/.rimeterm/yazi/plugins/`. Rimeterm's bundled `rimeterm-bridge.yazi`
+# is not managed by `ya` — it lives in the same plugins dir but is
+# rewritten by rimeterm on version bumps.
+
+[plugin]
+deps = []

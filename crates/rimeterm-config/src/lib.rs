@@ -10,9 +10,14 @@
 //! come online.
 
 pub mod agents_state;
+pub mod assets;
+pub mod env;
 pub mod install_hint;
 pub mod layout_state;
 pub mod paths;
+
+#[doc(hidden)]
+pub mod test_util;
 pub mod tools;
 
 use std::path::Path;

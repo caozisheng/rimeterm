@@ -29,13 +29,21 @@ will be added as new subsystems come online.
 - [anyhow](https://github.com/dtolnay/anyhow) — MIT / Apache-2.0
 - [thiserror](https://github.com/dtolnay/thiserror) — MIT / Apache-2.0
 
-## Terminal ecosystem inspiration
+## Bundled essentials (C21.5)
 
-- [yazi](https://github.com/sxyazi/yazi), [gitui](https://github.com/gitui-org/gitui),
-  [bottom](https://github.com/ClementTsang/bottom),
-  [trippy](https://github.com/fujiapple852/trippy) — the "default four"
-  TUI tools rimeterm hosts by default (probed at startup; falls back to
-  an install-hint placeholder pane).
+As of C21.5, the rimeterm release archive **bundles prebuilt binaries**
+of the three essential TUI tools rimeterm's default four-quadrant
+layout requires. First launch extracts them into
+`~/.rimeterm/bin/`. Pinned versions live at
+[`essentials/VERSIONS.toml`](essentials/VERSIONS.toml); bump per rimeterm
+release. All three are MIT-licensed and redistribution-friendly.
+
+- [yazi](https://github.com/sxyazi/yazi) — MIT. File manager.
+- [gitui](https://github.com/gitui-org/gitui) — MIT. Git TUI.
+- [bottom](https://github.com/ClementTsang/bottom) — MIT. System monitor.
+- [trippy](https://github.com/fujiapple852/trippy) — MIT / Apache-2.0.
+  Not bundled; installed on demand into `~/.rimeterm/plugins/trippy/`
+  via `cargo install --root` when the user runs `tools.install trippy`.
 
 ## Terminal / TUI design lineage
 

@@ -19,6 +19,58 @@ fn main() -> Result<()> {
     let workspace_root = std::env::current_dir()?;
     let config = load_config(&workspace_root)?;
 
+    // C21.5: materialize bundled configs (yazi bridge + all seeds) into
+    // `~/.rimeterm/{yazi,gitui,bottom}/`. Idempotent — the fingerprint
+    // check keeps it a no-op after the first launch of any given
+    // version, so there's no need to gate on a "first run" flag.
+    let report = rimeterm_config::assets::materialize_configs(env!("CARGO_PKG_VERSION"));
+    if !report.errors.is_empty() {
+        for err in &report.errors {
+            tracing::warn!(error = %err, "config asset materialize hit a snag");
+        }
+    }
+    if !report.managed_rewritten.is_empty() || !report.seeds_written.is_empty() {
+        tracing::info!(
+            managed = report.managed_rewritten.len(),
+            seeds = report.seeds_written.len(),
+            "materialized bundled configs"
+        );
+    }
+
+    // C21.5: extract prebuilt essentials binaries from the release
+    // archive's sibling `essentials/` folder into `~/.rimeterm/bin/`.
+    // Silent-skip when the folder isn't present (dev builds via
+    // `cargo run`, custom repackagings).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let src = parent.join("essentials");
+            let ext = rimeterm_config::assets::extract_essentials(&src, env!("CARGO_PKG_VERSION"));
+            for err in &ext.errors {
+                tracing::warn!(error = %err, "essentials extract hit a snag");
+            }
+            if !ext.extracted.is_empty() {
+                tracing::info!(count = ext.extracted.len(), "extracted essentials binaries");
+            } else if ext.source_absent {
+                tracing::info!(
+                    "no sibling essentials/ folder next to rimeterm binary — \
+                     dev build via `cargo run`? run `node bootstrap-essentials.mjs` \
+                     to fetch prebuilt yazi/gitui/bottom into target/*/essentials/"
+                );
+            }
+
+            // C21.5 §5: self-copy `rimectl` next to the essentials so
+            // Yazi's bridge (`Command("rimectl")`) reliably finds it via
+            // the augmented PATH.
+            let rimectl_report = rimeterm_config::assets::copy_rimectl_alongside(parent);
+            for err in &rimectl_report.errors {
+                tracing::warn!(error = %err, "rimectl self-copy hit a snag");
+            }
+            if !rimectl_report.extracted.is_empty() {
+                tracing::info!("copied rimectl into ~/.rimeterm/bin/");
+            }
+        }
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

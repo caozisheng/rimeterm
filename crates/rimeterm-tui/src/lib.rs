@@ -16,5 +16,6 @@ pub mod shell_factory;
 pub mod status_bar;
 pub mod tab_strip;
 pub mod terminal;
+pub mod viewer;
 
 pub use app::App;

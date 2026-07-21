@@ -57,6 +57,10 @@ use crate::shell_factory::spawn_shell;
 use crate::status_bar::render as render_status_bar;
 use crate::tab_strip::render as render_tab_strip;
 use crate::terminal::TerminalGuard;
+use crate::viewer::{
+    self, SelectionSnapshot, SourceMeta, ViewerCompletion, ViewerKind, ViewerOverlayState,
+    overlay_rect,
+};
 
 /// Pending command actions the app main loop resolves outside command bodies.
 #[derive(Debug, Default)]
@@ -74,6 +78,10 @@ struct ActionFlags {
     settings: AtomicBool,
     resize_toggle: AtomicBool,
     acknowledgement: AtomicBool,
+    viewer_open: AtomicBool,
+    viewer_close: AtomicBool,
+    viewer_open_with_system: AtomicBool,
+    viewer_reveal: AtomicBool,
 }
 
 /// A mutation the IPC handler queues for the main loop. Each variant carries
@@ -412,6 +420,19 @@ pub struct App {
     /// mid-runtime factory calls (new_shell_tab_in / new_agent_tab_in)
     /// can hand a fresh clone to newly-spawned children.
     osc_tx: mpsc::UnboundedSender<(PaneId, String)>,
+    /// C20: modal viewer overlay state. Never enters the layout tree.
+    viewer: ViewerOverlayState,
+    /// Last `file.selected` from the active files:yazi tab. Consumed by
+    /// `Alt+V` to freeze a snapshot.
+    last_yazi_selection: Option<SelectionSnapshot>,
+    /// Worker channel: async Markdown/image loaders push completions
+    /// here; main loop drains them into [`ViewerOverlayState`].
+    viewer_completion_tx: mpsc::UnboundedSender<ViewerCompletion>,
+    viewer_completion_rx: mpsc::UnboundedReceiver<ViewerCompletion>,
+    /// `ratatui-image` picker built once at startup (halfblocks fallback
+    /// when the terminal has no graphics protocol). Cloned per protocol
+    /// build inside `viewer::render_overlay`.
+    viewer_picker: Option<ratatui_image::picker::Picker>,
     flags: Arc<ActionFlags>,
     should_quit: bool,
     /// Transient status-bar hint (e.g. "Ctrl+T rejected: files is fixed").
@@ -726,6 +747,13 @@ impl App {
             Arc::clone(&pending_mutations),
             redraw_tx.clone(),
         )?;
+        let (viewer_completion_tx, viewer_completion_rx) =
+            mpsc::unbounded_channel::<ViewerCompletion>();
+        // Best-effort graphics protocol detection. Query at startup so
+        // the terminal capabilities cache is warm before we ever try to
+        // build an image protocol. Halfblocks fallback keeps the viewer
+        // usable everywhere.
+        let viewer_picker = ratatui_image::picker::Picker::from_query_stdio().ok();
 
         Ok(Self {
             workspace_root,
@@ -745,6 +773,11 @@ impl App {
             redraw_rx,
             osc_rx,
             osc_tx,
+            viewer: ViewerOverlayState::default(),
+            last_yazi_selection: None,
+            viewer_completion_tx,
+            viewer_completion_rx,
+            viewer_picker,
             flags,
             should_quit: false,
             hint: None,
@@ -809,6 +842,12 @@ impl App {
                     self.dispatch_osc_event(event);
                     self.drain_osc_events();
                 }
+                Some(completion) = self.viewer_completion_rx.recv() => {
+                    self.apply_viewer_completion(completion);
+                    while let Ok(next) = self.viewer_completion_rx.try_recv() {
+                        self.apply_viewer_completion(next);
+                    }
+                }
                 _ = tokio::time::sleep(Duration::from_millis(16)) => {}
             }
 
@@ -825,7 +864,137 @@ impl App {
         Ok(())
     }
 
+    /// Route the viewer overlay's global toggle (`Alt+V`) and its
+    /// modal input. Returns `true` when the key was fully handled and
+    /// the caller should stop dispatching.
+    fn on_viewer_key(&mut self, key: KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let alt_v = matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+            && key.modifiers.contains(KeyModifiers::ALT);
+
+        if self.viewer.is_open() {
+            if alt_v || matches!(key.code, KeyCode::Esc) {
+                self.close_viewer_overlay();
+                return true;
+            }
+            self.on_viewer_modal_key(key);
+            return true;
+        }
+
+        if alt_v {
+            self.open_viewer_overlay();
+            return true;
+        }
+        false
+    }
+
+    fn on_viewer_modal_key(&mut self, key: KeyEvent) {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.viewer.scroll_markdown(1, u16::MAX),
+            KeyCode::Up | KeyCode::Char('k') => self.viewer.scroll_markdown(-1, u16::MAX),
+            KeyCode::PageDown => self.viewer.scroll_markdown(10, u16::MAX),
+            KeyCode::PageUp => self.viewer.scroll_markdown(-10, u16::MAX),
+            KeyCode::Home | KeyCode::Char('g') => self.viewer.scroll_markdown(i32::MIN, u16::MAX),
+            KeyCode::End | KeyCode::Char('G') => self.viewer.scroll_markdown(i32::MAX, u16::MAX),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.viewer.nudge_image_scale(1),
+            KeyCode::Char('-') => self.viewer.nudge_image_scale(-1),
+            KeyCode::Char('0') => self.viewer.reset_image_scale(),
+            _ => {}
+        }
+        let _ = self.redraw_tx.send(());
+    }
+
+    fn open_viewer_overlay(&mut self) {
+        let Some(selection) = self.last_yazi_selection.clone() else {
+            self.set_hint("viewer: no active-yazi selection yet — hover a file first".into());
+            return;
+        };
+        // Refuse when the overlay wouldn't fit; users would see a
+        // broken modal otherwise.
+        if overlay_rect(self.last_pane_area).is_none() && self.last_pane_area.width != 0 {
+            self.set_hint("viewer: terminal too small (need ≥ 48×16)".into());
+            return;
+        }
+        let meta = match std::fs::metadata(&selection.path) {
+            Ok(m) => SourceMeta {
+                is_regular_file: m.is_file(),
+                len: m.len(),
+            },
+            Err(err) => {
+                self.set_hint(format!("viewer: {err}"));
+                return;
+            }
+        };
+        let source = match viewer::classify_source(&selection.path, meta) {
+            Ok(Some(source)) => source,
+            Ok(None) => {
+                self.set_hint("viewer: use Yazi Quick Look or Ctrl+O — unsupported type".into());
+                return;
+            }
+            Err(err) => {
+                self.set_hint(format!("viewer: {}", classify_hint(err)));
+                return;
+            }
+        };
+        let return_focus = self.focus.focused_pane();
+        let snap_gen = self.viewer.open_snapshot(source.clone(), return_focus);
+        let tx = self.viewer_completion_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let payload = match source.kind {
+                ViewerKind::Markdown => viewer::load_markdown_blocking(&source.path),
+                ViewerKind::Image => viewer::load_image_blocking(&source.path),
+            };
+            let _ = tx.send(ViewerCompletion {
+                generation: snap_gen,
+                path: source.path,
+                payload,
+            });
+        });
+        let _ = self.redraw_tx.send(());
+    }
+
+    fn close_viewer_overlay(&mut self) {
+        let return_focus = self.viewer.close();
+        if let Some(pane) = return_focus {
+            let group = self
+                .tree
+                .tab_groups()
+                .iter()
+                .find(|g| g.members().contains(&pane))
+                .map(|g| g.id());
+            self.focus.set_focus(pane, group);
+        }
+        let _ = self.redraw_tx.send(());
+    }
+
+    fn apply_viewer_completion(&mut self, completion: ViewerCompletion) {
+        if self.viewer.apply_completion(completion) {
+            let _ = self.redraw_tx.send(());
+        }
+    }
+
+    /// Handle the platform side of `viewer.open-with-system` / `viewer.reveal`.
+    /// Fire-and-forget: dispatch never closes or mutates the overlay.
+    fn viewer_dispatch_external(&mut self, action: ExternalAction) {
+        let Some(source) = self.viewer.snapshot() else {
+            self.set_hint("viewer: nothing open".into());
+            return;
+        };
+        let path = source.path.clone();
+        match spawn_external(action, &path) {
+            Ok(()) => {
+                self.set_hint(format!("viewer: {} → {}", action.hint(), path.display(),));
+            }
+            Err(err) => self.set_hint(format!("viewer: {} failed: {err}", action.hint())),
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent) {
+        if self.on_viewer_key(key) {
+            return;
+        }
         if self.menu_state.open {
             match menu_key(&mut self.menu_state, &self.menu, key) {
                 MenuKeyOutcome::Run(cmd) => {
@@ -1775,10 +1944,22 @@ impl App {
             crate::picker::render(rect, buf, &self.picker_state);
         }
 
+        // Viewer overlay renders on top of everything (§19.11). Only
+        // draws when open; workspace geometry underneath is untouched.
+        if self.viewer.is_open() {
+            if let Some(rect) = overlay_rect(area) {
+                viewer::render_overlay(&self.viewer, rect, buf, self.viewer_picker.as_ref());
+            }
+        }
+
         // Suppress the caret when any overlay owns the input focus.
         // Menu/palette/picker draw their own selection markers; a
         // stray shell caret bleeding through would be confusing.
-        let cursor = if self.menu_state.open || self.palette_state.open || self.picker_state.open {
+        let cursor = if self.menu_state.open
+            || self.palette_state.open
+            || self.picker_state.open
+            || self.viewer.is_open()
+        {
             None
         } else {
             focused_cursor
@@ -1988,6 +2169,24 @@ impl App {
         if f.acknowledgement.swap(false, Ordering::Relaxed) {
             info!("app.acknowledgement fired (v0.1 stub: log only)");
             self.set_hint("Acknowledgement will open ACKNOWLEDGEMENTS.md (M3+)".into());
+        }
+        if f.viewer_open.swap(false, Ordering::Relaxed) {
+            if self.viewer.is_open() {
+                self.set_hint("viewer already open".into());
+            } else {
+                self.open_viewer_overlay();
+            }
+        }
+        if f.viewer_close.swap(false, Ordering::Relaxed) {
+            if self.viewer.is_open() {
+                self.close_viewer_overlay();
+            }
+        }
+        if f.viewer_open_with_system.swap(false, Ordering::Relaxed) {
+            self.viewer_dispatch_external(ExternalAction::OpenWithSystem);
+        }
+        if f.viewer_reveal.swap(false, Ordering::Relaxed) {
+            self.viewer_dispatch_external(ExternalAction::Reveal);
         }
     }
 
@@ -2413,6 +2612,14 @@ impl App {
     fn dispatch_osc_event(&mut self, (origin, payload): (PaneId, String)) {
         match decode_osc_rimeterm(&payload) {
             Ok(decoded) => {
+                if let OscDecoded::FileSelected { path } = &decoded {
+                    if self.is_active_files_yazi(origin) {
+                        self.last_yazi_selection = Some(SelectionSnapshot {
+                            origin,
+                            path: path.clone(),
+                        });
+                    }
+                }
                 if let Some(event) = Self::kernel_event_from_osc(origin, decoded) {
                     self.event_bus.send(event);
                 } else {
@@ -2423,6 +2630,21 @@ impl App {
                 warn!(origin = origin.0, error = %error, "dropping malformed OSC rimeterm payload");
             }
         }
+    }
+
+    /// True when `origin` is the pane currently active in the
+    /// `files` tab-group and that pane is the yazi tab. C20 only
+    /// snapshots the yazi selection.
+    fn is_active_files_yazi(&self, origin: PaneId) -> bool {
+        let Some(group) = self.tree.find_tab_group(BUILTIN_FILES) else {
+            return false;
+        };
+        if group.active_pane() != Some(origin) {
+            return false;
+        }
+        self.panes
+            .get(origin)
+            .is_some_and(|pane| pane.title().to_ascii_lowercase().contains("yazi"))
     }
 
     /// Drain decoded-at-the-edge OSC 1337 payloads and broadcast them
@@ -2624,6 +2846,82 @@ impl App {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+enum ExternalAction {
+    OpenWithSystem,
+    Reveal,
+}
+
+impl ExternalAction {
+    fn hint(self) -> &'static str {
+        match self {
+            ExternalAction::OpenWithSystem => "open with system",
+            ExternalAction::Reveal => "reveal",
+        }
+    }
+}
+
+/// Fire-and-forget platform handoff. Uses `spawn` (not `output`) so the
+/// UI thread never blocks on an external app; we don't reap the child.
+fn spawn_external(action: ExternalAction, path: &std::path::Path) -> std::io::Result<()> {
+    let path = std::fs::canonicalize(path)?;
+    #[cfg(target_os = "windows")]
+    {
+        match action {
+            ExternalAction::OpenWithSystem => {
+                std::process::Command::new("cmd")
+                    .args(["/C", "start", ""])
+                    .arg(&path)
+                    .spawn()?;
+            }
+            ExternalAction::Reveal => {
+                std::process::Command::new("explorer.exe")
+                    .arg(format!("/select,{}", path.display()))
+                    .spawn()?;
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match action {
+            ExternalAction::OpenWithSystem => {
+                std::process::Command::new("open").arg(&path).spawn()?;
+            }
+            ExternalAction::Reveal => {
+                std::process::Command::new("open")
+                    .arg("-R")
+                    .arg(&path)
+                    .spawn()?;
+            }
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = match action {
+            ExternalAction::OpenWithSystem => path.clone(),
+            ExternalAction::Reveal => path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| path.clone()),
+        };
+        std::process::Command::new("xdg-open")
+            .arg(&target)
+            .spawn()?;
+    }
+    Ok(())
+}
+
+fn classify_hint(err: viewer::ClassifyError) -> String {
+    match err {
+        viewer::ClassifyError::Unsupported => "unsupported type".into(),
+        viewer::ClassifyError::NotRegularFile => "not a regular file".into(),
+        viewer::ClassifyError::TooLarge { size, cap } => {
+            format!("file is {} bytes (cap {} bytes)", size, cap)
+        }
+        viewer::ClassifyError::Unreadable(msg) => msg,
+    }
+}
+
 fn pick_shell(config: &Config) -> Result<ShellChoice> {
     let hints: &[String] = if cfg!(windows) {
         &config.core.shell_win
@@ -2658,7 +2956,16 @@ fn build_external_pane(
     color: Color,
     kind_label: &str,
 ) -> Result<PaneId> {
-    match rimeterm_pty::detect_tool(&spec.command) {
+    // C21.5: check rimeterm-managed dirs (`~/.rimeterm/bin/` for
+    // essentials, `~/.rimeterm/plugins/*/bin/` for opt-in plugins)
+    // before `detect_tool` walks `$PATH`. Without this,
+    // `spec.command == ["yazi"]` resolves via which::which even when
+    // the bundled `~/.rimeterm/bin/yazi.exe` exists — negating both
+    // the essentials extraction and the `prefer_system` opt-out.
+    let resolved = resolve_managed_program(&spec.command)
+        .map(rimeterm_pty::ToolAvailability::Available)
+        .unwrap_or_else(|| rimeterm_pty::detect_tool(&spec.command));
+    match resolved {
         rimeterm_pty::ToolAvailability::Available(program) => {
             let args: Vec<String> = spec.command.iter().skip(1).cloned().collect();
             let spawn = crate::agent_factory::spawn_external(
@@ -2670,6 +2977,7 @@ fn build_external_pane(
                 24,
                 redraw,
                 osc_tx,
+                Some(spec.id.as_str()),
             )?;
             let id = spawn.pane.id();
             // Store the cloneable Session handle before we consume the pane
@@ -2721,6 +3029,37 @@ fn build_external_pane(
             Ok(id)
         }
     }
+}
+
+/// Resolve `spec.command[0]` against the C21.5 managed dirs
+/// (`~/.rimeterm/bin/` for essentials, `~/.rimeterm/plugins/*/bin/`
+/// for user-installed plugins) before touching `$PATH`. Returns
+/// `None` when the tool isn't found in either — the caller falls
+/// through to `rimeterm_pty::detect_tool` which walks `$PATH`.
+///
+/// Skips when `spec.command` isn't a bare binary name (e.g. contains a
+/// `/` or `\` — user pinned an absolute path via `config.toml`). In
+/// that case rimeterm respects the user's override and lets
+/// `detect_tool` handle it.
+fn resolve_managed_program(command: &[String]) -> Option<std::path::PathBuf> {
+    let raw = command.first()?;
+    if raw.contains('/') || raw.contains('\\') {
+        return None;
+    }
+    let exe = rimeterm_config::tools::platform_exe_name(raw);
+    if let Some(bin) = rimeterm_config::paths::bin_dir() {
+        let candidate = bin.join(&exe);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    for plug in rimeterm_config::paths::plugin_bin_dirs() {
+        let candidate = plug.join(&exe);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Legacy alias for M3 callers.
@@ -2876,6 +3215,34 @@ fn register_commands(
         "Acknowledgement",
         "Show ACKNOWLEDGEMENTS.md",
         flags.acknowledgement
+    );
+    flag_cmd!(
+        cmds,
+        "viewer.open",
+        "Open viewer overlay",
+        "Freeze the last active-yazi selection into the Modal Snapshot viewer",
+        flags.viewer_open
+    );
+    flag_cmd!(
+        cmds,
+        "viewer.close",
+        "Close viewer overlay",
+        "Dismiss the Modal Snapshot viewer",
+        flags.viewer_close
+    );
+    flag_cmd!(
+        cmds,
+        "viewer.open-with-system",
+        "Open viewer file with system app",
+        "Fire-and-forget system app for the current viewer snapshot",
+        flags.viewer_open_with_system
+    );
+    flag_cmd!(
+        cmds,
+        "viewer.reveal",
+        "Reveal viewer file in system file manager",
+        "Open the file's containing folder in the OS file manager",
+        flags.viewer_reveal
     );
     flag_cmd!(
         cmds,
@@ -3363,6 +3730,43 @@ fn register_commands(
         register(cmds, cmd)?;
     }
 
+    // `essentials.reinstall` — force re-extraction of the prebuilt
+    // essentials from the release archive's sibling `essentials/`
+    // folder. Users invoke this when they've corrupted their
+    // `~/.rimeterm/bin/` and want a clean copy without re-installing
+    // rimeterm. Idempotent otherwise.
+    {
+        let cmd = Command {
+            id: "essentials.reinstall",
+            title: "Re-extract bundled essentials into ~/.rimeterm/bin/",
+            description: Some("no args; returns per-binary extract report"),
+            run: Arc::new(move |_args: &serde_json::Value| {
+                let Ok(exe) = std::env::current_exe() else {
+                    return Err("cannot resolve rimeterm binary path".to_string());
+                };
+                let Some(parent) = exe.parent() else {
+                    return Err("rimeterm binary has no parent dir".to_string());
+                };
+                let src = parent.join("essentials");
+                // Force a re-copy by deleting the fingerprint marker
+                // first. `extract_essentials` is idempotent otherwise;
+                // this is the one place we want it to actually work.
+                if let Some(bin) = rimeterm_config::paths::bin_dir() {
+                    let _ = std::fs::remove_file(bin.join(".rimeterm-essentials-version"));
+                }
+                let report =
+                    rimeterm_config::assets::extract_essentials(&src, env!("CARGO_PKG_VERSION"));
+                Ok(serde_json::json!({
+                    "source_absent": report.source_absent,
+                    "extracted": report.extracted,
+                    "skipped_up_to_date": report.skipped_up_to_date,
+                    "errors": report.errors,
+                }))
+            }),
+        };
+        register(cmds, cmd)?;
+    }
+
     // ── §14 C14 Agents Picker ──
     //
     // `agents.list` mirrors `tools.list`: probes AGENT_REGISTRY, returns
@@ -3764,10 +4168,36 @@ pub(crate) fn parse_tool_action_args(args: &serde_json::Value) -> Result<String,
 /// Shell out to `cargo` for a tool-registry entry. Blocks up to
 /// `TOOL_ACTION_TIMEOUT_S`; returns exit status + captured stdout/stderr.
 /// v0.1 blocks the current thread; C14 will pipe output into a live pane.
+/// C21.5 branches on `ToolKind`: essentials short-circuit with
+/// `already_bundled`, plugins install into `~/.rimeterm/plugins/<name>/`
+/// via `cargo install --root`.
 pub(crate) fn run_tool_action(
     action: ToolAction,
     spec: &'static rimeterm_config::tools::ToolSpec,
 ) -> Result<serde_json::Value, String> {
+    use rimeterm_config::tools::{InstallSource, ToolKind};
+
+    let kind = rimeterm_config::tools::kind_of(spec.name)
+        .ok_or_else(|| format!("`{}` not in any tool registry", spec.name))?;
+
+    // Essentials: no cargo action ever. Return a structured
+    // `already_bundled` payload so IPC clients and the UI can render
+    // the disabled-buttons state without extra probes.
+    if kind == ToolKind::Essential {
+        let label = match action {
+            ToolAction::Install => "install",
+            ToolAction::Upgrade => "upgrade",
+            ToolAction::Uninstall => "uninstall",
+        };
+        return Ok(serde_json::json!({
+            "action": label,
+            "tool": spec.name,
+            "kind": "essential",
+            "result": "already_bundled",
+            "hint": "essentials ship with the rimeterm release archive — upgrade by installing a newer rimeterm",
+        }));
+    }
+
     // Refuse to shell out if `cargo` isn't on PATH — otherwise
     // `Command::spawn` prints a cryptic OS error and we look broken.
     if which::which("cargo").is_err() {
@@ -3777,12 +4207,25 @@ pub(crate) fn run_tool_action(
         );
     }
 
+    // Plugin dir under `~/.rimeterm/plugins/<name>`. cargo writes to
+    // `<root>/bin/<binary>` and maintains `<root>/.crates.toml` for
+    // its own bookkeeping; the extra plugin dir is disposable.
+    let plugin_root = rimeterm_config::paths::plugins_dir()
+        .ok_or_else(|| "cannot resolve $RIMETERM_HOME/plugins".to_string())?
+        .join(spec.name);
+    if let Err(e) = std::fs::create_dir_all(&plugin_root) {
+        return Err(format!("mkdir {}: {e}", plugin_root.display()));
+    }
+    let root_flag = plugin_root.display().to_string();
+
     // Build the argv per action.
     let mut argv: Vec<String> = Vec::new();
     let (action_label, uninstall_mode) = match action {
         ToolAction::Install => {
             argv.push("install".into());
             argv.push("--locked".into());
+            argv.push("--root".into());
+            argv.push(root_flag.clone());
             for c in spec.crates {
                 argv.push((*c).to_string());
             }
@@ -3792,6 +4235,8 @@ pub(crate) fn run_tool_action(
             argv.push("install".into());
             argv.push("--locked".into());
             argv.push("--force".into());
+            argv.push("--root".into());
+            argv.push(root_flag.clone());
             for c in spec.crates {
                 argv.push((*c).to_string());
             }
@@ -3799,6 +4244,8 @@ pub(crate) fn run_tool_action(
         }
         ToolAction::Uninstall => {
             argv.push("uninstall".into());
+            argv.push("--root".into());
+            argv.push(root_flag.clone());
             for c in spec.crates {
                 argv.push((*c).to_string());
             }
@@ -3806,19 +4253,35 @@ pub(crate) fn run_tool_action(
         }
     };
 
-    // Uninstall only makes sense for cargo-installed binaries; if the
-    // registry says the binary is system-managed, refuse before spending
-    // cargo cycles on it.
+    // Uninstall gate: only proceed when the plugin actually lives in
+    // our managed dir. `Cargo` (user's own or v0.1.x legacy) and
+    // `System` binaries are off-limits.
     if uninstall_mode {
         let detected = rimeterm_config::tools::detect_one(
             spec,
             rimeterm_config::tools::cargo_bin_dir().as_deref(),
         );
-        if detected.install_source == rimeterm_config::tools::InstallSource::System {
-            return Err(format!(
-                "`{}` is installed via a system package manager — uninstall it with the same tool",
-                spec.name
-            ));
+        match detected.install_source {
+            InstallSource::Plugin => {}
+            InstallSource::Cargo | InstallSource::System => {
+                return Err(format!(
+                    "`{}` is not managed by rimeterm — uninstall it with the same tool that installed it",
+                    spec.name
+                ));
+            }
+            InstallSource::Essential => {
+                // Guarded above; unreachable in practice.
+                return Err(format!(
+                    "`{}` is an essential — bundled with rimeterm, not user-installed",
+                    spec.name
+                ));
+            }
+            InstallSource::Missing => {
+                return Err(format!(
+                    "`{}` not installed; nothing to uninstall",
+                    spec.name
+                ));
+            }
         }
     }
 
@@ -4197,6 +4660,27 @@ fn next_shell_number(members: &[PaneId], panes: &PaneRegistry) -> usize {
 mod tests {
     use super::*;
 
+    #[test]
+    fn classify_hint_maps_all_error_variants_to_non_empty_string() {
+        for err in [
+            viewer::ClassifyError::Unsupported,
+            viewer::ClassifyError::NotRegularFile,
+            viewer::ClassifyError::TooLarge {
+                size: 4_096,
+                cap: 1_024,
+            },
+            viewer::ClassifyError::Unreadable("permission denied".into()),
+        ] {
+            let msg = classify_hint(err);
+            assert!(!msg.trim().is_empty(), "classify_hint produced empty msg");
+        }
+    }
+
+    #[test]
+    fn classify_hint_too_large_includes_size_and_cap() {
+        let msg = classify_hint(viewer::ClassifyError::TooLarge { size: 42, cap: 10 });
+        assert!(msg.contains("42") && msg.contains("10"), "got {msg}");
+    }
     #[test]
     fn neighbor_group_navigates_left_right() {
         assert_eq!(neighbor_group(BUILTIN_FILES, 2), Some(BUILTIN_AGENTS));
@@ -5015,5 +5499,167 @@ mod tests {
     fn osc_unknown_event_does_not_map_to_kernel_event() {
         let decoded = decode_osc_rimeterm(r#"{"event":"future.event"}"#).unwrap();
         assert!(App::kernel_event_from_osc(PaneId(1), decoded).is_none());
+    }
+
+    #[test]
+    fn osc_decode_matches_yazi_bridge_payload_shape() {
+        // Mirrors the exact payload string that
+        // `assets/yazi/plugins/rimeterm-bridge.yazi` writes for a hover.
+        // Regression guard: if the Lua plugin's JSON shape drifts, this
+        // test fails and points at the schema mismatch.
+        let hover = r#"{"event":"file.selected","path":"C:\\work\\notes.md"}"#;
+        assert_eq!(
+            decode_osc_rimeterm(hover),
+            Ok(OscDecoded::FileSelected {
+                path: std::path::PathBuf::from(r"C:\work\notes.md"),
+            })
+        );
+        let cwd = r#"{"event":"cwd.changed","path":"/tmp/proj"}"#;
+        assert_eq!(
+            decode_osc_rimeterm(cwd),
+            Ok(OscDecoded::YaziCwd {
+                path: std::path::PathBuf::from("/tmp/proj"),
+            })
+        );
+    }
+
+    #[test]
+    fn viewer_commands_are_registered_and_flip_flags() {
+        let flags = Arc::new(ActionFlags::default());
+        let snapshot = Arc::new(parking_lot::RwLock::new(WorkspaceSnapshot::default()));
+        let session_writes: Arc<
+            parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
+        > = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let pending: Arc<parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
+        let (redraw_tx, _redraw_rx) = mpsc::unbounded_channel();
+        let mut cmds = CommandRegistry::new();
+        register_commands(
+            &mut cmds,
+            Arc::clone(&flags),
+            Arc::clone(&snapshot),
+            Arc::clone(&session_writes),
+            Arc::clone(&pending),
+            redraw_tx,
+        )
+        .expect("register");
+        for id in [
+            "viewer.open",
+            "viewer.close",
+            "viewer.open-with-system",
+            "viewer.reveal",
+        ] {
+            assert!(cmds.get(id).is_some(), "missing {id}");
+        }
+        assert!(!flags.viewer_open.load(Ordering::Relaxed));
+        cmds.run("viewer.open").expect("run");
+        assert!(flags.viewer_open.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn essentials_reinstall_command_is_registered() {
+        let flags = Arc::new(ActionFlags::default());
+        let snapshot = Arc::new(parking_lot::RwLock::new(WorkspaceSnapshot::default()));
+        let session_writes: Arc<
+            parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
+        > = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let pending: Arc<parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
+        let (redraw_tx, _redraw_rx) = mpsc::unbounded_channel();
+        let mut cmds = CommandRegistry::new();
+        register_commands(
+            &mut cmds,
+            Arc::clone(&flags),
+            Arc::clone(&snapshot),
+            Arc::clone(&session_writes),
+            Arc::clone(&pending),
+            redraw_tx,
+        )
+        .expect("register");
+        assert!(
+            cmds.get("essentials.reinstall").is_some(),
+            "essentials.reinstall must be registered (C21.5 §6)"
+        );
+    }
+
+    #[test]
+    fn tools_install_of_essential_returns_already_bundled() {
+        // Essentials must never shell out to cargo — this locks in the
+        // §9.4 tools-install branch behavior for yazi/gitui/bottom.
+        let yazi_spec = rimeterm_config::tools::find("yazi").expect("yazi in registry");
+        let out = run_tool_action(ToolAction::Install, yazi_spec).expect("essentials never fail");
+        assert_eq!(out["result"], "already_bundled");
+        assert_eq!(out["kind"], "essential");
+
+        // Same for uninstall — no matter what the user tries, we never
+        // touch a bundled essential.
+        let out = run_tool_action(ToolAction::Uninstall, yazi_spec).unwrap();
+        assert_eq!(out["result"], "already_bundled");
+    }
+
+    #[test]
+    fn resolve_managed_program_prefers_bin_dir_then_plugin_then_none() {
+        // Serialize with the crate-wide env lock — mutating
+        // RIMETERM_HOME races other tests otherwise.
+        let _guard = rimeterm_config::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("RIMETERM_HOME").ok();
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "rimeterm-resolve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        unsafe { std::env::set_var("RIMETERM_HOME", &root) };
+
+        // 1. Nothing on disk → None.
+        assert!(resolve_managed_program(&["yazi".into()]).is_none());
+
+        // 2. Plugin bin only → resolves to plugin.
+        let plug_bin = root.join("plugins").join("trippy").join("bin");
+        std::fs::create_dir_all(&plug_bin).unwrap();
+        let plug_exe = plug_bin.join(rimeterm_config::tools::platform_exe_name("trip"));
+        std::fs::write(&plug_exe, b"stub").unwrap();
+        assert_eq!(
+            resolve_managed_program(&["trip".into()]).as_deref(),
+            Some(plug_exe.as_path())
+        );
+
+        // 3. Bin dir wins over plugin when both would match.
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let yazi_exe = bin_dir.join(rimeterm_config::tools::platform_exe_name("yazi"));
+        std::fs::write(&yazi_exe, b"stub").unwrap();
+        assert_eq!(
+            resolve_managed_program(&["yazi".into()]).as_deref(),
+            Some(yazi_exe.as_path())
+        );
+
+        // 4. Absolute path skips managed lookup so a user override wins.
+        assert!(
+            resolve_managed_program(&["/usr/local/bin/yazi".into()]).is_none(),
+            "absolute paths must skip managed dirs"
+        );
+        assert!(
+            resolve_managed_program(&["C:\\tools\\yazi.exe".into()]).is_none(),
+            "backslash paths must also skip"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("RIMETERM_HOME", v) },
+            None => unsafe { std::env::remove_var("RIMETERM_HOME") },
+        }
+    }
+
+    #[test]
+    fn external_action_hint_is_stable() {
+        assert_eq!(ExternalAction::OpenWithSystem.hint(), "open with system");
+        assert_eq!(ExternalAction::Reveal.hint(), "reveal");
     }
 }

@@ -11,7 +11,7 @@ Windows-priority, cross-platform.
 | **CI** | [![CI](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml) Linux · macOS (arm) · Windows |
 | **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · archives (`.tar.gz` / `.zip`) for all targets, plus macOS `.pkg` installer. Windows `.msi` + Linux `.deb` in progress. |
 | **MSRV** | Rust 1.90 (edition 2024) |
-| **Status** | v0.1.2 released (C15 + C16 + C17 + C18-A + C18-B/C/D + spinner fix + native installers); tip at **C18-B/C/D**. Retagged v0.1.2 once to fold C18-A and the `expire_pending_spawn` sampling fix in. Follow-up plan in `docs/rimeterm-overall-design.md#15.2` (design doc is local-only) |
+| **Status** | v0.1.2 released (C15 + C16 + C17 + C18-A + C18-B/C/D + spinner fix + native installers); tip at **C18-B/C/D**. Retagged v0.1.2 once to fold C18-A and the `expire_pending_spawn` sampling fix in. **Next: C21.5** (essentials `yazi`/`gitui`/`bottom` bundled in release + `~/.rimeterm/plugins/` for on-demand extensions — design in `docs/plans/2026-07-21-managed-bin-directory-design.md`). Follow-up plan in `docs/rimeterm-overall-design.md#15.2` (design doc is local-only) |
 
 ---
 
@@ -47,14 +47,18 @@ Excerpt from the internal design contract (§0):
    Linux / macOS.
 6. **Fully open source, no closed-source tail** — every dependency must
    allow free redistribution.
-7. **External tools = dependencies. Not bundled, not forked, but
-   optionally installable via `cargo install`.** rimeterm probes with
-   `which::which` first; user-installed via `winget` / `scoop` / `brew` /
-   `apt` always wins. Missing tools fall back to a placeholder pane with
-   an install hint. The convenience `cargo install --locked <crate>`
-   channel exists for `yazi` / `gitui` / `bottom` / `trippy` (all
-   `crates.io` crates) so users on platforms without a system package
-   manager have a one-command path.
+7. **Three essentials bundled; everything else opt-in.** rimeterm's
+   release archive ships prebuilt `yazi` / `gitui` / `bottom` (the
+   three tools required for the default four-quadrant experience);
+   first launch extracts them to `~/.rimeterm/bin/` alongside curated
+   configs under `~/.rimeterm/{yazi,gitui,bottom}/`. Every other
+   tool — `trippy` today, whatever the user adds tomorrow — is
+   opt-in via `tools.install`, installed into
+   `~/.rimeterm/plugins/<name>/` via `cargo install --root`. Detection
+   probes `~/.rimeterm/bin/` → `~/.rimeterm/plugins/*/bin/` → `$PATH`;
+   Upgrade/Uninstall buttons only ever touch the plugin dir so a
+   user's own `~/.cargo/bin/` is never at risk. External shells outside
+   rimeterm see nothing new — we only mutate PTY-child env.
 8. **ratatui components first** — every widget already in ratatui or
    maintained third-party crates (`nucleo-matcher`, `ratatui-image`, …)
    MUST be reused before writing a new one.
@@ -78,6 +82,26 @@ Excerpt from the internal design contract (§0):
   missing agents render dim with an install hint. Your pick is
   **persisted** to `~/.rimeterm/data/workspaces/<hash>/agents.state.toml`
   so the next launch reopens the same tab without prompting.
+- **Native Settings overlay** — Tools / Agents tabs expose registry status,
+  install / upgrade / uninstall actions, refresh, and detected-agent
+  launch without dropping to `rimectl`. C19 is functionally wired; visible
+  per-row actions, disabled states, mouse handling, and end-to-end coverage
+  remain acceptance work. **C21.5 (planned)** splits the tools view into
+  essentials (yazi/gitui/bottom — bundled, upgraded with rimeterm) and
+  plugins (trippy + user-added — cargo installed on demand into
+  `~/.rimeterm/plugins/`); Upgrade / Uninstall buttons are gated on the
+  plugin channel only, closing the "we might nuke your personal cargo
+  install" hole.
+- **Viewer overlay** (`Alt+V`) — Yazi's native third column keeps its
+  MIME/plugin Quick Look. `Alt+V` freezes the last Yazi selection into a
+  centered Modal Snapshot: Markdown via `tui-markdown`, images via
+  `ratatui-image`. The overlay never enters the layout tree, never resizes
+  PTYs, and never mirrors Yazi's internal preview widget. **C21.5** ships
+  yazi + a curated preview stack (`piper.yazi` + `glow.yazi` +
+  `chafa.yazi`) + the `rimeterm-bridge.yazi` plugin under
+  `~/.rimeterm/yazi/` and injects `YAZI_CONFIG_HOME` — so previews and
+  Alt+V both work out-of-the-box without touching your system Yazi
+  config. See [docs/yazi-setup.md](docs/yazi-setup.md).
 - **`rimectl` IPC** — line-delimited JSON over Windows named pipe /
   Unix socket. Full command registry: `workspace.snapshot`, `.pane.write`,
   `.pane.output`, `.pane.wait` (server-side regex poll), `.pane.open`
@@ -121,38 +145,60 @@ cargo install --path crates/rimeterm --bin rimeterm
 cargo install --path crates/rimectl  --bin rimectl
 ```
 
-## External tools (optional, detected on start)
+**Dev builds only**: essentials (yazi/gitui/bottom) are bundled by the
+release CI, not by `cargo`. If you're running from a checkout, populate
+`target/{debug,release}/essentials/` once with
+`node bootstrap-essentials.mjs` (requires Node ≥ 18). Rimeterm boots
+fine without them — detection falls through to `$PATH` — but the four
+quadrant tabs will show placeholder panes if `$PATH` is also empty.
 
-rimeterm doesn't bundle any of these. Install what you use; the rest
-gets a placeholder pane with the install hint.
+## Bundled essentials + on-demand plugins (C21.5)
 
-| tool | binary | Windows | macOS | Linux | Cargo (universal) |
-|---|---|---|---|---|---|
-| yazi (file manager) | `yazi` | `winget install sxyazi.yazi` | `brew install yazi` | see [install docs] | `cargo install --locked yazi-fm yazi-cli` |
-| gitui | `gitui` | `winget install StephanDilly.gitui` | `brew install gitui` | `sudo pacman -S gitui` (Arch) | `cargo install --locked gitui` |
-| bottom (sysmon) | `btm` | `winget install Clement.bottom` | `brew install bottom` | `sudo apt install bottom` (Debian) | `cargo install --locked bottom` |
-| trippy (traceroute) | `trip` | `winget install FujiApple.Trippy` | `brew install trippy` | `sudo pacman -S trippy` (Arch) | `cargo install --locked trippy` — needs Npcap on Windows / `CAP_NET_RAW` on Linux |
+**Essentials** (`yazi`, `gitui`, `bottom`) ship in the release archive
+as prebuilt binaries. First launch extracts them to `~/.rimeterm/bin/`
+and seeds `~/.rimeterm/{yazi,gitui,bottom}/` with curated configs
+(including a Yazi preview stack: `piper.yazi` + `glow.yazi` +
+`chafa.yazi` + our own `rimeterm-bridge.yazi`). Nothing to install
+manually. Upgrade path is "install a newer rimeterm release".
 
-[install docs]: https://yazi-rs.github.io/docs/installation
+**Plugins** (`trippy` today, user-added tomorrow) live under
+`~/.rimeterm/plugins/<name>/` and are installed on demand via
+`tools.install`:
 
-**In-app shortcut**: on a placeholder pane (tool not installed), press
-`[I]` to open a fresh shell tab with `cargo install --locked <crate>`
-pre-typed — review and hit Enter to run.
+| kind | shipped as | dir |
+|---|---|---|
+| yazi (file manager) | essential | `~/.rimeterm/bin/yazi` + `~/.rimeterm/yazi/` |
+| gitui | essential | `~/.rimeterm/bin/gitui` + `~/.rimeterm/gitui/` |
+| bottom (sysmon) | essential | `~/.rimeterm/bin/btm` + `~/.rimeterm/bottom/` |
+| trippy (traceroute) | plugin | `~/.rimeterm/plugins/trippy/{bin,config}/` — `cargo install --locked --root ~/.rimeterm/plugins/trippy trippy` |
 
-Agents live off `npm` / `pip` / binary releases — see
-`rimectl agents.list` for install hints per entry.
+**In-app shortcut**: on a plugin placeholder pane (tool not installed),
+press `[I]` to run `cargo install --locked --root <plugin dir>
+<crate>` — output is piped into a fresh shell tab.
+
+**Prefer your system yazi/gitui/bottom instead?** Set
+`[install.essentials] prefer_system = ["yazi", "gitui", "bottom"]` in
+`~/.rimeterm/config.toml`; rimeterm skips extraction and falls through
+to `$PATH` for those entries. External shells outside rimeterm are
+never touched either way.
+
+Agents (`omp` / `claude` / `codex` / `pi` / …) live off `npm` / `pip` /
+binary releases — see `rimectl agents.list` for install hints per
+entry. They are not managed by rimeterm.
 
 ## Build
 
 ```bash
 cargo check --workspace
-cargo run   --bin rimeterm       # launch the terminal
-cargo run   --bin probe-shell    # print which shell would be picked
+node bootstrap-essentials.mjs      # one-shot: fetch yazi/gitui/bottom
+cargo run   --bin rimeterm         # launch the terminal
+cargo run   --bin probe-shell      # print which shell would be picked
 cargo test  --workspace
 ```
 
-Requires Rust ≥ 1.90 (edition 2024). Windows uses ConPTY (Win10 1809+);
-Linux / macOS build the same tree via `portable-pty`.
+Requires Rust ≥ 1.90 (edition 2024) and Node ≥ 18 for the essentials
+bootstrap. Windows uses ConPTY (Win10 1809+); Linux / macOS build the
+same tree via `portable-pty`.
 
 ## Keybindings
 

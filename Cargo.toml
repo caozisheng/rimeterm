@@ -43,6 +43,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 which         = "8"
 directories   = "6"
 unicode-width = "0.2"
+# C20 viewer overlay (§19.11)
+tui-markdown  = { version = "0.3.8", default-features = false }
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+image         = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [workspace.lints.rust]
 unreachable_pub = "warn"

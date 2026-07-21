@@ -106,6 +106,18 @@ jobs:
       - name: Cargo build --release (rimeterm + rimectl)
         run: cargo build --release --workspace --bins --target ${{ matrix.target }}
 
+      # C21.5: fetch prebuilt yazi/gitui/bottom for this matrix row.
+      # Pins live at essentials/VERSIONS.toml. The script hard-fails on
+      # 404/checksum mismatch — release will error out cleanly if an
+      # upstream tag or asset name changes.
+      - name: Fetch prebuilt essentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          node .github/scripts/fetch-essentials.mjs \
+            "${{ matrix.target }}" \
+            "essentials-staging"
+
       - name: Stage payload
         id: stage
         shell: bash
@@ -119,6 +131,11 @@ jobs:
           cp "target/${{ matrix.target }}/release/rimeterm${EXT}" "${STAGE}/"
           cp "target/${{ matrix.target }}/release/rimectl${EXT}"  "${STAGE}/"
           cp LICENSE README.md ACKNOWLEDGEMENTS.md "${STAGE}/"
+          # C21.5: bundle prebuilt essentials next to the rimeterm
+          # binary so first launch can extract them into
+          # ~/.rimeterm/bin/ (see rimeterm-config::assets::extract_essentials).
+          mkdir -p "${STAGE}/essentials"
+          cp -r essentials-staging/. "${STAGE}/essentials/"
           echo "dir=${STAGE}"   >> "$GITHUB_OUTPUT"
           echo "name=${NAME}"   >> "$GITHUB_OUTPUT"
           echo "Payload:"

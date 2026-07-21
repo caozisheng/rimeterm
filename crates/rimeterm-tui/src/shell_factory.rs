@@ -35,7 +35,9 @@ pub fn spawn_shell(
         program: program.clone(),
         args: Vec::new(),
         cwd: Some(cwd),
-        env: default_env(),
+        // C21.5: shells get the augmented PATH but no per-tool sandbox
+        // env — they're user-driven, not a specific essentials tab.
+        env: rimeterm_config::env::default_env(None),
         cols: initial_cols,
         rows: initial_rows,
         backend: PtyBackend::Native,
@@ -71,12 +73,4 @@ pub fn spawn_shell(
     Ok(ShellSpawn {
         pane: crate::pty_pane::PtyPane::with_id(pane_id, session, display_name),
     })
-}
-
-fn default_env() -> Vec<(String, String)> {
-    // §6.2 Windows column: force UTF-8; harmless on other OSes.
-    vec![
-        ("PYTHONIOENCODING".into(), "utf-8".into()),
-        ("TERM".into(), "xterm-256color".into()),
-    ]
 }

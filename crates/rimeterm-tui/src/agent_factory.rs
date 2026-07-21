@@ -30,16 +30,17 @@ pub fn spawn_external(
     initial_rows: u16,
     redraw: UnboundedSender<()>,
     osc_tx: UnboundedSender<(rimeterm_core::pane::PaneId, String)>,
+    // C21.5: tool identity so `default_env` can inject the config
+    // sandbox env (`YAZI_CONFIG_HOME`, `XDG_CONFIG_HOME`/`APPDATA`,
+    // `BTM_CONFIG_LOCATION`) for essentials. `None` for shells /
+    // agents / plugins with no sandbox.
+    tool_id: Option<&str>,
 ) -> Result<ExternalSpawn> {
     let cfg = SessionConfig {
         program: program.clone(),
         args,
         cwd: Some(cwd),
-        // §6.2 Windows column: force UTF-8; harmless on other OSes.
-        env: vec![
-            ("PYTHONIOENCODING".into(), "utf-8".into()),
-            ("TERM".into(), "xterm-256color".into()),
-        ],
+        env: rimeterm_config::env::default_env(tool_id),
         cols: initial_cols,
         rows: initial_rows,
         backend: PtyBackend::Native,
@@ -119,5 +120,6 @@ pub fn spawn_agent(
         initial_rows,
         redraw,
         osc_tx,
+        None, // agents don't get a config sandbox — they run their own
     )
 }

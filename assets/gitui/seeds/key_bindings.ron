@@ -1,0 +1,8 @@
+// Seeded by rimeterm on first launch. Safe to edit; rimeterm never
+// overwrites this file. Delete `~/.rimeterm/gitui/key_bindings.ron` to
+// re-seed it on next start.
+//
+// See https://github.com/gitui-org/gitui/blob/master/KEY_CONFIG.md for
+// the full schema. Empty overrides `= gitui defaults.
+(
+)

@@ -21,3 +21,8 @@ Thumbs.db
 
 # Icon source (multi-res .ico is generated from this and shipped in-tree).
 /rimeterm-icon.png
+
+# planning-with-files skill scratchpads
+/task_plan.md
+/findings.md
+/progress.md

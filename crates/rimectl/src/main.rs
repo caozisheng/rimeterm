@@ -16,6 +16,7 @@
 //! `workspace.pane.wait --json '{...}'` so shell scripts can go
 //! `write → wait` without hand-writing JSON.
 
+use std::io::Write;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -42,6 +43,7 @@ async fn real_main() -> Result<()> {
         CliAction::ListEndpoints => list_endpoints().await,
         CliAction::Wait(w) => run_wait(w).await,
         CliAction::Command(c) => run_command(c).await,
+        CliAction::OscEmit(e) => run_osc_emit(&e),
     }
 }
 
@@ -54,6 +56,19 @@ enum CliAction {
     ListEndpoints,
     Wait(WaitInvocation),
     Command(CommandInvocation),
+    OscEmit(OscEmitInvocation),
+}
+
+/// `rimectl osc-emit <event> <path>` — write a single
+/// `\x1b]1337;rimeterm;{"event":"…","path":"…"}\x07` envelope to stdout,
+/// then exit. Used by the Yazi bridge plugin (see
+/// `assets/yazi/plugins/rimeterm-bridge.yazi`): Yazi's `Command` API
+/// spawns this process with stdout inherited from Yazi's PTY, so the
+/// OSC bytes flow into rimeterm's non-destructive scanner (§5.5).
+#[derive(Debug, PartialEq)]
+struct OscEmitInvocation {
+    event: String,
+    path: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -82,12 +97,13 @@ struct CommandInvocation {
 /// Grammar (informal):
 ///
 /// ```text
-/// argv = help | list-endpoints | wait-form | cmd-form
-/// help          = -h | --help
-/// list-endpoints= --list-endpoints
-/// wait-form     = --wait <regex> --pane <id>
-///                 [--timeout-ms <n>] [--poll-ms <n>] [--pid <n>]
-/// cmd-form      = <cmd-id> [--pid <n>] [--json <string>]
+/// argv = help | list-endpoints | osc-emit-form | wait-form | cmd-form
+/// help           = -h | --help
+/// list-endpoints = --list-endpoints
+/// osc-emit-form  = osc-emit <event> <path>
+/// wait-form      = --wait <regex> --pane <id>
+///                  [--timeout-ms <n>] [--poll-ms <n>] [--pid <n>]
+/// cmd-form       = <cmd-id> [--pid <n>] [--json <string>]
 /// ```
 fn parse_cli(argv: &[String]) -> Result<CliAction, String> {
     if argv.iter().any(|a| a == "-h" || a == "--help") {
@@ -95,6 +111,23 @@ fn parse_cli(argv: &[String]) -> Result<CliAction, String> {
     }
     if argv.iter().any(|a| a == "--list-endpoints") {
         return Ok(CliAction::ListEndpoints);
+    }
+    if argv.first().map(String::as_str) == Some("osc-emit") {
+        let event = argv
+            .get(1)
+            .ok_or_else(|| "osc-emit needs <event> <path>".to_string())?
+            .clone();
+        let path = argv
+            .get(2)
+            .ok_or_else(|| "osc-emit needs <event> <path>".to_string())?
+            .clone();
+        if argv.len() > 3 {
+            return Err(format!(
+                "unexpected extra argument `{}` after `osc-emit`",
+                argv[3]
+            ));
+        }
+        return Ok(CliAction::OscEmit(OscEmitInvocation { event, path }));
     }
 
     // Collect flags first — order-independent — leaving positional args behind.
@@ -222,6 +255,27 @@ fn take_val(argv: &[String], i: &mut usize, flag: &str) -> Result<String, String
     Ok(val)
 }
 
+/// Emit `\x1b]1337;rimeterm;<json>\x07` on stdout, then flush. Serves the
+/// Yazi bridge plugin — see `assets/yazi/plugins/rimeterm-bridge.yazi`.
+/// Stays synchronous: no IPC, no async runtime work needed, and Yazi's
+/// `Command` reaps the child before the next event fires.
+fn run_osc_emit(inv: &OscEmitInvocation) -> Result<()> {
+    // `serde_json` handles all the escape edge cases (backslashes on
+    // Windows paths, embedded quotes, control chars). The kernel's OSC
+    // decoder (§5.5) expects `{"event":"…","path":"…"}` — an object with
+    // exactly two string fields for `file.selected` / `cwd.changed`.
+    let payload = serde_json::json!({ "event": inv.event, "path": inv.path });
+    let json = serde_json::to_string(&payload).context("encode OSC payload")?;
+    let mut out = std::io::stdout().lock();
+    out.write_all(b"\x1b]1337;rimeterm;")
+        .context("write OSC prefix")?;
+    out.write_all(json.as_bytes())
+        .context("write OSC payload")?;
+    out.write_all(b"\x07").context("write OSC terminator")?;
+    out.flush().context("flush stdout")?;
+    Ok(())
+}
+
 async fn run_command(inv: CommandInvocation) -> Result<()> {
     let pid = resolve_pid(inv.pid).await?;
     let request_args = match inv.args_json.as_deref() {
@@ -340,6 +394,7 @@ fn print_help() {
 USAGE:
     rimectl <command-id> [--pid <n>] [--json '<args>']
     rimectl --wait <regex> --pane <id> [--timeout-ms N] [--poll-ms N] [--pid <n>]
+    rimectl osc-emit <event> <path>
     rimectl --list-endpoints
     rimectl --help
 
@@ -357,6 +412,11 @@ SUGAR NOTES:
     `--wait` expands to `workspace.pane.wait --json '{...}'`. Exit code
     is 0 on match, non-zero on timeout — safe for `&&` chains.
     Server-side ranges: timeout_ms ≤ 60000, poll_ms ∈ [25, 1000].
+
+    `osc-emit` writes a `\x1b]1337;rimeterm;{"event":"…","path":"…"}\x07`
+    envelope on stdout, then exits. Used by the bundled Yazi bridge
+    plugin (`assets/yazi/plugins/rimeterm-bridge.yazi`); events land in
+    the pane the child inherits its PTY from.
 
 DISCOVERY:
     Without --pid, rimectl connects to the most recently-started rimeterm
@@ -621,5 +681,29 @@ mod tests {
                 "poll_ms": 250,
             })
         );
+    }
+
+    #[test]
+    fn osc_emit_parses_two_positionals() {
+        let got = parse_cli(&argv(&["osc-emit", "file.selected", "/tmp/a.md"])).unwrap();
+        assert_eq!(
+            got,
+            CliAction::OscEmit(OscEmitInvocation {
+                event: "file.selected".into(),
+                path: "/tmp/a.md".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn osc_emit_rejects_missing_path() {
+        let err = parse_cli(&argv(&["osc-emit", "file.selected"])).unwrap_err();
+        assert!(err.contains("<event> <path>"), "got: {err}");
+    }
+
+    #[test]
+    fn osc_emit_rejects_extra_arg() {
+        let err = parse_cli(&argv(&["osc-emit", "file.selected", "/tmp/a", "extra"])).unwrap_err();
+        assert!(err.contains("extra"), "got: {err}");
     }
 }

@@ -1,0 +1,80 @@
+# Pinned upstream versions for the C21.5 essentials bundle.
+#
+# Per-tool block declares:
+#   version           — upstream release version (used verbatim in URLs
+#                       after the `tag_prefix`)
+#   repo              — owner/repo on GitHub for the release download URL
+#   tag_prefix        — usually "v", but bottom's tags omit the v so we
+#                       set it to "" there. Full tag = "{tag_prefix}{version}"
+#   assets_per_target — explicit map<Rust target triple → asset filename>.
+#                       Explicit beats template — some upstreams (gitui)
+#                       don't use Rust triples in their filenames at all.
+#   ext_per_target    — map<triple → archive extension>. Drives which
+#                       `tar` flag the fetch script picks.
+#   binaries.files    — list of binary basenames the archive contains;
+#                       fetch script adds `.exe` on Windows automatically.
+#   sha256            — map<asset filename → SHA-256>. Bootstrap-friendly:
+#                       empty hash accepts + records. Populate at release
+#                       time; subsequent runs verify against the pin.
+#
+# When bumping a tool: bump `version` + verify each `assets_per_target`
+# entry still resolves + verify the SHA-256 pins are still valid.
+
+[yazi]
+version = "26.5.6"
+repo = "sxyazi/yazi"
+tag_prefix = "v"
+[yazi.assets_per_target]
+x86_64-unknown-linux-gnu = "yazi-x86_64-unknown-linux-gnu.zip"
+aarch64-apple-darwin = "yazi-aarch64-apple-darwin.zip"
+x86_64-pc-windows-msvc = "yazi-x86_64-pc-windows-msvc.zip"
+[yazi.ext_per_target]
+x86_64-unknown-linux-gnu = "zip"
+aarch64-apple-darwin = "zip"
+x86_64-pc-windows-msvc = "zip"
+[yazi.binaries]
+files = ["yazi", "ya"]
+[yazi.sha256]
+"yazi-x86_64-unknown-linux-gnu.zip" = ""
+"yazi-aarch64-apple-darwin.zip" = ""
+"yazi-x86_64-pc-windows-msvc.zip" = ""
+
+[gitui]
+version = "0.28.1"
+repo = "gitui-org/gitui"
+tag_prefix = "v"
+[gitui.assets_per_target]
+# gitui doesn't use Rust triples — the assets are named per platform.
+x86_64-unknown-linux-gnu = "gitui-linux-x86_64.tar.gz"
+aarch64-apple-darwin = "gitui-mac.tar.gz"
+x86_64-pc-windows-msvc = "gitui-win.tar.gz"
+[gitui.ext_per_target]
+x86_64-unknown-linux-gnu = "tar.gz"
+aarch64-apple-darwin = "tar.gz"
+x86_64-pc-windows-msvc = "tar.gz"
+[gitui.binaries]
+files = ["gitui"]
+[gitui.sha256]
+"gitui-linux-x86_64.tar.gz" = ""
+"gitui-mac.tar.gz" = ""
+"gitui-win.tar.gz" = ""
+
+[bottom]
+version = "0.14.6"
+repo = "ClementTsang/bottom"
+# bottom's tags omit the `v` prefix. `URL = /releases/download/0.14.6/...`
+tag_prefix = ""
+[bottom.assets_per_target]
+x86_64-unknown-linux-gnu = "bottom_x86_64-unknown-linux-gnu.tar.gz"
+aarch64-apple-darwin = "bottom_aarch64-apple-darwin.tar.gz"
+x86_64-pc-windows-msvc = "bottom_x86_64-pc-windows-msvc.zip"
+[bottom.ext_per_target]
+x86_64-unknown-linux-gnu = "tar.gz"
+aarch64-apple-darwin = "tar.gz"
+x86_64-pc-windows-msvc = "zip"
+[bottom.binaries]
+files = ["btm"]
+[bottom.sha256]
+"bottom_x86_64-unknown-linux-gnu.tar.gz" = ""
+"bottom_aarch64-apple-darwin.tar.gz" = ""
+"bottom_x86_64-pc-windows-msvc.zip" = ""
