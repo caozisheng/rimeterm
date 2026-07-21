@@ -31,16 +31,30 @@ will be added as new subsystems come online.
 
 ## Bundled essentials (C21.5)
 
-As of C21.5, the rimeterm release archive **bundles prebuilt binaries**
-of the three essential TUI tools rimeterm's default four-quadrant
-layout requires. First launch extracts them into
-`~/.rimeterm/bin/`. Pinned versions live at
-[`essentials/VERSIONS.toml`](essentials/VERSIONS.toml); bump per rimeterm
-release. All three are MIT-licensed and redistribution-friendly.
+rimeterm's release archive **bundles prebuilt binaries** for the
+following tools so first launch works with no extra installs. All
+are permissively licensed and redistribution-friendly. Pinned
+versions live at [`essentials/VERSIONS.toml`](essentials/VERSIONS.toml);
+bump per rimeterm release.
 
-- [yazi](https://github.com/sxyazi/yazi) — MIT. File manager.
+**Quadrant tools:**
+- [yazi](https://github.com/sxyazi/yazi) — MIT. File manager (files quadrant).
 - [gitui](https://github.com/gitui-org/gitui) — MIT. Git TUI.
 - [bottom](https://github.com/ClementTsang/bottom) — MIT. System monitor.
+
+**Yazi Quick Look previewers:**
+- [bat](https://github.com/sharkdp/bat) — MIT / Apache-2.0.
+  Syntax-highlighted text/code preview (Yazi's default text handler).
+- [glow](https://github.com/charmbracelet/glow) — MIT. Markdown preview.
+- [chafa](https://hpjansson.org/chafa/) — LGPL-3.0. Image preview
+  fallback (used when the terminal doesn't support Kitty / iTerm2 /
+  Sixel graphics protocols). Rehosted under the `essentials-mirror`
+  release tag because upstream doesn't publish to GitHub Releases;
+  `aarch64-apple-darwin` is skipped since upstream has no macOS
+  build (macOS terminals almost always support Kitty or iTerm2 image
+  protocols so chafa isn't needed there).
+
+**Extension slot (plugins, on-demand):**
 - [trippy](https://github.com/fujiapple852/trippy) — MIT / Apache-2.0.
   Not bundled; installed on demand into `~/.rimeterm/plugins/trippy/`
   via `cargo install --root` when the user runs `tools.install trippy`.

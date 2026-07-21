@@ -45,8 +45,13 @@ async function main() {
   }
   const pins = parseToml(await fs.readFile(versionsPath, "utf8"));
 
-  for (const tool of ["yazi", "gitui", "bottom"]) {
-    await fetchOneTool(tool, pins[tool], triple, dest);
+  for (const tool of ["yazi", "gitui", "bottom", "bat", "glow", "chafa"]) {
+    const pin = pins[tool];
+    if (pin && pin.enabled === "false") {
+      console.log(`== ${tool} disabled in VERSIONS.toml (enabled=false), skipping`);
+      continue;
+    }
+    await fetchOneTool(tool, pin, triple, dest);
   }
 
   // Copy VERSIONS.toml sidecar for the runtime golden test.
@@ -63,6 +68,14 @@ async function fetchOneTool(tool, pin, triple, dest) {
   if (!pin) throw new Error(`no [${tool}] section in VERSIONS.toml`);
   const ext = pin.ext_per_target?.[triple];
   if (!ext) {
+    // Optional-per-target support: if the pin declares this triple in
+    // `skip_targets`, silently skip (used for chafa on macOS — no
+    // upstream prebuilt, macOS uses native Kitty/iTerm2 image
+    // protocols in Yazi anyway).
+    if (pin.skip_targets?.includes?.(triple)) {
+      console.log(`== ${tool} skipped for ${triple} (no upstream prebuilt)`);
+      return;
+    }
     console.error(`no ext_per_target entry for ${tool} → ${triple}`);
     process.exit(3);
   }
@@ -71,9 +84,14 @@ async function fetchOneTool(tool, pin, triple, dest) {
     console.error(`no assets_per_target entry for ${tool} → ${triple}`);
     process.exit(3);
   }
-  const tagPrefix = pin.tag_prefix ?? "v";
-  const url = `https://github.com/${pin.repo}/releases/download/${tagPrefix}${pin.version}/${asset}`;
-  console.log(`== ${tool} ${tagPrefix}${pin.version} → ${asset}`);
+  // Mirror override: some upstreams (chafa) don't publish GitHub
+  // prebuilts. We re-host their binaries under a dedicated tag in
+  // caozisheng/rimeterm and set `mirror_release_tag` in the pin so the
+  // URL points at that instead of `{tag_prefix}{version}`.
+  const releaseTag = pin.mirror_release_tag
+    ?? `${pin.tag_prefix ?? "v"}${pin.version}`;
+  const url = `https://github.com/${pin.repo}/releases/download/${releaseTag}/${asset}`;
+  console.log(`== ${tool} ${releaseTag} → ${asset}`);
 
   const tmpBase = await fs.mkdtemp(path.join(os.tmpdir(), `rimeterm-fetch-${tool}-`));
   try {

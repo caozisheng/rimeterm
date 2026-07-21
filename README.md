@@ -248,6 +248,15 @@ press `[I]` to run `cargo install --locked --root <plugin dir>
 to `$PATH` for those entries. External shells outside rimeterm are
 never touched either way.
 
+**Coexistence with `winget` / `brew` / `apt` installs**: no conflict.
+rimeterm only prepends `~/.rimeterm/bin/` to its *own* child
+processes' `PATH`. Inside rimeterm (the four quadrants and any shell
+tab it opens), the bundled essentials win — version-pinned,
+config-matched. Outside rimeterm (any shell you launch yourself), the
+system `PATH` is untouched and your `winget install sxyazi.yazi` etc.
+continues to work normally. Two independent copies live side-by-side;
+they never fight for the same `yazi` invocation.
+
 Agents (`omp` / `claude` / `codex` / `pi` / …) live off `npm` / `pip` /
 binary releases — see `rimectl agents.list` for install hints per
 entry. They are not managed by rimeterm.

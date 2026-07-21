@@ -123,6 +123,18 @@
                                   Source="$(var.EssentialsDir)\btm.exe"
                                   KeyPath="yes" />
                         </Component>
+                        <Component Id="BatExe" Guid="B53CD7FD-6829-D7B6-593B-1715AEFF00CA" Win64="yes">
+                            <File Id="BatExeFile"
+                                  Name="bat.exe"
+                                  Source="$(var.EssentialsDir)\bat.exe"
+                                  KeyPath="yes" />
+                        </Component>
+                        <Component Id="GlowExe" Guid="C54EE80D-793B-E9C7-6A5C-2826BFFF00CB" Win64="yes">
+                            <File Id="GlowExeFile"
+                                  Name="glow.exe"
+                                  Source="$(var.EssentialsDir)\glow.exe"
+                                  KeyPath="yes" />
+                        </Component>
                         <Component Id="VersionsToml" Guid="A53BD7FC-6828-D7B5-493A-06040DFF00B9" Win64="yes">
                             <File Id="VersionsFile"
                                   Name="VERSIONS.toml"
@@ -179,6 +191,8 @@
             <ComponentRef Id="YaExe" />
             <ComponentRef Id="GituiExe" />
             <ComponentRef Id="BtmExe" />
+            <ComponentRef Id="BatExe" />
+            <ComponentRef Id="GlowExe" />
             <ComponentRef Id="VersionsToml" />
             <ComponentRef Id="LicenseDoc" />
             <ComponentRef Id="ReadmeDoc" />

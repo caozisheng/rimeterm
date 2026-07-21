@@ -48,6 +48,8 @@ assets = [
     ["essentials-staging/ya",    "usr/lib/rimeterm/essentials/ya",    "755"],
     ["essentials-staging/gitui", "usr/lib/rimeterm/essentials/gitui", "755"],
     ["essentials-staging/btm",   "usr/lib/rimeterm/essentials/btm",   "755"],
+    ["essentials-staging/bat",   "usr/lib/rimeterm/essentials/bat",   "755"],
+    ["essentials-staging/glow",  "usr/lib/rimeterm/essentials/glow",  "755"],
     ["essentials-staging/VERSIONS.toml", "usr/lib/rimeterm/essentials/VERSIONS.toml", "644"],
     ["README.md",               "usr/share/doc/rimeterm/README",         "644"],
     ["LICENSE",                 "usr/share/doc/rimeterm/copyright",      "644"],
@@ -56,7 +58,7 @@ assets = [
 extended-description = """\
 A TUI terminal built for coding agents (Claude Code, Codex, Cursor,
 Gemini CLI, and others). Ratatui front-end, portable-pty backend,
-alacritty_terminal VT parser. Bundles yazi/gitui/bottom in
+alacritty_terminal VT parser. Bundles yazi/gitui/bottom/bat in
 /usr/lib/rimeterm/essentials/ so first launch works with no extra
 installs.
 """
