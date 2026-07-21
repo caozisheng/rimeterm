@@ -118,11 +118,17 @@ jobs:
       # upstream tag or asset name changes.
       - name: Fetch prebuilt essentials
         shell: bash
+        # Fetches into `crates/rimeterm/essentials-staging/` because
+        # both cargo-deb (asset paths in [package.metadata.deb]) and
+        # cargo-wix (Source= paths in wix/main.wxs) resolve relative
+        # to the crate directory, not the workspace root. Sinking here
+        # means the same on-disk layout satisfies all three consumers:
+        # deb (assets), wix (File Source), and archive-stage below.
         run: |
           set -euo pipefail
           node .github/scripts/fetch-essentials.mjs \
             "${{ matrix.target }}" \
-            "essentials-staging"
+            "crates/rimeterm/essentials-staging"
 
       - name: Stage payload
         id: stage
@@ -141,7 +147,7 @@ jobs:
           # binary so first launch can extract them into
           # ~/.rimeterm/bin/ (see rimeterm-config::assets::extract_essentials).
           mkdir -p "${STAGE}/essentials"
-          cp -r essentials-staging/. "${STAGE}/essentials/"
+          cp -r crates/rimeterm/essentials-staging/. "${STAGE}/essentials/"
           echo "dir=${STAGE}"   >> "$GITHUB_OUTPUT"
           echo "name=${NAME}"   >> "$GITHUB_OUTPUT"
           echo "Payload:"
@@ -236,13 +242,20 @@ jobs:
         # the release binary already compiled above.
         #
         # essentials-staging/ was populated earlier by
-        # fetch-essentials.mjs; the wxs `<File Source="essentials-staging/…">`
-        # references relative to the workspace root, and cargo-wix
-        # spawns candle.exe from that directory.
+        # fetch-essentials.mjs at `crates/rimeterm/essentials-staging/`
+        # so both cargo-wix `<File Source="essentials-staging/…">` and
+        # cargo-deb assets resolve relative to the crate dir cleanly.
         run: |
           set -euo pipefail
+          # Point cargo-wix at the actual release binary dir. The
+          # earlier `cargo build --target ${matrix.target} --release`
+          # step wrote to `target/${matrix.target}/release/`; without
+          # this override cargo-wix defaults to `target/release/` and
+          # light.exe (WiX linker) reports LGHT0103 file-not-found.
+          # `--target-bin-dir` was added in cargo-wix 0.3.
           cargo wix --no-build \
             --package rimeterm \
+            --target-bin-dir "target/${{ matrix.target }}/release" \
             --install-version "${{ steps.version.outputs.value }}" \
             --nocapture \
             --output "rimeterm-${{ steps.version.outputs.value }}-x86_64.msi"
@@ -296,7 +309,7 @@ jobs:
 
           cp target/${{ matrix.target }}/release/rimeterm "$ROOT/usr/local/lib/rimeterm/"
           cp target/${{ matrix.target }}/release/rimectl  "$ROOT/usr/local/lib/rimeterm/"
-          cp -R essentials-staging/. "$ROOT/usr/local/lib/rimeterm/essentials/"
+          cp -R crates/rimeterm/essentials-staging/. "$ROOT/usr/local/lib/rimeterm/essentials/"
           cp README.md            "$ROOT/usr/local/share/doc/rimeterm/README"
           cp LICENSE              "$ROOT/usr/local/share/doc/rimeterm/LICENSE"
           cp ACKNOWLEDGEMENTS.md  "$ROOT/usr/local/share/doc/rimeterm/ACKNOWLEDGEMENTS"

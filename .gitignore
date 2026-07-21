@@ -26,3 +26,8 @@ Thumbs.db
 /task_plan.md
 /findings.md
 /progress.md
+
+# CI drop location for prebuilt yazi/gitui/bottom (see release.yml +
+# .github/scripts/fetch-essentials.mjs). Also created when running
+# `node bootstrap-essentials.mjs`.
+/crates/rimeterm/essentials-staging/
