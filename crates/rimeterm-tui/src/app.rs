@@ -2742,17 +2742,11 @@ impl App {
         let Some(group) = self.tree.find_tab_group(BUILTIN_FILES) else {
             return;
         };
-        let Some((idx, old_id)) = group
-            .members()
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, id)| {
-                self.panes
-                    .get(*id)
-                    .is_some_and(|p| p.title().to_ascii_lowercase().contains("gitui"))
-            })
-        else {
+        let Some((idx, old_id)) = group.members().iter().copied().enumerate().find(|(_, id)| {
+            self.panes
+                .get(*id)
+                .is_some_and(|p| p.title().to_ascii_lowercase().contains("gitui"))
+        }) else {
             return;
         };
 

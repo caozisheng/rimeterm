@@ -247,11 +247,7 @@ impl TabGroup {
     /// holds. Used when a live PTY pane needs to be respawned in place,
     /// e.g. gitui following the yazi cwd (§19.3-A extension): the tab
     /// slot is the same, only the child process changes.
-    pub fn replace_member(
-        &mut self,
-        index: usize,
-        new_id: PaneId,
-    ) -> Result<PaneId, PolicyError> {
+    pub fn replace_member(&mut self, index: usize, new_id: PaneId) -> Result<PaneId, PolicyError> {
         let slot = self
             .members
             .get_mut(index)
