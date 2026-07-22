@@ -127,9 +127,6 @@ files = ["glow"]
 # protocols first anyway. Users on other Macs can `brew install chafa`.
 [chafa]
 version = "1.18.2"
-# Flip to `true` (remove this line) after uploading assets to the
-# essentials-mirror release. See docs/essentials-mirror.md.
-enabled = "false"
 repo = "caozisheng/rimeterm"
 mirror_release_tag = "essentials-mirror"
 skip_targets = ["aarch64-apple-darwin"]
@@ -142,5 +139,5 @@ x86_64-pc-windows-msvc = "zip"
 [chafa.binaries]
 files = ["chafa"]
 [chafa.sha256]
-"chafa-1.18.2-1-x86_64-linux-gnu.tar.gz" = ""
-"chafa-1.18.2-1-x86_64-windows.zip" = ""
+"chafa-1.18.2-1-x86_64-linux-gnu.tar.gz" = "deb149bc8823589f635f24db3ecc83b7daa86e4c20d8a9f58e9ce53bd97bdda9"
+"chafa-1.18.2-1-x86_64-windows.zip" = "dcd3245c31851eef11eb077fefc12c6c76f3b0616754f0275fa8c3cb1e694165"

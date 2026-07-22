@@ -135,6 +135,12 @@
                                   Source="$(var.EssentialsDir)\glow.exe"
                                   KeyPath="yes" />
                         </Component>
+                        <Component Id="ChafaExe" Guid="D65FF91E-8A4C-FAD8-7B6D-3937CFFF00DC" Win64="yes">
+                            <File Id="ChafaExeFile"
+                                  Name="chafa.exe"
+                                  Source="$(var.EssentialsDir)\chafa.exe"
+                                  KeyPath="yes" />
+                        </Component>
                         <Component Id="VersionsToml" Guid="A53BD7FC-6828-D7B5-493A-06040DFF00B9" Win64="yes">
                             <File Id="VersionsFile"
                                   Name="VERSIONS.toml"
@@ -193,6 +199,7 @@
             <ComponentRef Id="BtmExe" />
             <ComponentRef Id="BatExe" />
             <ComponentRef Id="GlowExe" />
+            <ComponentRef Id="ChafaExe" />
             <ComponentRef Id="VersionsToml" />
             <ComponentRef Id="LicenseDoc" />
             <ComponentRef Id="ReadmeDoc" />

@@ -11,7 +11,7 @@ Windows-priority, cross-platform.
 | **CI** | [![CI](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml) Linux · macOS (arm) · Windows |
 | **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · archives (`.tar.gz` / `.zip`) for every target plus native installers (`.msi` / `.deb` / `.pkg`), all bundling the essentials sibling. |
 | **MSRV** | Rust 1.90 (edition 2024) |
-| **Status** | v0.1.3 released (C19 Settings overlay + C20 Alt+V Viewer + C21.5 essentials/plugins split — bundled yazi/gitui/bottom in the release archive, `~/.rimeterm/{bin,plugins}` managed dirs, materialized Yazi bridge). Design docs live in `docs/rimeterm-overall-design.md` (local-only) |
+| **Status** | v0.1.4 released — essentials expanded to include Yazi preview stack (`bat` + `glow` + `chafa`) alongside `yazi/gitui/bottom`. All bundled via prebuilt binaries; chafa re-hosted from the vendor's stand-alone build under a self-hosted mirror release. |
 
 ---
 

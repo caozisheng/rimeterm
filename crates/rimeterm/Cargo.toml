@@ -50,6 +50,7 @@ assets = [
     ["essentials-staging/btm",   "usr/lib/rimeterm/essentials/btm",   "755"],
     ["essentials-staging/bat",   "usr/lib/rimeterm/essentials/bat",   "755"],
     ["essentials-staging/glow",  "usr/lib/rimeterm/essentials/glow",  "755"],
+    ["essentials-staging/chafa", "usr/lib/rimeterm/essentials/chafa", "755"],
     ["essentials-staging/VERSIONS.toml", "usr/lib/rimeterm/essentials/VERSIONS.toml", "644"],
     ["README.md",               "usr/share/doc/rimeterm/README",         "644"],
     ["LICENSE",                 "usr/share/doc/rimeterm/copyright",      "644"],
