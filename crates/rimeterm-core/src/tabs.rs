@@ -239,6 +239,27 @@ impl TabGroup {
             }
         }
     }
+
+    /// Swap the member at `index` with `new_id`, returning the pane id
+    /// that used to live there. Preserves `active` (indices don't shift)
+    /// and is legal under **both** `Fixed` and `Open` policies — cardinality
+    /// never changes, so `Fixed`'s stable-member-list guarantee still
+    /// holds. Used when a live PTY pane needs to be respawned in place,
+    /// e.g. gitui following the yazi cwd (§19.3-A extension): the tab
+    /// slot is the same, only the child process changes.
+    pub fn replace_member(
+        &mut self,
+        index: usize,
+        new_id: PaneId,
+    ) -> Result<PaneId, PolicyError> {
+        let slot = self
+            .members
+            .get_mut(index)
+            .ok_or(PolicyError::NotFound(new_id, self.id))?;
+        let old = *slot;
+        *slot = new_id;
+        Ok(old)
+    }
 }
 
 #[cfg(test)]

@@ -81,8 +81,24 @@ fn main() -> Result<()> {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_env("RIMETERM_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("warn,rimeterm=info"));
+    let filter = EnvFilter::try_from_env("RIMETERM_LOG").unwrap_or_else(|_| {
+        // `rimeterm=info` alone misses events from the `rimeterm_tui`,
+        // `rimeterm_pty`, `rimeterm_config`, `rimeterm_ipc`,
+        // `rimeterm_core` crates — tracing directives match target names
+        // exactly, not by shared prefix. Enumerate each workspace crate
+        // so the default filter actually shows the events the user needs
+        // to diagnose bridge / OSC / spawn issues.
+        EnvFilter::new(
+            "warn,\
+             rimeterm=info,\
+             rimeterm_tui=info,\
+             rimeterm_pty=info,\
+             rimeterm_config=info,\
+             rimeterm_ipc=info,\
+             rimeterm_core=info,\
+             rimectl=info",
+        )
+    });
     // Logs go to stderr so the alt-screen (stdout) is not disturbed.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)

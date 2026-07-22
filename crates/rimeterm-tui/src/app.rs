@@ -144,6 +144,15 @@ pub(crate) enum PaneMutation {
         group: Option<rimeterm_core::TabGroupId>,
         ack: std::sync::mpsc::SyncSender<Result<String, String>>,
     },
+    /// Explicitly set the effective workspace root (`active_root`). Used
+    /// by `workspace.cwd.set` for scripting / diagnostics: lets the user
+    /// prove the label + agent-spawn + gitui-refresh pipeline works
+    /// without relying on yazi's OSC bridge. Same downstream effects as
+    /// a real `cwd.changed` event.
+    SetActiveRoot {
+        path: PathBuf,
+        ack: std::sync::mpsc::SyncSender<Result<String, String>>,
+    },
 }
 
 /// Title of the placeholder pane that seeds the `agents` group on first
@@ -425,6 +434,16 @@ pub struct App {
     /// Last `file.selected` from the active files:yazi tab. Consumed by
     /// `Alt+V` to freeze a snapshot.
     last_yazi_selection: Option<SelectionSnapshot>,
+    /// Effective "current workspace root" — where the status bar's
+    /// `workspace: xxx` label points, and the cwd handed to freshly
+    /// spawned agent tabs and to any respawn of `gitui`. Seeded from the
+    /// launch-time `workspace_root` and mutated on every `cwd.changed`
+    /// OSC event from a yazi tab in the files group (§19.3-A extension:
+    /// the user asked for gitui + new agents to follow yazi rather than
+    /// stay pinned to the launch dir). Persistent state files
+    /// (`agents.state.toml`, `layout.state.toml`) keep using the frozen
+    /// [`Self::workspace_root`] so their identity survives navigation.
+    active_root: PathBuf,
     /// Worker channel: async Markdown/image loaders push completions
     /// here; main loop drains them into [`ViewerOverlayState`].
     viewer_completion_tx: mpsc::UnboundedSender<ViewerCompletion>,
@@ -756,6 +775,7 @@ impl App {
         let viewer_picker = ratatui_image::picker::Picker::from_query_stdio().ok();
 
         Ok(Self {
+            active_root: workspace_root.clone(),
             workspace_root,
             config,
             shell_choice,
@@ -1766,7 +1786,7 @@ impl App {
             .split(area);
 
         let ws_label = self
-            .workspace_root
+            .active_root
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("(workspace)");
@@ -2084,6 +2104,10 @@ impl App {
                     let outcome = self.reset_layout_scope(group).map_err(|e| e.to_string());
                     acks.push(Ack::Str(ack, outcome));
                 }
+                PaneMutation::SetActiveRoot { path, ack } => {
+                    let outcome = self.set_active_root(path);
+                    acks.push(Ack::Str(ack, outcome));
+                }
             }
         }
         // Publish the post-mutation state THEN wake the waiting clients;
@@ -2335,11 +2359,12 @@ impl App {
             command: spec.argv.iter().map(|s| s.to_string()).collect(),
             install_hint: Some(spec.install_hint.to_string()),
         };
+        let spawn_cwd = self.agent_spawn_cwd();
         let new_id = build_agent_pane(
             &mut self.panes,
             &self.session_writes,
             &external_spec,
-            &self.workspace_root,
+            &spawn_cwd,
             self.redraw_tx.clone(),
             self.osc_tx.clone(),
         )?;
@@ -2495,7 +2520,7 @@ impl App {
             focused_group: self.focus.focused_group().map(|g| g.as_str()),
             focused_pane_id: self.focus.focused_pane().map(|p| p.0),
             groups: Vec::new(),
-            workspace_root: self.workspace_root.display().to_string(),
+            workspace_root: self.active_root.display().to_string(),
             shell_short: self.shell_short.clone(),
         };
         let sessions = self.session_writes.lock();
@@ -2612,13 +2637,28 @@ impl App {
     fn dispatch_osc_event(&mut self, (origin, payload): (PaneId, String)) {
         match decode_osc_rimeterm(&payload) {
             Ok(decoded) => {
-                if let OscDecoded::FileSelected { path } = &decoded {
-                    if self.is_active_files_yazi(origin) {
-                        self.last_yazi_selection = Some(SelectionSnapshot {
-                            origin,
-                            path: path.clone(),
-                        });
+                match &decoded {
+                    OscDecoded::FileSelected { path } => {
+                        if self.is_active_files_yazi(origin) {
+                            self.last_yazi_selection = Some(SelectionSnapshot {
+                                origin,
+                                path: path.clone(),
+                            });
+                        }
                     }
+                    OscDecoded::YaziCwd { path } => {
+                        // No origin gate: cwd.changed is only ever emitted
+                        // by yazi's bridge (`rimectl osc-emit cwd.changed`
+                        // is also legitimate manual/scripted use). Any
+                        // source that goes to the trouble of writing this
+                        // OSC envelope is asking to set the active root.
+                        if self.active_root != *path {
+                            self.active_root = path.clone();
+                            self.set_hint(format!("cwd → {}", path.display()));
+                            self.refresh_gitui_at_active_root();
+                        }
+                    }
+                    OscDecoded::Ignored { .. } => {}
                 }
                 if let Some(event) = Self::kernel_event_from_osc(origin, decoded) {
                     self.event_bus.send(event);
@@ -2645,6 +2685,113 @@ impl App {
         self.panes
             .get(origin)
             .is_some_and(|pane| pane.title().to_ascii_lowercase().contains("yazi"))
+    }
+
+    /// Cwd to hand a freshly-spawned agent PTY. Reads [`Self::active_root`]
+    /// so `Ctrl+T` in an agents group opens the picker in the directory
+    /// the user is browsing in yazi, not the launch-time `workspace_root`.
+    /// Existing agent PTYs are unaffected — changing a live child's cwd
+    /// from outside isn't a thing on any POSIX / Windows PTY.
+    fn agent_spawn_cwd(&self) -> PathBuf {
+        self.active_root.clone()
+    }
+
+    /// Explicit override for the effective workspace root. Same behavior
+    /// as receiving a real `cwd.changed` OSC event: mutates
+    /// [`Self::active_root`], toasts the hint bar, and triggers gitui
+    /// refresh. Returns the applied absolute path as a string so IPC
+    /// callers can confirm what the app actually acted on.
+    fn set_active_root(&mut self, path: PathBuf) -> Result<String, String> {
+        let abs = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()
+                .map(|c| c.join(&path))
+                .unwrap_or(path)
+        };
+        if !abs.is_dir() {
+            return Err(format!("not a directory: {}", abs.display()));
+        }
+        if self.active_root == abs {
+            return Ok(abs.display().to_string());
+        }
+        self.active_root = abs.clone();
+        self.set_hint(format!("cwd → {}", abs.display()));
+        self.refresh_gitui_at_active_root();
+        Ok(abs.display().to_string())
+    }
+
+    /// Respawn the gitui tab in the files group at [`Self::active_root`].
+    /// Yazi navigating into a different directory (potentially a different
+    /// git repo) means gitui's frozen cwd is stale; the user asked for
+    /// gitui to follow. We swap the pane behind the tab slot in place via
+    /// [`TabGroup::replace_member`] so the tab order and Fixed-policy
+    /// invariant are preserved. Silently no-ops when there's no gitui
+    /// tab (user disabled it) or the spec / files group is missing.
+    fn refresh_gitui_at_active_root(&mut self) {
+        let Some(spec) = self
+            .config
+            .files
+            .tabs
+            .iter()
+            .find(|s| s.id == "gitui")
+            .cloned()
+        else {
+            return;
+        };
+        let Some(group) = self.tree.find_tab_group(BUILTIN_FILES) else {
+            return;
+        };
+        let Some((idx, old_id)) = group
+            .members()
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, id)| {
+                self.panes
+                    .get(*id)
+                    .is_some_and(|p| p.title().to_ascii_lowercase().contains("gitui"))
+            })
+        else {
+            return;
+        };
+
+        let icon = "🌿";
+        let color = Color::Green;
+        let new_id = match build_external_pane(
+            &mut self.panes,
+            &self.session_writes,
+            &spec,
+            &self.active_root,
+            self.redraw_tx.clone(),
+            self.osc_tx.clone(),
+            icon,
+            color,
+            "files",
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(error = %e, "refresh_gitui: spawn failed; keeping old pane");
+                return;
+            }
+        };
+        let group = self
+            .tree
+            .find_tab_group_mut(BUILTIN_FILES)
+            .expect("files group present");
+        if let Err(e) = group.replace_member(idx, new_id) {
+            warn!(error = %e, "refresh_gitui: replace_member rejected; rolling back");
+            drop_pane(&mut self.panes, new_id);
+            self.session_writes.lock().remove(&new_id);
+            return;
+        }
+        drop_pane(&mut self.panes, old_id);
+        self.session_writes.lock().remove(&old_id);
+        // If gitui was the focused pane, keep focus on the new one so the
+        // user's cursor doesn't get orphaned on a dropped PaneId.
+        if self.focus.focused_pane() == Some(old_id) {
+            self.focus.set_focus(new_id, Some(BUILTIN_FILES));
+        }
     }
 
     /// Drain decoded-at-the-edge OSC 1337 payloads and broadcast them
@@ -3306,6 +3453,40 @@ fn register_commands(
                     .recv_timeout(std::time::Duration::from_secs(5))
                     .map_err(|_| "app main loop dropped ack".to_string())??;
                 Ok(serde_json::json!({"scope": scope}))
+            }),
+        };
+        register(cmds, cmd)?;
+    }
+    // `workspace.cwd.set` — explicit override for the effective root.
+    // Lets the user drive the label + agent-spawn + gitui-refresh path
+    // from a shell (`rimectl workspace.cwd.set --json '{"path":"D:/x"}'`),
+    // bypassing the yazi OSC bridge. Same downstream effects as a real
+    // `cwd.changed` OSC event; returns the applied absolute path.
+    //   args: {path: "<abs-or-rel-dir>"}
+    //   → {path: "<applied-abs-path>"}
+    {
+        let queue = pending_mutations.clone();
+        let wake = redraw_tx.clone();
+        let cmd = Command {
+            id: "workspace.cwd.set",
+            title: "Set active workspace root",
+            description: Some("args: {path: \"<dir>\"}"),
+            run: Arc::new(move |args: &serde_json::Value| {
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "expected {path: \"<dir>\"}".to_string())?
+                    .to_string();
+                let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+                queue.lock().push_back(PaneMutation::SetActiveRoot {
+                    path: std::path::PathBuf::from(&path),
+                    ack: ack_tx,
+                });
+                let _ = wake.send(());
+                let applied = ack_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|_| "app main loop dropped ack".to_string())??;
+                Ok(serde_json::json!({"path": applied}))
             }),
         };
         register(cmds, cmd)?;

@@ -46,16 +46,22 @@ local function emit(event, url)
 	end
 end
 
+-- Yazi 26.5's LOCAL `ps.sub("cd" | "hover")` callback body is only
+-- `{ tab = <index> }` — no `.url` field. That's carried by the REMOTE
+-- variant (`sub_remote`) only. `cx.tabs[body.tab + 1]` didn't work in
+-- practice (silently nil), so read from `cx.active` — the currently
+-- focused tab is always the source of the event we care about.
+-- Docs: https://yazi-rs.github.io/docs/dds#cd
 function M:setup()
-	ps.sub("hover", function(body)
-		if body ~= nil and body.url ~= nil then
-			emit("file.selected", body.url)
+	ps.sub("hover", function()
+		if cx.active.current and cx.active.current.hovered then
+			emit("file.selected", cx.active.current.hovered.url)
 		end
 	end)
 
-	ps.sub("cd", function(body)
-		if body ~= nil and body.url ~= nil then
-			emit("cwd.changed", body.url)
+	ps.sub("cd", function()
+		if cx.active.current then
+			emit("cwd.changed", cx.active.current.cwd)
 		end
 	end)
 end

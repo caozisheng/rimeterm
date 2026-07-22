@@ -146,6 +146,23 @@ pub fn augmented_path_env() -> Option<(String, String)> {
         prefixes.push(bin);
     }
     prefixes.extend(plugin_bin_dirs());
+    // Add the directory of the currently-running rimeterm binary. This
+    // guarantees `rimectl` (always shipped as a sibling — release
+    // tarball, pkg, deb, msi, and dev `target/{debug,release}/`) is
+    // findable from any child. Without it, the Yazi bridge plugin's
+    // `Command("rimectl"):spawn()` silently fails on dev machines whose
+    // shell PATH doesn't already include `target/debug/`, and every OSC
+    // 1337 rimeterm event (`file.selected`, `cwd.changed`) is dropped
+    // at the source — the failure mode the user hit that made the
+    // `workspace: xxx` label look stuck at launch.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let dir = dir.to_path_buf();
+            if !prefixes.iter().any(|p| p == &dir) {
+                prefixes.push(dir);
+            }
+        }
+    }
     if prefixes.is_empty() {
         return None;
     }
