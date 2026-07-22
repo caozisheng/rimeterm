@@ -2,18 +2,28 @@
 # overwrites this file. Delete `~/.rimeterm/yazi/yazi.toml` to re-seed
 # it on next start.
 #
-# This is a minimal starting point — see
-# https://yazi-rs.github.io/docs/configuration/yazi for the full schema.
-#
-# Common additions:
-#   [plugin]
-#   prepend_previewers = [
-#     { name = "*.md",    run = "glow" },
-#     { mime = "image/*", run = "chafa" },
-#   ]
-# (requires the corresponding preview plugins installed via `ya pkg add`).
+# See https://yazi-rs.github.io/docs/configuration/yazi for the full
+# schema.
 
 [manager]
 show_hidden = false
 sort_by = "natural"
 sort_sensitive = false
+
+# Quick Look previewers.
+#
+# rimeterm ships the referenced Yazi plugins (`chafa.yazi`, `glow.yazi`)
+# under `plugins/` and the backing binaries under `~/.rimeterm/bin/`, so
+# these entries work zero-config.
+#
+# - Images -> chafa (coloured Unicode symbols; works on terminals that
+#   lack Sixel / Kitty / iTerm2 graphics protocols, e.g. Windows
+#   Terminal). Comment out to fall back to Yazi's built-in image
+#   protocol path.
+# - Markdown -> glow (formatted prose; more readable than raw source).
+[plugin]
+prepend_previewers = [
+    { mime = "image/*",    run = "chafa" },
+    { name = "*.md",       run = "glow" },
+    { name = "*.markdown", run = "glow" },
+]

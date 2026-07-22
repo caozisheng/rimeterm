@@ -73,6 +73,56 @@ const ASSETS: &[(ToolBucket, Asset)] = &[
             ownership: Ownership::Managed,
         },
     ),
+    // yazi — chafa image previewer plugin (managed).
+    (
+        ToolBucket::Yazi,
+        Asset {
+            rel_path: "plugins/chafa.yazi/main.lua",
+            bytes: include_bytes!("../../../assets/yazi/plugins/chafa.yazi/main.lua"),
+            ownership: Ownership::Managed,
+        },
+    ),
+    (
+        ToolBucket::Yazi,
+        Asset {
+            rel_path: "plugins/chafa.yazi/README.md",
+            bytes: include_bytes!("../../../assets/yazi/plugins/chafa.yazi/README.md"),
+            ownership: Ownership::Managed,
+        },
+    ),
+    (
+        ToolBucket::Yazi,
+        Asset {
+            rel_path: "plugins/chafa.yazi/LICENSE",
+            bytes: include_bytes!("../../../assets/yazi/plugins/chafa.yazi/LICENSE"),
+            ownership: Ownership::Managed,
+        },
+    ),
+    // yazi — glow markdown previewer plugin (managed).
+    (
+        ToolBucket::Yazi,
+        Asset {
+            rel_path: "plugins/glow.yazi/main.lua",
+            bytes: include_bytes!("../../../assets/yazi/plugins/glow.yazi/main.lua"),
+            ownership: Ownership::Managed,
+        },
+    ),
+    (
+        ToolBucket::Yazi,
+        Asset {
+            rel_path: "plugins/glow.yazi/README.md",
+            bytes: include_bytes!("../../../assets/yazi/plugins/glow.yazi/README.md"),
+            ownership: Ownership::Managed,
+        },
+    ),
+    (
+        ToolBucket::Yazi,
+        Asset {
+            rel_path: "plugins/glow.yazi/LICENSE",
+            bytes: include_bytes!("../../../assets/yazi/plugins/glow.yazi/LICENSE"),
+            ownership: Ownership::Managed,
+        },
+    ),
     // yazi — user-owned seeds.
     (
         ToolBucket::Yazi,
@@ -497,8 +547,8 @@ mod tests {
             let report = materialize_configs("1.0.0");
             assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
             assert!(report.seeds_kept.is_empty());
-            // 3 managed (main.lua/README.md/LICENSE) + 6 seeds.
-            assert_eq!(report.managed_rewritten.len(), 3);
+            // 9 managed (3 plugins × main.lua/README.md/LICENSE) + 6 seeds.
+            assert_eq!(report.managed_rewritten.len(), 9);
             assert_eq!(report.seeds_written.len(), 6);
 
             // Every file must exist on disk.
@@ -549,7 +599,7 @@ mod tests {
 
             let report = materialize_configs("1.0.1");
             assert!(report.errors.is_empty());
-            assert_eq!(report.managed_rewritten.len(), 3, "plugin dir rewritten");
+            assert_eq!(report.managed_rewritten.len(), 9, "plugin dir rewritten");
             assert_eq!(report.seeds_kept.len(), 6, "all seeds kept");
 
             // Plugin was restored to bundled bytes.
