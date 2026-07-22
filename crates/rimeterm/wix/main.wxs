@@ -12,12 +12,14 @@
         btm.exe
         VERSIONS.toml
     LICENSE, ACKNOWLEDGEMENTS.md, README.md
-
   On install:
     - copies the whole tree under `%ProgramFiles%\rimeterm\`
     - appends `%ProgramFiles%\rimeterm` to the MACHINE `PATH` so both
       binaries are launchable from any shell
     - creates a Start-menu shortcut to rimeterm.exe
+    - creates a Desktop shortcut to rimeterm.exe (v0.1.5+; opt out with
+      `msiexec /i ... ADDLOCAL=Complete REMOVE=DesktopShortcut` or by
+      deleting the shortcut after install).
 
   On uninstall:
     - removes the tree AND the PATH entry.
@@ -188,6 +190,28 @@
                     </Component>
                 </Directory>
             </Directory>
+
+            <!-- Desktop shortcut (v0.1.5+). Its own Component so it can
+                 be skipped via ADDLOCAL/REMOVE without touching the
+                 Start-menu one. KeyPath is an HKCU RegistryValue per
+                 MSI best practice for non-file components. -->
+            <Directory Id="DesktopFolder" Name="Desktop">
+                <Component Id="DesktopShortcut"
+                           Guid="D75EFA2F-9B5C-4AE8-7C6D-38271EFFD3EC"
+                           Win64="yes">
+                    <Shortcut Id="RimetermDesktopShortcut"
+                              Name="rimeterm"
+                              Description="TUI terminal for coding agents"
+                              Target="[APPLICATIONFOLDER]rimeterm.exe"
+                              WorkingDirectory="APPLICATIONFOLDER" />
+                    <RegistryValue Root="HKCU"
+                                   Key="Software\rimeterm"
+                                   Name="DesktopShortcut"
+                                   Type="integer"
+                                   Value="1"
+                                   KeyPath="yes" />
+                </Component>
+            </Directory>
         </Directory>
 
         <Feature Id="Complete" Level="1" Title="rimeterm" Description="rimeterm + essentials">
@@ -206,6 +230,7 @@
             <ComponentRef Id="AckDoc" />
             <ComponentRef Id="PathEntry" />
             <ComponentRef Id="StartMenuShortcut" />
+            <ComponentRef Id="DesktopShortcut" />
         </Feature>
 
     </Product>

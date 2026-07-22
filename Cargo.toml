@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
@@ -21,12 +21,12 @@ description = "TUI-native terminal built for coding agents."
 
 [workspace.dependencies]
 # workspace-internal
-rimeterm-core   = { path = "crates/rimeterm-core",   version = "0.1.4" }
-rimeterm-config = { path = "crates/rimeterm-config", version = "0.1.4" }
-rimeterm-pty    = { path = "crates/rimeterm-pty",    version = "0.1.4" }
-rimeterm-tui    = { path = "crates/rimeterm-tui",    version = "0.1.4" }
+rimeterm-core   = { path = "crates/rimeterm-core",   version = "0.1.5" }
+rimeterm-config = { path = "crates/rimeterm-config", version = "0.1.5" }
+rimeterm-pty    = { path = "crates/rimeterm-pty",    version = "0.1.5" }
+rimeterm-tui    = { path = "crates/rimeterm-tui",    version = "0.1.5" }
 
-rimeterm-ipc    = { path = "crates/rimeterm-ipc",    version = "0.1.4" }
+rimeterm-ipc    = { path = "crates/rimeterm-ipc",    version = "0.1.5" }
 # third-party
 tokio         = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "time"] }
 tokio-stream  = { version = "0.1", features = ["sync"] }
