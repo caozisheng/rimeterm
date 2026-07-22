@@ -12,6 +12,7 @@ pub mod pane_registry;
 pub mod picker;
 pub mod placeholder_pane;
 pub mod pty_pane;
+pub mod pty_selection;
 pub mod shell_factory;
 pub mod status_bar;
 pub mod tab_strip;

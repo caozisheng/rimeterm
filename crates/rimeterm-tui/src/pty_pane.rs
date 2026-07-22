@@ -19,6 +19,8 @@ use alacritty_terminal::vte::ansi::{Color as AlacColor, NamedColor};
 
 use std::time::Instant;
 
+use crate::pty_selection::{self, Cell as SelCell, Granularity, SelectionState};
+
 pub struct PtyPane {
     id: PaneId,
     title: String,
@@ -26,6 +28,10 @@ pub struct PtyPane {
     last_area: Rect,
     /// PTY resize throttler (§19.12.6). See [`rimeterm_pty::ResizeThrottle`].
     resize: ResizeThrottle,
+    /// C22.6: local text selection when the child hasn't asked for xterm
+    /// mouse reports. Rendered as a reverse-video overlay in `render` and
+    /// copied to the system clipboard on mouse-up.
+    selection: SelectionState,
 }
 
 impl PtyPane {
@@ -39,6 +45,7 @@ impl PtyPane {
             session,
             last_area: Rect::default(),
             resize: ResizeThrottle::platform(),
+            selection: SelectionState::default(),
         }
     }
 
@@ -71,6 +78,116 @@ impl PtyPane {
         if let Some((cols, rows)) = self.resize.flush_now() {
             let _ = self.session.resize(cols.max(2), rows.max(1));
         }
+    }
+
+    /// True when the child has requested any xterm mouse tracking mode
+    /// via DECSET (1000/1002/1003/1006). Consulted before every mouse
+    /// event to decide whether to forward SGR bytes (yazi / htop / vim
+    /// path) or own the mouse locally for text selection (bash / pwsh
+    /// path). Shift-modifier always forces local ownership so users can
+    /// still select text inside a full-screen TUI.
+    fn child_wants_mouse(&self) -> bool {
+        self.session
+            .with_term(|term| term.mode().contains(TermMode::MOUSE_MODE))
+    }
+
+    /// True when the child has enabled bracketed-paste mode
+    /// (DECSET 2004). We wrap pasted content in `\x1b[200~..\x1b[201~`
+    /// so shells stop treating multi-line paste as multi-Enter.
+    fn child_wants_bracketed_paste(&self) -> bool {
+        self.session
+            .with_term(|term| term.mode().contains(TermMode::BRACKETED_PASTE))
+    }
+
+    /// Copy the current selection's text to the system clipboard. Called
+    /// from `on_mouse` on `Up(Left)` and from the `Ctrl+Shift+C` key
+    /// handler. Silent no-op when the selection is empty or the
+    /// clipboard is unavailable (headless CI, locked session).
+    fn copy_selection(&mut self) {
+        if !self.selection.is_active() {
+            return;
+        }
+        let text = self
+            .session
+            .with_term(|term| pty_selection::extract_text(term, &self.selection));
+        let Some(text) = text else {
+            return;
+        };
+        // arboard::Clipboard::new() opens / closes the OS handle each
+        // call. That's the recommended usage — long-lived handles can
+        // leak on X11 when the process exits without a proper
+        // disconnect — and cost is a low-microsecond thing off the hot
+        // path.
+        if let Ok(mut clip) = arboard::Clipboard::new() {
+            let _ = clip.set_text(text);
+        }
+    }
+
+    /// Read the clipboard, wrap in bracketed-paste sentinels if the
+    /// child asked for them (DECSET 2004), and write to the PTY.
+    /// Silent no-op on empty clipboard or clipboard error.
+    fn paste_from_clipboard(&mut self) {
+        let Ok(mut clip) = arboard::Clipboard::new() else {
+            return;
+        };
+        let Ok(text) = clip.get_text() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        // Normalize CRLF -> LF: nearly every Unix shell and REPL
+        // interprets `\r` as Enter, so a Windows clipboard payload with
+        // `\r\n` line endings runs each line as its own command. Even
+        // in bracketed mode, some shells still split on `\r`, so
+        // strip them unconditionally.
+        let normalized: String = text.replace("\r\n", "\n").replace('\r', "\n");
+
+        let mut buf = Vec::with_capacity(normalized.len() + 12);
+        if self.child_wants_bracketed_paste() {
+            buf.extend_from_slice(b"\x1b[200~");
+            buf.extend_from_slice(normalized.as_bytes());
+            buf.extend_from_slice(b"\x1b[201~");
+        } else {
+            buf.extend_from_slice(normalized.as_bytes());
+        }
+        let _ = self.session.write(&buf);
+    }
+
+    /// Convert a mouse column/row (in absolute terminal cells) into an
+    /// inner-content selection cell relative to `outer_rect`'s content
+    /// area. Returns `None` when the point lies on the border (which
+    /// should not start a selection).
+    fn selection_cell_from(&self, col: u16, row: u16, outer_rect: Rect) -> Option<SelCell> {
+        let inner = inner_rect(outer_rect);
+        if !point_in_rect(col, row, inner) {
+            return None;
+        }
+        Some(SelCell {
+            row: row - inner.y,
+            col: col - inner.x,
+        })
+    }
+
+    /// Same as [`Self::selection_cell_from`] but clamps the point to
+    /// the inner rect so a drag that overshoots the border still
+    /// updates the cursor. Used for `Drag` events where the mouse may
+    /// have moved beyond the pane while a button is held.
+    fn selection_cell_clamped(&self, col: u16, row: u16, outer_rect: Rect) -> SelCell {
+        let inner = inner_rect(outer_rect);
+        let x = col.clamp(inner.x, inner.x + inner.width.saturating_sub(1));
+        let y = row.clamp(inner.y, inner.y + inner.height.saturating_sub(1));
+        SelCell {
+            row: y - inner.y,
+            col: x - inner.x,
+        }
+    }
+
+    /// Test helper: read the current selection state without cloning
+    /// the whole PtyPane. Used by unit tests to assert routing decisions.
+    #[cfg(test)]
+    pub(crate) fn selection_snapshot(&self) -> SelectionState {
+        self.selection.clone()
     }
 }
 
@@ -203,6 +320,23 @@ impl PaneProvider for PtyPane {
             vt_cursor_col,
         );
 
+        // C22.6 selection overlay. Painted AFTER the grid blit so
+        // reverse-video wins over the shell's own colours. Line/word
+        // modes are handled inside `SelectionState::contains` which
+        // knows how to flow past the raw cursor.
+        if self.selection.is_active() {
+            let cols = inner.width;
+            for row in 0..inner.height {
+                for col in 0..inner.width {
+                    if self.selection.contains(row, col, cols) {
+                        let target = &mut buf[(inner.x + col, inner.y + row)];
+                        let style = target.style().add_modifier(Modifier::REVERSED);
+                        target.set_style(style);
+                    }
+                }
+            }
+        }
+
         RenderOutcome {
             request_redraw: false,
             cursor,
@@ -214,6 +348,33 @@ impl PaneProvider for PtyPane {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        // C22.6 keyboard clipboard shortcuts. Match Ctrl+Shift+C/V
+        // (Windows Terminal, Alacritty, Wezterm all use these). The
+        // shell almost never sees these combos anyway because Ctrl+C
+        // is intercepted at the app menu; Ctrl+Shift adds enough
+        // discriminator that we never step on child input.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            match key.code {
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    self.copy_selection();
+                    return true;
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    self.paste_from_clipboard();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // Esc clears an active selection before falling through to the
+        // child. Otherwise a leftover highlight after copy is annoying.
+        if key.code == KeyCode::Esc && self.selection.is_active() {
+            self.selection.clear();
+            // Don't `return true` — the child might want Esc too
+            // (e.g. vim mode-switch). Just consumed the highlight.
+        }
         if let Some(bytes) = encode_key(key) {
             let _ = self.session.write(&bytes);
             true
@@ -227,17 +388,79 @@ impl PaneProvider for PtyPane {
         // not forwarded to the child (users are targeting the pane frame,
         // typically to grab focus).
         let inner = inner_rect(outer_rect);
-        if !point_in_rect(ev.column, ev.row, inner) {
+        if !point_in_rect(ev.column, ev.row, inner)
+            && !matches!(ev.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
+        {
             return false;
         }
-        // xterm SGR mouse expects **1-based, inside-content** coordinates.
-        let x = ev.column - inner.x + 1;
-        let y = ev.row - inner.y + 1;
-        if let Some(bytes) = encode_sgr_mouse(ev.kind, ev.modifiers, x, y) {
-            let _ = self.session.write(&bytes);
-            true
-        } else {
-            false
+
+        // C22.6 routing decision. If the child asked for xterm mouse
+        // reports (yazi / htop / vim), we forward. Otherwise (bash /
+        // pwsh / fish idle prompt), we own the mouse for text
+        // selection + paste. Shift always forces local ownership so
+        // users can still select text inside a full-screen TUI.
+        let child_owns_mouse =
+            self.child_wants_mouse() && !ev.modifiers.contains(KeyModifiers::SHIFT);
+
+        if child_owns_mouse {
+            // Any local selection needs to be dropped before we hand
+            // control back to the child — otherwise a stale highlight
+            // stays on screen after a `less` invocation exits.
+            self.selection.clear();
+            // xterm SGR mouse expects **1-based, inside-content**
+            // coordinates.
+            let x = ev.column - inner.x + 1;
+            let y = ev.row - inner.y + 1;
+            if let Some(bytes) = encode_sgr_mouse(ev.kind, ev.modifiers, x, y) {
+                let _ = self.session.write(&bytes);
+                return true;
+            }
+            return false;
+        }
+
+        // --- Local ownership: selection + paste ---
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(cell) = self.selection_cell_from(ev.column, ev.row, outer_rect) {
+                    if ev.modifiers.contains(KeyModifiers::SHIFT) {
+                        // Shift+Left grows the existing selection.
+                        self.selection.shift_extend(cell);
+                    } else {
+                        self.selection.begin(cell, Instant::now());
+                        if self.selection.granularity() == Granularity::Word {
+                            self.session.with_term(|term| {
+                                pty_selection::snap_to_word(&mut self.selection, term)
+                            });
+                        }
+                    }
+                    return true;
+                }
+                false
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.selection.is_active() {
+                    let cell = self.selection_cell_clamped(ev.column, ev.row, outer_rect);
+                    self.selection.extend(cell);
+                    return true;
+                }
+                false
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.selection.is_active() {
+                    self.selection.commit();
+                    self.copy_selection();
+                    return true;
+                }
+                false
+            }
+            MouseEventKind::Down(MouseButton::Middle) => {
+                self.paste_from_clipboard();
+                true
+            }
+            // Scroll wheel outside a TUI app: mostly cosmetic (Windows
+            // shells don't scroll their own history through it), let it
+            // bubble up so the app-level shortcut key can handle it.
+            _ => false,
         }
     }
 }

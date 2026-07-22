@@ -27,6 +27,7 @@ regex = "1.10"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 which = { workspace = true }
 unicode-width = { workspace = true }
+arboard = { workspace = true }
 anyhow = { workspace = true }
 # C20 viewer overlay
 tui-markdown = { workspace = true }

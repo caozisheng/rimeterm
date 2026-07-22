@@ -11,7 +11,7 @@ Windows-priority, cross-platform.
 | **CI** | [![CI](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml) Linux · macOS (arm) · Windows |
 | **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · archives (`.tar.gz` / `.zip`) for every target plus native installers (`.msi` / `.deb` / `.pkg`), all bundling the essentials sibling. |
 | **MSRV** | Rust 1.90 (edition 2024) |
-| **Status** | v0.1.5 released — Windows installer now creates a Desktop shortcut, and Yazi's third-column Quick Look ships pre-wired for images (via `chafa`) and Markdown (via `glow`) out of the box. |
+| **Status** | v0.1.6 released — mouse selection, copy, and paste. Drag to select in shells, double/triple-click for word/line, `Ctrl+Shift+C`/`Ctrl+Shift+V` for clipboard, middle-click to paste. Full-screen TUI apps (`yazi`/`htop`/`vim`) keep their native mouse; hold `Shift` to override. |
 
 ---
 
@@ -79,10 +79,14 @@ Excerpt from the internal design contract (§0):
   `~/.rimeterm/data/workspaces/<hash>/layout.state.toml`.
 - **Mouse everywhere** — click a pane to focus; click a tab to switch;
   click `×` to close; click `[+]` to open a dropdown picker; drag a
-  divider to resize; scroll and drag are forwarded to the pane's PTY
-  child as xterm SGR mouse sequences (so yazi / htop / omp all work).
-  **Right-click** opens a context menu built for the click zone
-  (divider / tab / pane / placeholder).
+  divider to resize; drag inside a shell prompt to **select text** and
+  auto-copy to the system clipboard on release (double-click = word,
+  triple-click = line). `Ctrl+Shift+C` / `Ctrl+Shift+V` and middle-click
+  are the keyboard shortcuts; paste is bracketed automatically when the
+  child asked for it. Full-screen TUI apps (`yazi` / `htop` / `omp`)
+  keep their native SGR mouse — hold **Shift** to force local selection
+  inside them. **Right-click** opens a context menu built for the click
+  zone (divider / tab / pane / placeholder).
 - **Agent picker** — the `agents` quadrant starts empty. `Ctrl+T` or
   `[+]` opens a dropdown of every coding agent detected on `$PATH`;
   missing agents render dim with an install hint. Your pick is
@@ -305,8 +309,11 @@ same tree via `portable-pty`.
 | any other key | Forwarded to the focused pane (encoded with proper modifiers + arrows) |
 
 Mouse: click a tab to switch, click `×` to close, click `[+]` to open a
-picker; right-click anywhere for a context menu; scroll wheel + drag are
-forwarded to the PTY.
+picker; right-click anywhere for a context menu; drag in a shell prompt
+to select + copy to clipboard, `Ctrl+Shift+C`/`V` and middle-click for
+clipboard, hold Shift to force selection inside full-screen TUI apps.
+In `yazi` / `htop` / `omp` the scroll wheel + drag are forwarded to the
+PTY as SGR mouse sequences.
 
 ## Scripting via `rimectl`
 
