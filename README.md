@@ -11,7 +11,7 @@ Windows-priority, cross-platform.
 | **CI** | [![CI](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml) Linux · macOS (arm) · Windows |
 | **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · archives (`.tar.gz` / `.zip`) for every target plus native installers (`.msi` / `.deb` / `.pkg`), all bundling the essentials sibling. |
 | **MSRV** | Rust 1.90 (edition 2024) |
-| **Status** | v0.1.7 released — bug-fix: Yazi Quick Look for images now works out of the box. The v0.1.4-0.1.6 seed of `~/.rimeterm/yazi/yazi.toml` used a stale Yazi schema (`[manager]` + `name = "*.md"`), which Yazi 26.5.6 refuses to parse; it silently fell back to preset previewers so chafa never registered. Fresh installs on v0.1.7 get correct `[mgr]` + `url = "*.md"` seed. Upgraders: `rm ~/.rimeterm/yazi/yazi.toml` and relaunch to re-seed. |
+| **Status** | v0.1.8 released — Yazi Quick Look for images now works on Windows out of the box. v0.1.7 fixed the config schema but still matched images via `mime = "image/*"`, forcing Yazi to shell out to POSIX `file(1)` (absent on Windows) and silently blanking Quick Look. v0.1.8 matches by file extension (`url = "*.{png,jpg,…}"`), bypassing `file(1)` entirely. Upgraders on ≤ 0.1.7: `rm ~/.rimeterm/yazi/yazi.toml` and relaunch to re-seed. |
 
 ---
 
@@ -361,6 +361,13 @@ Every command is listed by `rimectl help`. Selected highlights:
   300 s hard timeout; returns exit code + captured output.
 - `agents.list` — probe all registry entries; returns detected path +
   install hint per agent.
+
+## Roadmap
+
+- **Auto-update (C26, planned for v0.2.x)** — in-app version check +
+  install-source-aware upgrade path (archive / MSI / DEB / PKG / winget
+  / scoop / brew). Design pending; see §15.2 in
+  [`docs/rimeterm-overall-design.md`](docs/rimeterm-overall-design.md).
 
 ## Configuration
 

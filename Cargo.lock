@@ -2065,7 +2065,7 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
 name = "rimectl"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "rimeterm-ipc",
@@ -2075,7 +2075,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "rimeterm-config",
@@ -2090,7 +2090,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-config"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "directories",
@@ -2104,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-ipc"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "libc",
@@ -2134,7 +2134,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-pty"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -2151,7 +2151,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-tui"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

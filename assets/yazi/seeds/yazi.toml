@@ -16,14 +16,18 @@ sort_sensitive = false
 # under `plugins/` and the backing binaries under `~/.rimeterm/bin/`, so
 # these entries work zero-config.
 #
+# We match by file extension (`url` selector) rather than by MIME type
+# because Yazi's MIME probe shells out to POSIX `file(1)`, which does
+# not ship on Windows. Extension matching keeps Quick Look working on
+# every platform with zero external-tool dependency beyond the two
+# binaries we already ship.
+#
 # - Images -> chafa (coloured Unicode symbols; works on terminals that
 #   lack Sixel / Kitty / iTerm2 graphics protocols, e.g. Windows
-#   Terminal). Comment out to fall back to Yazi's built-in image
-#   protocol path.
+#   Terminal). Add extensions freely; every entry below is one glob.
 # - Markdown -> glow (formatted prose; more readable than raw source).
 [plugin]
 prepend_previewers = [
-    { mime = "image/*",   run = "chafa" },
-    { url = "*.md",       run = "glow" },
-    { url = "*.markdown", run = "glow" },
+    { url = "*.{png,jpg,jpeg,gif,bmp,webp,avif,ico,tif,tiff}", run = "chafa" },
+    { url = "*.{md,markdown}",                                 run = "glow" },
 ]
