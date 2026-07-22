@@ -11,7 +11,7 @@ Windows-priority, cross-platform.
 | **CI** | [![CI](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml) Linux · macOS (arm) · Windows |
 | **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) · archives (`.tar.gz` / `.zip`) for every target plus native installers (`.msi` / `.deb` / `.pkg`), all bundling the essentials sibling. |
 | **MSRV** | Rust 1.90 (edition 2024) |
-| **Status** | v0.1.6 released — mouse selection, copy, and paste. Drag to select in shells, double/triple-click for word/line, `Ctrl+Shift+C`/`Ctrl+Shift+V` for clipboard, middle-click to paste. Full-screen TUI apps (`yazi`/`htop`/`vim`) keep their native mouse; hold `Shift` to override. |
+| **Status** | v0.1.7 released — bug-fix: Yazi Quick Look for images now works out of the box. The v0.1.4-0.1.6 seed of `~/.rimeterm/yazi/yazi.toml` used a stale Yazi schema (`[manager]` + `name = "*.md"`), which Yazi 26.5.6 refuses to parse; it silently fell back to preset previewers so chafa never registered. Fresh installs on v0.1.7 get correct `[mgr]` + `url = "*.md"` seed. Upgraders: `rm ~/.rimeterm/yazi/yazi.toml` and relaunch to re-seed. |
 
 ---
 

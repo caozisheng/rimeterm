@@ -5,7 +5,7 @@
 # See https://yazi-rs.github.io/docs/configuration/yazi for the full
 # schema.
 
-[manager]
+[mgr]
 show_hidden = false
 sort_by = "natural"
 sort_sensitive = false
@@ -23,7 +23,7 @@ sort_sensitive = false
 # - Markdown -> glow (formatted prose; more readable than raw source).
 [plugin]
 prepend_previewers = [
-    { mime = "image/*",    run = "chafa" },
-    { name = "*.md",       run = "glow" },
-    { name = "*.markdown", run = "glow" },
+    { mime = "image/*",   run = "chafa" },
+    { url = "*.md",       run = "glow" },
+    { url = "*.markdown", run = "glow" },
 ]
