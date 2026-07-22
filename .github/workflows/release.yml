@@ -41,6 +41,15 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version to build (e.g. "0.1.9" or "0.2.0-rc.1"). MUST be
+          MAJOR.MINOR.PATCH[-prerelease] — WiX / pkgbuild reject
+          anything else. Leave blank to auto-derive `0.0.0-dev.<sha>`.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write   # needed to create the GitHub Release
@@ -96,13 +105,27 @@ jobs:
       - name: Resolve version string
         id: version
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             # `refs/tags/v0.1.0` -> `0.1.0`
             VERSION="${GITHUB_REF##refs/tags/v}"
+          elif [[ -n "${INPUT_VERSION}" ]]; then
+            # Explicit override from workflow_dispatch. Validate here so
+            # the failure is one clean error, not a WiX version-parser
+            # cryptic message 15 steps in.
+            if [[ ! "${INPUT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.\-]+)?$ ]]; then
+              echo "::error::input version '${INPUT_VERSION}' is not MAJOR.MINOR.PATCH[-prerelease]"
+              exit 1
+            fi
+            VERSION="${INPUT_VERSION}"
           else
-            VERSION="dev-$(git rev-parse --short HEAD)"
+            # workflow_dispatch without input: emit a well-formed
+            # pre-release identifier all three packagers (WiX, cargo-deb,
+            # pkgbuild) accept.
+            VERSION="0.0.0-dev.$(git rev-parse --short HEAD)"
           fi
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building version: ${VERSION}"
