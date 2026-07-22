@@ -236,10 +236,16 @@ function run(cmd, args) {
 }
 
 async function findFile(root, name) {
+  // Case-insensitive compare: chafa's Windows zip ships `Chafa.exe`
+  // with a capital C. Windows filesystems are case-insensitive but
+  // `readdir` returns the original case, so a strict `e.name === name`
+  // check misses it. Compare via lowercased name and return the actual
+  // path so callers get whatever case is on disk.
+  const needle = name.toLowerCase();
   const entries = await fs.readdir(root, { withFileTypes: true });
   for (const e of entries) {
     const full = path.join(root, e.name);
-    if (e.isFile() && e.name === name) return full;
+    if (e.isFile() && e.name.toLowerCase() === needle) return full;
     if (e.isDirectory()) {
       const nested = await findFile(full, name);
       if (nested) return nested;
