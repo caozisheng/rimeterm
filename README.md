@@ -37,8 +37,9 @@ Excerpt from the internal design contract (§0):
    are kernel-level concepts, not overlays.
 2. **One process, many surfaces** — every pane shares the same render /
    event / config / keymap system.
-3. **Hot-pluggable = no belief** — any pane (including the default four
-   `yazi` / `gitui` / `bottom` / `trippy`) can be disabled, replaced, or
+3. **Hot-pluggable = no belief** — every pane (including bundled
+   essentials `yazi` / `gitui` / `bottom` and the Yazi preview
+   toolchain `bat` / `glow` / `chafa`) can be disabled, replaced, or
    reloaded. The kernel knows nothing about them beyond a contract.
 4. **Correctness > performance > polish** — millisecond response is the
    floor, not the pitch.
@@ -47,18 +48,23 @@ Excerpt from the internal design contract (§0):
    Linux / macOS.
 6. **Fully open source, no closed-source tail** — every dependency must
    allow free redistribution.
-7. **Three essentials bundled; everything else opt-in.** rimeterm's
-   release archive ships prebuilt `yazi` / `gitui` / `bottom` (the
-   three tools required for the default four-quadrant experience);
-   first launch extracts them to `~/.rimeterm/bin/` alongside curated
-   configs under `~/.rimeterm/{yazi,gitui,bottom}/`. Every other
-   tool — `trippy` today, whatever the user adds tomorrow — is
-   opt-in via `tools.install`, installed into
-   `~/.rimeterm/plugins/<name>/` via `cargo install --root`. Detection
-   probes `~/.rimeterm/bin/` → `~/.rimeterm/plugins/*/bin/` → `$PATH`;
-   Upgrade/Uninstall buttons only ever touch the plugin dir so a
-   user's own `~/.cargo/bin/` is never at risk. External shells outside
-   rimeterm see nothing new — we only mutate PTY-child env.
+7. **Essentials bundled; everything else opt-in.** rimeterm's release
+   archive ships prebuilt binaries for the tools that make the default
+   four-quadrant experience work out of the box:
+   - **Quadrant tools**: `yazi` / `gitui` / `bottom`.
+   - **Yazi Quick Look previewers**: `bat` (text/code),
+     `glow` (Markdown), `chafa` (image fallback for terminals without
+     Kitty/iTerm2/Sixel).
+
+   First launch extracts them to `~/.rimeterm/bin/` alongside curated
+   configs under `~/.rimeterm/{yazi,gitui,bottom}/`. Every other tool —
+   `trippy` today, whatever the user adds tomorrow — is opt-in via
+   `tools.install`, installed into `~/.rimeterm/plugins/<name>/` via
+   `cargo install --root`. Detection probes `~/.rimeterm/bin/` →
+   `~/.rimeterm/plugins/*/bin/` → `$PATH`; Upgrade/Uninstall buttons
+   only touch the plugin dir so a user's own `~/.cargo/bin/` is never
+   at risk. External shells outside rimeterm see nothing new — we only
+   mutate PTY-child env.
 8. **ratatui components first** — every widget already in ratatui or
    maintained third-party crates (`nucleo-matcher`, `ratatui-image`, …)
    MUST be reused before writing a new one.
@@ -82,26 +88,25 @@ Excerpt from the internal design contract (§0):
   missing agents render dim with an install hint. Your pick is
   **persisted** to `~/.rimeterm/data/workspaces/<hash>/agents.state.toml`
   so the next launch reopens the same tab without prompting.
-- **Native Settings overlay** — Tools / Agents tabs expose registry status,
-  install / upgrade / uninstall actions, refresh, and detected-agent
-  launch without dropping to `rimectl`. C19 is functionally wired; visible
-  per-row actions, disabled states, mouse handling, and end-to-end coverage
-  remain acceptance work. **C21.5 (planned)** splits the tools view into
-  essentials (yazi/gitui/bottom — bundled, upgraded with rimeterm) and
-  plugins (trippy + user-added — cargo installed on demand into
-  `~/.rimeterm/plugins/`); Upgrade / Uninstall buttons are gated on the
-  plugin channel only, closing the "we might nuke your personal cargo
-  install" hole.
+- **Native Settings overlay** — Tools / Agents tabs expose registry
+  status, install / upgrade / uninstall actions, refresh, and
+  detected-agent launch without dropping to `rimectl`. **C21.5 shipped
+  in v0.1.3**: the tools view splits into essentials
+  (`yazi`/`gitui`/`bottom` + Yazi previewers `bat`/`glow`/`chafa` —
+  bundled with rimeterm) and plugins (`trippy` today, user-added
+  tomorrow — `cargo install --root ~/.rimeterm/plugins/<name>`).
+  Upgrade/Uninstall buttons only light up for the plugin channel, so
+  a user's own `~/.cargo/bin/` is never at risk.
 - **Viewer overlay** (`Alt+V`) — Yazi's native third column keeps its
-  MIME/plugin Quick Look. `Alt+V` freezes the last Yazi selection into a
-  centered Modal Snapshot: Markdown via `tui-markdown`, images via
-  `ratatui-image`. The overlay never enters the layout tree, never resizes
-  PTYs, and never mirrors Yazi's internal preview widget. **C21.5** ships
-  yazi + a curated preview stack (`piper.yazi` + `glow.yazi` +
-  `chafa.yazi`) + the `rimeterm-bridge.yazi` plugin under
-  `~/.rimeterm/yazi/` and injects `YAZI_CONFIG_HOME` — so previews and
-  Alt+V both work out-of-the-box without touching your system Yazi
-  config. See [docs/yazi-setup.md](docs/yazi-setup.md).
+  MIME/plugin Quick Look. `Alt+V` freezes the last Yazi selection into
+  a centered Modal Snapshot: Markdown via `tui-markdown`, images via
+  `ratatui-image`. The overlay never enters the layout tree, never
+  resizes PTYs, and never mirrors Yazi's internal preview widget.
+  Bundled Yazi config (`~/.rimeterm/yazi/`) auto-loads the
+  `rimeterm-bridge.yazi` plugin so Alt+V works out-of-the-box; Yazi
+  Quick Look also gets syntax-highlighted text (via `bat`), Markdown
+  (via `glow`), and image fallbacks (via `chafa`). See
+  [docs/yazi-setup.md](docs/yazi-setup.md).
 - **`rimectl` IPC** — line-delimited JSON over Windows named pipe /
   Unix socket. Full command registry: `workspace.snapshot`, `.pane.write`,
   `.pane.output`, `.pane.wait` (server-side regex poll), `.pane.open`
@@ -130,7 +135,7 @@ Every archive at [latest release] contains:
 rimeterm-<version>-<target>/
 ├── rimeterm(.exe)
 ├── rimectl(.exe)
-├── essentials/            ← prebuilt yazi + ya + gitui + btm + VERSIONS.toml
+├── essentials/            ← prebuilt yazi + ya + gitui + btm + bat + glow + chafa + VERSIONS.toml
 ├── LICENSE
 ├── README.md
 └── ACKNOWLEDGEMENTS.md
@@ -211,32 +216,40 @@ cargo install --path crates/rimeterm --bin rimeterm
 cargo install --path crates/rimectl  --bin rimectl
 ```
 
-**Dev builds only**: essentials (yazi/gitui/bottom) are bundled by the
-release CI, not by `cargo`. If you're running from a checkout, populate
-`target/{debug,release}/essentials/` once with
+**Dev builds only**: essentials (yazi/gitui/bottom + bat/glow/chafa)
+are bundled by the release CI, not by `cargo`. If you're running from
+a checkout, populate `target/{debug,release}/essentials/` once with
 `node bootstrap-essentials.mjs` (requires Node ≥ 18). Rimeterm boots
 fine without them — detection falls through to `$PATH` — but the four
-quadrant tabs will show placeholder panes if `$PATH` is also empty.
+quadrant tabs and Yazi Quick Look will show placeholder panes / empty
+previews if `$PATH` is also empty.
 
-## Bundled essentials + on-demand plugins (C21.5)
+## Bundled essentials + on-demand plugins
 
-**Essentials** (`yazi`, `gitui`, `bottom`) ship in the release archive
-as prebuilt binaries. First launch extracts them to `~/.rimeterm/bin/`
-and seeds `~/.rimeterm/{yazi,gitui,bottom}/` with curated configs
-(including a Yazi preview stack: `piper.yazi` + `glow.yazi` +
-`chafa.yazi` + our own `rimeterm-bridge.yazi`). Nothing to install
-manually. Upgrade path is "install a newer rimeterm release".
+**Essentials** ship in the release archive as prebuilt binaries. First
+launch extracts them to `~/.rimeterm/bin/` and seeds
+`~/.rimeterm/{yazi,gitui,bottom}/` with curated configs (init.lua,
+yazi.toml, key_bindings.ron, etc.) plus the `rimeterm-bridge.yazi`
+plugin so `Alt+V` works out of the box. Nothing to install manually.
+Upgrade path is "install a newer rimeterm release".
 
-**Plugins** (`trippy` today, user-added tomorrow) live under
-`~/.rimeterm/plugins/<name>/` and are installed on demand via
-`tools.install`:
+**Plugins** live under `~/.rimeterm/plugins/<name>/` and are installed
+on demand via `tools.install`:
 
 | kind | shipped as | dir |
 |---|---|---|
-| yazi (file manager) | essential | `~/.rimeterm/bin/yazi` + `~/.rimeterm/yazi/` |
+| yazi (file manager) | essential | `~/.rimeterm/bin/{yazi,ya}` + `~/.rimeterm/yazi/` |
 | gitui | essential | `~/.rimeterm/bin/gitui` + `~/.rimeterm/gitui/` |
 | bottom (sysmon) | essential | `~/.rimeterm/bin/btm` + `~/.rimeterm/bottom/` |
+| bat (Yazi text/code preview) | essential | `~/.rimeterm/bin/bat` |
+| glow (Yazi Markdown preview) | essential | `~/.rimeterm/bin/glow` |
+| chafa (Yazi image fallback) | essential (Linux + Windows only) | `~/.rimeterm/bin/chafa` |
 | trippy (traceroute) | plugin | `~/.rimeterm/plugins/trippy/{bin,config}/` — `cargo install --locked --root ~/.rimeterm/plugins/trippy trippy` |
+
+Chafa is skipped on macOS because upstream ships no `aarch64-apple-darwin`
+build and macOS terminals almost always support Kitty / iTerm2 image
+protocols natively (Yazi uses those first anyway). `brew install chafa`
+works if you need it.
 
 **In-app shortcut**: on a plugin placeholder pane (tool not installed),
 press `[I]` to run `cargo install --locked --root <plugin dir>
@@ -265,7 +278,7 @@ entry. They are not managed by rimeterm.
 
 ```bash
 cargo check --workspace
-node bootstrap-essentials.mjs      # one-shot: fetch yazi/gitui/bottom
+node bootstrap-essentials.mjs      # one-shot: fetch essentials (yazi + ya + gitui + btm + bat + glow + chafa)
 cargo run   --bin rimeterm         # launch the terminal
 cargo run   --bin probe-shell      # print which shell would be picked
 cargo test  --workspace
