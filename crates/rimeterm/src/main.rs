@@ -1,12 +1,18 @@
 //! rimeterm binary entrypoint.
 //!
 //! Boot order (matches §18 first-run + §12 perf budget):
-//! 1. Init tracing (stderr, `RIMETERM_LOG` env filter).
+//! 1. Init tracing (file sink under `~/.rimeterm/logs/`, `RIMETERM_LOG`
+//!    env filter). Stderr is deliberately avoided because the TUI runs
+//!    in the alt-screen and stray writes to the terminal show up on
+//!    top of the rendered UI.
 //! 2. Resolve workspace root (CWD).
 //! 3. Load config: repo `<root>/.rimeterm/config.toml` → user → default.
 //! 4. Hand off to [`rimeterm_tui::App::run`].
 
+use std::fs::OpenOptions;
+use std::io;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use anyhow::Result;
 use rimeterm_config::Config;
@@ -99,12 +105,70 @@ fn init_tracing() {
              rimectl=info",
         )
     });
-    // Logs go to stderr so the alt-screen (stdout) is not disturbed.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
+
+    // Escape hatch for headless debugging (`RIMETERM_LOG_STDERR=1`).
+    // Off by default because the TUI shares the terminal with stderr,
+    // so any log line lands mid-frame over the rendered UI.
+    let force_stderr = std::env::var_os("RIMETERM_LOG_STDERR")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+
+    if force_stderr {
+        let _ = builder
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init();
+        return;
+    }
+
+    match open_log_sink() {
+        Some(file) => {
+            // `tracing_subscriber` implements `MakeWriter` on `Mutex<W>`
+            // directly, so passing the mutex by value is the shortest
+            // path to a shared file sink — no leaks, no Arc, no adapter
+            // struct.
+            let _ = builder
+                .with_writer(Mutex::new(file))
+                .with_ansi(false)
+                .try_init();
+        }
+        // No writable log target and stderr would scribble the TUI, so
+        // drop events on the floor instead. Users who need logs set
+        // `RIMETERM_LOG_FILE=<path>` or `RIMETERM_LOG_STDERR=1`.
+        None => {
+            let _ = builder.with_writer(io::sink).with_ansi(false).try_init();
+        }
+    }
+}
+
+/// Resolve the log file path and open it in append mode.
+///
+/// Order:
+/// 1. `RIMETERM_LOG_FILE` env var (explicit override).
+/// 2. `<RIMETERM_HOME>/logs/rimeterm.log` — matches the "everything
+///    under one dot-dir" layout the rest of the app already uses.
+///
+/// Returns `None` when neither a path is resolvable nor the file can
+/// be created (rare — headless CI without HOME plus no override).
+fn open_log_sink() -> Option<std::fs::File> {
+    let path = if let Some(env_path) = std::env::var_os("RIMETERM_LOG_FILE")
+        && !env_path.is_empty()
+    {
+        PathBuf::from(env_path)
+    } else {
+        rimeterm_config::paths::home()?.join("logs").join("rimeterm.log")
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()
 }
 
 fn load_config(workspace_root: &PathBuf) -> Result<Config> {

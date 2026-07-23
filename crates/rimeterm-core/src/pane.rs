@@ -146,6 +146,15 @@ pub trait PaneProvider: Send + 'static {
         false
     }
 
+    /// Designate whether this pane forwards all mouse events to its child
+    /// and never owns the mouse for local text selection / paste. The App
+    /// sets `true` on left-column (files) panes. rimeterm's own D1/D2
+    /// dividers stay draggable (App checks dividers first). Default no-op;
+    /// only PtyPane honors it.
+    fn set_mouse_passthrough(&mut self, on: bool) {
+        let _ = on;
+    }
+
     /// Force any in-flight PTY resize (throttled by §19.12.6) to apply
     /// immediately. NativePane providers keep the default no-op; PtyPane
     /// overrides to flush the pending size to the underlying pseudo-console.

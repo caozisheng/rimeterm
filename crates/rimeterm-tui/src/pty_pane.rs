@@ -32,6 +32,13 @@ pub struct PtyPane {
     /// mouse reports. Rendered as a reverse-video overlay in `render` and
     /// copied to the system clipboard on mouse-up.
     selection: SelectionState,
+    /// When `true` the pane never owns the mouse for local text selection
+    /// / middle-click paste — every mouse event either forwards to the
+    /// child as SGR bytes (when the child asked for xterm mouse) or is
+    /// dropped. Set on the left column (files: yazi / gitui). This does
+    /// NOT affect rimeterm's own D1/D2 divider drag: App::on_mouse checks
+    /// dividers BEFORE pane-priority, so the seams stay draggable.
+    mouse_passthrough: bool,
 }
 
 impl PtyPane {
@@ -46,6 +53,18 @@ impl PtyPane {
             last_area: Rect::default(),
             resize: ResizeThrottle::platform(),
             selection: SelectionState::default(),
+            mouse_passthrough: false,
+        }
+    }
+
+    /// Designate this pane as mouse-passthrough: never own the mouse for
+    /// local text selection / paste. The App sets this on every pane in
+    /// the left (files) column. rimeterm's own D1/D2 dividers stay
+    /// draggable because App::on_mouse checks dividers first.
+    pub fn set_mouse_passthrough(&mut self, on: bool) {
+        self.mouse_passthrough = on;
+        if on {
+            self.selection.clear();
         }
     }
 
@@ -100,11 +119,15 @@ impl PtyPane {
     }
 
     /// Expose child mouse ownership check to App so it can decide whether
-    /// to route Left Down to the pane FIRST (before checking divider drag).
-    /// This prevents rimeterm from intercepting clicks on yazi's internal
-    /// three-column dividers (§C22.6 yazi conflict resolution).
+    /// to route Left Down to the pane (App checks dividers FIRST, so the
+    /// D1/D2 seams stay draggable regardless). Passthrough panes (left /
+    /// files column) always claim priority so a click on yazi's frame is
+    /// forwarded instead of starting a rimeterm selection.
     pub fn wants_mouse_priority(&self, shift_held: bool) -> bool {
-        self.child_wants_mouse() && !shift_held
+        if shift_held {
+            return false;
+        }
+        self.mouse_passthrough || self.child_wants_mouse()
     }
 
     /// Copy the current selection's text to the system clipboard. Called
@@ -397,7 +420,21 @@ impl PaneProvider for PtyPane {
 
 
     fn wants_mouse_priority(&self, shift_held: bool) -> bool {
-        self.child_wants_mouse() && !shift_held
+        // Mirrors the inherent method. App checks dividers BEFORE this,
+        // so D1/D2 stay draggable; passthrough just claims priority for
+        // the pane's own cells so clicks forward to the child.
+        if shift_held {
+            return false;
+        }
+        self.mouse_passthrough || self.child_wants_mouse()
+    }
+    fn set_mouse_passthrough(&mut self, on: bool) {
+        // Delegate to the inherent method so the trait-object call site
+        // (`&mut dyn PaneProvider`) actually flips the field. Without
+        // this override the trait's default no-op would run and the flag
+        // would stay false forever — the root cause of the earlier
+        // "passthrough=false" diagnostics.
+        PtyPane::set_mouse_passthrough(self, on);
     }
     fn on_mouse(&mut self, ev: MouseEvent, outer_rect: Rect) -> bool {
         // Border occupies 1 cell on every side; clicks on the border are
@@ -410,15 +447,27 @@ impl PaneProvider for PtyPane {
             return false;
         }
 
-        // C22.6 routing decision. If the child asked for xterm mouse
-        // reports (yazi / htop / vim), we forward. Otherwise (bash /
-        // pwsh / fish idle prompt), we own the mouse for text
-        // selection + paste. Shift always forces local ownership so
-        // users can still select text inside a full-screen TUI.
-        let child_owns_mouse =
-            self.child_wants_mouse() && !ev.modifiers.contains(KeyModifiers::SHIFT);
+        // C22.6 routing decision. Three cases:
+        //
+        // 1. Child asked for xterm mouse reports (yazi / htop / vim) AND
+        //    user didn't hold Shift → forward SGR bytes to the child.
+        // 2. Pane is mouse-passthrough (left / files column) AND user
+        //    didn't hold Shift → forward SGR bytes UNCONDITIONALLY, even
+        //    if the child hasn't enabled a mouse mode. This is the key
+        //    fix: yazi toggles mouse mode on/off depending on its active
+        //    view (e.g. its input prompt disables it). If we dropped
+        //    events while mouse mode was off, yazi would never receive
+        //    the click that re-enters mouse mode, and its internal
+        //    divider drag would be dead. Forwarding SGR always lets the
+        //    child decide; an app that doesn't understand SGR simply
+        //    ignores the bytes.
+        // 3. Otherwise (shell prompt, or Shift held) → own the mouse for
+        //    local text selection + paste.
+        let shift_forces_local = ev.modifiers.contains(KeyModifiers::SHIFT);
+        let forward_to_child = !shift_forces_local
+            && (self.mouse_passthrough || self.child_wants_mouse());
 
-        if child_owns_mouse {
+        if forward_to_child {
             // Any local selection needs to be dropped before we hand
             // control back to the child — otherwise a stale highlight
             // stays on screen after a `less` invocation exits.

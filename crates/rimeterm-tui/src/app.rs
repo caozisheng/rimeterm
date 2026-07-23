@@ -547,6 +547,12 @@ impl App {
                 color,
                 "files",
             )?;
+            // Left column (files) panes are mouse-passthrough: they never
+            // start rimeterm text selections / paste. D1/D2 dividers still
+            // drag because on_mouse checks dividers before pane-priority.
+            if let Some(pane) = panes.get_mut(id) {
+                pane.set_mouse_passthrough(true);
+            }
             files_members.push(id);
         }
 
@@ -1249,6 +1255,12 @@ impl App {
         // Priority: when a pane has an active text selection, right-click
         // should copy (GNOME Terminal, KDE Konsole convention) rather than
         // opening the menu. Only open the menu when no selection exists.
+        //
+        // The context menu also offers "Copy selected file path" on the
+        // left (files) column — a shortcut to grab yazi's current hover
+        // target (tracked via the OSC bridge) without drag-selecting the
+        // filename. Text selection still works normally on every pane;
+        // this entry is just a convenience.
         if let MouseEventKind::Down(MouseButton::Right) = m.kind {
             // Check if the click landed on a pane with an active selection.
             if let Some((pane_id, outer_rect)) = self.pane_outer_at(m.column, m.row) {
@@ -1270,31 +1282,21 @@ impl App {
         // --- Left Down: dispatch by zone ---
         //
         // Priority order:
-        // 1. If the pane under the cursor wants mouse control (yazi, vim,
-        //    htop), forward the Down to it FIRST — child apps that render
-        //    their own dividers (yazi's three-column layout) need to receive
-        //    the event rather than having rimeterm intercept for a layout
-        //    divider drag.
-        // 2. Otherwise: divider drag → tab strip → pane focus.
+        // 1. Divider drag. rimeterm's own seams (D1 left/right column,
+        //    D2 right-column top/bottom) MUST win over everything — a
+        //    divider strip is the last cell of the pane to its left, so
+        //    `pane_outer_at` would otherwise hand the click to that pane,
+        //    and a child in xterm-mouse mode (yazi) would swallow it.
+        //    Checking dividers first is what keeps the seams draggable
+        //    even when the neighbouring pane owns the mouse.
+        // 2. Pane that wants mouse control (yazi / vim / htop) — forward
+        //    the Down so the child can handle its own interactions (yazi's
+        //    *internal* three-column divider drag, vim click, etc). These
+        //    internal seams live on different cells than D1/D2, so step 1
+        //    never steals them.
+        // 3. Tab strip → pane focus.
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-            // Check if a pane under the cursor wants mouse control.
-            if let Some((pane_id, outer_rect)) = self.pane_outer_at(m.column, m.row) {
-                if let Some(pane) = self.panes.get(pane_id) {
-                    if pane.wants_mouse_priority(m.modifiers.contains(crossterm::event::KeyModifiers::SHIFT)) {
-                        // Child wants the mouse — forward the Down event
-                        // and let it handle internal interactions (yazi
-                        // divider drag, vim click, etc). Drop the immutable
-                        // borrow before getting a mutable one.
-                        let _ = pane;
-                        if let Some(pane_mut) = self.panes.get_mut(pane_id) {
-                            let _ = pane_mut.on_mouse(m, outer_rect);
-                        }
-                        return;
-                    }
-                }
-            }
-            // No child ownership claim — check rimeterm's own interactive zones.
-            // 1. Divider drag.
+            // 1. Divider drag — highest priority.
             if let Some(d) = self
                 .last_dividers
                 .iter()
@@ -1304,7 +1306,29 @@ impl App {
                 self.start_divider_drag(d, m.column, m.row);
                 return;
             }
-            // 2. Tab strip: activate / close / fire the group's `[+]`.
+            // 2. Pane that wants mouse control (child owns the mouse).
+            if let Some((pane_id, outer_rect)) = self.pane_outer_at(m.column, m.row) {
+                if let Some(pane) = self.panes.get(pane_id) {
+                    if pane.wants_mouse_priority(
+                        m.modifiers.contains(crossterm::event::KeyModifiers::SHIFT),
+                    ) {
+                        // Child wants the mouse — focus the clicked pane
+                        // first (so keyboard / cursor follow the click
+                        // even though the event itself is forwarded to
+                        // the child), then forward the Down event so the
+                        // child can handle its own interactions (yazi's
+                        // own dividers, vim click, etc). Drop the
+                        // immutable borrow before the mutable calls.
+                        let _ = pane;
+                        self.focus_pane_at(m.column, m.row);
+                        if let Some(pane_mut) = self.panes.get_mut(pane_id) {
+                            let _ = pane_mut.on_mouse(m, outer_rect);
+                        }
+                        return;
+                    }
+                }
+            }
+            // 3. Tab strip: activate / close / fire the group's `[+]`.
             if let Some(hit) = self.tab_hit(m.column, m.row) {
                 match hit {
                     TabStripHit::Activate { gid, idx } => self.activate_tab(gid, idx),
@@ -1313,7 +1337,7 @@ impl App {
                 }
                 return;
             }
-            // 3. Fell into a pane rect: focus + forward the Down.
+            // 4. Fell into a pane rect: focus + forward the Down.
             self.focus_pane_at(m.column, m.row);
         }
 
@@ -1584,6 +1608,23 @@ impl App {
             }
             return;
         }
+        // yazi.copy.path: copy the last hovered yazi file path to the
+        // clipboard. Emitted by the right-click context menu on the left
+        // (files) column — a convenience so the user can grab yazi's
+        // current selection without drag-selecting the filename text.
+        if intent == "yazi.copy.path" {
+            match self.last_yazi_selection.clone() {
+                Some(sel) => {
+                    let text = sel.path.display().to_string();
+                    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
+                        Ok(()) => self.set_hint(format!("📋 copied: {}", text)),
+                        Err(_) => self.set_hint("⛔ clipboard unavailable".into()),
+                    }
+                }
+                None => self.set_hint("no file hovered in yazi".into()),
+            }
+            return;
+        }
         let mut parts = intent.split(':');
         match parts.next() {
             Some("tab.activate") => {
@@ -1731,6 +1772,28 @@ impl App {
                 "Focus this pane",
                 format!("pane.focus:{}", pane_id.0),
             ));
+            // Left (files) column convenience: a one-click way to copy
+            // yazi's currently-hovered file path (tracked via the OSC
+            // bridge) without drag-selecting the filename text. Disabled
+            // with a hint when nothing is hovered yet.
+            let in_files = owner.is_some_and(|(gid, _, _)| gid == BUILTIN_FILES);
+            if in_files {
+                match &self.last_yazi_selection {
+                    Some(sel) => {
+                        let label = sel.path.display().to_string();
+                        entries.push(crate::picker::PickerEntry::intent(
+                            "Copy selected file path",
+                            "yazi.copy.path",
+                        ).with_note(label));
+                    }
+                    None => {
+                        entries.push(crate::picker::PickerEntry::disabled(
+                            "Copy selected file path",
+                            "no file hovered",
+                        ));
+                    }
+                }
+            }
             if let Some((gid, idx, policy)) = owner {
                 if matches!(policy, rimeterm_core::tabs::MembersPolicy::Open { .. }) {
                     entries.push(crate::picker::PickerEntry::intent(
@@ -2801,6 +2864,11 @@ impl App {
                 return;
             }
         };
+        // gitui respawns into the left (files) column — same passthrough
+        // policy as the initial spawn.
+        if let Some(pane) = self.panes.get_mut(new_id) {
+            pane.set_mouse_passthrough(true);
+        }
         let group = self
             .tree
             .find_tab_group_mut(BUILTIN_FILES)
