@@ -1,19 +1,19 @@
-//! M2 App wiring — the four-quadrant workspace.
+//! M2 App wiring — the three-zone workspace.
 //!
-//! Layout matches §19.1 (viewer folded state):
+//! Layout matches §19.1 (new 3-zone design):
 //!
 //! ```text
 //! ┌ ≡ rimeterm ─── workspace ─── shell: pwsh 7 ─┐
 //! │ ┤ files ├ …           │ ┤ agents ├ …       │
-//! │  (yazi/gitui)         │  (omp/pi/…)        │
-//! ├───────────────────────┼────────────────────┤
-//! │ ┤ sysmon ├ …          │ ┤ shells ├ …       │
-//! │  (bottom/…)           │  (shell-1)         │
+//! │  (yazi/viewer/gitui)  │  (omp/pi/…)        │
+//! │                       ├────────────────────┤
+//! │                       │ ┤ shells ├ …       │
+//! │                       │  (bottom/shell-1)  │
 //! └ hint bar ──────────────────────────────────┘
 //! ```
 //!
-//! Real plugin providers land in later milestones; every non-shell cell shows
-//! a `PlaceholderPane` labeled with the group's active tab.
+//! Left pane is full-height; right column splits into agents (top) and shells (bottom).
+//! The shells group contains bottom as the first tab, followed by shell tabs.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,7 +35,7 @@ use rimeterm_core::focus::FocusManager;
 use rimeterm_core::layout::{LayoutNode, LayoutTree};
 use rimeterm_core::pane::{PaneId, PaneProvider, PaneRenderCtx};
 use rimeterm_core::tabs::{
-    BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS, BUILTIN_SYSMON, MembersPolicy, PaneKind,
+    BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS, MembersPolicy, PaneKind,
     TabGroup, TabGroupId,
 };
 use rimeterm_pty::{ShellChoice, detect_default_shell};
@@ -74,7 +74,7 @@ struct ActionFlags {
     tab_prev: AtomicBool,
     tab_goto: AtomicUsize,       // 1..=9 = goto; 0 = idle.
     focus_dir: AtomicUsize,      // 1=left 2=right 3=up 4=down; 0 = idle.
-    focus_quadrant: AtomicUsize, // 1..=4; 0 = idle.
+    focus_quadrant: AtomicUsize, // 1..=3 (3-zone layout); 0 = idle.
     settings: AtomicBool,
     resize_toggle: AtomicBool,
     acknowledgement: AtomicBool,
@@ -175,7 +175,7 @@ impl std::fmt::Display for LayoutResetError {
             Self::UnknownGroup(g) => {
                 write!(
                     f,
-                    "unknown group `{g}` (expected one of: files, sysmon, agents, shells)"
+                    "unknown group `{g}` (expected one of: files, agents, shells)"
                 )
             }
         }
@@ -340,22 +340,20 @@ enum ResizeTarget {
 /// For a focused group, tell the app which split path + boundary + sign to
 /// apply a keyboard resize step to.
 ///
-/// - files : column 0, row 0. `Horizontal` moves the root seam (boundary 0);
-///   grow = shift right = +sign. `Vertical` moves the left column seam.
-/// - sysmon: column 0, row 1. `Horizontal` = root seam, `Vertical` = left row seam
-///   but sign flipped (grow = up = shrink files → so we apply a `-` sign).
-/// - agents: column 1, row 0. `Horizontal` = root seam, sign flipped (grow =
-///   shift left = shrink files column).
-/// - shells: column 1, row 1. Same as agents/sysmon logic.
+/// 3-zone layout:
+/// - files : left column (no vertical split). `Horizontal` moves the root seam.
+/// - agents: right column, top. `Horizontal` moves root seam (sign flipped).
+///   `Vertical` moves the right column seam (boundary 0).
+/// - shells: right column, bottom. Same as agents but `Vertical` sign flipped.
 fn resize_target_for_group(
     gid: rimeterm_core::TabGroupId,
     target: ResizeTarget,
 ) -> Option<(rimeterm_core::layout::SplitPath, usize, u16, f32)> {
     use rimeterm_core::layout::SplitPath;
-    use rimeterm_core::{BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS, BUILTIN_SYSMON};
+    use rimeterm_core::{BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS};
     match (gid, target) {
-        (g, ResizeTarget::Horizontal) if g == BUILTIN_FILES => Some((SplitPath::root(), 0, 0, 1.0)),
-        (g, ResizeTarget::Horizontal) if g == BUILTIN_SYSMON => {
+        // Horizontal: adjust left/right column boundary
+        (g, ResizeTarget::Horizontal) if g == BUILTIN_FILES => {
             Some((SplitPath::root(), 0, 0, 1.0))
         }
         (g, ResizeTarget::Horizontal) if g == BUILTIN_AGENTS => {
@@ -364,12 +362,9 @@ fn resize_target_for_group(
         (g, ResizeTarget::Horizontal) if g == BUILTIN_SHELLS => {
             Some((SplitPath::root(), 0, 0, -1.0))
         }
-        (g, ResizeTarget::Vertical) if g == BUILTIN_FILES => {
-            Some((SplitPath::root().push(0), 0, 0, 1.0))
-        }
-        (g, ResizeTarget::Vertical) if g == BUILTIN_SYSMON => {
-            Some((SplitPath::root().push(0), 0, 0, -1.0))
-        }
+        
+        // Vertical: only right column has vertical split
+        // FILES has no vertical neighbor, so no vertical resize
         (g, ResizeTarget::Vertical) if g == BUILTIN_AGENTS => {
             Some((SplitPath::root().push(1), 0, 0, 1.0))
         }
@@ -384,13 +379,17 @@ fn resize_target_for_group(
 /// this group is focused.
 fn paths_for_group(gid: rimeterm_core::TabGroupId) -> Vec<rimeterm_core::layout::SplitPath> {
     use rimeterm_core::layout::SplitPath;
-    use rimeterm_core::{BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS, BUILTIN_SYSMON};
-    let column = match gid {
-        g if g == BUILTIN_FILES || g == BUILTIN_SYSMON => 0,
-        g if g == BUILTIN_AGENTS || g == BUILTIN_SHELLS => 1,
-        _ => return Vec::new(),
-    };
-    vec![SplitPath::root(), SplitPath::root().push(column)]
+    use rimeterm_core::{BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS};
+    
+    match gid {
+        // Left column (FILES): no vertical split, only root
+        g if g == BUILTIN_FILES => vec![SplitPath::root()],
+        // Right column (AGENTS/SHELLS): root + right column's vertical split
+        g if g == BUILTIN_AGENTS || g == BUILTIN_SHELLS => {
+            vec![SplitPath::root(), SplitPath::root().push(1)]
+        }
+        _ => Vec::new(),
+    }
 }
 
 #[allow(dead_code)] // config / event_bus are wired in later milestones
@@ -550,29 +549,6 @@ impl App {
             )?;
             files_members.push(id);
         }
-        let mut sysmon_members = Vec::new();
-        for spec in &config.sysmon.tabs {
-            let icon = match spec.id.as_str() {
-                "trippy" => "🛰",
-                _ => "📊",
-            };
-            let color = match spec.id.as_str() {
-                "trippy" => Color::Blue,
-                _ => Color::Magenta,
-            };
-            let id = build_external_pane(
-                &mut panes,
-                &session_writes,
-                spec,
-                &workspace_root,
-                redraw_tx.clone(),
-                osc_tx.clone(),
-                icon,
-                color,
-                "sysmon",
-            )?;
-            sysmon_members.push(id);
-        }
 
         let mut agents_members = Vec::new();
         // (pane_id, static registry id) for each agent tab we spawn during
@@ -665,7 +641,30 @@ impl App {
             agents_members.push(id);
         }
 
-        // shells starts with a real PTY.
+        // Shells group: bottom as first tab, followed by shell tabs.
+        // Bottom (system monitor) is now part of the shells tab group.
+        let mut shells_members = Vec::new();
+        
+        // 1. Add bottom as the first tab (if configured in sysmon.tabs)
+        for spec in &config.sysmon.tabs {
+            if spec.id == "bottom" {
+                let id = build_external_pane(
+                    &mut panes,
+                    &session_writes,
+                    spec,
+                    &workspace_root,
+                    redraw_tx.clone(),
+                    osc_tx.clone(),
+                    "📊",
+                    Color::Magenta,
+                    "shells",
+                )?;
+                shells_members.push(id);
+                break;
+            }
+        }
+        
+        // 2. Add the first shell tab
         let first = spawn_shell(
             &shell_choice,
             workspace_root.clone(),
@@ -680,6 +679,7 @@ impl App {
             .lock()
             .insert(first_id, first.pane.session().clone());
         panes.insert(Box::new(first.pane));
+        shells_members.push(first_id);
 
         // Groups.
         let files = TabGroup::new(
@@ -687,12 +687,6 @@ impl App {
             files_members,
             MembersPolicy::Fixed,
             PaneKind::Files,
-        );
-        let sysmon = TabGroup::new(
-            BUILTIN_SYSMON,
-            sysmon_members,
-            MembersPolicy::Fixed,
-            PaneKind::Sysmon,
         );
         let agents = TabGroup::new(
             BUILTIN_AGENTS,
@@ -702,23 +696,20 @@ impl App {
         );
         let shells = TabGroup::new(
             BUILTIN_SHELLS,
-            vec![first_id],
+            shells_members,
             MembersPolicy::Open { max: 16 },
             PaneKind::Shell,
         );
 
-        // Layout: horizontal split (left | right), each column a vertical split
-        // of two tab groups. Ratios match §19.2 closed state (0.35 / 0.65 cols,
-        // 0.65 / 0.35 rows on the left, 0.55 / 0.45 rows on the right).
+        // Layout: horizontal split (left | right), right column is a vertical split.
+        // Left pane is full-height (files group: yazi/viewer/gitui toggle).
+        // Right splits into agents (top 55%) and shells (bottom 45%, contains bottom tab + shells).
+        // Ratios match §19.2 new design: 0.35 / 0.65 cols, 0.55 / 0.45 right rows.
         let root = LayoutNode::split(
             Direction::Horizontal,
             vec![0.35, 0.65],
             vec![
-                LayoutNode::split(
-                    Direction::Vertical,
-                    vec![0.65, 0.35],
-                    vec![LayoutNode::tabs(files), LayoutNode::tabs(sysmon)],
-                ),
+                LayoutNode::tabs(files),  // Left: single pane, full-height
                 LayoutNode::split(
                     Direction::Vertical,
                     vec![0.55, 0.45],
@@ -1849,7 +1840,6 @@ impl App {
         // as separate layout nodes and keeps the LayoutTree pure.
         let group_ids = [
             BUILTIN_FILES,
-            BUILTIN_SYSMON,
             BUILTIN_AGENTS,
             BUILTIN_SHELLS,
         ];
@@ -2297,11 +2287,11 @@ impl App {
     }
 
     fn focus_quadrant(&mut self, quad: usize) {
+        // 3-zone layout: 1=left (files), 2=right-top (agents), 3=right-bottom (shells)
         let gid = match quad {
             1 => BUILTIN_FILES,
             2 => BUILTIN_AGENTS,
-            3 => BUILTIN_SYSMON,
-            4 => BUILTIN_SHELLS,
+            3 => BUILTIN_SHELLS,
             _ => return,
         };
         self.focus_group(gid);
@@ -3312,24 +3302,28 @@ pub(crate) fn format_agent_picker_hint() -> String {
     lines.join("\n")
 }
 
+/// Map (current_group, direction) → neighbor group in the 3-zone layout.
+/// Returns `None` if the move would go out of bounds.
+///
+/// 3-zone layout (§19.1 new design):
+///   ┌ files (full-height) │ agents ┐
+///   │                     │ shells ┤
+///
+/// Directions: 1=left, 2=right, 3=up, 4=down.
 fn neighbor_group(from: TabGroupId, dir: usize) -> Option<TabGroupId> {
-    // Layout (quadrants):
-    //   ┌ files   │ agents ┐
-    //   ├ sysmon  │ shells ┤
     let same = from;
     let out = match (dir, from) {
-        // 1 = left
+        // Left/Right: horizontal navigation
         (1, g) if g == BUILTIN_AGENTS => BUILTIN_FILES,
-        (1, g) if g == BUILTIN_SHELLS => BUILTIN_SYSMON,
-        // 2 = right
+        (1, g) if g == BUILTIN_SHELLS => BUILTIN_FILES,
         (2, g) if g == BUILTIN_FILES => BUILTIN_AGENTS,
-        (2, g) if g == BUILTIN_SYSMON => BUILTIN_SHELLS,
-        // 3 = up
-        (3, g) if g == BUILTIN_SYSMON => BUILTIN_FILES,
+        
+        // Up/Down: only within right column
         (3, g) if g == BUILTIN_SHELLS => BUILTIN_AGENTS,
-        // 4 = down
-        (4, g) if g == BUILTIN_FILES => BUILTIN_SYSMON,
         (4, g) if g == BUILTIN_AGENTS => BUILTIN_SHELLS,
+        
+        // Left column (FILES) has no up/down neighbors
+        // Out of bounds cases return same (filtered below)
         _ => same,
     };
     if out == from { None } else { Some(out) }
@@ -4264,7 +4258,6 @@ pub(crate) fn parse_layout_reset_args(
     }
     let gid = match group {
         "files" => rimeterm_core::BUILTIN_FILES,
-        "sysmon" => rimeterm_core::BUILTIN_SYSMON,
         "agents" => rimeterm_core::BUILTIN_AGENTS,
         "shells" => rimeterm_core::BUILTIN_SHELLS,
         other => {
@@ -4649,7 +4642,6 @@ pub(crate) fn live_hover_overlay(
 fn parse_group_id(s: &str) -> Option<TabGroupId> {
     match s {
         "files" => Some(BUILTIN_FILES),
-        "sysmon" => Some(BUILTIN_SYSMON),
         "agents" => Some(BUILTIN_AGENTS),
         "shells" => Some(BUILTIN_SHELLS),
         _ => None,
@@ -4900,39 +4892,42 @@ mod tests {
     }
     #[test]
     fn neighbor_group_navigates_left_right() {
-        assert_eq!(neighbor_group(BUILTIN_FILES, 2), Some(BUILTIN_AGENTS));
+        // 3-zone: files ←→ agents/shells
         assert_eq!(neighbor_group(BUILTIN_AGENTS, 1), Some(BUILTIN_FILES));
-        assert_eq!(neighbor_group(BUILTIN_SYSMON, 2), Some(BUILTIN_SHELLS));
-        assert_eq!(neighbor_group(BUILTIN_SHELLS, 1), Some(BUILTIN_SYSMON));
+        assert_eq!(neighbor_group(BUILTIN_SHELLS, 1), Some(BUILTIN_FILES));
+        assert_eq!(neighbor_group(BUILTIN_FILES, 2), Some(BUILTIN_AGENTS));
     }
 
     #[test]
     fn neighbor_group_navigates_up_down() {
-        assert_eq!(neighbor_group(BUILTIN_FILES, 4), Some(BUILTIN_SYSMON));
-        assert_eq!(neighbor_group(BUILTIN_SYSMON, 3), Some(BUILTIN_FILES));
+        // 3-zone: up/down only within right column
         assert_eq!(neighbor_group(BUILTIN_AGENTS, 4), Some(BUILTIN_SHELLS));
         assert_eq!(neighbor_group(BUILTIN_SHELLS, 3), Some(BUILTIN_AGENTS));
+        
+        // FILES has no up/down neighbors
+        assert_eq!(neighbor_group(BUILTIN_FILES, 3), None);
+        assert_eq!(neighbor_group(BUILTIN_FILES, 4), None);
     }
 
     #[test]
-    fn neighbor_group_returns_none_when_no_neighbor() {
-        // Going up from a top-row group has no neighbor.
-        assert_eq!(neighbor_group(BUILTIN_FILES, 3), None);
-        assert_eq!(neighbor_group(BUILTIN_AGENTS, 3), None);
-        // Going down from a bottom-row group has no neighbor.
-        assert_eq!(neighbor_group(BUILTIN_SYSMON, 4), None);
+    fn neighbor_group_rejects_out_of_bounds() {
+        // Going down from bottom-right has no neighbor.
         assert_eq!(neighbor_group(BUILTIN_SHELLS, 4), None);
-        // Going left from the left column has no neighbor.
+        // Going left from left column has no neighbor.
         assert_eq!(neighbor_group(BUILTIN_FILES, 1), None);
-        assert_eq!(neighbor_group(BUILTIN_SYSMON, 1), None);
-        // Going right from the right column has no neighbor.
+        // Going right from right column has no neighbor.
         assert_eq!(neighbor_group(BUILTIN_AGENTS, 2), None);
         assert_eq!(neighbor_group(BUILTIN_SHELLS, 2), None);
+        // Going up from top-right has no neighbor.
+        assert_eq!(neighbor_group(BUILTIN_AGENTS, 3), None);
     }
 
     #[test]
     fn resize_target_maps_group_to_split_path() {
         use rimeterm_core::layout::SplitPath;
+        // 3-zone layout: left full-height, right split vertically
+        
+        // Horizontal resize: all groups can adjust left/right boundary
         let (path, boundary, _, sign) =
             resize_target_for_group(BUILTIN_FILES, ResizeTarget::Horizontal).unwrap();
         assert_eq!(path, SplitPath::root());
@@ -4944,9 +4939,16 @@ mod tests {
         assert_eq!(path, SplitPath::root());
         assert!(sign < 0.0);
 
+        // Vertical resize: only right column groups can adjust up/down
+        // FILES has no vertical split, so returns None
+        assert_eq!(
+            resize_target_for_group(BUILTIN_FILES, ResizeTarget::Vertical),
+            None
+        );
+
         let (path, _, _, sign) =
-            resize_target_for_group(BUILTIN_FILES, ResizeTarget::Vertical).unwrap();
-        assert_eq!(path, SplitPath::root().push(0));
+            resize_target_for_group(BUILTIN_AGENTS, ResizeTarget::Vertical).unwrap();
+        assert_eq!(path, SplitPath::root().push(1));
         assert!(sign > 0.0);
 
         let (path, _, _, sign) =
@@ -4958,13 +4960,15 @@ mod tests {
     #[test]
     fn paths_for_group_returns_column_split_and_root() {
         use rimeterm_core::layout::SplitPath;
+        // 3-zone: column 1 (right) has both root and its own split
         assert_eq!(
             paths_for_group(BUILTIN_AGENTS),
             vec![SplitPath::root(), SplitPath::root().push(1)]
         );
+        // Column 0 (left, FILES) has no vertical split, only root
         assert_eq!(
             paths_for_group(BUILTIN_FILES),
-            vec![SplitPath::root(), SplitPath::root().push(0)]
+            vec![SplitPath::root()]
         );
     }
 
@@ -5493,7 +5497,6 @@ mod tests {
     fn layout_reset_valid_group_ids_all_map() {
         for (raw, expected) in [
             ("files", rimeterm_core::BUILTIN_FILES),
-            ("sysmon", rimeterm_core::BUILTIN_SYSMON),
             ("agents", rimeterm_core::BUILTIN_AGENTS),
             ("shells", rimeterm_core::BUILTIN_SHELLS),
         ] {
