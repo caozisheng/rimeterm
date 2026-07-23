@@ -35,8 +35,7 @@ use rimeterm_core::focus::FocusManager;
 use rimeterm_core::layout::{LayoutNode, LayoutTree};
 use rimeterm_core::pane::{PaneId, PaneProvider, PaneRenderCtx};
 use rimeterm_core::tabs::{
-    BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS, MembersPolicy, PaneKind,
-    TabGroup, TabGroupId,
+    BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS, MembersPolicy, PaneKind, TabGroup, TabGroupId,
 };
 use rimeterm_pty::{ShellChoice, detect_default_shell};
 use tokio::sync::mpsc;
@@ -353,16 +352,14 @@ fn resize_target_for_group(
     use rimeterm_core::{BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS};
     match (gid, target) {
         // Horizontal: adjust left/right column boundary
-        (g, ResizeTarget::Horizontal) if g == BUILTIN_FILES => {
-            Some((SplitPath::root(), 0, 0, 1.0))
-        }
+        (g, ResizeTarget::Horizontal) if g == BUILTIN_FILES => Some((SplitPath::root(), 0, 0, 1.0)),
         (g, ResizeTarget::Horizontal) if g == BUILTIN_AGENTS => {
             Some((SplitPath::root(), 0, 0, -1.0))
         }
         (g, ResizeTarget::Horizontal) if g == BUILTIN_SHELLS => {
             Some((SplitPath::root(), 0, 0, -1.0))
         }
-        
+
         // Vertical: only right column has vertical split
         // FILES has no vertical neighbor, so no vertical resize
         (g, ResizeTarget::Vertical) if g == BUILTIN_AGENTS => {
@@ -380,7 +377,7 @@ fn resize_target_for_group(
 fn paths_for_group(gid: rimeterm_core::TabGroupId) -> Vec<rimeterm_core::layout::SplitPath> {
     use rimeterm_core::layout::SplitPath;
     use rimeterm_core::{BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS};
-    
+
     match gid {
         // Left column (FILES): no vertical split, only root
         g if g == BUILTIN_FILES => vec![SplitPath::root()],
@@ -650,7 +647,7 @@ impl App {
         // Shells group: bottom as first tab, followed by shell tabs.
         // Bottom (system monitor) is now part of the shells tab group.
         let mut shells_members = Vec::new();
-        
+
         // 1. Add bottom as the first tab (if configured in sysmon.tabs)
         for spec in &config.sysmon.tabs {
             if spec.id == "bottom" {
@@ -669,7 +666,7 @@ impl App {
                 break;
             }
         }
-        
+
         // 2. Add the first shell tab
         let first = spawn_shell(
             &shell_choice,
@@ -715,7 +712,7 @@ impl App {
             Direction::Horizontal,
             vec![0.35, 0.65],
             vec![
-                LayoutNode::tabs(files),  // Left: single pane, full-height
+                LayoutNode::tabs(files), // Left: single pane, full-height
                 LayoutNode::split(
                     Direction::Vertical,
                     vec![0.55, 0.45],
@@ -1781,10 +1778,13 @@ impl App {
                 match &self.last_yazi_selection {
                     Some(sel) => {
                         let label = sel.path.display().to_string();
-                        entries.push(crate::picker::PickerEntry::intent(
-                            "Copy selected file path",
-                            "yazi.copy.path",
-                        ).with_note(label));
+                        entries.push(
+                            crate::picker::PickerEntry::intent(
+                                "Copy selected file path",
+                                "yazi.copy.path",
+                            )
+                            .with_note(label),
+                        );
                     }
                     None => {
                         entries.push(crate::picker::PickerEntry::disabled(
@@ -1901,11 +1901,7 @@ impl App {
         // Compute the rect for each *tab group cell*, then split off a 1-row
         // tab strip inside each cell. This is simpler than tracking tab strips
         // as separate layout nodes and keeps the LayoutTree pure.
-        let group_ids = [
-            BUILTIN_FILES,
-            BUILTIN_AGENTS,
-            BUILTIN_SHELLS,
-        ];
+        let group_ids = [BUILTIN_FILES, BUILTIN_AGENTS, BUILTIN_SHELLS];
         for gid in group_ids {
             let Some(cell) = group_cell_rect(&self.tree, vertical[1], gid) else {
                 continue;
@@ -3385,11 +3381,11 @@ fn neighbor_group(from: TabGroupId, dir: usize) -> Option<TabGroupId> {
         (1, g) if g == BUILTIN_AGENTS => BUILTIN_FILES,
         (1, g) if g == BUILTIN_SHELLS => BUILTIN_FILES,
         (2, g) if g == BUILTIN_FILES => BUILTIN_AGENTS,
-        
+
         // Up/Down: only within right column
         (3, g) if g == BUILTIN_SHELLS => BUILTIN_AGENTS,
         (4, g) if g == BUILTIN_AGENTS => BUILTIN_SHELLS,
-        
+
         // Left column (FILES) has no up/down neighbors
         // Out of bounds cases return same (filtered below)
         _ => same,
@@ -4971,7 +4967,7 @@ mod tests {
         // 3-zone: up/down only within right column
         assert_eq!(neighbor_group(BUILTIN_AGENTS, 4), Some(BUILTIN_SHELLS));
         assert_eq!(neighbor_group(BUILTIN_SHELLS, 3), Some(BUILTIN_AGENTS));
-        
+
         // FILES has no up/down neighbors
         assert_eq!(neighbor_group(BUILTIN_FILES, 3), None);
         assert_eq!(neighbor_group(BUILTIN_FILES, 4), None);
@@ -4994,7 +4990,7 @@ mod tests {
     fn resize_target_maps_group_to_split_path() {
         use rimeterm_core::layout::SplitPath;
         // 3-zone layout: left full-height, right split vertically
-        
+
         // Horizontal resize: all groups can adjust left/right boundary
         let (path, boundary, _, sign) =
             resize_target_for_group(BUILTIN_FILES, ResizeTarget::Horizontal).unwrap();
@@ -5034,10 +5030,7 @@ mod tests {
             vec![SplitPath::root(), SplitPath::root().push(1)]
         );
         // Column 0 (left, FILES) has no vertical split, only root
-        assert_eq!(
-            paths_for_group(BUILTIN_FILES),
-            vec![SplitPath::root()]
-        );
+        assert_eq!(paths_for_group(BUILTIN_FILES), vec![SplitPath::root()]);
     }
 
     #[test]

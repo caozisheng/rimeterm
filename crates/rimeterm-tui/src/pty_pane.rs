@@ -418,7 +418,6 @@ impl PaneProvider for PtyPane {
         self.selection.is_active()
     }
 
-
     fn wants_mouse_priority(&self, shift_held: bool) -> bool {
         // Mirrors the inherent method. App checks dividers BEFORE this,
         // so D1/D2 stay draggable; passthrough just claims priority for
@@ -464,8 +463,8 @@ impl PaneProvider for PtyPane {
         // 3. Otherwise (shell prompt, or Shift held) → own the mouse for
         //    local text selection + paste.
         let shift_forces_local = ev.modifiers.contains(KeyModifiers::SHIFT);
-        let forward_to_child = !shift_forces_local
-            && (self.mouse_passthrough || self.child_wants_mouse());
+        let forward_to_child =
+            !shift_forces_local && (self.mouse_passthrough || self.child_wants_mouse());
 
         if forward_to_child {
             // Any local selection needs to be dropped before we hand

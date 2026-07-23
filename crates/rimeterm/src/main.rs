@@ -158,7 +158,9 @@ fn open_log_sink() -> Option<std::fs::File> {
     {
         PathBuf::from(env_path)
     } else {
-        rimeterm_config::paths::home()?.join("logs").join("rimeterm.log")
+        rimeterm_config::paths::home()?
+            .join("logs")
+            .join("rimeterm.log")
     };
 
     if let Some(parent) = path.parent() {
