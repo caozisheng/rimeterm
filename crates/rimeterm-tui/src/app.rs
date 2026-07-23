@@ -1253,14 +1253,56 @@ impl App {
             return;
         }
 
-        // --- Right Down: open the context menu (never forward to child) ---
+        // --- Right Down: copy selection if active, else open context menu ---
+        //
+        // Priority: when a pane has an active text selection, right-click
+        // should copy (GNOME Terminal, KDE Konsole convention) rather than
+        // opening the menu. Only open the menu when no selection exists.
         if let MouseEventKind::Down(MouseButton::Right) = m.kind {
+            // Check if the click landed on a pane with an active selection.
+            if let Some((pane_id, outer_rect)) = self.pane_outer_at(m.column, m.row) {
+                if let Some(pane) = self.panes.get_mut(pane_id) {
+                    if pane.has_active_selection() {
+                        // Forward to the pane so it can handle the copy.
+                        // PtyPane will copy on right-click when selection
+                        // is active (we'll add that logic next).
+                        let _ = pane.on_mouse(m, outer_rect);
+                        return;
+                    }
+                }
+            }
+            // No active selection — open the context menu.
             self.open_context_menu(m.column, m.row);
             return;
         }
 
-        // --- Left Down: dispatch by zone (divider → tab strip → pane) ---
+        // --- Left Down: dispatch by zone ---
+        //
+        // Priority order:
+        // 1. If the pane under the cursor wants mouse control (yazi, vim,
+        //    htop), forward the Down to it FIRST — child apps that render
+        //    their own dividers (yazi's three-column layout) need to receive
+        //    the event rather than having rimeterm intercept for a layout
+        //    divider drag.
+        // 2. Otherwise: divider drag → tab strip → pane focus.
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            // Check if a pane under the cursor wants mouse control.
+            if let Some((pane_id, outer_rect)) = self.pane_outer_at(m.column, m.row) {
+                if let Some(pane) = self.panes.get(pane_id) {
+                    if pane.wants_mouse_priority(m.modifiers.contains(crossterm::event::KeyModifiers::SHIFT)) {
+                        // Child wants the mouse — forward the Down event
+                        // and let it handle internal interactions (yazi
+                        // divider drag, vim click, etc). Drop the immutable
+                        // borrow before getting a mutable one.
+                        let _ = pane;
+                        if let Some(pane_mut) = self.panes.get_mut(pane_id) {
+                            let _ = pane_mut.on_mouse(m, outer_rect);
+                        }
+                        return;
+                    }
+                }
+            }
+            // No child ownership claim — check rimeterm's own interactive zones.
             // 1. Divider drag.
             if let Some(d) = self
                 .last_dividers

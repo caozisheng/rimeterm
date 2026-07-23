@@ -99,6 +99,14 @@ impl PtyPane {
             .with_term(|term| term.mode().contains(TermMode::BRACKETED_PASTE))
     }
 
+    /// Expose child mouse ownership check to App so it can decide whether
+    /// to route Left Down to the pane FIRST (before checking divider drag).
+    /// This prevents rimeterm from intercepting clicks on yazi's internal
+    /// three-column dividers (§C22.6 yazi conflict resolution).
+    pub fn wants_mouse_priority(&self, shift_held: bool) -> bool {
+        self.child_wants_mouse() && !shift_held
+    }
+
     /// Copy the current selection's text to the system clipboard. Called
     /// from `on_mouse` on `Up(Left)` and from the `Ctrl+Shift+C` key
     /// handler. Silent no-op when the selection is empty or the
@@ -383,6 +391,14 @@ impl PaneProvider for PtyPane {
         }
     }
 
+    fn has_active_selection(&self) -> bool {
+        self.selection.is_active()
+    }
+
+
+    fn wants_mouse_priority(&self, shift_held: bool) -> bool {
+        self.child_wants_mouse() && !shift_held
+    }
     fn on_mouse(&mut self, ev: MouseEvent, outer_rect: Rect) -> bool {
         // Border occupies 1 cell on every side; clicks on the border are
         // not forwarded to the child (users are targeting the pane frame,
@@ -458,6 +474,17 @@ impl PaneProvider for PtyPane {
                 true
             }
             // Scroll wheel outside a TUI app: mostly cosmetic (Windows
+            MouseEventKind::Down(MouseButton::Right) => {
+                // Right-click on an active selection: copy and clear.
+                // This path is only reached when App detected we have a
+                // selection and forwarded the event (§C22.6 right-click).
+                if self.selection.is_active() {
+                    self.copy_selection();
+                    self.selection.clear();
+                    return true;
+                }
+                false
+            }
             // shells don't scroll their own history through it), let it
             // bubble up so the app-level shortcut key can handle it.
             _ => false,

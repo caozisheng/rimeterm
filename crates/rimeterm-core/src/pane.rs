@@ -127,6 +127,25 @@ pub trait PaneProvider: Send + 'static {
         let _ = ev;
     }
 
+    /// Check if this pane has an active text selection. Used to decide
+    /// whether right-click should copy (when selection exists) or open
+    /// a context menu (when no selection). Default returns `false`; only
+    /// PtyPane with local selection ownership overrides this.
+    fn has_active_selection(&self) -> bool {
+        false
+    }
+
+    /// Check if this pane needs priority mouse ownership for a Down event.
+    /// Used by App to decide whether to route Left Down to the pane FIRST
+    /// (before checking divider drag), so TUI apps like yazi that render
+    /// their own internal dividers can receive the event for their own
+    /// interaction. Default returns `false`; PtyPane overrides when the
+    /// child has requested xterm mouse tracking.
+    fn wants_mouse_priority(&self, shift_held: bool) -> bool {
+        let _ = shift_held;
+        false
+    }
+
     /// Force any in-flight PTY resize (throttled by §19.12.6) to apply
     /// immediately. NativePane providers keep the default no-op; PtyPane
     /// overrides to flush the pending size to the underlying pseudo-console.
