@@ -16,7 +16,7 @@ use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
     Widget, Wrap,
 };
-use rimeterm_core::pane::PaneId;
+use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::pty_selection::{Cell as SelCell, SelectionState};
@@ -175,10 +175,13 @@ pub type ReturnFocus = Option<PaneId>;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Generation(pub u64);
 
-/// Payload carried by worker completions. `path` and `generation` both
-/// must match the current snapshot for the completion to apply.
+/// Payload carried by worker completions. `pane_id`, `generation`, and
+/// `path` must all match a live viewer tab's state for the completion
+/// to apply — stale results (tab closed, snapshot bumped, wrong file)
+/// are silently discarded.
 #[derive(Debug)]
 pub struct ViewerCompletion {
+    pub pane_id: PaneId,
     pub generation: Generation,
     pub path: PathBuf,
     pub payload: ViewerPayload,
@@ -523,11 +526,23 @@ impl ViewerOverlayState {
     ///   never paste — mirrors §19.14 QuickLook policy).
     /// - `ScrollUp` / `ScrollDown` step the scroll by 3 wrapped rows.
     pub fn on_mouse(&mut self, ev: MouseEvent) -> bool {
+        // The close button exists in Loading / Ready / Error states,
+        // before a Markdown `text_area` necessarily exists. Test it
+        // before the text-area guard so `[×]` always works.
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .close_button_rect
+                .is_some_and(|r| point_in_rect(ev.column, ev.row, r))
+        {
+            self.close_requested = true;
+            self.selection.clear();
+            return true;
+        }
+
         let Some(text_area) = self.text_area else {
             return false;
         };
         let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
-
         match ev.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_markdown(-3);
@@ -538,18 +553,6 @@ impl ViewerOverlayState {
                 true
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // §19.11 addendum: `[×]` close button lives on the top
-                // border of the viewer, above every other target.
-                // Consulted first so a mouse-driven "close" always
-                // wins over a stray selection start on the border.
-                if self
-                    .close_button_rect
-                    .is_some_and(|r| point_in_rect(ev.column, ev.row, r))
-                {
-                    self.close_requested = true;
-                    self.selection.clear();
-                    return true;
-                }
                 if self.point_on_scrollbar(ev.column, ev.row) {
                     self.scrollbar_drag = true;
                     self.selection.clear();
@@ -805,6 +808,11 @@ pub fn render_into_pane(
     // between paragraphs).
     ratatui::widgets::Clear.render(pane_rect, buf);
     block.render(pane_rect, buf);
+
+    // Close affordance lives on the tab strip's `×` (files group is now
+    // an Open policy; viewer tabs are closable). We deliberately do NOT
+    // paint an in-viewer [×] anymore.
+    state.close_button_rect = None;
 
     // Reset frame-scoped state before deciding how to fill inner.
     state.text_area = None;
@@ -1108,6 +1116,43 @@ fn render_message(area: Rect, buf: &mut Buffer, msg: &str) {
         .render(area, buf);
 }
 
+/// Lightweight pane provider that occupies a tab slot in the files group.
+/// The actual rendering is done by `render_into_pane` using the matching
+/// `ViewerOverlayState` in `App::viewers`. This struct only carries the
+/// stable id and the tab title (the file's basename).
+pub struct ViewerPane {
+    id: PaneId,
+    title: String,
+}
+
+impl ViewerPane {
+    pub fn new(title: String) -> Self {
+        Self {
+            id: PaneId::next(),
+            title,
+        }
+    }
+}
+
+impl PaneProvider for ViewerPane {
+    fn id(&self) -> PaneId {
+        self.id
+    }
+
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn caps(&self) -> PaneCaps {
+        PaneCaps::default()
+    }
+
+    fn render(&mut self, _area: Rect, _buf: &mut Buffer, _ctx: &PaneRenderCtx) -> RenderOutcome {
+        // App renders viewer content directly via render_into_pane.
+        RenderOutcome::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1279,6 +1324,7 @@ mod state_tests {
 
     fn markdown_completion(snap_gen: Generation, name: &str, body: &str) -> ViewerCompletion {
         ViewerCompletion {
+            pane_id: PaneId(0),
             generation: snap_gen,
             path: PathBuf::from(name),
             payload: ViewerPayload::Markdown(body.to_owned()),
@@ -1340,6 +1386,7 @@ mod state_tests {
         let mut state = ViewerOverlayState::default();
         let snap_gen = state.open_snapshot(src("a.md", ViewerKind::Markdown), None);
         let bogus = ViewerCompletion {
+            pane_id: PaneId(0),
             generation: snap_gen,
             path: PathBuf::from("a.md"),
             payload: ViewerPayload::Image(ImageReady {
@@ -1355,6 +1402,7 @@ mod state_tests {
         let mut state = ViewerOverlayState::default();
         let snap_gen = state.open_snapshot(src("a.md", ViewerKind::Markdown), None);
         let err = ViewerCompletion {
+            pane_id: PaneId(0),
             generation: snap_gen,
             path: PathBuf::from("a.md"),
             payload: ViewerPayload::Error("permission denied".into()),
@@ -1491,6 +1539,17 @@ mod state_tests {
     }
 
     #[test]
+    fn left_click_on_close_button_sets_one_shot_request_without_text_area() {
+        let mut state = ViewerOverlayState::default();
+        state.open_snapshot(src("a.md", ViewerKind::Markdown), None);
+        state.close_button_rect = Some(Rect::new(10, 2, 3, 1));
+
+        assert!(state.on_mouse(mev(MouseEventKind::Down(MouseButton::Left), 11, 2,)));
+        assert!(state.take_close_request());
+        assert!(!state.take_close_request(), "close request is one-shot");
+    }
+
+    #[test]
     fn right_click_without_selection_is_swallowed_silently() {
         let mut state = ViewerOverlayState::default();
         state.open_snapshot(src("a.md", ViewerKind::Markdown), None);
@@ -1608,6 +1667,35 @@ mod markdown_tests {
         render_overlay(&mut state, bounds, &mut buf, None);
         // Top-left corner of the block border is `┌`.
         assert_eq!(buf[(0, 0)].symbol(), "┌");
+    }
+
+    #[test]
+    fn render_into_pane_does_not_draw_in_viewer_close_button() {
+        // The viewer no longer paints its own `[×]` — closing is
+        // handled by the tab strip's `×` affordance now that viewer
+        // instances live as tabs in the files group.
+        let mut state = ViewerOverlayState::default();
+        state.open_snapshot(
+            ViewerSource {
+                path: PathBuf::from("notes.md"),
+                kind: ViewerKind::Markdown,
+            },
+            None,
+        );
+        let bounds = Rect::new(4, 2, 30, 12);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 20));
+        render_into_pane(&mut state, bounds, &mut buf, None);
+
+        // The three cells that used to host `[×]` must now be part of
+        // the plain top border (`─`) or the corner (`┐`).
+        let button_x = bounds.x + bounds.width - 4;
+        for dx in 0..3 {
+            let sym = buf[(button_x + dx, bounds.y)].symbol();
+            assert_ne!(sym, "[", "unexpected `[` at dx={dx}");
+            assert_ne!(sym, "×", "unexpected `×` at dx={dx}");
+            assert_ne!(sym, "]", "unexpected `]` at dx={dx}");
+        }
+        assert_eq!(state.close_button_rect, None);
     }
 }
 

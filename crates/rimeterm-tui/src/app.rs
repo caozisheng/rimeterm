@@ -424,8 +424,9 @@ pub struct App {
     /// mid-runtime factory calls (new_shell_tab_in / new_agent_tab_in)
     /// can hand a fresh clone to newly-spawned children.
     osc_tx: mpsc::UnboundedSender<(PaneId, String)>,
-    /// C20: modal viewer overlay state. Never enters the layout tree.
-    viewer: ViewerOverlayState,
+    /// C20: per-tab viewer states, keyed by the viewer tab's PaneId.
+    /// Each entry is created when a viewer tab opens and removed when it closes.
+    viewers: std::collections::HashMap<PaneId, ViewerOverlayState>,
     /// Last `file.selected` from the active files:yazi tab. Consumed by
     /// `Alt+V` to freeze a snapshot.
     last_yazi_selection: Option<SelectionSnapshot>,
@@ -467,12 +468,11 @@ pub struct App {
     /// `pane.render` received). Different from `LayoutTree::compute_rects`
     /// output, which returns the full quadrant cell including its tab strip.
     last_pane_outer_rects: Vec<(PaneId, Rect)>,
-    /// Absolute-frame rect of the last drawn viewer overlay, or `None`
-    /// when the viewer isn't currently rendered. Captured during
-    /// `draw()` so `on_mouse` can intercept clicks in-place — the
-    /// viewer takes over the files pane exactly (§19.11 addendum),
-    /// so mouse events inside this rect must NOT reach whatever
-    /// PtyPane sits behind it in the pane registry.
+    /// Content rect of the currently active viewer tab (pane_rect after
+    /// tab strip stripped off). Set during `draw` when a viewer tab is
+    /// active in the files group; `None` otherwise. Used by `on_mouse`
+    /// to route clicks/scroll inside this rect to the viewer state
+    /// while letting tab-strip clicks fall through to the normal path.
     last_viewer_rect: Option<Rect>,
     /// §19.10.1 addendum: PaneIds whose tab strip must NOT show `×`
     /// and whose `close_tab_in_group` path rejects even a valid index.
@@ -534,6 +534,8 @@ impl App {
         // Everything except the shells group is a Placeholder until later
         // milestones bring in the real PTY / native providers.
         let mut panes = PaneRegistry::new();
+        let mut pinned_pane_ids: std::collections::HashSet<PaneId> =
+            std::collections::HashSet::new();
 
         let mut files_members = Vec::new();
         for spec in &config.files.tabs {
@@ -569,6 +571,8 @@ impl App {
                 }
             }
             files_members.push(id);
+            // Pin yazi/gitui so × never appears and Ctrl+W is rejected.
+            pinned_pane_ids.insert(id);
         }
 
         let mut agents_members = Vec::new();
@@ -679,8 +683,6 @@ impl App {
         // so its tab strip loses the `×` affordance and Ctrl+W /
         // right-click-close paths reject it. Populated when we spawn
         // bottom below; empty when no bottom is configured.
-        let mut pinned_pane_ids: std::collections::HashSet<PaneId> =
-            std::collections::HashSet::new();
         let mut shells_members = Vec::new();
 
         // 1. Add bottom as the first tab (if configured in sysmon.tabs)
@@ -736,8 +738,8 @@ impl App {
         let files = TabGroup::new(
             BUILTIN_FILES,
             files_members,
-            MembersPolicy::Fixed,
-            PaneKind::Files,
+            MembersPolicy::Open { max: 16 },
+            PaneKind::Viewer,
         );
         let agents = TabGroup::new(
             BUILTIN_AGENTS,
@@ -835,7 +837,7 @@ impl App {
             redraw_rx,
             osc_rx,
             osc_tx,
-            viewer: ViewerOverlayState::default(),
+            viewers: std::collections::HashMap::new(),
             last_yazi_selection: None,
             viewer_completion_tx,
             viewer_completion_rx,
@@ -928,62 +930,62 @@ impl App {
         Ok(())
     }
 
-    /// Route the viewer overlay's global toggle (`Alt+V`) and its
-    /// modal input. Returns `true` when the key was fully handled and
-    /// the caller should stop dispatching.
+    /// Route `Alt+V` and per-tab viewer keys. Returns `true` when consumed.
     fn on_viewer_key(&mut self, key: KeyEvent) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         let alt_v = matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
             && key.modifiers.contains(KeyModifiers::ALT);
 
-        if self.viewer.is_open() {
+        // Check if the active files-group tab is a viewer tab.
+        let active_viewer_id = self
+            .tree
+            .find_tab_group(BUILTIN_FILES)
+            .and_then(|g| g.active_pane())
+            .filter(|id| self.viewers.contains_key(id));
+
+        if let Some(vid) = active_viewer_id {
             if alt_v || matches!(key.code, KeyCode::Esc) {
-                self.close_viewer_overlay();
+                self.close_viewer_tab(vid);
                 return true;
             }
-            self.on_viewer_modal_key(key);
+            self.on_viewer_modal_key(vid, key);
             return true;
         }
 
         if alt_v {
-            self.open_viewer_overlay();
+            self.open_viewer_tab();
             return true;
         }
         false
     }
 
-    fn on_viewer_modal_key(&mut self, key: KeyEvent) {
+    fn on_viewer_modal_key(&mut self, vid: PaneId, key: KeyEvent) {
         use crossterm::event::KeyCode;
+        let Some(state) = self.viewers.get_mut(&vid) else {
+            return;
+        };
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => self.viewer.scroll_markdown(1),
-            KeyCode::Up | KeyCode::Char('k') => self.viewer.scroll_markdown(-1),
-            KeyCode::PageDown => self.viewer.scroll_markdown(10),
-            KeyCode::PageUp => self.viewer.scroll_markdown(-10),
-            KeyCode::Home | KeyCode::Char('g') => self.viewer.scroll_markdown(i32::MIN),
-            KeyCode::End | KeyCode::Char('G') => self.viewer.scroll_markdown(i32::MAX),
-            KeyCode::Char('+') | KeyCode::Char('=') => self.viewer.nudge_image_scale(1),
-            KeyCode::Char('-') => self.viewer.nudge_image_scale(-1),
-            KeyCode::Char('0') => self.viewer.reset_image_scale(),
+            KeyCode::Down | KeyCode::Char('j') => state.scroll_markdown(1),
+            KeyCode::Up | KeyCode::Char('k') => state.scroll_markdown(-1),
+            KeyCode::PageDown => state.scroll_markdown(10),
+            KeyCode::PageUp => state.scroll_markdown(-10),
+            KeyCode::Home | KeyCode::Char('g') => state.scroll_markdown(i32::MIN),
+            KeyCode::End | KeyCode::Char('G') => state.scroll_markdown(i32::MAX),
+            KeyCode::Char('+') | KeyCode::Char('=') => state.nudge_image_scale(1),
+            KeyCode::Char('-') => state.nudge_image_scale(-1),
+            KeyCode::Char('0') => state.reset_image_scale(),
             _ => {}
         }
         let _ = self.redraw_tx.send(());
     }
 
-    fn open_viewer_overlay(&mut self) {
+    /// Open a new viewer tab in the files group for the last yazi selection.
+    fn open_viewer_tab(&mut self) {
         let Some(selection) = self.last_yazi_selection.clone() else {
             self.set_hint("viewer: no active-yazi selection yet — hover a file first".into());
             return;
         };
-        // Refuse when no left pane is on screen at all (terminal
-        // squeezed below the responsive fold, §19.5). We no longer
-        // need the old floating-modal 48×16 floor because the viewer
-        // takes over the yazi pane exactly — whatever fits yazi fits
-        // the viewer.
-        if self.last_pane_area.width == 0 || self.last_pane_area.height == 0 {
-            self.set_hint("viewer: terminal too small".into());
-            return;
-        }
         let meta = match std::fs::metadata(&selection.path) {
             Ok(m) => SourceMeta {
                 is_regular_file: m.is_file(),
@@ -1005,8 +1007,35 @@ impl App {
                 return;
             }
         };
-        let return_focus = self.focus.focused_pane();
-        let snap_gen = self.viewer.open_snapshot(source.clone(), return_focus);
+        // Build a lightweight pane provider for the tab slot.
+        let title = source
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("viewer")
+            .to_string();
+        let pane = viewer::ViewerPane::new(title);
+        let pane_id = pane.id();
+        self.panes.insert(Box::new(pane));
+
+        let group = match self.tree.find_tab_group_mut(BUILTIN_FILES) {
+            Some(g) => g,
+            None => {
+                drop_pane(&mut self.panes, pane_id);
+                return;
+            }
+        };
+        if let Err(e) = group.try_add(pane_id, PaneKind::Viewer) {
+            self.set_hint(format!("⛔ viewer: {e}"));
+            drop_pane(&mut self.panes, pane_id);
+            return;
+        }
+        self.focus.set_focus(pane_id, Some(BUILTIN_FILES));
+
+        let mut state = ViewerOverlayState::default();
+        let snap_gen = state.open_snapshot(source.clone(), None);
+        self.viewers.insert(pane_id, state);
+
         let tx = self.viewer_completion_tx.clone();
         tokio::task::spawn_blocking(move || {
             let payload = match source.kind {
@@ -1014,6 +1043,7 @@ impl App {
                 ViewerKind::Image => viewer::load_image_blocking(&source.path),
             };
             let _ = tx.send(ViewerCompletion {
+                pane_id,
                 generation: snap_gen,
                 path: source.path,
                 payload,
@@ -1022,37 +1052,41 @@ impl App {
         let _ = self.redraw_tx.send(());
     }
 
-    fn close_viewer_overlay(&mut self) {
-        let return_focus = self.viewer.close();
-        if let Some(pane) = return_focus {
-            let group = self
-                .tree
-                .tab_groups()
-                .iter()
-                .find(|g| g.members().contains(&pane))
-                .map(|g| g.id());
-            self.focus.set_focus(pane, group);
+    /// Close the viewer tab with the given pane id.
+    fn close_viewer_tab(&mut self, pane_id: PaneId) {
+        self.viewers.remove(&pane_id);
+        // close_pane_by_id handles tab removal, focus restore, and pane drop.
+        if let Err(e) = self.close_pane_by_id(pane_id) {
+            warn!(error = %e, "close_viewer_tab: close_pane_by_id failed");
         }
         let _ = self.redraw_tx.send(());
     }
 
     fn apply_viewer_completion(&mut self, completion: ViewerCompletion) {
-        if self.viewer.apply_completion(completion) {
-            let _ = self.redraw_tx.send(());
+        if let Some(state) = self.viewers.get_mut(&completion.pane_id) {
+            if state.apply_completion(completion) {
+                let _ = self.redraw_tx.send(());
+            }
         }
     }
 
     /// Handle the platform side of `viewer.open-with-system` / `viewer.reveal`.
-    /// Fire-and-forget: dispatch never closes or mutates the overlay.
     fn viewer_dispatch_external(&mut self, action: ExternalAction) {
-        let Some(source) = self.viewer.snapshot() else {
+        // Use the active viewer tab in the files group, if any.
+        let source = self
+            .tree
+            .find_tab_group(BUILTIN_FILES)
+            .and_then(|g| g.active_pane())
+            .and_then(|id| self.viewers.get(&id))
+            .and_then(|s| s.snapshot())
+            .map(|s| s.path.clone());
+        let Some(path) = source else {
             self.set_hint("viewer: nothing open".into());
             return;
         };
-        let path = source.path.clone();
         match spawn_external(action, &path) {
             Ok(()) => {
-                self.set_hint(format!("viewer: {} → {}", action.hint(), path.display(),));
+                self.set_hint(format!("viewer: {} → {}", action.hint(), path.display()));
             }
             Err(err) => self.set_hint(format!("viewer: {} failed: {err}", action.hint())),
         }
@@ -1251,29 +1285,35 @@ impl App {
     /// Route a mouse event. Priority:
     /// 1. Active divider drag (from a prior Down on a seam) — resize the layout.
     /// 2. Down / Up / Drag / Scroll on a pane rect — forward to that pane's
-    ///    `PaneProvider::on_mouse` (PtyPane translates to SGR mouse
-    ///    sequences and writes into the child's stdin, so yazi / omp get
-    ///    click, scroll, drag-select natively).
+    ///    escape sequences).
     /// 3. Down on a bare divider (no pane hit) — start a drag.
     /// 4. Down on empty space (unlikely) — no-op.
     fn on_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
 
-        // §19.11 addendum: while the viewer owns the left pane it also
-        // owns every mouse event that lands inside its rect. This
-        // must run BEFORE the divider-drag priority arm below so a
-        // Left drag started in the viewer (text selection or
-        // scrollbar thumb) keeps routing here even after the pointer
-        // strays across the pane border. Drag/Up sessions initiated
-        // in the viewer are recognised via the viewer's own state.
-        if self.viewer.is_open() {
-            let in_viewer = self
+        // While a viewer tab is active in the files group it owns mouse
+        // events that land inside the content rect (pane_rect, below the
+        // tab strip). Tab-strip clicks fall through to the normal path so
+        // the user can switch away from the viewer by clicking another tab.
+        let active_viewer_id = self
+            .tree
+            .find_tab_group(BUILTIN_FILES)
+            .and_then(|g| g.active_pane())
+            .filter(|id| self.viewers.contains_key(id));
+        if let Some(vid) = active_viewer_id {
+            let state = self.viewers.get(&vid);
+            let sticky = matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
+                && state.is_some_and(|s| s.selection_active() || s.scrollbar_dragging());
+            let in_content = self
                 .last_viewer_rect
                 .is_some_and(|r| point_in_rect(m.column, m.row, r));
-            let sticky = matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
-                && (self.viewer.selection_active() || self.viewer.scrollbar_dragging());
-            if in_viewer || sticky {
-                let _ = self.viewer.on_mouse(m);
+            if in_content || sticky {
+                if let Some(state) = self.viewers.get_mut(&vid) {
+                    let _ = state.on_mouse(m);
+                    if state.take_close_request() {
+                        self.close_viewer_tab(vid);
+                    }
+                }
                 let _ = self.redraw_tx.send(());
                 return;
             }
@@ -1914,9 +1954,6 @@ impl App {
         self.last_dividers = self.tree.dividers(vertical[1]);
         self.last_tab_strips.clear();
         self.last_pane_outer_rects.clear();
-        // §19.11 addendum: cleared here so this frame's decision to
-        // draw (or not draw) the viewer is authoritative. The files
-        // pane loop below sets it when the viewer takes over.
         self.last_viewer_rect = None;
         // Filled by the focused pane's render (see below). Overlays
         // (menu/palette/picker) override to `None` at the end of draw
@@ -1962,20 +1999,16 @@ impl App {
                 self.last_tab_strips.push((gid, hits));
                 render_tab_strip(strip_rect, buf, group, &titles, &closable);
                 if let Some(active_id) = group.active_pane() {
-                    // §19.11 addendum: while the viewer is open the
-                    // files pane's yazi never draws; the viewer takes
-                    // over the same `pane_rect` (matching yazi's
-                    // geometry exactly). We deliberately do NOT push
-                    // to `last_pane_outer_rects` so mouse events land
-                    // on the viewer instead of the yazi behind it.
-                    let is_files = gid == BUILTIN_FILES;
-                    if is_files && self.viewer.is_open() {
+                    if let Some(viewer_state) = self.viewers.get_mut(&active_id) {
                         viewer::render_into_pane(
-                            &mut self.viewer,
+                            viewer_state,
                             pane_rect,
                             buf,
                             self.viewer_picker.as_ref(),
                         );
+                        // Viewer content owns this rect for mouse events.
+                        // Tab-strip clicks are excluded — `strip_rect`
+                        // lives above and stays with the normal path.
                         self.last_viewer_rect = Some(pane_rect);
                     } else {
                         self.last_pane_outer_rects.push((active_id, pane_rect));
@@ -1986,10 +2019,6 @@ impl App {
                                 title_override: None,
                             };
                             let outcome = pane.render(pane_rect, buf, &ctx);
-                            // Only the focused pane's caret request is
-                            // captured — every other pane's `cursor` is
-                            // discarded. Overlays (menu/palette/picker)
-                            // override this at the end of draw().
                             if focused {
                                 focused_cursor = outcome.cursor;
                             }
@@ -2106,18 +2135,16 @@ impl App {
             crate::picker::render(rect, buf, &self.picker_state);
         }
 
-        // §19.11 addendum: viewer no longer renders as a floating
-        // modal — it takes over the files pane rect during the pane
-        // loop above. This block is intentionally empty; kept as an
-        // anchor for the caret-suppression check below.
-
         // Suppress the caret when any overlay owns the input focus.
-        // Menu/palette/picker draw their own selection markers; a
-        // stray shell caret bleeding through would be confusing.
+        let active_is_viewer = self
+            .tree
+            .find_tab_group(BUILTIN_FILES)
+            .and_then(|g| g.active_pane())
+            .is_some_and(|id| self.viewers.contains_key(&id));
         let cursor = if self.menu_state.open
             || self.palette_state.open
             || self.picker_state.open
-            || self.viewer.is_open()
+            || active_is_viewer
         {
             None
         } else {
@@ -2334,15 +2361,16 @@ impl App {
             self.set_hint("Acknowledgement will open ACKNOWLEDGEMENTS.md (M3+)".into());
         }
         if f.viewer_open.swap(false, Ordering::Relaxed) {
-            if self.viewer.is_open() {
-                self.set_hint("viewer already open".into());
-            } else {
-                self.open_viewer_overlay();
-            }
+            self.open_viewer_tab();
         }
         if f.viewer_close.swap(false, Ordering::Relaxed) {
-            if self.viewer.is_open() {
-                self.close_viewer_overlay();
+            if let Some(vid) = self
+                .tree
+                .find_tab_group(BUILTIN_FILES)
+                .and_then(|g| g.active_pane())
+                .filter(|id| self.viewers.contains_key(id))
+            {
+                self.close_viewer_tab(vid);
             }
         }
         if f.viewer_open_with_system.swap(false, Ordering::Relaxed) {
@@ -2607,6 +2635,7 @@ impl App {
             }
         }
         let removed = group.try_close(idx, false).map_err(|e| anyhow!("{e}"))?;
+        self.viewers.remove(&removed);
         drop_pane(&mut self.panes, removed);
         self.session_writes.lock().remove(&removed);
         // Clean the reverse lookup + persist if we just changed the
@@ -4702,10 +4731,9 @@ fn tab_goto_title(index: usize) -> &'static str {
 
 fn quadrant_title(idx: usize) -> &'static str {
     match idx {
-        0 => "Focus files (top-left)",
-        1 => "Focus agents (top-right)",
-        2 => "Focus sysmon (bottom-left)",
-        _ => "Focus shells (bottom-right)",
+        0 => "Focus files (left)",
+        1 => "Focus agents (right-top)",
+        _ => "Focus shells (right-bottom)",
     }
 }
 /// Remove a pane from the registry; underlying Session's Drop closes the pty.
@@ -4716,7 +4744,7 @@ fn drop_pane(panes: &mut PaneRegistry, id: PaneId) {
 }
 
 fn hint_bar_text() -> String {
-    "Ctrl+Q Quit · F1 / Ctrl+Shift+P Palette · Alt+H/J/K/L Nav · Alt+1..4 Quadrant · Ctrl+PgUp/PgDn or Alt+[/] Tab · Ctrl+T new shell · F10 Menu".into()
+    "Ctrl+Q Quit · F1 / Ctrl+Shift+P Palette · Alt+H/J/K/L Nav · Alt+1..3 Pane · Ctrl+PgUp/PgDn or Alt+[/] Tab · Ctrl+T New tab · Ctrl+W Close tab · F10 Menu".into()
 }
 
 fn point_in_rect(x: u16, y: u16, r: Rect) -> bool {
@@ -6011,5 +6039,15 @@ mod tests {
     fn external_action_hint_is_stable() {
         assert_eq!(ExternalAction::OpenWithSystem.hint(), "open with system");
         assert_eq!(ExternalAction::Reveal.hint(), "reveal");
+    }
+
+    #[test]
+    fn status_hint_matches_three_zone_keymap() {
+        let hint = hint_bar_text();
+        assert!(hint.contains("Alt+1..3 Pane"));
+        assert!(!hint.contains("Alt+1..4"));
+        assert!(!hint.contains("Quadrant"));
+        assert!(hint.contains("Ctrl+T New tab"));
+        assert!(hint.contains("Ctrl+W Close tab"));
     }
 }
