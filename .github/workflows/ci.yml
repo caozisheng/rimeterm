@@ -17,6 +17,12 @@ on:
   pull_request:
     branches: [main]
 
+# Auto-fix fmt drift needs to push commits back to the branch. On PRs
+# from forks this is impossible (token has no write access), so the
+# commit step is gated on `github.event_name != 'pull_request'`.
+permissions:
+  contents: write
+
 # Cancel superseded runs from the same ref (rebase-heavy PRs).
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -78,10 +84,36 @@ jobs:
         with:
           shared-key: ${{ matrix.shared-key }}
 
-      # fmt is host-agnostic; run it on every matrix row so a fmt drift
-      # committed from any platform is caught wherever CI runs first.
-      - name: cargo fmt --all --check
+      # Auto-format then verify. `cargo fmt --all` fixes drift in-place;
+      # the follow-up `--check` is a safety net (should always pass after
+      # the write). If the write produced changes, the step below commits
+      # and pushes them back to the branch so the tree stays fmt-clean
+      # without forcing every contributor to remember `cargo fmt` locally.
+      - name: cargo fmt --all (auto-fix)
+        run: cargo fmt --all
+
+      - name: cargo fmt --all --check (verify)
         run: cargo fmt --all --check
+
+      # If `cargo fmt --all` rewrote anything, commit + push the fixup so
+      # the branch stays fmt-clean. Only on Linux (fmt output is host-
+      # agnostic — one push beats three racing) and only on push events
+      # (PRs from forks can't push back). Uses the auto-injected
+      # `GITHUB_TOKEN` with `contents: write` (see permissions block).
+      - name: Commit fmt fixup (Linux, push only)
+        if: matrix.shared-key == 'ci-linux' && github.event_name == 'push'
+        shell: bash
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "fmt-clean; nothing to commit"
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "style: cargo fmt --all (auto-fix by CI)"
+            git push
+            echo "pushed fmt fixup"
+          fi
 
       - name: cargo clippy --workspace --all-targets --all-features
         # Gate only on the `correctness` group. Everything else stays a
