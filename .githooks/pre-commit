@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: auto-format staged Rust files before the commit is
+# created, so every commit lands fmt-clean and CI's `cargo fmt --all
+# --check` never has anything to fix.
+#
+# Install once per clone:
+#   git config core.hooksPath .githooks
+# (the hook is committed, so every contributor gets it)
+#
+# What it does:
+#   1. Collect staged *.rs files (nothing else — keeps the hook fast and
+#      avoids touching non-Rust changes in the same commit).
+#   2. Runs `cargo fmt` on just those files (rustfmt accepts paths).
+#   3. Re-stages the formatted output so the about-to-be-created commit
+#      includes the formatting.
+#   4. If rustfmt isn't installed (rare — it ships with every rustup
+#      toolchain), warn and continue rather than blocking the commit.
+#
+# Skip with `git commit --no-verify` when you genuinely need to commit
+# unformatted code (e.g. a WIP snapshot).
+
+set -euo pipefail
+
+# Gather staged .rs files. `--diff-filter=d` drops deleted files (rustfmt
+# can't format what's gone); the pathspec limits to Rust sources.
+staged=$(git diff --cached --name-only --diff-filter=d -- '*.rs')
+
+if [ -z "$staged" ]; then
+    exit 0
+fi
+
+if ! command -v rustfmt >/dev/null 2>&1; then
+    echo "pre-commit: rustfmt not found — skipping format (install via rustup component add rustfmt)" >&2
+    exit 0
+fi
+
+# Format each staged Rust file in place. rustfmt honors rustfmt.toml /
+# edition from the manifest, so output matches `cargo fmt`.
+# shellcheck disable=SC2086  # we want word-splitting on the file list
+fmt_changed=0
+for f in $staged; do
+    if [ -f "$f" ]; then
+        # Capture whether rustfmt rewrote anything by comparing before/after.
+        before=$(cat "$f")
+        rustfmt --edition 2024 "$f" 2>/dev/null || true
+        after=$(cat "$f")
+        if [ "$before" != "$after" ]; then
+            git add "$f"
+            fmt_changed=1
+        fi
+    fi
+done
+
+if [ "$fmt_changed" -eq 1 ]; then
+    echo "pre-commit: reformatted staged Rust files (cargo fmt) and re-staged them" >&2
+fi
+
+exit 0

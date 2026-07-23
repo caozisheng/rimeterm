@@ -297,6 +297,18 @@ Requires Rust ≥ 1.90 (edition 2024) and Node ≥ 18 for the essentials
 bootstrap. Windows uses ConPTY (Win10 1809+); Linux / macOS build the
 same tree via `portable-pty`.
 
+**Git hooks (one-time):** point git at the shared hooks so every commit
+is auto-formatted before it's created:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The `pre-commit` hook runs `rustfmt` on staged `.rs` files and re-stages
+the result, so commits always land fmt-clean and CI's
+`cargo fmt --all --check` never has anything to fix. Bypass with
+`git commit --no-verify` for WIP snapshots.
+
 ## Keybindings
 
 | key | action |
