@@ -155,6 +155,31 @@ pub trait PaneProvider: Send + 'static {
         let _ = on;
     }
 
+    /// §19.14.4: enable "right-click = paste" semantics. When `on` the
+    /// pane's `Down(Right)` handler pastes the clipboard (after copying
+    /// any active selection). App sets `true` on agents / shells panes.
+    /// Files-column panes (yazi / gitui) keep the default `false` so
+    /// right-clicks forward to the child's own context menu.
+    ///
+    /// Read-only panes (bottom, PTY children with no stdin) transparently
+    /// downgrade to "copy only" — the paste attempt is a silent no-op
+    /// when the write path is closed.
+    fn set_right_click_paste(&mut self, on: bool) {
+        let _ = on;
+    }
+
+    /// §19.14.1: hand the pane a `[parent, current, preview]` ratio so
+    /// it can split its inner rect into three zones and route `Down(Left)`
+    /// / `Down(Right)` differently in the read-only preview column
+    /// (Quick Look). `None` disables zoning and falls back to the plain
+    /// passthrough / local-selection dichotomy.
+    ///
+    /// Called on the yazi tab in the files group. gitui and every
+    /// non-files PTY pane keeps the default `None`.
+    fn set_yazi_layout(&mut self, layout: Option<[u8; 3]>) {
+        let _ = layout;
+    }
+
     /// Force any in-flight PTY resize (throttled by §19.12.6) to apply
     /// immediately. NativePane providers keep the default no-op; PtyPane
     /// overrides to flush the pending size to the underlying pseudo-console.

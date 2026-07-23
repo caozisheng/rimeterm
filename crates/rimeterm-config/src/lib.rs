@@ -33,6 +33,7 @@ pub struct Config {
     pub agents: AgentsConfig,
     pub files: FilesConfig,
     pub sysmon: SysmonConfig,
+    pub mouse: MouseConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -72,6 +73,57 @@ impl Default for UiConfig {
         Self {
             theme: "rime-cold".into(),
             follow_system_theme: true,
+        }
+    }
+}
+
+/// Mouse-input policy (§19.14). Governs right-click semantics on the
+/// interactive right-column panes (agents / shells) and the geometry of
+/// the left-column yazi zone router.
+///
+/// All fields are optional in TOML thanks to `#[serde(default)]`; defaults
+/// match the shipping behaviour described in §19.14.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MouseConfig {
+    /// When `true` (default), `Down(Right)` on agents / shells panes
+    /// pastes the clipboard (matching Windows Terminal / conhost /
+    /// iTerm2 defaults). Set to `false` to restore the legacy
+    /// "copy-and-clear active selection, no paste" behaviour.
+    ///
+    /// Quick Look (left-column preview zone) is **read-only** and
+    /// always uses copy semantics regardless of this flag —
+    /// §19.14.2 invariant 36.
+    pub right_click_paste: bool,
+
+    /// Render a `ratatui::Scrollbar` on the right edge of the Quick
+    /// Look zone. Only drawn when yazi actually reports scroll metrics
+    /// (§19.14.3); left `true` here just means "don't hide it even
+    /// when yazi reports". Toggle to `false` to suppress the widget
+    /// entirely.
+    pub quicklook_scrollbar: bool,
+
+    /// yazi's `[mgr] ratio` for the three visible columns
+    /// `[parent, current, preview]` — mirrors yazi's own config knob.
+    /// The Quick Look zone starts where the preview column would
+    /// start given this ratio and the pane's current inner width.
+    ///
+    /// Yazi's own default (as of yazi 0.4+) is `[1, 4, 3]`. If a user
+    /// customises `yazi.toml`, they should mirror the same three
+    /// integers here so rimeterm's zone splitter agrees with what
+    /// yazi actually draws.
+    ///
+    /// All three values must be > 0; the loader clamps zero / negative
+    /// entries to `1` before returning.
+    pub yazi_layout: [u8; 3],
+}
+
+impl Default for MouseConfig {
+    fn default() -> Self {
+        Self {
+            right_click_paste: true,
+            quicklook_scrollbar: true,
+            yazi_layout: [1, 4, 3],
         }
     }
 }
@@ -316,5 +368,28 @@ install_hint = "brew install yazi"
         assert_eq!(spec.id, "yazi");
         assert_eq!(spec.command, vec!["yazi".to_string()]);
         assert_eq!(spec.install_hint.as_deref(), Some("brew install yazi"));
+    }
+
+    #[test]
+    fn default_mouse_config_matches_docs() {
+        let m = MouseConfig::default();
+        assert!(m.right_click_paste);
+        assert!(m.quicklook_scrollbar);
+        assert_eq!(m.yazi_layout, [1, 4, 3]);
+    }
+
+    #[test]
+    fn mouse_config_partial_toml() {
+        let cfg: Config = toml::from_str("[mouse]\nright_click_paste = false\n").unwrap();
+        assert!(!cfg.mouse.right_click_paste);
+        // Other fields keep defaults.
+        assert!(cfg.mouse.quicklook_scrollbar);
+        assert_eq!(cfg.mouse.yazi_layout, [1, 4, 3]);
+    }
+
+    #[test]
+    fn mouse_config_user_layout_override() {
+        let cfg: Config = toml::from_str("[mouse]\nyazi_layout = [2, 3, 5]\n").unwrap();
+        assert_eq!(cfg.mouse.yazi_layout, [2, 3, 5]);
     }
 }

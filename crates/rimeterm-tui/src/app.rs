@@ -58,7 +58,6 @@ use crate::tab_strip::render as render_tab_strip;
 use crate::terminal::TerminalGuard;
 use crate::viewer::{
     self, SelectionSnapshot, SourceMeta, ViewerCompletion, ViewerKind, ViewerOverlayState,
-    overlay_rect,
 };
 
 /// Pending command actions the app main loop resolves outside command bodies.
@@ -468,6 +467,19 @@ pub struct App {
     /// `pane.render` received). Different from `LayoutTree::compute_rects`
     /// output, which returns the full quadrant cell including its tab strip.
     last_pane_outer_rects: Vec<(PaneId, Rect)>,
+    /// Absolute-frame rect of the last drawn viewer overlay, or `None`
+    /// when the viewer isn't currently rendered. Captured during
+    /// `draw()` so `on_mouse` can intercept clicks in-place — the
+    /// viewer takes over the files pane exactly (§19.11 addendum),
+    /// so mouse events inside this rect must NOT reach whatever
+    /// PtyPane sits behind it in the pane registry.
+    last_viewer_rect: Option<Rect>,
+    /// §19.10.1 addendum: PaneIds whose tab strip must NOT show `×`
+    /// and whose `close_tab_in_group` path rejects even a valid index.
+    /// Currently only holds bottom (the system monitor). Kept as a
+    /// `HashSet` so the "pinned" set can grow without touching the
+    /// tab_strip API.
+    pinned_pane_ids: std::collections::HashSet<PaneId>,
     /// Divider under the mouse cursor RIGHT NOW (updated on every
     /// MouseEventKind::Moved). Painted with a hover highlight and shows a
     /// `↔ drag to resize` hint in the bottom bar so users know the seam
@@ -545,10 +557,16 @@ impl App {
                 "files",
             )?;
             // Left column (files) panes are mouse-passthrough: they never
-            // start rimeterm text selections / paste. D1/D2 dividers still
-            // drag because on_mouse checks dividers before pane-priority.
+            // start rimeterm text selections / paste in the file lists.
+            // D1/D2 dividers still drag because on_mouse checks dividers
+            // before pane-priority. §19.14.1 further carves the yazi
+            // pane into (List | QuickLook) zones so the preview column
+            // owns local text selection despite passthrough.
             if let Some(pane) = panes.get_mut(id) {
                 pane.set_mouse_passthrough(true);
+                if spec.id == "yazi" {
+                    pane.set_yazi_layout(Some(config.mouse.yazi_layout));
+                }
             }
             files_members.push(id);
         }
@@ -568,6 +586,13 @@ impl App {
                 redraw_tx.clone(),
                 osc_tx.clone(),
             )?;
+            // §19.14.4: agents panes flip Down(Right) semantics to
+            // "copy-then-paste" (Windows Terminal / iTerm2 default).
+            // Users who want the legacy copy-only behaviour set
+            // `[mouse] right_click_paste = false`.
+            if let Some(pane) = panes.get_mut(id) {
+                pane.set_right_click_paste(config.mouse.right_click_paste);
+            }
             agents_members.push(id);
             // Try to map the config spec id back to a registry entry so
             // we can persist it. Config-only specs (rare) get skipped.
@@ -608,6 +633,10 @@ impl App {
                                 osc_tx.clone(),
                             ) {
                                 Ok(pane_id) => {
+                                    // §19.14.4: match the config-path setup.
+                                    if let Some(pane) = panes.get_mut(pane_id) {
+                                        pane.set_right_click_paste(config.mouse.right_click_paste);
+                                    }
                                     agents_members.push(pane_id);
                                     startup_agent_ids.push((pane_id, spec.id));
                                 }
@@ -646,6 +675,12 @@ impl App {
 
         // Shells group: bottom as first tab, followed by shell tabs.
         // Bottom (system monitor) is now part of the shells tab group.
+        // §19.10.1 addendum: bottom's PaneId lives in a "pinned" set
+        // so its tab strip loses the `×` affordance and Ctrl+W /
+        // right-click-close paths reject it. Populated when we spawn
+        // bottom below; empty when no bottom is configured.
+        let mut pinned_pane_ids: std::collections::HashSet<PaneId> =
+            std::collections::HashSet::new();
         let mut shells_members = Vec::new();
 
         // 1. Add bottom as the first tab (if configured in sysmon.tabs)
@@ -662,6 +697,14 @@ impl App {
                     Color::Magenta,
                     "shells",
                 )?;
+                // §19.14.4: bottom is read-only (no stdin), so paste
+                // silently no-ops — the copy-selection branch still
+                // works. Enabling the flag keeps behaviour uniform
+                // across every shells-group tab.
+                if let Some(pane) = panes.get_mut(id) {
+                    pane.set_right_click_paste(config.mouse.right_click_paste);
+                }
+                pinned_pane_ids.insert(id);
                 shells_members.push(id);
                 break;
             }
@@ -682,6 +725,11 @@ impl App {
             .lock()
             .insert(first_id, first.pane.session().clone());
         panes.insert(Box::new(first.pane));
+        // §19.14.4: shell-1 gets right-click-paste like every other
+        // shells-group tab.
+        if let Some(pane) = panes.get_mut(first_id) {
+            pane.set_right_click_paste(config.mouse.right_click_paste);
+        }
         shells_members.push(first_id);
 
         // Groups.
@@ -802,6 +850,8 @@ impl App {
             last_dividers: Vec::new(),
             last_tab_strips: Vec::new(),
             last_pane_outer_rects: Vec::new(),
+            last_viewer_rect: None,
+            pinned_pane_ids,
             hovered_divider: None,
             pending_spawn: None,
             pane_agent_id: startup_agent_ids.into_iter().collect(),
@@ -906,12 +956,12 @@ impl App {
     fn on_viewer_modal_key(&mut self, key: KeyEvent) {
         use crossterm::event::KeyCode;
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => self.viewer.scroll_markdown(1, u16::MAX),
-            KeyCode::Up | KeyCode::Char('k') => self.viewer.scroll_markdown(-1, u16::MAX),
-            KeyCode::PageDown => self.viewer.scroll_markdown(10, u16::MAX),
-            KeyCode::PageUp => self.viewer.scroll_markdown(-10, u16::MAX),
-            KeyCode::Home | KeyCode::Char('g') => self.viewer.scroll_markdown(i32::MIN, u16::MAX),
-            KeyCode::End | KeyCode::Char('G') => self.viewer.scroll_markdown(i32::MAX, u16::MAX),
+            KeyCode::Down | KeyCode::Char('j') => self.viewer.scroll_markdown(1),
+            KeyCode::Up | KeyCode::Char('k') => self.viewer.scroll_markdown(-1),
+            KeyCode::PageDown => self.viewer.scroll_markdown(10),
+            KeyCode::PageUp => self.viewer.scroll_markdown(-10),
+            KeyCode::Home | KeyCode::Char('g') => self.viewer.scroll_markdown(i32::MIN),
+            KeyCode::End | KeyCode::Char('G') => self.viewer.scroll_markdown(i32::MAX),
             KeyCode::Char('+') | KeyCode::Char('=') => self.viewer.nudge_image_scale(1),
             KeyCode::Char('-') => self.viewer.nudge_image_scale(-1),
             KeyCode::Char('0') => self.viewer.reset_image_scale(),
@@ -925,10 +975,13 @@ impl App {
             self.set_hint("viewer: no active-yazi selection yet — hover a file first".into());
             return;
         };
-        // Refuse when the overlay wouldn't fit; users would see a
-        // broken modal otherwise.
-        if overlay_rect(self.last_pane_area).is_none() && self.last_pane_area.width != 0 {
-            self.set_hint("viewer: terminal too small (need ≥ 48×16)".into());
+        // Refuse when no left pane is on screen at all (terminal
+        // squeezed below the responsive fold, §19.5). We no longer
+        // need the old floating-modal 48×16 floor because the viewer
+        // takes over the yazi pane exactly — whatever fits yazi fits
+        // the viewer.
+        if self.last_pane_area.width == 0 || self.last_pane_area.height == 0 {
+            self.set_hint("viewer: terminal too small".into());
             return;
         }
         let meta = match std::fs::metadata(&selection.path) {
@@ -1206,6 +1259,25 @@ impl App {
     fn on_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
 
+        // §19.11 addendum: while the viewer owns the left pane it also
+        // owns every mouse event that lands inside its rect. This
+        // must run BEFORE the divider-drag priority arm below so a
+        // Left drag started in the viewer (text selection or
+        // scrollbar thumb) keeps routing here even after the pointer
+        // strays across the pane border. Drag/Up sessions initiated
+        // in the viewer are recognised via the viewer's own state.
+        if self.viewer.is_open() {
+            let in_viewer = self
+                .last_viewer_rect
+                .is_some_and(|r| point_in_rect(m.column, m.row, r));
+            let sticky = matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
+                && (self.viewer.selection_active() || self.viewer.scrollbar_dragging());
+            if in_viewer || sticky {
+                let _ = self.viewer.on_mouse(m);
+                let _ = self.redraw_tx.send(());
+                return;
+            }
+        }
         // --- Active drag takes precedence ---
         if let MouseEventKind::Drag(MouseButton::Left) = m.kind {
             if self.active_drag.is_some() {
@@ -1247,31 +1319,35 @@ impl App {
             return;
         }
 
-        // --- Right Down: copy selection if active, else open context menu ---
+        // --- Right Down: pane-local action; context menu ONLY on
+        // divider / tab strip ---
         //
-        // Priority: when a pane has an active text selection, right-click
-        // should copy (GNOME Terminal, KDE Konsole convention) rather than
-        // opening the menu. Only open the menu when no selection exists.
+        // §19.14 addendum (per user directive): right-click INSIDE a
+        // pane never opens a context menu; the click is handed to the
+        // pane so its local semantics run — paste for agents / shells
+        // (§19.14.4), copy for Quick Look (§19.14.2 read-only zone),
+        // or a forward-to-yazi context menu for the yazi List zone.
+        // This kills the ambiguity where right-click-on-selection did
+        // copy-and-paste while right-click-with-no-selection popped
+        // a menu — one gesture, one action.
         //
-        // The context menu also offers "Copy selected file path" on the
-        // left (files) column — a shortcut to grab yazi's current hover
-        // target (tracked via the OSC bridge) without drag-selecting the
-        // filename. Text selection still works normally on every pane;
-        // this entry is just a convenience.
+        // The context menu is preserved for structural clicks:
+        //   - on a rimeterm D1 / D2 divider (resize / reset splits)
+        //   - on a tab strip (activate / close / new tab)
+        // Both live outside every pane's outer rect, so
+        // `pane_outer_at` returns `None` there and `open_context_menu`
+        // stays reachable via the fall-through arm.
         if let MouseEventKind::Down(MouseButton::Right) = m.kind {
-            // Check if the click landed on a pane with an active selection.
             if let Some((pane_id, outer_rect)) = self.pane_outer_at(m.column, m.row) {
                 if let Some(pane) = self.panes.get_mut(pane_id) {
-                    if pane.has_active_selection() {
-                        // Forward to the pane so it can handle the copy.
-                        // PtyPane will copy on right-click when selection
-                        // is active (we'll add that logic next).
-                        let _ = pane.on_mouse(m, outer_rect);
-                        return;
-                    }
+                    // Focus first so subsequent keyboard input targets
+                    // whatever the user right-clicked into — matches
+                    // the left-click flow (step 4 below).
+                    let _ = pane.on_mouse(m, outer_rect);
+                    return;
                 }
             }
-            // No active selection — open the context menu.
+            // Divider / tab strip / empty gutter → structural menu.
             self.open_context_menu(m.column, m.row);
             return;
         }
@@ -1756,69 +1832,14 @@ impl App {
             return;
         }
 
-        // Pane hit — anchor inside that pane's outer rect so the menu
-        // stays on the shell / yazi / whatever the user right-clicked.
-        if let Some((pane_id, outer_rect)) = self.pane_outer_at(col, row) {
-            let owner = self.tree.tab_groups().iter().find_map(|g| {
-                g.members()
-                    .iter()
-                    .position(|m| *m == pane_id)
-                    .map(|i| (g.id(), i, g.policy()))
-            });
-            entries.push(crate::picker::PickerEntry::intent(
-                "Focus this pane",
-                format!("pane.focus:{}", pane_id.0),
-            ));
-            // Left (files) column convenience: a one-click way to copy
-            // yazi's currently-hovered file path (tracked via the OSC
-            // bridge) without drag-selecting the filename text. Disabled
-            // with a hint when nothing is hovered yet.
-            let in_files = owner.is_some_and(|(gid, _, _)| gid == BUILTIN_FILES);
-            if in_files {
-                match &self.last_yazi_selection {
-                    Some(sel) => {
-                        let label = sel.path.display().to_string();
-                        entries.push(
-                            crate::picker::PickerEntry::intent(
-                                "Copy selected file path",
-                                "yazi.copy.path",
-                            )
-                            .with_note(label),
-                        );
-                    }
-                    None => {
-                        entries.push(crate::picker::PickerEntry::disabled(
-                            "Copy selected file path",
-                            "no file hovered",
-                        ));
-                    }
-                }
-            }
-            if let Some((gid, idx, policy)) = owner {
-                if matches!(policy, rimeterm_core::tabs::MembersPolicy::Open { .. }) {
-                    entries.push(crate::picker::PickerEntry::intent(
-                        "Close this tab",
-                        format!("tab.close:{}:{}", gid, idx),
-                    ));
-                    push_group_new_entry(&mut entries, gid);
-                }
-                // Placeholder-specific: quick access to agent picker.
-                if let Some(pane) = self.panes.get(pane_id) {
-                    if pane.title() == AGENT_PICKER_TITLE {
-                        entries.push(crate::picker::PickerEntry::intent(
-                            "Pick an agent…",
-                            "agents.pick",
-                        ));
-                    }
-                }
-            }
-            let anchor = crate::picker::PickerAnchor::Anchored {
-                x: col,
-                y: row,
-                bounds: outer_rect,
-            };
-            self.picker_state.open_with_anchor("Pane", entries, anchor);
-        }
+        // Pane-internal right-click intentionally has NO context menu
+        // anymore (user directive after §19.14). `App::on_mouse`
+        // routes right-clicks that land inside a pane straight to
+        // `PaneProvider::on_mouse` and never reaches this function,
+        // so the pane-hit fall-through has been deleted rather than
+        // guarded with a runtime flag. If a future change wants a
+        // pane-scoped action (e.g. "Focus this pane" from a keyboard
+        // shortcut), route it through the command palette instead.
     }
 
     /// The outer rect of `gid`'s active pane, i.e. what the tab strip
@@ -1893,6 +1914,10 @@ impl App {
         self.last_dividers = self.tree.dividers(vertical[1]);
         self.last_tab_strips.clear();
         self.last_pane_outer_rects.clear();
+        // §19.11 addendum: cleared here so this frame's decision to
+        // draw (or not draw) the viewer is authoritative. The files
+        // pane loop below sets it when the viewer takes over.
+        self.last_viewer_rect = None;
         // Filled by the focused pane's render (see below). Overlays
         // (menu/palette/picker) override to `None` at the end of draw
         // so the caret doesn't leak past them.
@@ -1924,24 +1949,50 @@ impl App {
                             .unwrap_or_else(|| "(gone)".into())
                     })
                     .collect();
-                let hits = crate::tab_strip::hit_rects(strip_rect, group, &titles);
+                // Bottom (§19.10.1) is a pinned tab: no `×`. We compute
+                // the closable mask from `self.pinned_pane_ids`, so the
+                // shells strip renders `┤ bottom │ × shell-1 ├ [+]` with
+                // the leading tab losing its close affordance.
+                let closable: Vec<bool> = group
+                    .members()
+                    .iter()
+                    .map(|id| !self.pinned_pane_ids.contains(id))
+                    .collect();
+                let hits = crate::tab_strip::hit_rects(strip_rect, group, &titles, &closable);
                 self.last_tab_strips.push((gid, hits));
-                render_tab_strip(strip_rect, buf, group, &titles);
+                render_tab_strip(strip_rect, buf, group, &titles, &closable);
                 if let Some(active_id) = group.active_pane() {
-                    self.last_pane_outer_rects.push((active_id, pane_rect));
-                    if let Some(pane) = self.panes.get_mut(active_id) {
-                        let focused = self.focus.focused_pane() == Some(active_id);
-                        let ctx = PaneRenderCtx {
-                            focused,
-                            title_override: None,
-                        };
-                        let outcome = pane.render(pane_rect, buf, &ctx);
-                        // Only the focused pane's caret request is
-                        // captured — every other pane's `cursor` is
-                        // discarded. Overlays (menu/palette/picker)
-                        // override this at the end of draw().
-                        if focused {
-                            focused_cursor = outcome.cursor;
+                    // §19.11 addendum: while the viewer is open the
+                    // files pane's yazi never draws; the viewer takes
+                    // over the same `pane_rect` (matching yazi's
+                    // geometry exactly). We deliberately do NOT push
+                    // to `last_pane_outer_rects` so mouse events land
+                    // on the viewer instead of the yazi behind it.
+                    let is_files = gid == BUILTIN_FILES;
+                    if is_files && self.viewer.is_open() {
+                        viewer::render_into_pane(
+                            &mut self.viewer,
+                            pane_rect,
+                            buf,
+                            self.viewer_picker.as_ref(),
+                        );
+                        self.last_viewer_rect = Some(pane_rect);
+                    } else {
+                        self.last_pane_outer_rects.push((active_id, pane_rect));
+                        if let Some(pane) = self.panes.get_mut(active_id) {
+                            let focused = self.focus.focused_pane() == Some(active_id);
+                            let ctx = PaneRenderCtx {
+                                focused,
+                                title_override: None,
+                            };
+                            let outcome = pane.render(pane_rect, buf, &ctx);
+                            // Only the focused pane's caret request is
+                            // captured — every other pane's `cursor` is
+                            // discarded. Overlays (menu/palette/picker)
+                            // override this at the end of draw().
+                            if focused {
+                                focused_cursor = outcome.cursor;
+                            }
                         }
                     }
                 }
@@ -2055,13 +2106,10 @@ impl App {
             crate::picker::render(rect, buf, &self.picker_state);
         }
 
-        // Viewer overlay renders on top of everything (§19.11). Only
-        // draws when open; workspace geometry underneath is untouched.
-        if self.viewer.is_open() {
-            if let Some(rect) = overlay_rect(area) {
-                viewer::render_overlay(&self.viewer, rect, buf, self.viewer_picker.as_ref());
-            }
-        }
+        // §19.11 addendum: viewer no longer renders as a floating
+        // modal — it takes over the files pane rect during the pane
+        // loop above. This block is intentionally empty; kept as an
+        // anchor for the caret-suppression check below.
 
         // Suppress the caret when any overlay owns the input focus.
         // Menu/palette/picker draw their own selection markers; a
@@ -2410,6 +2458,11 @@ impl App {
             .lock()
             .insert(new_id, spawn.pane.session().clone());
         self.panes.insert(Box::new(spawn.pane));
+        // §19.14.4: newly-spawned shells inherit the same right-click
+        // paste policy as startup ones. Config is source of truth.
+        if let Some(pane) = self.panes.get_mut(new_id) {
+            pane.set_right_click_paste(self.config.mouse.right_click_paste);
+        }
 
         let group = self.tree.find_tab_group_mut(gid).expect("group present");
         group
@@ -2459,6 +2512,11 @@ impl App {
             self.redraw_tx.clone(),
             self.osc_tx.clone(),
         )?;
+        // §19.14.4: mid-runtime agents inherit the same right-click
+        // paste policy as startup ones.
+        if let Some(pane) = self.panes.get_mut(new_id) {
+            pane.set_right_click_paste(self.config.mouse.right_click_paste);
+        }
         self.pane_agent_id.insert(new_id, spec.id);
 
         // If the group is still holding the picker-placeholder from
@@ -2536,6 +2594,17 @@ impl App {
         match group.policy() {
             MembersPolicy::Fixed => return Err(anyhow!("{} is fixed; cannot close tabs", gid)),
             MembersPolicy::Open { .. } => {}
+        }
+        // §19.10.1 addendum: reject a close on a pinned pane (bottom).
+        // The mouse path never surfaces the `×` affordance, so this
+        // is the belt-and-braces guard for Ctrl+W / IPC `pane.close`.
+        if let Some(pane_id) = group.members().get(idx).copied() {
+            if self.pinned_pane_ids.contains(&pane_id) {
+                return Err(anyhow!(
+                    "tab is pinned in {}; cannot close (see §19.10.1)",
+                    gid
+                ));
+            }
         }
         let removed = group.try_close(idx, false).map_err(|e| anyhow!("{e}"))?;
         drop_pane(&mut self.panes, removed);

@@ -3,16 +3,23 @@
 //! The overlay is a modal Snapshot: `Alt+V` freezes the last `files:yazi:active`
 //! selection and opens a read-only viewer. Yazi keeps its native third-column
 //! Quick Look; rimeterm never proxies Yazi's preview widget.
-//!
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
+use ratatui::text::{Line, Text};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
+    Widget, Wrap,
+};
 use rimeterm_core::pane::PaneId;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::pty_selection::{Cell as SelCell, SelectionState};
 
 /// Configured byte cap for Markdown snapshots (§19.11.2).
 pub const MARKDOWN_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -231,11 +238,51 @@ pub struct ViewerOverlayState {
     markdown: Option<String>,
     image: Option<ImageReady>,
     return_focus: ReturnFocus,
-    /// Zero-based first visible line of the Markdown snapshot. Ignored
-    /// for image sources.
+    /// Zero-based first visible wrapped row of the Markdown snapshot.
+    /// Ignored for image sources.
     markdown_scroll: u16,
     /// Ratatui-image scale key (`+ - 0`). Ignored for Markdown.
     image_scale: i16,
+
+    // --- §19.11 addendum: interaction state ---
+    /// Text-area rect captured on the last `render_into_pane` call, in
+    /// absolute frame coordinates. Used by [`Self::on_mouse`] to
+    /// translate mouse hits into text cells. `None` before the first
+    /// render — all mouse events are dropped until then.
+    text_area: Option<Rect>,
+    /// Right-edge scrollbar rect captured on the last render. `None`
+    /// when there's nothing to scroll (content fits) or when the
+    /// snapshot is an image.
+    scrollbar_rect: Option<Rect>,
+    /// Total wrapped-row count of the current Markdown at
+    /// `text_area.width`, refreshed every render. Zero for image /
+    /// loading / error states. Drives the scrollbar thumb and clamps
+    /// [`Self::scroll_markdown`].
+    content_lines: u16,
+    /// Local text selection over the rendered viewport
+    /// (§19.11 addendum). Cells are stored relative to `text_area`
+    /// with `.row` in the visible viewport (NOT source-line).
+    selection: SelectionState,
+    /// Per-row snapshot of the rendered viewport, captured out of the
+    /// ratatui `Buffer` right after `Paragraph` renders. Used by
+    /// [`Self::copy_selection`] outside the draw pass — the buffer is
+    /// only borrowable inside `render`.
+    rendered_lines: Vec<String>,
+    /// Set while the user holds Left on the scrollbar column. Contains
+    /// the `text_area.y` at drag start so mouse `Drag` events can
+    /// compute the new scroll position by row ratio.
+    scrollbar_drag: bool,
+    /// `[×]` close-button rect captured on the last render (top-right
+    /// corner of the viewer border). `None` when the pane was too
+    /// narrow to fit the 3-cell affordance. Consulted by
+    /// [`Self::on_mouse`] on `Down(Left)` before selection / scrollbar
+    /// hits so users can always dismiss the viewer with the mouse.
+    close_button_rect: Option<Rect>,
+    /// One-shot flag set when the user clicks `[×]`. The App polls
+    /// [`Self::take_close_request`] each frame; on `true` it calls
+    /// `close_viewer_overlay` (which owns focus restoration, so we
+    /// don't try to duplicate that logic here).
+    close_requested: bool,
 }
 
 impl Default for ViewerOverlayState {
@@ -249,6 +296,14 @@ impl Default for ViewerOverlayState {
             return_focus: None,
             markdown_scroll: 0,
             image_scale: 0,
+            text_area: None,
+            scrollbar_rect: None,
+            content_lines: 0,
+            selection: SelectionState::default(),
+            rendered_lines: Vec::new(),
+            scrollbar_drag: false,
+            close_button_rect: None,
+            close_requested: false,
         }
     }
 }
@@ -291,10 +346,6 @@ impl ViewerOverlayState {
         self.image_scale
     }
 
-    /// Open a fresh Loading snapshot for `source`. Bumps the generation,
-    /// resets scroll/zoom, and records the pane to restore on close.
-    /// Returns the generation the worker MUST echo back — mismatch =
-    /// stale completion, drop.
     pub fn open_snapshot(&mut self, source: ViewerSource, return_focus: ReturnFocus) -> Generation {
         self.generation = Generation(self.generation.0.wrapping_add(1));
         self.status = ViewerStatus::Loading;
@@ -304,6 +355,14 @@ impl ViewerOverlayState {
         self.markdown_scroll = 0;
         self.image_scale = 0;
         self.return_focus = return_focus;
+        self.selection.clear();
+        self.rendered_lines.clear();
+        self.content_lines = 0;
+        self.text_area = None;
+        self.scrollbar_rect = None;
+        self.scrollbar_drag = false;
+        self.close_button_rect = None;
+        self.close_requested = false;
         self.generation
     }
 
@@ -353,6 +412,14 @@ impl ViewerOverlayState {
         self.image = None;
         self.markdown_scroll = 0;
         self.image_scale = 0;
+        self.selection.clear();
+        self.rendered_lines.clear();
+        self.content_lines = 0;
+        self.text_area = None;
+        self.scrollbar_rect = None;
+        self.scrollbar_drag = false;
+        self.close_button_rect = None;
+        self.close_requested = false;
         // Bump generation on close too — a completion that races the
         // close is definitively stale.
         self.generation = Generation(self.generation.0.wrapping_add(1));
@@ -368,21 +435,55 @@ impl ViewerOverlayState {
         // side-channels.
     }
 
-    /// Adjust Markdown scroll by `delta` lines, clamped to `max_scroll`.
-    /// `max_scroll` comes from the rendered layout (Task 5). No-op when
-    /// snapshot is not Markdown.
-    pub fn scroll_markdown(&mut self, delta: i32, max_scroll: u16) {
+    /// One-shot poll: returns `true` and clears the flag when the user
+    /// clicked `[×]` on the last-drawn viewer. Consulted by the App
+    /// after routing a mouse event through [`Self::on_mouse`] so it
+    /// can call `close_viewer_overlay` (which owns focus restoration).
+    pub fn take_close_request(&mut self) -> bool {
+        std::mem::take(&mut self.close_requested)
+    }
+
+    /// Maximum permitted `markdown_scroll` value at the current
+    /// viewport size. Zero when the content fits, or when the
+    /// snapshot is Image / Loading / Error (nothing to scroll).
+    /// Refreshed on every `render_into_pane` call.
+    pub fn max_scroll(&self) -> u16 {
+        let viewport = self.text_area.map(|r| r.height).unwrap_or(0);
+        self.content_lines.saturating_sub(viewport)
+    }
+
+    /// Adjust Markdown scroll by `delta` rows, clamped against
+    /// [`Self::max_scroll`]. No-op when the snapshot is not Markdown.
+    /// Positive `delta` scrolls down; negative up. §19.11 addendum.
+    pub fn scroll_markdown(&mut self, delta: i32) {
         if !matches!(
             self.snapshot.as_ref().map(|s| s.kind),
             Some(ViewerKind::Markdown),
         ) {
             return;
         }
+        let max = i32::from(self.max_scroll());
         let current = i32::from(self.markdown_scroll);
-        let clamped = current
-            .saturating_add(delta)
-            .clamp(0, i32::from(max_scroll));
+        let clamped = current.saturating_add(delta).clamp(0, max);
         self.markdown_scroll = clamped as u16;
+        // Any scroll invalidates selection cell coordinates (they were
+        // in the previous viewport). Simpler to drop than to re-project.
+        self.selection.clear();
+    }
+
+    /// Test-only setter that seeds content-line count without going
+    /// through the render path. Exists so unit tests can exercise
+    /// [`Self::scroll_markdown`] clamp behaviour without spinning up
+    /// a ratatui Buffer.
+    #[cfg(test)]
+    pub fn set_content_metrics_for_test(&mut self, content_lines: u16, viewport_height: u16) {
+        self.content_lines = content_lines;
+        self.text_area = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: viewport_height,
+        });
     }
 
     /// Reset image scale to 0 (Fit). No-op when snapshot is not Image.
@@ -404,6 +505,207 @@ impl ViewerOverlayState {
         ) {
             self.image_scale = (self.image_scale + delta).clamp(-4, 8);
         }
+    }
+
+    /// Dispatch a mouse event delivered by the App while the viewer is
+    /// open (§19.11 addendum). Returns `true` when the event was
+    /// consumed; the App swallows it either way to keep the panes
+    /// underneath quiet.
+    ///
+    /// Behavior mirrors the Quick Look policy (§19.14.2):
+    /// - `Down(Left)` on the scrollbar column starts a thumb drag.
+    /// - `Down(Left)` anywhere else in the text area begins a
+    ///   local text selection.
+    /// - `Drag(Left)` extends selection or moves the scroll thumb.
+    /// - `Up(Left)` commits selection + copies to the clipboard, or
+    ///   releases the scrollbar.
+    /// - `Down(Right)` copies any active selection (read-only zone,
+    ///   never paste — mirrors §19.14 QuickLook policy).
+    /// - `ScrollUp` / `ScrollDown` step the scroll by 3 wrapped rows.
+    pub fn on_mouse(&mut self, ev: MouseEvent) -> bool {
+        let Some(text_area) = self.text_area else {
+            return false;
+        };
+        let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
+
+        match ev.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_markdown(-3);
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_markdown(3);
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // §19.11 addendum: `[×]` close button lives on the top
+                // border of the viewer, above every other target.
+                // Consulted first so a mouse-driven "close" always
+                // wins over a stray selection start on the border.
+                if self
+                    .close_button_rect
+                    .is_some_and(|r| point_in_rect(ev.column, ev.row, r))
+                {
+                    self.close_requested = true;
+                    self.selection.clear();
+                    return true;
+                }
+                if self.point_on_scrollbar(ev.column, ev.row) {
+                    self.scrollbar_drag = true;
+                    self.selection.clear();
+                    self.set_scroll_from_scrollbar_row(ev.row, text_area);
+                    return true;
+                }
+                if let Some(cell) = cell_in_area(ev.column, ev.row, text_area) {
+                    if shift {
+                        self.selection.shift_extend(cell);
+                    } else {
+                        self.selection.begin(cell, Instant::now());
+                    }
+                    true
+                } else {
+                    // Border / title strip / hint area inside pane
+                    // rect. Still consume so the underlying pane
+                    // doesn't see the event.
+                    self.selection.clear();
+                    true
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.scrollbar_drag {
+                    self.set_scroll_from_scrollbar_row(ev.row, text_area);
+                    return true;
+                }
+                if self.selection.is_active() {
+                    let cell = cell_in_area_clamped(ev.column, ev.row, text_area);
+                    self.selection.extend(cell);
+                    return true;
+                }
+                false
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.scrollbar_drag {
+                    self.scrollbar_drag = false;
+                    return true;
+                }
+                if self.selection.is_active() {
+                    self.selection.commit();
+                    self.copy_selection();
+                    return true;
+                }
+                false
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                // §19.11 addendum: viewer is a read-only surface.
+                // Right-click = copy any active selection, never paste.
+                if self.selection.is_active() {
+                    self.copy_selection();
+                    self.selection.clear();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// True when the currently-drawn scrollbar exists and covers
+    /// `(col, row)`. Used to decide whether a `Down(Left)` starts a
+    /// thumb drag or a text selection.
+    fn point_on_scrollbar(&self, col: u16, row: u16) -> bool {
+        self.scrollbar_rect
+            .is_some_and(|r| point_in_rect(col, row, r))
+    }
+
+    /// Map a scrollbar-column mouse row to a scroll position by
+    /// linear interpolation (top row → scroll 0; bottom row →
+    /// max_scroll). Bail out silently when there's nothing to scroll.
+    fn set_scroll_from_scrollbar_row(&mut self, row: u16, text_area: Rect) {
+        let max = self.max_scroll();
+        if max == 0 || text_area.height == 0 {
+            return;
+        }
+        let clamped = row.clamp(
+            text_area.y,
+            text_area
+                .y
+                .saturating_add(text_area.height.saturating_sub(1)),
+        );
+        let rel = u32::from(clamped - text_area.y);
+        let span = u32::from(text_area.height.saturating_sub(1)).max(1);
+        let new_scroll = ((rel * u32::from(max) + span / 2) / span) as u16;
+        self.markdown_scroll = new_scroll.min(max);
+        // The scrollbar drag deliberately does NOT clear the current
+        // selection — dragging the thumb should not lose a highlight
+        // the user made just before. But cells now point at a
+        // different viewport row; simplest is to drop it. Matches
+        // [`Self::scroll_markdown`].
+        self.selection.clear();
+    }
+
+    /// Extract the currently-selected text from `rendered_lines` and
+    /// push it to the system clipboard. No-op on empty selection or
+    /// missing snapshot.
+    pub fn copy_selection(&self) {
+        if !self.selection.is_active() {
+            return;
+        }
+        let Some((start, end)) = self.selection.char_range() else {
+            return;
+        };
+        let mut out = String::new();
+        let last_row = end.row as usize;
+        for row in (start.row as usize)..=last_row {
+            let Some(line) = self.rendered_lines.get(row) else {
+                break;
+            };
+            let (col_start, col_end) = if start.row == end.row {
+                (start.col, end.col)
+            } else if row == start.row as usize {
+                (start.col, u16::MAX)
+            } else if row == last_row {
+                (0, end.col)
+            } else {
+                (0, u16::MAX)
+            };
+            let slice = extract_columns(line, col_start, col_end);
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&slice);
+        }
+        if out.trim().is_empty() {
+            return;
+        }
+        if let Ok(mut clip) = arboard::Clipboard::new() {
+            let _ = clip.set_text(out);
+        }
+    }
+
+    // --- Accessors used by the App / integration tests ---
+
+    /// Content lines currently reported by the last render. Zero for
+    /// non-Markdown / loading states.
+    pub fn content_lines(&self) -> u16 {
+        self.content_lines
+    }
+
+    /// Absolute-coordinate rect of the last-rendered text area, or
+    /// `None` if the viewer hasn't been drawn yet.
+    pub fn text_area(&self) -> Option<Rect> {
+        self.text_area
+    }
+
+    /// True while a scrollbar thumb drag is in progress (Left held).
+    /// The App consults this so click sequences that cross out of the
+    /// viewer rect still route back here until the button releases.
+    pub fn scrollbar_dragging(&self) -> bool {
+        self.scrollbar_drag
+    }
+
+    /// True while a text selection drag is in progress (Left held).
+    /// Same routing rationale as [`Self::scrollbar_dragging`].
+    pub fn selection_active(&self) -> bool {
+        self.selection.is_active()
     }
 }
 
@@ -466,15 +768,17 @@ fn io_err(e: &io::Error) -> String {
     e.to_string()
 }
 
-/// Render the modal overlay into `bounds` (already clamped by
-/// [`overlay_rect`]). Owns no I/O — parses the stored Markdown source on
-/// the render thread, which is bounded to the 8 MiB cap.
+/// Render the viewer into the left-column pane rect (§19.11 addendum:
+/// the viewer is now a true fullscreen takeover of the yazi pane, not
+/// a floating modal). Owns no I/O — parses the stored Markdown source
+/// on the render thread, which is bounded to the 8 MiB cap.
 ///
-/// Callers pass `bounds = overlay_rect(workspace).unwrap()` so this
-/// function does not need to re-validate the floor.
-pub fn render_overlay(
-    state: &ViewerOverlayState,
-    bounds: Rect,
+/// Takes `state` by `&mut` so it can persist per-frame layout hints
+/// (`text_area`, `scrollbar_rect`, `content_lines`) plus a snapshot of
+/// the rendered rows for [`ViewerOverlayState::copy_selection`].
+pub fn render_into_pane(
+    state: &mut ViewerOverlayState,
+    pane_rect: Rect,
     buf: &mut Buffer,
     picker: Option<&ratatui_image::picker::Picker>,
 ) {
@@ -486,30 +790,247 @@ pub fn render_overlay(
         .title(Line::styled(
             title,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD),
         ))
-        .borders(Borders::ALL);
-    let inner = block.inner(bounds);
-    // Clear the modal cells so background PTY glyphs don't bleed through.
-    ratatui::widgets::Clear.render(bounds, buf);
-    block.render(bounds, buf);
-    match (state.status(), state.snapshot().map(|s| s.kind)) {
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(pane_rect);
+    // Clear pane cells so any previously-rendered yazi glyphs don't
+    // bleed through where the block skips characters (e.g. gaps
+    // between paragraphs).
+    ratatui::widgets::Clear.render(pane_rect, buf);
+    block.render(pane_rect, buf);
+
+    // Reset frame-scoped state before deciding how to fill inner.
+    state.text_area = None;
+    state.scrollbar_rect = None;
+    state.content_lines = 0;
+    state.rendered_lines.clear();
+
+    // Split up the immutable borrows before we hand `state` mutably to
+    // `render_markdown` (which persists geometry back onto the state).
+    let status = state.status().clone();
+    let kind = state.snapshot().map(|s| s.kind);
+    match (status, kind) {
         (ViewerStatus::Loading, _) => render_message(inner, buf, "Loading…"),
-        (ViewerStatus::Error(msg), _) => render_message(inner, buf, msg),
+        (ViewerStatus::Error(msg), _) => render_message(inner, buf, &msg),
         (ViewerStatus::Ready, Some(ViewerKind::Markdown)) => {
-            let source = state.markdown().unwrap_or("");
-            let text = tui_markdown::from_str(source);
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .scroll((state.markdown_scroll(), 0))
-                .render(inner, buf);
+            render_markdown(state, inner, buf);
         }
         (ViewerStatus::Ready, Some(ViewerKind::Image)) => {
+            state.text_area = Some(inner);
             render_image(state, inner, buf, picker);
         }
         _ => {}
     }
+}
+
+/// Legacy name kept as a thin wrapper so external callers (currently
+/// none outside app.rs — but tests reference it) compile against the
+/// new signature during the transition.
+pub fn render_overlay(
+    state: &mut ViewerOverlayState,
+    bounds: Rect,
+    buf: &mut Buffer,
+    picker: Option<&ratatui_image::picker::Picker>,
+) {
+    render_into_pane(state, bounds, buf, picker);
+}
+
+/// Renders Markdown into `inner`, reserving the right-most column for
+/// a `ratatui::Scrollbar`. Captures layout hints on `state` for the
+/// mouse handler + `copy_selection`.
+fn render_markdown(state: &mut ViewerOverlayState, inner: Rect, buf: &mut Buffer) {
+    if inner.width < 2 || inner.height == 0 {
+        return;
+    }
+    let source = state.markdown().unwrap_or("").to_string();
+    let text = tui_markdown::from_str(&source);
+
+    // Reserve the right-most column for the scrollbar. We split
+    // upfront so `content_lines` counting matches the paragraph width
+    // exactly (else the thumb would drift by 1 col of wrap).
+    let text_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width.saturating_sub(1),
+        height: inner.height,
+    };
+    let scrollbar_col = Rect {
+        x: inner.x.saturating_add(text_area.width),
+        y: inner.y,
+        width: 1,
+        height: inner.height,
+    };
+
+    let content_lines = wrapped_line_count(&text, text_area.width);
+    state.content_lines = content_lines;
+    state.text_area = Some(text_area);
+
+    // Clamp scroll defensively — the content may have shrunk between
+    // renders (e.g. after a resize). Compute against post-count max.
+    let max_scroll = content_lines.saturating_sub(text_area.height);
+    if state.markdown_scroll > max_scroll {
+        state.markdown_scroll = max_scroll;
+    }
+    let scroll = state.markdown_scroll;
+
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0))
+        .render(text_area, buf);
+
+    // Snapshot the rendered rows out of the buffer so the mouse-up
+    // copy path can produce exactly what the user saw. Cheap on a
+    // ~35% column: ≤ text_area.width * text_area.height Cell reads.
+    state.rendered_lines = capture_rendered_rows(buf, text_area);
+
+    // Selection reverse-video overlay. Painted AFTER the paragraph
+    // so it wins the style merge, matching `PtyPane`'s convention.
+    if state.selection.is_active() {
+        let cols = text_area.width;
+        for row in 0..text_area.height {
+            for col in 0..text_area.width {
+                if state.selection.contains(row, col, cols) {
+                    let target = &mut buf[(text_area.x + col, text_area.y + row)];
+                    let style = target.style().add_modifier(Modifier::REVERSED);
+                    target.set_style(style);
+                }
+            }
+        }
+    }
+
+    // Scrollbar. Only draw when there's something to scroll — an
+    // idle thumb on a short document looks broken.
+    let max_scroll = content_lines.saturating_sub(text_area.height);
+    if max_scroll > 0 && scrollbar_col.width > 0 {
+        let mut sb_state = ScrollbarState::new(usize::from(content_lines))
+            .position(usize::from(scroll))
+            .viewport_content_length(usize::from(text_area.height));
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .render(scrollbar_col, buf, &mut sb_state);
+        state.scrollbar_rect = Some(scrollbar_col);
+    }
+}
+
+/// Read `area`'s cells out of the ratatui buffer and turn each row
+/// into a flat display string (spacer cells for wide chars contribute
+/// their empty symbol, so widths line up column-for-column).
+fn capture_rendered_rows(buf: &Buffer, area: Rect) -> Vec<String> {
+    let mut rows = Vec::with_capacity(area.height as usize);
+    for row in 0..area.height {
+        let mut line = String::with_capacity(area.width as usize);
+        for col in 0..area.width {
+            let x = area.x + col;
+            let y = area.y + row;
+            let sym = buf
+                .cell(ratatui::layout::Position::new(x, y))
+                .map(|c| c.symbol())
+                .unwrap_or("");
+            line.push_str(sym);
+        }
+        rows.push(line);
+    }
+    rows
+}
+
+/// Sum the wrapped-row count of a `Text` at `width`. Approximates
+/// ratatui's word-wrap by ceil-dividing each line's display width;
+/// good enough for scrollbar sizing and PgDn behaviour on Markdown
+/// (accuracy off by ≤1 row per wrapped source line).
+fn wrapped_line_count(text: &Text, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    let width_u32 = u32::from(width);
+    let mut total: u32 = 0;
+    for line in &text.lines {
+        let mut line_width: u32 = 0;
+        for span in &line.spans {
+            line_width =
+                line_width.saturating_add(UnicodeWidthStr::width(span.content.as_ref()) as u32);
+        }
+        let rows = if line_width == 0 {
+            1
+        } else {
+            line_width.div_ceil(width_u32)
+        };
+        total = total.saturating_add(rows);
+    }
+    total.min(u32::from(u16::MAX)) as u16
+}
+
+/// Convert an absolute-coordinate mouse hit into a text-area cell,
+/// or `None` when the point misses. Cells are 0-indexed from
+/// `text_area.x` / `.y`, matching what `SelectionState` expects.
+fn cell_in_area(col: u16, row: u16, text_area: Rect) -> Option<SelCell> {
+    if !point_in_rect(col, row, text_area) {
+        return None;
+    }
+    Some(SelCell {
+        row: row - text_area.y,
+        col: col - text_area.x,
+    })
+}
+
+/// Same as [`cell_in_area`] but clamps overshoots into the rect so
+/// a drag past the border still updates the selection cursor.
+fn cell_in_area_clamped(col: u16, row: u16, text_area: Rect) -> SelCell {
+    let x = col.clamp(
+        text_area.x,
+        text_area
+            .x
+            .saturating_add(text_area.width.saturating_sub(1)),
+    );
+    let y = row.clamp(
+        text_area.y,
+        text_area
+            .y
+            .saturating_add(text_area.height.saturating_sub(1)),
+    );
+    SelCell {
+        row: y - text_area.y,
+        col: x - text_area.x,
+    }
+}
+
+/// Slice `line` (a captured display-row) to the display-column range
+/// `[start_col, end_col]` inclusive. Handles CJK / emoji by summing
+/// `unicode_width` per char.
+fn extract_columns(line: &str, start_col: u16, end_col: u16) -> String {
+    if end_col < start_col {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut col: u16 = 0;
+    for c in line.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0) as u16;
+        if col > end_col {
+            break;
+        }
+        if col >= start_col {
+            out.push(c);
+        }
+        col = col.saturating_add(w.max(1));
+    }
+    out.trim_end().to_string()
+}
+
+/// Inclusive-left, exclusive-right rectangle hit test. Duplicated
+/// here to avoid taking a dependency on `pty_pane`; matches its
+/// semantics.
+fn point_in_rect(col: u16, row: u16, r: Rect) -> bool {
+    col >= r.x
+        && col < r.x.saturating_add(r.width)
+        && row >= r.y
+        && row < r.y.saturating_add(r.height)
 }
 
 fn render_image(
@@ -863,15 +1384,19 @@ mod state_tests {
 
     #[test]
     fn scroll_markdown_clamps_to_max_and_ignores_image() {
+        // Fresh Markdown snapshot: seed content metrics so max_scroll
+        // is well-defined without going through a real render.
         let mut state = ViewerOverlayState::default();
         state.open_snapshot(src("a.md", ViewerKind::Markdown), None);
-        state.scroll_markdown(5, 3);
+        state.set_content_metrics_for_test(13, 10); // 13 rows, 10-row viewport → max = 3
+        state.scroll_markdown(5);
         assert_eq!(state.markdown_scroll(), 3);
-        state.scroll_markdown(-100, 3);
+        state.scroll_markdown(-100);
         assert_eq!(state.markdown_scroll(), 0);
 
+        // Image snapshots ignore scroll_markdown entirely.
         state.open_snapshot(src("logo.png", ViewerKind::Image), None);
-        state.scroll_markdown(5, 3);
+        state.scroll_markdown(5);
         assert_eq!(state.markdown_scroll(), 0);
     }
 
@@ -893,6 +1418,111 @@ mod state_tests {
         state.open_snapshot(src("a.md", ViewerKind::Markdown), None);
         state.nudge_image_scale(3);
         assert_eq!(state.image_scale(), 0);
+    }
+
+    // --- §19.11 addendum: mouse handling for the pane-inside viewer ---
+
+    fn mev(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn wheel_scrolls_by_three_wrapped_rows() {
+        let mut state = ViewerOverlayState::default();
+        state.open_snapshot(src("a.md", ViewerKind::Markdown), None);
+        state.set_content_metrics_for_test(50, 10); // max = 40
+
+        assert!(state.on_mouse(mev(MouseEventKind::ScrollDown, 5, 5)));
+        assert_eq!(state.markdown_scroll(), 3);
+        assert!(state.on_mouse(mev(MouseEventKind::ScrollDown, 5, 5)));
+        assert_eq!(state.markdown_scroll(), 6);
+        assert!(state.on_mouse(mev(MouseEventKind::ScrollUp, 5, 5)));
+        assert_eq!(state.markdown_scroll(), 3);
+    }
+
+    #[test]
+    fn wheel_clamps_at_bounds() {
+        let mut state = ViewerOverlayState::default();
+        state.open_snapshot(src("a.md", ViewerKind::Markdown), None);
+        state.set_content_metrics_for_test(12, 10); // max = 2
+
+        for _ in 0..10 {
+            state.on_mouse(mev(MouseEventKind::ScrollDown, 5, 5));
+        }
+        assert_eq!(state.markdown_scroll(), 2);
+        for _ in 0..10 {
+            state.on_mouse(mev(MouseEventKind::ScrollUp, 5, 5));
+        }
+        assert_eq!(state.markdown_scroll(), 0);
+    }
+
+    #[test]
+    fn left_down_in_text_area_begins_selection() {
+        let mut state = ViewerOverlayState::default();
+        state.open_snapshot(src("a.md", ViewerKind::Markdown), None);
+        state.set_content_metrics_for_test(20, 10);
+        // set_content_metrics_for_test seeds text_area = (0,0,40,10);
+        // click at (col=5, row=3) is inside.
+        assert!(state.on_mouse(mev(MouseEventKind::Down(MouseButton::Left), 5, 3)));
+        assert!(state.selection_active());
+        // The App wraps mouse events; the viewer holds ownership by
+        // reporting the selection active flag.
+        assert!(!state.scrollbar_dragging());
+    }
+
+    #[test]
+    fn left_up_ends_selection_drag() {
+        let mut state = ViewerOverlayState::default();
+        state.open_snapshot(src("a.md", ViewerKind::Markdown), None);
+        state.set_content_metrics_for_test(20, 10);
+
+        state.on_mouse(mev(MouseEventKind::Down(MouseButton::Left), 3, 2));
+        state.on_mouse(mev(MouseEventKind::Drag(MouseButton::Left), 10, 4));
+        state.on_mouse(mev(MouseEventKind::Up(MouseButton::Left), 10, 4));
+        // After Up the selection is committed (still active) but the
+        // drag flag is off.
+        assert!(state.selection_active());
+        assert!(!state.scrollbar_dragging());
+    }
+
+    #[test]
+    fn right_click_without_selection_is_swallowed_silently() {
+        let mut state = ViewerOverlayState::default();
+        state.open_snapshot(src("a.md", ViewerKind::Markdown), None);
+        state.set_content_metrics_for_test(20, 10);
+        // Right-click on Markdown: read-only zone, must return true so
+        // App swallows the event (no context-menu popup here either).
+        assert!(state.on_mouse(mev(MouseEventKind::Down(MouseButton::Right), 5, 5)));
+        assert!(!state.selection_active());
+    }
+
+    #[test]
+    fn on_mouse_no_op_when_text_area_missing() {
+        // Viewer opened but never rendered: text_area is None; every
+        // event returns false so the App is free to route elsewhere
+        // (there's nothing to interact with yet).
+        let mut state = ViewerOverlayState::default();
+        state.open_snapshot(src("a.md", ViewerKind::Markdown), None);
+        assert!(!state.on_mouse(mev(MouseEventKind::Down(MouseButton::Left), 5, 5)));
+        assert!(!state.on_mouse(mev(MouseEventKind::ScrollDown, 5, 5)));
+    }
+
+    #[test]
+    fn extract_columns_handles_wide_chars() {
+        // ASCII: straightforward slice.
+        assert_eq!(extract_columns("hello world", 0, 4), "hello".to_string());
+        assert_eq!(extract_columns("hello world", 6, 10), "world".to_string());
+        // Empty range guards.
+        assert_eq!(extract_columns("abc", 5, 3), String::new());
+        // Wide chars occupy 2 columns each; extraction respects
+        // display width.
+        assert_eq!(extract_columns("你好abc", 0, 3), "你好".to_string());
+        assert_eq!(extract_columns("你好abc", 4, 6), "abc".to_string());
     }
 }
 
@@ -955,11 +1585,11 @@ mod markdown_tests {
 
     #[test]
     fn render_overlay_is_noop_when_closed() {
-        let state = ViewerOverlayState::default();
+        let mut state = ViewerOverlayState::default();
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 10));
         // Prime a distinct glyph so we can prove render_overlay leaves it alone.
         buf.set_string(0, 0, "X", Style::default());
-        render_overlay(&state, Rect::new(0, 0, 40, 10), &mut buf, None);
+        render_overlay(&mut state, Rect::new(0, 0, 40, 10), &mut buf, None);
         assert_eq!(buf[(0, 0)].symbol(), "X");
     }
 
@@ -975,7 +1605,7 @@ mod markdown_tests {
         );
         let bounds = Rect::new(0, 0, 60, 20);
         let mut buf = Buffer::empty(bounds);
-        render_overlay(&state, bounds, &mut buf, None);
+        render_overlay(&mut state, bounds, &mut buf, None);
         // Top-left corner of the block border is `┌`.
         assert_eq!(buf[(0, 0)].symbol(), "┌");
     }
