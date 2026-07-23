@@ -19,9 +19,11 @@ Windows-priority, cross-platform.
 
 rimeterm is a **TUI multiplexer** where **AI coding agents are first-class
 citizens**, sitting next to the file manager, the shell, and the system
-monitor. Four quadrants, tabs inside each, hot-swappable panes, a scripted
-IPC surface (`rimectl`), and a picker that spawns any coding agent you
-have on `$PATH` — `omp` / `codex` / `claude` / `pi` today, more later.
+monitor. Three zones (full-height file browser on the left, agents +
+shells stacked on the right), tabs inside each zone, hot-swappable panes,
+a scripted IPC surface (`rimectl`), and a picker that spawns any coding
+agent you have on `$PATH` — `omp` / `codex` / `claude` / `pi` today,
+more later.
 
 It is **not** a terminal emulator competing with wezterm / Alacritty /
 Kitty. It runs *inside* your existing terminal and multiplexes PTY
@@ -50,15 +52,15 @@ Excerpt from the internal design contract (§0):
    allow free redistribution.
 7. **Essentials bundled; everything else opt-in.** rimeterm's release
    archive ships prebuilt binaries for the tools that make the default
-   four-quadrant experience work out of the box:
-   - **Quadrant tools**: `yazi` / `gitui` / `bottom`.
+   three-zone experience work out of the box:
+   - **Zone tools**: `yazi` (left zone) / `gitui` (left zone toggle) / `bottom` (first tab in shells zone).
    - **Yazi Quick Look previewers**: `bat` (text/code),
      `glow` (Markdown), `chafa` (image fallback for terminals without
      Kitty/iTerm2/Sixel).
 
    First launch extracts them to `~/.rimeterm/bin/` alongside curated
    configs under `~/.rimeterm/{yazi,gitui,bottom}/`. Every other tool —
-   `trippy` today, whatever the user adds tomorrow — is opt-in via
+   `trippy` and any other tool the user adds tomorrow are opt-in via
    `tools.install`, installed into `~/.rimeterm/plugins/<name>/` via
    `cargo install --root`. Detection probes `~/.rimeterm/bin/` →
    `~/.rimeterm/plugins/*/bin/` → `$PATH`; Upgrade/Uninstall buttons
@@ -71,9 +73,12 @@ Excerpt from the internal design contract (§0):
 
 ## Feature snapshot
 
-- **Four-quadrant layout** — `files` (yazi/gitui) · `sysmon`
-  (bottom/trippy) · `agents` (dropdown-picked) · `shells` (pwsh / bash /
-  fish; multi-tab). Every quadrant has an internal tab strip.
+- **Three-zone layout** — **left** (yazi full-height with viewer/gitui
+  mode toggle) · **right-top** `agents` (dropdown-picked) · **right-bottom**
+  `shells` (bottom monitor as first tab + pwsh / bash / fish tabs;
+  multi-tab). Left column reaches from top to bottom; right column
+  splits into agents (55%) and shells (45%). Every zone with tabs has
+  an internal tab strip.
 - **Draggable dividers** with min-size floors; keyboard resize mode
   (`Ctrl+Alt+R`). Layout ratios persist per-workspace to
   `~/.rimeterm/data/workspaces/<hash>/layout.state.toml`.
@@ -87,7 +92,7 @@ Excerpt from the internal design contract (§0):
   keep their native SGR mouse — hold **Shift** to force local selection
   inside them. **Right-click** opens a context menu built for the click
   zone (divider / tab / pane / placeholder).
-- **Agent picker** — the `agents` quadrant starts empty. `Ctrl+T` or
+- **Agent picker** — the `agents` zone starts empty. `Ctrl+T` or
   `[+]` opens a dropdown of every coding agent detected on `$PATH`;
   missing agents render dim with an install hint. Your pick is
   **persisted** to `~/.rimeterm/data/workspaces/<hash>/agents.state.toml`
@@ -224,8 +229,8 @@ cargo install --path crates/rimectl  --bin rimectl
 are bundled by the release CI, not by `cargo`. If you're running from
 a checkout, populate `target/{debug,release}/essentials/` once with
 `node bootstrap-essentials.mjs` (requires Node ≥ 18). Rimeterm boots
-fine without them — detection falls through to `$PATH` — but the four
-quadrant tabs and Yazi Quick Look will show placeholder panes / empty
+fine without them — detection falls through to `$PATH` — but the
+three-zone tabs and Yazi Quick Look will show placeholder panes / empty
 previews if `$PATH` is also empty.
 
 ## Bundled essentials + on-demand plugins
@@ -244,7 +249,7 @@ on demand via `tools.install`:
 |---|---|---|
 | yazi (file manager) | essential | `~/.rimeterm/bin/{yazi,ya}` + `~/.rimeterm/yazi/` |
 | gitui | essential | `~/.rimeterm/bin/gitui` + `~/.rimeterm/gitui/` |
-| bottom (sysmon) | essential | `~/.rimeterm/bin/btm` + `~/.rimeterm/bottom/` |
+| bottom (shells first tab) | essential | `~/.rimeterm/bin/btm` + `~/.rimeterm/bottom/` |
 | bat (Yazi text/code preview) | essential | `~/.rimeterm/bin/bat` |
 | glow (Yazi Markdown preview) | essential | `~/.rimeterm/bin/glow` |
 | chafa (Yazi image fallback) | essential (Linux + Windows only) | `~/.rimeterm/bin/chafa` |
@@ -267,7 +272,7 @@ never touched either way.
 
 **Coexistence with `winget` / `brew` / `apt` installs**: no conflict.
 rimeterm only prepends `~/.rimeterm/bin/` to its *own* child
-processes' `PATH`. Inside rimeterm (the four quadrants and any shell
+processes' `PATH`. Inside rimeterm (the three zones and any shell
 tab it opens), the bundled essentials win — version-pinned,
 config-matched. Outside rimeterm (any shell you launch yourself), the
 system `PATH` is untouched and your `winget install sxyazi.yazi` etc.
@@ -300,7 +305,7 @@ same tree via `portable-pty`.
 | `F1` / `Ctrl+Shift+P` | Toggle command palette (both bindings — WT eats the latter by default) |
 | `Ctrl+Alt+R` | Toggle keyboard Resize mode |
 | `Alt+H/J/K/L` | Focus left / down / up / right cell |
-| `Alt+1..4` | Jump to quadrant (files / agents / sysmon / shells) |
+| `Alt+1..3` | Jump to zone (1=left · 2=agents · 3=shells) |
 | `Ctrl+PgUp/PgDn` or `Alt+[/]` | Previous / next tab in focused group |
 | `Alt+Shift+1..9` | Jump directly to tab N in focused group |
 | `Ctrl+T` | New tab: shell (`shells` group) or open agent picker (`agents` group) |
@@ -349,7 +354,7 @@ Every command is listed by `rimectl help`. Selected highlights:
   chains break cleanly).
 - `workspace.layout.reset {group?}` — reset split ratios. No args
   resets every split and clears `layout.state.toml`. `{"group":"files"|
-  "sysmon"|"agents"|"shells"}` scopes the reset to that group's cell
+  "agents"|"shells"}` scopes the reset to that group's cell
   and re-persists other overrides.
 - `file.selected` / `cwd.changed` — PTY plugins emit these through
   `ESC ] 1337 ; rimeterm ; <json> ST` (or BEL-terminated OSC); rimeterm
