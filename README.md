@@ -5,6 +5,10 @@ Windows-priority, cross-platform.
 
 <img width="1163" height="694" alt="image" src="https://github.com/user-attachments/assets/73bbee34-d51b-4685-9b42-7d89c9b1c31e" />
 
+<img width="1163" height="694" alt="image" src="https://github.com/user-attachments/assets/8b4cb289-d211-4797-a65f-9b331bbd3a67" />
+
+<img width="1163" height="694" alt="image" src="https://github.com/user-attachments/assets/5b29ad84-ac62-411b-9e22-1b114220142d" />
+
 
 | | |
 |---|---|
