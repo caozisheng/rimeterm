@@ -3,14 +3,6 @@
 **A terminal built for coding agents.** TUI-native (ratatui), Rust-first,
 Windows-priority, cross-platform.
 
-<img width="1163" height="694" alt="image" src="https://github.com/user-attachments/assets/73bbee34-d51b-4685-9b42-7d89c9b1c31e" />
-
-<img width="1163" height="694" alt="image" src="https://github.com/user-attachments/assets/8b4cb289-d211-4797-a65f-9b331bbd3a67" />
-
-<img width="1163" height="694" alt="image" src="https://github.com/user-attachments/assets/96223d29-43be-4d76-b6f7-117ca461c1ba" />
-
-
-
 | | |
 |---|---|
 | **License** | Apache-2.0 · see [`LICENSE`](LICENSE) |
