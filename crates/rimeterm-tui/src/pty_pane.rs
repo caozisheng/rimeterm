@@ -83,6 +83,12 @@ pub(crate) enum YaziZone {
     /// Parent + current file lists — yazi owns the mouse; rimeterm
     /// never starts a local selection here.
     List,
+    /// yazi's internal column divider, detected live from the PTY grid
+    /// (a column whose cells are mostly box-drawing verticals). yazi
+    /// owns the mouse here too — it uses this column to drag-resize its
+    /// own column ratios. Detected from the grid (not a config ratio
+    /// estimate) so it stays correct after yazi resizes its columns.
+    Seam,
     /// Read-only preview (Quick Look). rimeterm owns the mouse: local
     /// text selection + right-click copy.
     QuickLook,
@@ -302,50 +308,85 @@ impl PtyPane {
         let _ = self.session.write(&buf);
     }
 
-    /// §19.14.1: classify a mouse column against `yazi_layout`.
-    /// Returns `None` when zoning is disabled (non-yazi pane) or when
-    /// the point falls outside the pane's inner rect — the caller then
-    /// falls back to the plain (unzoned) policy.
+    /// §19.14.1: classify a mouse column into a [`YaziZone`].
+    ///
+    /// When `yazi_layout` is set (this pane is the yazi tab), the zone
+    /// boundaries come from a **live PTY-grid scan** — not from the
+    /// configured ratio estimate. yazi renders its column dividers as
+    /// box-drawing verticals (`│`, `┃`, …), and those columns are
+    /// detectable by walking the grid. This stays correct after yazi
+    /// resizes its internal columns, which a static ratio cannot.
+    ///
+    /// Returns `None` when zoning is disabled (non-yazi pane).
     fn zone_at(&self, col: u16, inner: Rect) -> Option<YaziZone> {
-        let layout = self.yazi_layout?;
-        if inner.width == 0 {
+        // `yazi_layout` being `Some` is the "this is a yazi pane" signal.
+        // Its ratio value is no longer used for geometry (the grid scan
+        // replaced it) but the flag still gates zoning on/off.
+        if self.yazi_layout.is_none() || inner.width == 0 || inner.height == 0 {
             return None;
         }
-        // Column outside the inner rect: caller wants an explicit
-        // decision (e.g. drag clamping to preview column), so pin it
-        // to the boundary rather than returning None. Rows are checked
-        // by the caller — zones split horizontally only.
-        let preview_start_rel = layout.preview_start_col(inner.width);
-        let preview_start_abs = inner.x.saturating_add(preview_start_rel);
-        if col < inner.x {
-            return Some(YaziZone::List);
+        let seams = self.detect_seam_cols(inner);
+        // Click on or adjacent to a detected seam column → forward to
+        // yazi (it drags its own divider). ±1 slop absorbs sub-cell
+        // jitter and the single-cell ambiguity of where the line sits.
+        for &seam_col in &seams {
+            if seam_col.saturating_sub(1) <= col && col <= seam_col.saturating_add(1) {
+                return Some(YaziZone::Seam);
+            }
         }
-        if col >= preview_start_abs {
-            Some(YaziZone::QuickLook)
-        } else {
-            Some(YaziZone::List)
+        // The rightmost seam separates `current` from `preview` (= Quick
+        // Look). Anything strictly right of it is the preview column.
+        if let Some(&last_seam) = seams.last() {
+            if col > last_seam {
+                return Some(YaziZone::QuickLook);
+            }
         }
+        // No seam found, or left of the rightmost seam → file lists.
+        Some(YaziZone::List)
+    }
+
+    /// Scan the PTY grid for yazi's internal column dividers. A divider
+    /// is rendered as a near-full-height run of box-drawing verticals,
+    /// so we score each inner column by how many of its cells hold a
+    /// vertical-line char and keep columns above a ratio threshold.
+    ///
+    /// Returns inner-absolute column numbers (i.e. `inner.x + rel`),
+    /// in left-to-right order. Empty when no dividers are visible
+    /// (e.g. yazi still booting, or a non-yazi TUI that doesn't draw
+    /// verticals) — callers fall back to `List` for every column.
+    fn detect_seam_cols(&self, inner: Rect) -> Vec<u16> {
+        self.session
+            .with_term(|term| scan_seam_cols(term.grid(), inner))
     }
 
     /// §19.14.2: rect that a local selection (Down/Drag/Up) may span.
     /// Non-yazi panes get the full inner rect. yazi panes get the
-    /// QuickLook column strip only — so a drag that overshoots into
-    /// the file lists clamps to the seam instead of leaking the
-    /// highlight across zones.
+    /// QuickLook column strip — everything right of the rightmost
+    /// detected seam — so a drag that overshoots left clamps to the
+    /// seam column instead of leaking the highlight across zones.
+    /// Geometry is read live from the PTY grid (matches `zone_at`).
     fn local_selection_rect(&self, outer: Rect) -> Rect {
         let inner = inner_rect(outer);
-        match self.yazi_layout {
-            Some(layout) if inner.width > 0 => {
-                let start_rel = layout.preview_start_col(inner.width);
-                let width = inner.width.saturating_sub(start_rel);
-                Rect {
-                    x: inner.x.saturating_add(start_rel),
-                    y: inner.y,
-                    width,
-                    height: inner.height,
-                }
-            }
-            _ => inner,
+        if self.yazi_layout.is_none() || inner.width == 0 {
+            return inner;
+        }
+        let seams = self.detect_seam_cols(inner);
+        // No seam detected yet (yazi still booting / rendering): fall
+        // back to the full inner rect so selection isn't dead — the
+        // zone_at path will also return List and forward everything,
+        // so local selection won't actually start until a seam exists.
+        let Some(&last) = seams.last() else {
+            return inner;
+        };
+        // QuickLook starts one column past the seam (the seam column
+        // itself belongs to yazi's divider).
+        let start = last.saturating_add(1);
+        let width = inner.right().saturating_sub(start);
+        Rect {
+            x: start,
+            y: inner.y,
+            width,
+            height: inner.height,
         }
     }
 
@@ -793,6 +834,65 @@ impl PtyPane {
 /// Contract mirrors the doc-comment on `decide_forward`; kept as a
 /// free function (not a method) so tests don't need to construct a
 /// `PtyPane`.
+/// Scan the PTY grid for yazi's internal column dividers. yazi draws
+/// its three-column layout with box-drawing verticals, so each divider
+/// shows up as a column where most cells hold a vertical-line char.
+///
+/// We count vertical-char cells per inner column and keep columns whose
+/// density ≥ `SEAM_DENSITY_THRESHOLD`. Returns inner-absolute column
+/// numbers (`inner.x + rel`) in left→right order.
+///
+/// Extracted as a free function taking the grid by reference so the
+/// pure scoring logic (`seam_columns_from_counts`) stays unit-testable
+/// without a live alacritty `Term`.
+pub(crate) fn scan_seam_cols(grid: &alacritty_terminal::grid::Grid<Cell>, inner: Rect) -> Vec<u16> {
+    if inner.width == 0 || inner.height == 0 {
+        return Vec::new();
+    }
+    let mut counts = vec![0usize; inner.width as usize];
+    for rel_row in 0..inner.height as i32 {
+        for rel_col in 0..inner.width as usize {
+            let point = alacritty_terminal::index::Point::new(
+                alacritty_terminal::index::Line(rel_row),
+                alacritty_terminal::index::Column(rel_col),
+            );
+            if is_vertical_line_char(grid[point].c) {
+                counts[rel_col] += 1;
+            }
+        }
+    }
+    seam_columns_from_counts(&counts, inner.height as usize, inner.x)
+}
+
+/// Density threshold: a real divider spans nearly the full pane height.
+/// yazi sometimes shortens its borders on the active row, so we accept
+/// ≥ 75 % coverage rather than requiring every single cell.
+pub(crate) const SEAM_DENSITY_THRESHOLD: f32 = 0.75;
+
+/// Pure scoring kernel of [`scan_seam_cols`]. Given per-column vertical-
+/// char counts, the row count, and the inner rect's absolute x origin,
+/// return the columns that look like dividers, as absolute columns.
+pub(crate) fn seam_columns_from_counts(counts: &[usize], height: usize, inner_x: u16) -> Vec<u16> {
+    if height == 0 {
+        return Vec::new();
+    }
+    let threshold = (height as f32 * SEAM_DENSITY_THRESHOLD).ceil() as usize;
+    counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c >= threshold)
+        .map(|(rel, _)| inner_x.saturating_add(rel as u16))
+        .collect()
+}
+
+/// Is `c` a box-drawing vertical line? Covers the common variants yazi
+/// / ratatui borders use: thin `│`, heavy `┃`, dashed `╎╏┊┋`, and the
+/// double `║`. Excludes `|` (ASCII) on purpose — filenames legitimately
+/// contain it and it's not what yazi draws its frame with.
+pub(crate) fn is_vertical_line_char(c: char) -> bool {
+    matches!(c, '│' | '┃' | '┊' | '┋' | '╎' | '╏' | '║' | '╟')
+}
+
 pub(crate) fn decide_forward_pure(
     kind: MouseEventKind,
     zone: Option<YaziZone>,
@@ -821,7 +921,9 @@ pub(crate) fn decide_forward_pure(
         return false;
     }
 
-    // List zone or unzoned: legacy policy.
+    // List, Seam, or unzoned: legacy policy. Seam forwards to yazi so
+    // it can drag its own column divider; List forwards so yazi gets
+    // all file-list clicks. Both share `base_forward`.
     base_forward
 }
 
@@ -1432,6 +1534,88 @@ mod mouse_tests {
     }
 
     #[test]
+    fn seam_zone_forwards_so_yazi_can_drag_its_divider() {
+        // §19.14.1 YaziSeam: yazi's internal column divider. MUST forward
+        // so yazi can drag-resize its own column ratios. If this regresses
+        // to local, the divider click starts a rimeterm text selection.
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert!(
+                decide_forward_pure(kind, Some(YaziZone::Seam), false, true, false),
+                "kind={kind:?} should forward in Seam zone"
+            );
+        }
+    }
+
+    #[test]
+    fn seam_zone_shift_forces_local() {
+        // Shift override is global: even on the seam, Shift+Left starts
+        // a local selection so power users can frame text there.
+        assert!(!decide_forward_pure(
+            down_left(0, 0),
+            Some(YaziZone::Seam),
+            true,
+            true,
+            true,
+        ));
+    }
+
+    // --- grid-based seam detection (scan_seam_cols / scoring kernel) ---
+
+    #[test]
+    fn seam_columns_from_counts_keeps_dense_columns() {
+        // 10-row pane; columns 3 and 8 are fully vertical (10/10 = 100%,
+        // ≥ 75% threshold). Columns 0 and 5 each have one stray `│`
+        // (a filename), below threshold → dropped.
+        let counts = [1usize, 0, 0, 10, 0, 1, 0, 0, 10, 0];
+        let seams = seam_columns_from_counts(&counts, 10, 100);
+        assert_eq!(seams, vec![103, 108]);
+    }
+
+    #[test]
+    fn seam_columns_from_counts_accepts_75_percent_density() {
+        // yazi shortens borders on the active row: 8/10 = 80% ≥ 75%.
+        let counts = [8usize, 0, 0, 0];
+        assert_eq!(seam_columns_from_counts(&counts, 10, 0), vec![0]);
+    }
+
+    #[test]
+    fn seam_columns_from_counts_rejects_below_threshold() {
+        // 7/10 = 70% < 75% → no seam.
+        let counts = [7usize, 0, 0, 0];
+        assert!(seam_columns_from_counts(&counts, 10, 0).is_empty());
+    }
+
+    #[test]
+    fn seam_columns_from_counts_empty_on_no_dividers() {
+        // Plain shell output — no verticals at all.
+        let counts = [0usize; 20];
+        assert!(seam_columns_from_counts(&counts, 10, 0).is_empty());
+    }
+
+    #[test]
+    fn seam_columns_from_counts_zero_height_returns_empty() {
+        // Degenerate: avoids divide-by-zero / spurious matches.
+        assert!(seam_columns_from_counts(&[5, 5, 5], 0, 0).is_empty());
+    }
+
+    #[test]
+    fn is_vertical_line_char_covers_box_drawing_set() {
+        // yazi default theme uses thin `│`; heavy / dashed / double
+        // are covered so users on other themes aren't left out.
+        for c in ['│', '┃', '┊', '┋', '╎', '╏', '║'] {
+            assert!(is_vertical_line_char(c), "should recognize {c:?}");
+        }
+        // ASCII `|` is deliberately excluded — filenames contain it.
+        assert!(!is_vertical_line_char('|'));
+        assert!(!is_vertical_line_char('l'));
+        assert!(!is_vertical_line_char(' '));
+    }
+
+    #[test]
     fn shift_always_forces_local_even_in_list_zone() {
         // Shift+Left in the file lists still starts a rimeterm-side
         // selection so Alacritty / Wezterm muscle memory works.
@@ -1447,12 +1631,12 @@ mod mouse_tests {
     // --- §19.14.1 zone geometry: `ev` param unused so we're really
     // testing PtyPane's zone_at classifier via the pure math above. ---
 
-    // Note: PtyPane::zone_at itself is exercised end-to-end by
-    // preview_start_col tests. The invariant it holds is:
-    //   col < inner.x + preview_start_col  →  Some(List)
-    //   col >= inner.x + preview_start_col →  Some(QuickLook)
-    // The math tests above pin the boundary; the enum branching is
-    // trivial and doesn't warrant a Session-backed integration test.
+    // Note: PtyPane::zone_at now classifies via a live PTY-grid scan,
+    // not the ratio-based preview_start_col. The scoring kernel it
+    // calls (`seam_columns_from_counts`) is tested directly above.
+    // The full grid walk lives in `scan_seam_cols` and needs a live
+    // alacritty Term — covered by manual smoke (divider drag stays
+    // responsive after yazi resizes its columns).
 
     // Suppress unused-helper warning on `ev()` when this module has
     // no other consumer — kept because the earlier legacy tests use

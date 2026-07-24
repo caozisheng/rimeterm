@@ -558,12 +558,20 @@ impl App {
                 color,
                 "files",
             )?;
-            // Left column (files) panes are mouse-passthrough: they never
-            // start rimeterm text selections / paste in the file lists.
+            // Left column (files) panes are mouse-passthrough: the file
+            // lists + dividers forward to yazi / gitui as SGR bytes.
             // D1/D2 dividers still drag because on_mouse checks dividers
-            // before pane-priority. §19.14.1 further carves the yazi
-            // pane into (List | QuickLook) zones so the preview column
-            // owns local text selection despite passthrough.
+            // before pane-priority.
+            //
+            // The yazi tab additionally gets `set_yazi_layout`: this is
+            // NOT a ratio estimate anymore — it's a flag that turns on
+            // grid-based zoning. `zone_at` scans the PTY grid live to
+            // find yazi's actual divider columns (box-drawing verticals),
+            // so the QuickLook preview column keeps local text selection
+            // even after yazi resizes its columns. The ratio value in
+            // `config.mouse.yazi_layout` is unused for geometry now; it
+            // stays as the on/off gate so users can disable zoning via
+            // config (set `yazi_layout = []` semantics future work).
             if let Some(pane) = panes.get_mut(id) {
                 pane.set_mouse_passthrough(true);
                 if spec.id == "yazi" {
