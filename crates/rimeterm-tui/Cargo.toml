@@ -33,3 +33,6 @@ anyhow = { workspace = true }
 tui-markdown = { workspace = true }
 ratatui-image = { workspace = true }
 image = { workspace = true }
+# C22 viewer code-highlighting (translation to ratatui styles lives in
+# `viewer::code_highlight`; no upstream adapter crate needed).
+syntect = { workspace = true }

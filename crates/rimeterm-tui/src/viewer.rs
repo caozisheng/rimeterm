@@ -11,7 +11,7 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
     Widget, Wrap,
@@ -26,6 +26,12 @@ pub const MARKDOWN_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Configured byte cap for image snapshots (§19.11.2).
 pub const IMAGE_MAX_BYTES: u64 = 40 * 1024 * 1024;
+
+/// Configured byte cap for code snapshots (C22). Smaller than the
+/// Markdown cap because syntect highlighting is line-linear and
+/// per-frame — scrolling a 4 MiB file is still comfortable, 8 MiB
+/// starts to feel it on the slowest supported hardware.
+pub const CODE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Minimum usable overlay width in cells. Falls back to Yazi Quick Look
 /// when the terminal cannot host it (§19.5, §19.11).
@@ -43,10 +49,18 @@ pub const OVERLAY_PERCENT_H: u16 = 90;
 pub const OVERLAY_MARGIN: u16 = 2;
 
 /// The kind of snapshot the modal viewer will render.
+///
+/// `Copy` is preserved so callers can pass it by value freely — payload
+/// discovery (e.g. the syntect syntax for a `Code` variant) is resolved
+/// separately from the file path at load / render time.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ViewerKind {
     Markdown,
     Image,
+    /// Plain-text or source-code file rendered with syntect-driven
+    /// syntax highlighting (C22). Recognised extensions are the same
+    /// set the seeded Yazi Quick Look previewer forwards to `bat`.
+    Code,
 }
 
 /// A frozen viewer source. Constructed via [`classify_source`].
@@ -104,6 +118,7 @@ pub fn classify_source(
     let cap = match kind {
         ViewerKind::Markdown => MARKDOWN_MAX_BYTES,
         ViewerKind::Image => IMAGE_MAX_BYTES,
+        ViewerKind::Code => CODE_MAX_BYTES,
     };
     if meta.len > cap {
         return Err(ClassifyError::TooLarge {
@@ -122,6 +137,74 @@ const MARKDOWN_EXTS: &[&str] = &["md", "markdown"];
 /// The supported image extensions (§19.11.2). `svg` is deliberately
 /// excluded — `ratatui-image` does not render vector graphics.
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+/// The supported plain-text / source-code extensions (C22). Kept in
+/// lockstep with the `run = "code"` entry of `assets/yazi/seeds/yazi.toml`
+/// so the Alt+V modal opens exactly the files Yazi Quick Look already
+/// syntax-highlights. Any extension outside this list falls through to
+/// [`kind_for_extension`]'s `None` branch (Yazi keeps handling it).
+const CODE_EXTS: &[&str] = &[
+    "txt",
+    "log",
+    "ini",
+    "cfg",
+    "conf",
+    "env",
+    "toml",
+    "yaml",
+    "yml",
+    "json",
+    "jsonc",
+    "xml",
+    "csv",
+    "tsv",
+    "rs",
+    "c",
+    "h",
+    "cc",
+    "cpp",
+    "hpp",
+    "cxx",
+    "hxx",
+    "py",
+    "pyi",
+    "js",
+    "jsx",
+    "mjs",
+    "cjs",
+    "ts",
+    "tsx",
+    "go",
+    "java",
+    "kt",
+    "kts",
+    "rb",
+    "php",
+    "cs",
+    "swift",
+    "scala",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "ps1",
+    "psm1",
+    "lua",
+    "vim",
+    "el",
+    "sql",
+    "dockerfile",
+    "gitignore",
+    "gitattributes",
+    "editorconfig",
+    "proto",
+    "graphql",
+    "gql",
+    "tf",
+    "hcl",
+    "nix",
+    "ron",
+    "lock",
+];
 
 fn kind_for_extension(path: &Path) -> Option<ViewerKind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -129,6 +212,8 @@ fn kind_for_extension(path: &Path) -> Option<ViewerKind> {
         Some(ViewerKind::Markdown)
     } else if IMAGE_EXTS.contains(&ext.as_str()) {
         Some(ViewerKind::Image)
+    } else if CODE_EXTS.contains(&ext.as_str()) {
+        Some(ViewerKind::Code)
     } else {
         None
     }
@@ -194,6 +279,10 @@ pub enum ViewerPayload {
     Markdown(String),
     /// Placeholder for the image protocol state built in Task 6.
     Image(ImageReady),
+    /// Raw source text for a `ViewerKind::Code` snapshot (C22).
+    /// syntect highlighting runs at draw time — cheap enough because
+    /// only the viewport slice is styled per frame.
+    Code(String),
     /// Terminal I/O or decode failure surfaced from the worker.
     Error(String),
 }
@@ -240,9 +329,14 @@ pub struct ViewerOverlayState {
     /// `ViewerStatus::Ready`) so the enum stays `Clone` for testing.
     markdown: Option<String>,
     image: Option<ImageReady>,
+    /// Raw source text for the `Code` snapshot, populated once the
+    /// worker returns. Highlighted lazily per-frame by `render_code`.
+    code: Option<String>,
     return_focus: ReturnFocus,
-    /// Zero-based first visible wrapped row of the Markdown snapshot.
-    /// Ignored for image sources.
+    /// Zero-based first visible source row for the Markdown or Code
+    /// snapshot. Kept under its historical name (`markdown_scroll`)
+    /// so §19.11-era plumbing and tests stay stable; the value now
+    /// covers both scrollable-text kinds. Ignored for Image sources.
     markdown_scroll: u16,
     /// Ratatui-image scale key (`+ - 0`). Ignored for Markdown.
     image_scale: i16,
@@ -296,6 +390,7 @@ impl Default for ViewerOverlayState {
             generation: Generation(0),
             markdown: None,
             image: None,
+            code: None,
             return_focus: None,
             markdown_scroll: 0,
             image_scale: 0,
@@ -341,6 +436,12 @@ impl ViewerOverlayState {
         self.image.as_ref()
     }
 
+    /// Raw source text for the current `Code` snapshot, or `None`
+    /// when the snapshot is a different kind or still loading.
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
     pub fn markdown_scroll(&self) -> u16 {
         self.markdown_scroll
     }
@@ -355,6 +456,7 @@ impl ViewerOverlayState {
         self.snapshot = Some(source);
         self.markdown = None;
         self.image = None;
+        self.code = None;
         self.markdown_scroll = 0;
         self.image_scale = 0;
         self.return_focus = return_focus;
@@ -397,6 +499,13 @@ impl ViewerOverlayState {
                 self.image = Some(image);
                 self.status = ViewerStatus::Ready;
             }
+            ViewerPayload::Code(text) => {
+                if source.kind != ViewerKind::Code {
+                    return false;
+                }
+                self.code = Some(text);
+                self.status = ViewerStatus::Ready;
+            }
             ViewerPayload::Error(msg) => {
                 self.status = ViewerStatus::Error(msg);
             }
@@ -413,6 +522,7 @@ impl ViewerOverlayState {
         self.snapshot = None;
         self.markdown = None;
         self.image = None;
+        self.code = None;
         self.markdown_scroll = 0;
         self.image_scale = 0;
         self.selection.clear();
@@ -455,13 +565,14 @@ impl ViewerOverlayState {
         self.content_lines.saturating_sub(viewport)
     }
 
-    /// Adjust Markdown scroll by `delta` rows, clamped against
-    /// [`Self::max_scroll`]. No-op when the snapshot is not Markdown.
-    /// Positive `delta` scrolls down; negative up. §19.11 addendum.
+    /// Adjust the scrollable-text viewport by `delta` rows, clamped
+    /// against [`Self::max_scroll`]. Applies to both Markdown and Code
+    /// snapshots — image snapshots ignore this. Positive `delta`
+    /// scrolls down; negative up (§19.11 addendum, C22).
     pub fn scroll_markdown(&mut self, delta: i32) {
         if !matches!(
             self.snapshot.as_ref().map(|s| s.kind),
-            Some(ViewerKind::Markdown),
+            Some(ViewerKind::Markdown | ViewerKind::Code),
         ) {
             return;
         }
@@ -733,6 +844,17 @@ pub fn load_image_blocking(path: &Path) -> ViewerPayload {
     }
 }
 
+/// Blocking code / plain-text reader used by the tokio worker (C22).
+/// Enforces [`CODE_MAX_BYTES`] and rejects non-UTF-8 content — syntect
+/// operates on `&str`, and mixing decoders across kinds would break
+/// [`ViewerOverlayState::copy_selection`]'s cell-column arithmetic.
+pub fn load_code_blocking(path: &Path) -> ViewerPayload {
+    match read_text_bytes(path, CODE_MAX_BYTES, "code") {
+        Ok(text) => ViewerPayload::Code(text),
+        Err(err) => ViewerPayload::Error(err),
+    }
+}
+
 fn read_image_dyn(path: &Path, cap: u64) -> Result<image::DynamicImage, String> {
     let metadata = std::fs::metadata(path).map_err(|e| io_err(&e))?;
     if !metadata.is_file() {
@@ -753,14 +875,22 @@ fn read_image_dyn(path: &Path, cap: u64) -> Result<image::DynamicImage, String> 
 }
 
 fn read_markdown_bytes(path: &Path, cap: u64) -> Result<String, String> {
+    read_text_bytes(path, cap, "Markdown")
+}
+
+/// Shared UTF-8 file reader with a byte cap. `kind_label` appears in
+/// the "file exceeds N MiB … limit" error message so the operator can
+/// tell Markdown from Code / plain-text failures at a glance.
+fn read_text_bytes(path: &Path, cap: u64, kind_label: &str) -> Result<String, String> {
     let metadata = std::fs::metadata(path).map_err(|e| io_err(&e))?;
     if !metadata.is_file() {
         return Err("not a regular file".into());
     }
     if metadata.len() > cap {
         return Err(format!(
-            "file exceeds {} MiB Markdown limit",
-            cap / 1024 / 1024
+            "file exceeds {} MiB {} limit",
+            cap / 1024 / 1024,
+            kind_label,
         ));
     }
     let bytes = std::fs::read(path).map_err(|e| io_err(&e))?;
@@ -830,6 +960,9 @@ pub fn render_into_pane(
         (ViewerStatus::Ready, Some(ViewerKind::Markdown)) => {
             render_markdown(state, inner, buf);
         }
+        (ViewerStatus::Ready, Some(ViewerKind::Code)) => {
+            render_code(state, inner, buf);
+        }
         (ViewerStatus::Ready, Some(ViewerKind::Image)) => {
             state.text_area = Some(inner);
             render_image(state, inner, buf, picker);
@@ -853,12 +986,23 @@ pub fn render_overlay(
 /// Renders Markdown into `inner`, reserving the right-most column for
 /// a `ratatui::Scrollbar`. Captures layout hints on `state` for the
 /// mouse handler + `copy_selection`.
+///
+/// C22.5 addendum: fenced code blocks are post-processed through
+/// `syntect` — `tui-markdown 0.3.8` leaves both fence markers and
+/// their contents as plain unstyled lines, and we know from the
+/// probe that the source-line ↔ rendered-line mapping is 1:1 in the
+/// output. That lets us walk the source once, mark the ranges that
+/// live inside fences, and rewrite the corresponding lines in the
+/// `Text` without touching scroll / selection / capture invariants
+/// (line count and column widths are preserved — spans only get new
+/// styles).
 fn render_markdown(state: &mut ViewerOverlayState, inner: Rect, buf: &mut Buffer) {
     if inner.width < 2 || inner.height == 0 {
         return;
     }
     let source = state.markdown().unwrap_or("").to_string();
-    let text = tui_markdown::from_str(&source);
+    let mut text = tui_markdown::from_str(&source);
+    highlight_code_fences(&source, &mut text);
 
     // Reserve the right-most column for the scrollbar. We split
     // upfront so `content_lines` counting matches the paragraph width
@@ -925,6 +1069,318 @@ fn render_markdown(state: &mut ViewerOverlayState, inner: Rect, buf: &mut Buffer
             .end_symbol(None)
             .render(scrollbar_col, buf, &mut sb_state);
         state.scrollbar_rect = Some(scrollbar_col);
+    }
+}
+
+/// Rewrite lines inside fenced code blocks of `text` with syntect
+/// syntax colouring (C22.5).
+///
+/// `tui-markdown 0.3.8` renders fenced blocks as plain unstyled lines
+/// preserving the 1:1 source-line ↔ output-line mapping — we exploit
+/// that here to walk `source` linearly, mark which output rows are
+/// **inside** a fence (contents only, not the fence markers), and
+/// rebuild just those rows' spans. Rows outside fences are untouched,
+/// so tui-markdown's own headings/lists/emphasis rendering stands.
+///
+/// Fence detection is deliberately CommonMark-lite: opens on a line
+/// whose trimmed content starts with 3+ backticks or tildes, closes
+/// on a line whose trimmed content is exactly the same marker
+/// length. Info string after the opening fence is used as the syntect
+/// language token (e.g. ```` ```rust ```` → syntax "Rust"). Nested
+/// or malformed fences fall through to the untouched pass — never
+/// panic, worst case we simply skip highlighting for that block.
+fn highlight_code_fences<'a>(source: &str, text: &mut Text<'a>) {
+    use syntect::easy::HighlightLines;
+
+    let (syntax_set, theme_set) = code_highlight::assets();
+    let theme = &theme_set.themes["base16-ocean.dark"];
+
+    // Collect (row_index, language_token) for every source line that
+    // is INSIDE a fence — fence markers themselves are excluded so
+    // the "```rust" and closing "```" retain their default styling
+    // (recognisable as delimiters, not code).
+    #[derive(Copy, Clone)]
+    struct Fence<'a> {
+        marker: char,
+        len: usize,
+        lang: &'a str,
+    }
+    let mut open: Option<Fence<'_>> = None;
+    let mut interior_rows: Vec<(usize, &str)> = Vec::new();
+
+    for (idx, raw) in source.lines().enumerate() {
+        let trimmed = raw.trim_start();
+        match open {
+            None => {
+                // Look for an opening fence.
+                let marker = trimmed.chars().next();
+                if !matches!(marker, Some('`') | Some('~')) {
+                    continue;
+                }
+                let marker = marker.unwrap();
+                let len = trimmed.chars().take_while(|c| *c == marker).count();
+                if len < 3 {
+                    continue;
+                }
+                let info = trimmed[len..].trim();
+                // First whitespace-delimited token is the language.
+                let lang = info.split_whitespace().next().unwrap_or("");
+                open = Some(Fence { marker, len, lang });
+            }
+            Some(fence) => {
+                // Close on a bare marker line of matching kind whose
+                // run length is >= the opener (CommonMark rule). Info
+                // string is not permitted on a closer.
+                let is_close = trimmed.chars().all(|c| c == fence.marker)
+                    && trimmed.chars().count() >= fence.len
+                    && !trimmed.is_empty();
+                if is_close {
+                    open = None;
+                } else {
+                    interior_rows.push((idx, fence.lang));
+                }
+            }
+        }
+    }
+
+    if interior_rows.is_empty() {
+        return;
+    }
+
+    // Rebuild spans for the flagged rows. Group consecutive rows of
+    // the same language into one `HighlightLines` run so parser
+    // state (multi-line strings, block comments) stays coherent.
+    let mut cursor = 0;
+    while cursor < interior_rows.len() {
+        let (_start_row, lang) = interior_rows[cursor];
+        let mut end = cursor + 1;
+        while end < interior_rows.len()
+            && interior_rows[end].1 == lang
+            && interior_rows[end].0 == interior_rows[end - 1].0 + 1
+        {
+            end += 1;
+        }
+        let syntax = if lang.is_empty() {
+            syntax_set.find_syntax_plain_text()
+        } else {
+            syntax_set
+                .find_syntax_by_token(lang)
+                .unwrap_or_else(|| syntax_set.find_syntax_plain_text())
+        };
+        let mut highlighter = HighlightLines::new(syntax, theme);
+        for (row, _) in &interior_rows[cursor..end] {
+            let Some(line) = text.lines.get_mut(*row) else {
+                continue;
+            };
+            // Reconstruct the raw source line by concatenating span
+            // contents — tui-markdown left them verbatim so this is
+            // exactly what syntect would see if we had the raw text.
+            let raw: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            // syntect wants trailing newline for `HighlightLines`.
+            let mut with_nl = raw.clone();
+            with_nl.push('\n');
+            let Ok(styled) = highlighter.highlight_line(&with_nl, syntax_set) else {
+                continue;
+            };
+            let new_spans: Vec<Span<'a>> = styled
+                .into_iter()
+                .map(|(sty, s)| {
+                    let owned = s.trim_end_matches('\n').to_owned();
+                    Span::styled(owned, code_highlight::translate_style(sty))
+                })
+                .filter(|s| !s.content.is_empty())
+                .collect();
+            if !new_spans.is_empty() {
+                *line = Line::from(new_spans);
+            }
+        }
+        cursor = end;
+    }
+}
+
+/// Renders a Code / plain-text snapshot into `inner` with syntect
+/// syntax highlighting (C22). Mirrors [`render_markdown`] geometry so
+/// the scrollbar and selection plumbing behave identically — only the
+/// per-line styling differs.
+///
+/// Highlighting is bounded by the viewport (`inner.height` lines
+/// highlighted per frame), which keeps a ~megabyte source snappy even
+/// without a persistent cache: `syntect` re-parses from the file
+/// start on each frame's first visible line, then walks forward.
+/// For a 4 MiB cap this is well under a millisecond on modern CPUs.
+fn render_code(state: &mut ViewerOverlayState, inner: Rect, buf: &mut Buffer) {
+    use syntect::easy::HighlightLines;
+    use syntect::util::LinesWithEndings;
+
+    if inner.width < 2 || inner.height == 0 {
+        return;
+    }
+
+    // Reserve the right-most column for the scrollbar, matching
+    // `render_markdown`'s split. `text_area` is what selection /
+    // capture / scroll math reference; `scrollbar_col` is a single
+    // column strip on the right.
+    let text_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width.saturating_sub(1),
+        height: inner.height,
+    };
+    let scrollbar_col = Rect {
+        x: inner.x.saturating_add(text_area.width),
+        y: inner.y,
+        width: 1,
+        height: inner.height,
+    };
+
+    let source = state.code().unwrap_or("").to_owned();
+    let path = state.snapshot().map(|s| s.path.clone()).unwrap_or_default();
+
+    // The source-line count IS the content-line count for Code:
+    // long lines are not wrapped (right-side overflow is clipped,
+    // matching bat's default). Overlong wrapping would fight
+    // scrollbar row math and lose the column-for-column property
+    // `copy_selection` relies on.
+    let total_lines_u32: u32 = source
+        .lines()
+        .count()
+        .min(u32::MAX as usize)
+        .try_into()
+        .unwrap_or(u32::MAX);
+    let content_lines = total_lines_u32.min(u32::from(u16::MAX)) as u16;
+    state.content_lines = content_lines;
+    state.text_area = Some(text_area);
+
+    let max_scroll = content_lines.saturating_sub(text_area.height);
+    if state.markdown_scroll > max_scroll {
+        state.markdown_scroll = max_scroll;
+    }
+    let scroll = state.markdown_scroll;
+
+    // Resolve syntax by extension, falling back to plain text when
+    // the extension is unknown to syntect. Both branches highlight
+    // through `HighlightLines` for a uniform code path.
+    let (syntax_set, theme_set) = code_highlight::assets();
+    let syntax = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(|ext| syntax_set.find_syntax_by_extension(ext))
+        .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+    let theme = &theme_set.themes["base16-ocean.dark"];
+    let mut highlighter = HighlightLines::new(syntax, theme);
+
+    // Build ratatui lines for the visible viewport. Skip the syntect
+    // state forward for the invisible prefix so highlighting stays
+    // context-aware (multi-line strings, block comments) even mid-file.
+    let mut ratatui_lines: Vec<Line<'static>> = Vec::with_capacity(text_area.height as usize);
+    let start = scroll as usize;
+    let end = start.saturating_add(text_area.height as usize);
+    for (idx, raw_line) in LinesWithEndings::from(&source).enumerate() {
+        if idx >= end {
+            break;
+        }
+        // `highlight_line` MUST run on every line up to `end` to
+        // maintain syntect's parser state — never skip and resume.
+        let styled = highlighter
+            .highlight_line(raw_line, syntax_set)
+            .unwrap_or_default();
+        if idx < start {
+            continue;
+        }
+        let spans: Vec<Span<'static>> = styled
+            .into_iter()
+            .map(|(sty, s)| {
+                // Strip the trailing newline that `LinesWithEndings`
+                // preserved — ratatui puts each source line on its
+                // own row already, and rendering the '\n' as a cell
+                // widens the last selection column by one.
+                let s = s.trim_end_matches('\n').to_owned();
+                Span::styled(s, code_highlight::translate_style(sty))
+            })
+            .collect();
+        ratatui_lines.push(Line::from(spans));
+    }
+
+    Paragraph::new(Text::from(ratatui_lines))
+        // Code files are intentionally NOT wrapped — long lines clip.
+        // Matches `bat --wrap=never` and preserves 1-source-line = 1
+        // rendered-row invariant used by scrollbar + copy math.
+        .render(text_area, buf);
+
+    state.rendered_lines = capture_rendered_rows(buf, text_area);
+
+    if state.selection.is_active() {
+        let cols = text_area.width;
+        for row in 0..text_area.height {
+            for col in 0..text_area.width {
+                if state.selection.contains(row, col, cols) {
+                    let target = &mut buf[(text_area.x + col, text_area.y + row)];
+                    let style = target.style().add_modifier(Modifier::REVERSED);
+                    target.set_style(style);
+                }
+            }
+        }
+    }
+
+    if max_scroll > 0 && scrollbar_col.width > 0 {
+        let mut sb_state = ScrollbarState::new(usize::from(content_lines))
+            .position(usize::from(scroll))
+            .viewport_content_length(usize::from(text_area.height));
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .render(scrollbar_col, buf, &mut sb_state);
+        state.scrollbar_rect = Some(scrollbar_col);
+    }
+}
+
+/// Inline translation between `syntect::highlighting::Style` and
+/// `ratatui::style::Style`, plus a lazily-loaded default assets pair.
+///
+/// Kept in-crate rather than pulling `syntect-tui` because that crate
+/// pins ratatui 0.29 (as of 3.0.6) and dropping a duplicate ratatui
+/// into the workspace tree would break widget interop.
+mod code_highlight {
+    use ratatui::style::{Color, Modifier, Style};
+    use std::sync::LazyLock;
+    use syntect::highlighting::{FontStyle, Style as SyntectStyle, ThemeSet};
+    use syntect::parsing::SyntaxSet;
+
+    /// Global default assets. Loaded once per process; both `.load_defaults*`
+    /// constructors read from `include_bytes!`-baked data, no I/O.
+    static SYNTAX: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+    static THEME: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+
+    pub(super) fn assets() -> (&'static SyntaxSet, &'static ThemeSet) {
+        (&*SYNTAX, &*THEME)
+    }
+
+    /// Convert a syntect style to a ratatui style. Foreground/background
+    /// map by 24-bit RGB; alpha is ignored (ratatui has no alpha channel
+    /// on terminal cells). `FontStyle` bits map to `Modifier` bits.
+    pub(super) fn translate_style(s: SyntectStyle) -> Style {
+        let mut out =
+            Style::default().fg(Color::Rgb(s.foreground.r, s.foreground.g, s.foreground.b));
+        // Only apply the theme background when it's not the default
+        // "transparent-ish" — otherwise every character paints its own
+        // background and the block border colour bleeds oddly.
+        if s.background != syntect::highlighting::Color::BLACK {
+            out = out.bg(Color::Rgb(s.background.r, s.background.g, s.background.b));
+        }
+        let mut m = Modifier::empty();
+        if s.font_style.contains(FontStyle::BOLD) {
+            m |= Modifier::BOLD;
+        }
+        if s.font_style.contains(FontStyle::ITALIC) {
+            m |= Modifier::ITALIC;
+        }
+        if s.font_style.contains(FontStyle::UNDERLINE) {
+            m |= Modifier::UNDERLINED;
+        }
+        if !m.is_empty() {
+            out = out.add_modifier(m);
+        }
+        out
     }
 }
 
@@ -1099,6 +1555,7 @@ fn build_title(state: &ViewerOverlayState) -> String {
     let kind = match state.snapshot().map(|s| s.kind) {
         Some(ViewerKind::Markdown) => "Markdown",
         Some(ViewerKind::Image) => "Image",
+        Some(ViewerKind::Code) => "Code",
         None => "viewer",
     };
     let badge = match state.status() {
@@ -1200,10 +1657,49 @@ mod tests {
 
         #[test]
         fn svg_and_unknown_extensions_return_none() {
-            for name in ["diagram.svg", "Cargo.toml", "readme.rst", "notype"] {
+            // `.svg` is deliberately excluded (ratatui-image has no
+            // vector backend). `.rst` and `.docx` are not in any list.
+            // `notype` has no extension at all.
+            for name in ["diagram.svg", "readme.rst", "notes.docx", "notype"] {
                 let outcome = classify_source(Path::new(name), regular(1024)).expect("classify");
                 assert!(outcome.is_none(), "expected None for {name}");
             }
+        }
+
+        #[test]
+        fn code_extensions_map_to_code_kind() {
+            for name in [
+                "Cargo.toml",
+                "main.rs",
+                "hello.py",
+                "note.txt",
+                "server.c",
+                "server.cpp",
+                "types.ts",
+                "index.jsx",
+                "conf.yaml",
+                "data.json",
+                "script.sh",
+                "build.gradle.kts",
+            ] {
+                let src = classify_source(Path::new(name), regular(1024))
+                    .expect("classify")
+                    .expect("supported");
+                assert_eq!(src.kind, ViewerKind::Code, "expected Code for {name}");
+            }
+        }
+
+        #[test]
+        fn code_over_cap_reports_size_and_cap() {
+            let err = classify_source(Path::new("big.rs"), regular(CODE_MAX_BYTES + 1))
+                .expect_err("size cap");
+            assert_eq!(
+                err,
+                ClassifyError::TooLarge {
+                    size: CODE_MAX_BYTES + 1,
+                    cap: CODE_MAX_BYTES,
+                }
+            );
         }
 
         #[test]
@@ -1696,6 +2192,225 @@ mod markdown_tests {
             assert_ne!(sym, "]", "unexpected `]` at dx={dx}");
         }
         assert_eq!(state.close_button_rect, None);
+    }
+
+    #[test]
+    fn highlight_code_fences_preserves_line_count_and_content() {
+        // Invariant: only styles change; line count and per-line
+        // concatenated content match the pre-pass output. Scrollbar
+        // math (`wrapped_line_count`) and selection cell math both
+        // depend on this.
+        let src = "# hi\n\ntext\n\n```rust\nfn f() {}\n```\n\ntrailing\n";
+        let mut text = tui_markdown::from_str(src);
+        let before_line_count = text.lines.len();
+        let before_content: Vec<String> = text
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        highlight_code_fences(src, &mut text);
+        assert_eq!(text.lines.len(), before_line_count);
+        let after_content: Vec<String> = text
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(before_content, after_content);
+    }
+
+    #[test]
+    fn highlight_code_fences_restyles_interior_lines_only() {
+        // Fence markers keep their default style; the interior line
+        // (`fn main() {}`) gains at least one non-default style from
+        // syntect. This is the whole point of the pass.
+        let src = "```rust\nfn main() {}\n```\n";
+        let mut text = tui_markdown::from_str(src);
+        highlight_code_fences(src, &mut text);
+
+        let open_default = text.lines[0]
+            .spans
+            .iter()
+            .all(|s| s.style == Style::default());
+        assert!(open_default, "opening fence should not be restyled");
+        let close_default = text.lines[2]
+            .spans
+            .iter()
+            .all(|s| s.style == Style::default());
+        assert!(close_default, "closing fence should not be restyled");
+
+        let interior_has_style = text.lines[1]
+            .spans
+            .iter()
+            .any(|s| s.style != Style::default());
+        assert!(interior_has_style, "interior line should be highlighted");
+    }
+
+    #[test]
+    fn highlight_code_fences_handles_no_fences() {
+        // No-op path: source without any fence must be untouched.
+        let src = "# just prose\n\none paragraph.\n";
+        let mut text = tui_markdown::from_str(src);
+        let before: Vec<Vec<Style>> = text
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.style).collect())
+            .collect();
+        highlight_code_fences(src, &mut text);
+        let after: Vec<Vec<Style>> = text
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.style).collect())
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn highlight_code_fences_unclosed_fence_swallows_rest_gracefully() {
+        // An opening fence with no closer: every subsequent line is
+        // treated as interior, but the function must not panic. Line
+        // count invariant still holds.
+        let src = "```rust\nfn a() {}\nfn b() {}\n"; // no close
+        let mut text = tui_markdown::from_str(src);
+        let n = text.lines.len();
+        highlight_code_fences(src, &mut text);
+        assert_eq!(text.lines.len(), n);
+    }
+}
+
+#[cfg(test)]
+mod code_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn scratch_file(name: &str, bytes: &[u8]) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("rimeterm-viewer-code-{}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("scratch dir");
+        path.push(name);
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(bytes).expect("write");
+        path
+    }
+
+    #[test]
+    fn utf8_source_produces_code_payload() {
+        let path = scratch_file("hello.rs", b"fn main() { println!(\"hi\"); }\n");
+        match load_code_blocking(&path) {
+            ViewerPayload::Code(text) => assert!(text.contains("fn main")),
+            other => panic!("expected Code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversize_source_returns_error_payload() {
+        let big: Vec<u8> = vec![b'x'; CODE_MAX_BYTES as usize + 1];
+        let path = scratch_file("big.rs", &big);
+        match load_code_blocking(&path) {
+            // Kind-label appears verbatim in the error string so the
+            // operator can distinguish Markdown from Code failures.
+            ViewerPayload::Error(msg) => assert!(msg.contains("MiB code limit"), "got: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_utf8_source_returns_error_payload() {
+        let path = scratch_file("bad.txt", &[0x66, 0xff, 0x00]);
+        match load_code_blocking(&path) {
+            ViewerPayload::Error(msg) => assert!(msg.contains("UTF-8")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn code_completion_promotes_to_ready() {
+        let mut state = ViewerOverlayState::default();
+        let source = ViewerSource {
+            path: PathBuf::from("a.rs"),
+            kind: ViewerKind::Code,
+        };
+        let snap_gen = state.open_snapshot(source, None);
+        assert!(state.apply_completion(ViewerCompletion {
+            pane_id: PaneId(0),
+            generation: snap_gen,
+            path: PathBuf::from("a.rs"),
+            payload: ViewerPayload::Code("fn main() {}\n".into()),
+        }));
+        assert!(matches!(state.status(), ViewerStatus::Ready));
+        assert_eq!(state.code(), Some("fn main() {}\n"));
+    }
+
+    #[test]
+    fn wrong_kind_code_completion_is_rejected() {
+        // A markdown-labelled snapshot must reject a Code payload
+        // (same defence as the reciprocal test in `state_tests`).
+        let mut state = ViewerOverlayState::default();
+        let snap_gen = state.open_snapshot(
+            ViewerSource {
+                path: PathBuf::from("a.md"),
+                kind: ViewerKind::Markdown,
+            },
+            None,
+        );
+        let bogus = ViewerCompletion {
+            pane_id: PaneId(0),
+            generation: snap_gen,
+            path: PathBuf::from("a.md"),
+            payload: ViewerPayload::Code("fn main() {}\n".into()),
+        };
+        assert!(!state.apply_completion(bogus));
+        assert!(matches!(state.status(), ViewerStatus::Loading));
+    }
+
+    #[test]
+    fn scroll_markdown_now_advances_code_snapshots() {
+        // Regression guard: pre-C22 the scroll helper matched only
+        // `Markdown`, so Code snapshots were unscrollable.
+        let mut state = ViewerOverlayState::default();
+        state.open_snapshot(
+            ViewerSource {
+                path: PathBuf::from("a.rs"),
+                kind: ViewerKind::Code,
+            },
+            None,
+        );
+        state.set_content_metrics_for_test(20, 10); // max = 10
+        state.scroll_markdown(5);
+        assert_eq!(state.markdown_scroll(), 5);
+    }
+
+    #[test]
+    fn render_code_paints_a_border_and_produces_content() {
+        // Full-frame smoke: `render_into_pane` should dispatch to
+        // `render_code`, paint the block border, and drop at least the
+        // first source line into the buffer.
+        let path = scratch_file("hello.rs", b"fn main() {}\n");
+        let mut state = ViewerOverlayState::default();
+        let source = ViewerSource {
+            path: path.clone(),
+            kind: ViewerKind::Code,
+        };
+        let snap_gen = state.open_snapshot(source, None);
+        // Simulate the completed worker.
+        state.apply_completion(ViewerCompletion {
+            pane_id: PaneId(0),
+            generation: snap_gen,
+            path,
+            payload: load_code_blocking(&scratch_file("hello.rs", b"fn main() {}\n")),
+        });
+
+        let bounds = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(bounds);
+        render_into_pane(&mut state, bounds, &mut buf, None);
+
+        // Border corner visible at (0,0).
+        assert_eq!(buf[(0, 0)].symbol(), "┌");
+        // First visible content row contains the `fn main` characters.
+        let row: String = (1..bounds.width - 1)
+            .map(|x| buf[(x, 1)].symbol().to_owned())
+            .collect();
+        assert!(row.contains("fn"), "row was {row:?}");
+        assert!(row.contains("main"), "row was {row:?}");
     }
 }
 

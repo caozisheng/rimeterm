@@ -452,6 +452,12 @@ pub struct App {
     /// C20: per-tab viewer states, keyed by the viewer tab's PaneId.
     /// Each entry is created when a viewer tab opens and removed when it closes.
     viewers: std::collections::HashMap<PaneId, ViewerOverlayState>,
+    /// PaneId of the yazi tab in the files group, if any. Cached at
+    /// startup so `close_viewer_tab` can restore focus to yazi
+    /// specifically instead of whatever `TabGroup::try_close`'s
+    /// shifted-index heuristic picks (usually gitui). `None` when the
+    /// user has removed yazi from `files.tabs` in their config.
+    yazi_pane_id: Option<PaneId>,
     /// Last `file.selected` from the active files:yazi tab. Consumed by
     /// `Alt+V` to freeze a snapshot.
     last_yazi_selection: Option<SelectionSnapshot>,
@@ -573,6 +579,7 @@ impl App {
             std::collections::HashSet::new();
 
         let mut files_members = Vec::new();
+        let mut yazi_pane_id: Option<PaneId> = None;
         for spec in &config.files.tabs {
             let icon = match spec.id.as_str() {
                 "gitui" => "🌿",
@@ -612,6 +619,12 @@ impl App {
                 if spec.id == "yazi" {
                     pane.set_yazi_layout(Some(config.mouse.yazi_layout));
                 }
+            }
+            if spec.id == "yazi" {
+                // First-seen wins: if the user configured multiple yazi
+                // tabs (unusual but legal), close-restore focus targets
+                // the leftmost one, matching tab-strip reading order.
+                yazi_pane_id.get_or_insert(id);
             }
             files_members.push(id);
             // Pin yazi/gitui so × never appears and Ctrl+W is rejected.
@@ -881,6 +894,7 @@ impl App {
             osc_rx,
             osc_tx,
             viewers: std::collections::HashMap::new(),
+            yazi_pane_id,
             last_yazi_selection: None,
             viewer_completion_tx,
             viewer_completion_rx,
@@ -1012,6 +1026,35 @@ impl App {
             return true;
         }
 
+        // Right-arrow: when yazi is focused and hovering a regular
+        // file, `→` behaves like Alt+V (open the file in the modal
+        // viewer). Directories still fall through so yazi's own
+        // "right = enter" navigation is untouched. Any modifier
+        // (Ctrl/Shift/Alt) also falls through — we only steal the
+        // bare-arrow case, matching Alt+V's "no other key does this".
+        //
+        // The stat happens on the key path but is a single syscall
+        // (<1 ms on every supported filesystem) and only fires when
+        // yazi is the focused pane AND the user hit `→` — it will
+        // not run on every keystroke.
+        if matches!(key.code, KeyCode::Right) && key.modifiers.is_empty() {
+            if should_hijack_right_for_viewer(
+                self.yazi_pane_id,
+                self.focus.focused_pane(),
+                self.last_yazi_selection.as_ref(),
+            ) {
+                let sel_is_file = self
+                    .last_yazi_selection
+                    .as_ref()
+                    .and_then(|s| std::fs::metadata(&s.path).ok())
+                    .is_some_and(|m| m.is_file());
+                if sel_is_file {
+                    self.open_viewer_tab();
+                    return true;
+                }
+            }
+        }
+
         // Every other viewer-only key (Esc, j/k, PgUp/PgDn, +/-, 0, …)
         // only fires when the viewer is the FOCUSED pane. Otherwise
         // the key falls through to the global keymap / focused pane,
@@ -1019,7 +1062,14 @@ impl App {
         // the viewer still on screen.
         if let Some(vid) = active_viewer_id {
             if self.focus.focused_pane() == Some(vid) {
-                if matches!(key.code, KeyCode::Esc) {
+                // `Esc` and bare `←` both close the viewer — the
+                // arrow is symmetric with C22's `→ = open` shortcut
+                // when the yazi cursor lands on a file. Any modifier
+                // on `←` (Shift/Ctrl/Alt) falls through to the modal
+                // handler so future keymap growth (e.g. horizontal
+                // panning) doesn't get pre-empted.
+                let bare_left = matches!(key.code, KeyCode::Left) && key.modifiers.is_empty();
+                if matches!(key.code, KeyCode::Esc) || bare_left {
                     self.close_viewer_tab(vid);
                     return true;
                 }
@@ -1077,6 +1127,20 @@ impl App {
                 return;
             }
         };
+
+        // Dedup: if a viewer tab already displays this exact path,
+        // focus it instead of stacking a second copy. Path equality is
+        // sufficient because `classify_source` never rewrites the path
+        // and Yazi hands us absolute paths. `snapshot()` is `None`
+        // only in the closed state, which is unreachable here (viewers
+        // stay in the map until explicit close).
+        if let Some(existing) = find_open_viewer_for_path(&self.viewers, &source.path) {
+            if let Err(e) = self.focus_pane_by_id(existing) {
+                warn!(error = %e, "viewer dedup: focus_pane_by_id failed");
+            }
+            let _ = self.redraw_tx.send(());
+            return;
+        }
         // Build a lightweight pane provider for the tab slot.
         let title = source
             .path
@@ -1118,6 +1182,7 @@ impl App {
             let payload = match source.kind {
                 ViewerKind::Markdown => viewer::load_markdown_blocking(&source.path),
                 ViewerKind::Image => viewer::load_image_blocking(&source.path),
+                ViewerKind::Code => viewer::load_code_blocking(&source.path),
             };
             let _ = tx.send(ViewerCompletion {
                 pane_id,
@@ -1129,12 +1194,28 @@ impl App {
         let _ = self.redraw_tx.send(());
     }
 
-    /// Close the viewer tab with the given pane id.
+    /// Close the viewer tab with the given pane id and return focus to
+    /// the yazi tab. `close_pane_by_id`'s default is to focus whichever
+    /// tab `TabGroup::try_close` shifted into place (usually gitui — the
+    /// only pinned non-yazi tab in the files group), which is the wrong
+    /// answer for the Alt+V flow: the user came from yazi, they should
+    /// land back on yazi. Falls back to the default when yazi isn't
+    /// configured or has been removed since startup.
     fn close_viewer_tab(&mut self, pane_id: PaneId) {
         self.viewers.remove(&pane_id);
         // close_pane_by_id handles tab removal, focus restore, and pane drop.
         if let Err(e) = self.close_pane_by_id(pane_id) {
             warn!(error = %e, "close_viewer_tab: close_pane_by_id failed");
+            let _ = self.redraw_tx.send(());
+            return;
+        }
+        if let Some(yazi_id) = self.yazi_pane_id {
+            // The pane may have been removed from the group since
+            // startup (config reload path is TODO but could exist);
+            // `focus_pane_by_id` fails cleanly in that case.
+            if let Err(e) = self.focus_pane_by_id(yazi_id) {
+                warn!(error = %e, "close_viewer_tab: return-focus to yazi failed");
+            }
         }
         let _ = self.redraw_tx.send(());
     }
@@ -1728,9 +1809,13 @@ impl App {
         None
     }
 
-    /// Close whichever tab the user clicked `×` on. Uses the same policy
-    /// path as `workspace.pane.close` (delegates to `close_pane_by_id`),
-    /// so Open-group last-member protection kicks in identically.
+    /// Close whichever tab the user clicked `×` on. Delegates to
+    /// `close_pane_by_id` so Open-group last-member protection kicks
+    /// in identically for every tab kind, EXCEPT when the target is
+    /// a viewer tab: those go through `close_viewer_tab` so the
+    /// yazi-return-focus policy (§C22.3) applies uniformly across
+    /// every close gesture — mouse `×`, `Alt+V`, `Esc`, IPC-driven
+    /// `tab.close` intents from the palette.
     fn close_tab_at(&mut self, gid: TabGroupId, idx: usize) {
         let Some(pane_id) = self
             .tree
@@ -1739,6 +1824,10 @@ impl App {
         else {
             return;
         };
+        if self.viewers.contains_key(&pane_id) {
+            self.close_viewer_tab(pane_id);
+            return;
+        }
         if let Err(e) = self.close_pane_by_id(pane_id) {
             self.set_hint(format!("⛔ {}", e));
         }
@@ -3151,6 +3240,14 @@ impl App {
         }
         drop_pane(&mut self.panes, old_id);
         self.session_writes.lock().remove(&old_id);
+        // The pinned set is keyed by PaneId (not by tab slot / spec id),
+        // so a respawn must migrate the pin — otherwise the new pane
+        // renders an `×` and `close_tab_in_group` accepts a Ctrl+W on
+        // it. Absence of `old_id` in the set is legal (the initial
+        // startup path always inserts, but future callers might not),
+        // so we `remove` unconditionally and `insert` unconditionally.
+        self.pinned_pane_ids.remove(&old_id);
+        self.pinned_pane_ids.insert(new_id);
         // If gitui was the focused pane, keep focus on the new one so the
         // user's cursor doesn't get orphaned on a dropped PaneId.
         if self.focus.focused_pane() == Some(old_id) {
@@ -5219,6 +5316,56 @@ fn next_shell_number(members: &[PaneId], panes: &PaneRegistry) -> usize {
     max + 1
 }
 
+/// Return the PaneId of an already-open viewer tab whose snapshot
+/// path equals `path`, or `None` when no viewer holds it. Extracted
+/// from [`App::open_viewer_tab`] so the dedup rule is unit-testable
+/// without spinning up a full `App`.
+///
+/// Path equality is by-value (`PathBuf: Eq`): fine because
+/// `viewer::classify_source` preserves the caller's path verbatim and
+/// Yazi's `file.selected` events carry absolute paths. Normalization
+/// (`.` / `..` collapse, symlink resolution) is deliberately NOT
+/// performed — two logically-equal-but-syntactically-different paths
+/// stay distinct, matching what the tab title (basename) would show
+/// the user anyway.
+fn find_open_viewer_for_path(
+    viewers: &std::collections::HashMap<PaneId, ViewerOverlayState>,
+    path: &std::path::Path,
+) -> Option<PaneId> {
+    viewers
+        .iter()
+        .find_map(|(id, st)| st.snapshot().filter(|s| s.path == path).map(|_| *id))
+}
+
+/// Predicate for the C22 `→` shortcut: return `true` when the
+/// bare-arrow event should try to open the current yazi selection in
+/// the modal viewer. Split out of [`App::on_viewer_key`] so the
+/// gating logic (focus + configured yazi + non-empty selection) is
+/// unit-testable without touching the filesystem — the `is_file`
+/// check stays at the call site because it's a syscall, not a pure
+/// predicate.
+///
+/// Semantics:
+/// - `yazi_id` — cached from startup; `None` means the user removed
+///   yazi from `files.tabs`, so the shortcut is disabled entirely.
+/// - `focused` — the currently-focused pane; `→` only hijacks when
+///   the user is actually driving yazi, so directory-navigation `→`
+///   in every other pane keeps working.
+/// - `selection` — the last `file.selected` from yazi's OSC bridge;
+///   `None` means yazi hasn't emitted a hover event yet, so there's
+///   nothing to open.
+fn should_hijack_right_for_viewer(
+    yazi_id: Option<PaneId>,
+    focused: Option<PaneId>,
+    selection: Option<&viewer::SelectionSnapshot>,
+) -> bool {
+    let Some(yazi_id) = yazi_id else { return false };
+    if focused != Some(yazi_id) {
+        return false;
+    }
+    selection.is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6242,5 +6389,170 @@ mod tests {
         assert!(!hint.contains("Quadrant"));
         assert!(hint.contains("Ctrl+T New tab"));
         assert!(hint.contains("Ctrl+W Close tab"));
+    }
+
+    // --- viewer dedup (Alt+V idempotence) --------------------------
+
+    fn viewer_state_for(path: &str, kind: viewer::ViewerKind) -> viewer::ViewerOverlayState {
+        let mut st = viewer::ViewerOverlayState::default();
+        st.open_snapshot(
+            viewer::ViewerSource {
+                path: std::path::PathBuf::from(path),
+                kind,
+            },
+            None,
+        );
+        st
+    }
+
+    #[test]
+    fn find_open_viewer_returns_none_on_empty_map() {
+        let viewers = std::collections::HashMap::new();
+        assert_eq!(
+            find_open_viewer_for_path(&viewers, std::path::Path::new("/a/README.md")),
+            None,
+        );
+    }
+
+    #[test]
+    fn find_open_viewer_matches_by_full_path_not_basename() {
+        // Two different files with the same basename must NOT dedup:
+        // dedup keys off full path so `a/foo.rs` and `b/foo.rs` open
+        // in separate tabs.
+        let mut viewers = std::collections::HashMap::new();
+        let a_id = PaneId::next();
+        let b_id = PaneId::next();
+        viewers.insert(
+            a_id,
+            viewer_state_for("/a/foo.rs", viewer::ViewerKind::Code),
+        );
+        viewers.insert(
+            b_id,
+            viewer_state_for("/b/foo.rs", viewer::ViewerKind::Code),
+        );
+
+        assert_eq!(
+            find_open_viewer_for_path(&viewers, std::path::Path::new("/a/foo.rs")),
+            Some(a_id),
+        );
+        assert_eq!(
+            find_open_viewer_for_path(&viewers, std::path::Path::new("/b/foo.rs")),
+            Some(b_id),
+        );
+        assert_eq!(
+            find_open_viewer_for_path(&viewers, std::path::Path::new("/c/foo.rs")),
+            None,
+        );
+    }
+
+    #[test]
+    fn find_open_viewer_ignores_snapshot_kind() {
+        // Dedup is path-based, so hovering a Markdown that's already
+        // open as a viewer tab still hits, even if the caller's fresh
+        // classification would produce a different kind (impossible in
+        // practice — `classify_source` is deterministic — but the
+        // helper's contract must not depend on kind).
+        let mut viewers = std::collections::HashMap::new();
+        let id = PaneId::next();
+        viewers.insert(
+            id,
+            viewer_state_for("/x/notes.md", viewer::ViewerKind::Markdown),
+        );
+        assert_eq!(
+            find_open_viewer_for_path(&viewers, std::path::Path::new("/x/notes.md")),
+            Some(id),
+        );
+    }
+
+    #[test]
+    fn find_open_viewer_skips_closed_snapshots() {
+        // A viewer that has been closed but not yet removed from the
+        // map (transient state during shutdown) has `snapshot()` ==
+        // None and MUST NOT match.
+        let mut viewers = std::collections::HashMap::new();
+        let id = PaneId::next();
+        let mut st = viewer_state_for("/x/notes.md", viewer::ViewerKind::Markdown);
+        st.close();
+        viewers.insert(id, st);
+        assert_eq!(
+            find_open_viewer_for_path(&viewers, std::path::Path::new("/x/notes.md")),
+            None,
+        );
+    }
+
+    // --- Right-arrow shortcut gating ---------------------------------
+
+    fn selection(path: &str) -> viewer::SelectionSnapshot {
+        viewer::SelectionSnapshot {
+            origin: PaneId::next(),
+            path: std::path::PathBuf::from(path),
+        }
+    }
+
+    #[test]
+    fn right_arrow_disabled_when_yazi_not_configured() {
+        // User removed `yazi` from files.tabs → shortcut is off. Any
+        // other guard state (focus, selection) is irrelevant.
+        let sel = selection("/x/README.md");
+        assert!(!should_hijack_right_for_viewer(
+            None,
+            Some(PaneId::next()),
+            Some(&sel),
+        ));
+    }
+
+    #[test]
+    fn right_arrow_disabled_when_yazi_not_focused() {
+        // yazi exists but a shells / agents pane is focused → `→`
+        // must fall through to that pane's own handler so cursor
+        // movement / directory navigation still works.
+        let yazi = PaneId::next();
+        let elsewhere = PaneId::next();
+        let sel = selection("/x/README.md");
+        assert!(!should_hijack_right_for_viewer(
+            Some(yazi),
+            Some(elsewhere),
+            Some(&sel),
+        ));
+    }
+
+    #[test]
+    fn right_arrow_disabled_before_first_hover() {
+        // yazi is focused but never emitted `file.selected` yet →
+        // `selection == None`, nothing to open. `→` falls through so
+        // yazi's own key handler drives the cursor.
+        let yazi = PaneId::next();
+        assert!(!should_hijack_right_for_viewer(
+            Some(yazi),
+            Some(yazi),
+            None,
+        ));
+    }
+
+    #[test]
+    fn right_arrow_hijacks_when_yazi_focused_with_selection() {
+        // Happy path: yazi focused + selection present → the caller
+        // will proceed to the `is_file` syscall check.
+        let yazi = PaneId::next();
+        let sel = selection("/x/README.md");
+        assert!(should_hijack_right_for_viewer(
+            Some(yazi),
+            Some(yazi),
+            Some(&sel),
+        ));
+    }
+
+    #[test]
+    fn right_arrow_disabled_when_no_pane_focused() {
+        // Bootstrap edge case: `focused_pane()` may return None
+        // before the first draw. Guard must not treat `None` as
+        // "matches yazi".
+        let yazi = PaneId::next();
+        let sel = selection("/x/README.md");
+        assert!(!should_hijack_right_for_viewer(
+            Some(yazi),
+            None,
+            Some(&sel),
+        ));
     }
 }

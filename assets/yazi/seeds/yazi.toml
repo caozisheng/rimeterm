@@ -19,15 +19,21 @@ sort_sensitive = false
 # We match by file extension (`url` selector) rather than by MIME type
 # because Yazi's MIME probe shells out to POSIX `file(1)`, which does
 # not ship on Windows. Extension matching keeps Quick Look working on
-# every platform with zero external-tool dependency beyond the two
-# binaries we already ship.
+# every platform with zero external-tool dependency.
 #
-# - Images -> chafa (coloured Unicode symbols; works on terminals that
+# - Images   -> chafa (coloured Unicode symbols; works on terminals that
 #   lack Sixel / Kitty / iTerm2 graphics protocols, e.g. Windows
-#   Terminal). Add extensions freely; every entry below is one glob.
-# - Markdown -> glow (formatted prose; more readable than raw source).
+#   Terminal).
+# - Markdown -> glow  (formatted prose; more readable than raw source).
+# - Text/code -> Yazi's built-in `code` previewer (syntect-driven syntax
+#   highlighting, in-process, no subprocess and no `file(1)` probe).
+#   The extension list is curated for the coding-agent workload; append
+#   your own extensions freely — user edits to this file are preserved
+#   across rimeterm upgrades.
 [plugin]
 prepend_previewers = [
     { url = "*.{png,jpg,jpeg,gif,bmp,webp,avif,ico,tif,tiff}", run = "chafa" },
-    { url = "*.{md,markdown}",                                 run = "glow" },
+    { url = "*.{md,markdown}",                                 run = "glow"  },
+    { url = "*.{txt,log,ini,cfg,conf,env,toml,yaml,yml,json,jsonc,xml,csv,tsv,rs,c,h,cc,cpp,hpp,cxx,hxx,py,pyi,js,jsx,mjs,cjs,ts,tsx,go,java,kt,kts,rb,php,cs,swift,scala,sh,bash,zsh,fish,ps1,psm1,lua,vim,el,sql,dockerfile,gitignore,gitattributes,editorconfig,proto,graphql,gql,tf,hcl,nix,ron,lock}",
+                                                               run = "code"  },
 ]
