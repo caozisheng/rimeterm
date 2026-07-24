@@ -3,7 +3,8 @@
 **A terminal built for coding agents.** TUI-native (ratatui), Rust-first,
 Windows-priority, cross-platform.
 
-<img width="2796" height="1664" alt="rimeterm workspace screenshot" src="https://github.com/user-attachments/assets/b80c8187-797f-4d0f-8593-40ce609bb5a1" />
+<img width="1163" height="694" alt="image" src="https://github.com/user-attachments/assets/73bbee34-d51b-4685-9b42-7d89c9b1c31e" />
+
 
 | | |
 |---|---|
