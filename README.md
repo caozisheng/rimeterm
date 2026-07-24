@@ -7,7 +7,8 @@ Windows-priority, cross-platform.
 
 <img width="1163" height="694" alt="image" src="https://github.com/user-attachments/assets/8b4cb289-d211-4797-a65f-9b331bbd3a67" />
 
-<img width="1163" height="694" alt="image" src="https://github.com/user-attachments/assets/5b29ad84-ac62-411b-9e22-1b114220142d" />
+<img width="1163" height="694" alt="image" src="https://github.com/user-attachments/assets/96223d29-43be-4d76-b6f7-117ca461c1ba" />
+
 
 
 | | |
