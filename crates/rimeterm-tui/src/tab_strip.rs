@@ -7,10 +7,27 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use rimeterm_core::tabs::{MembersPolicy, TabGroup};
+
+/// Which affordance in a single tab strip is under the mouse pointer
+/// right now. Passed to [`render`] so the affordance repaints with a
+/// hover style — terminal apps can't advertise clickability via the OS
+/// cursor, so we compensate visually.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TabStripHover {
+    /// Mouse is not over this strip.
+    #[default]
+    None,
+    /// Hover a tab label (activates on click).
+    Tab(usize),
+    /// Hover a tab's `×` (closes on click).
+    Close(usize),
+    /// Hover the trailing `[+]` (new tab on click).
+    Plus,
+}
 
 /// Draw the tab strip into `area` (typically one row above the group's rect).
 ///
@@ -26,6 +43,7 @@ pub fn render(
     group: &TabGroup,
     titles: &[String],
     closable: &[bool],
+    hover: TabStripHover,
 ) {
     debug_assert_eq!(
         titles.len(),
@@ -46,22 +64,43 @@ pub fn render(
     let mut spans: Vec<Span<'_>> = Vec::with_capacity(group.len() * 3 + 3);
     let dim = Style::default().add_modifier(Modifier::DIM);
     let active_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    // Non-active tab hover: bold + underline so it clearly reads as
+    // clickable without overpowering the active tab's REVERSED look.
+    let tab_hover_style = Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    // Close-button hover: red + bold. Same red as viewer's own `[×]`,
+    // matching the "closing does something destructive" convention.
+    let close_hover_style = Style::default()
+        .fg(Color::LightRed)
+        .add_modifier(Modifier::BOLD);
+    // Plus-button hover: undim + bold. `[+]` is a positive action so we
+    // stop at "obviously clickable" without borrowing the destructive red.
+    let plus_hover_style = Style::default().add_modifier(Modifier::BOLD);
 
     spans.push(Span::styled(" ┤ ", dim));
     for (idx, title) in titles.iter().enumerate() {
         let is_active = idx == group.active_index();
+        let is_hover_tab = matches!(hover, TabStripHover::Tab(i) if i == idx);
         let label = format!(" {} ", title);
-        if is_active {
-            spans.push(Span::styled(label, active_style));
+        let label_style = if is_active {
+            active_style
+        } else if is_hover_tab {
+            tab_hover_style
         } else {
-            spans.push(Span::raw(label));
-        }
+            Style::default()
+        };
+        spans.push(Span::styled(label, label_style));
         // Close affordance is per-tab now (§19.10.1 addendum: bottom is
         // pinned inside the shells group). Skipping the `×` also skips
         // the trailing space so the tab strip stays visually tight
         // around pinned tabs.
         if is_closable(idx) {
-            spans.push(Span::styled("×", dim));
+            let is_hover_close = matches!(hover, TabStripHover::Close(i) if i == idx);
+            let close_style = if is_hover_close {
+                close_hover_style
+            } else {
+                dim
+            };
+            spans.push(Span::styled("×", close_style));
             spans.push(Span::raw(" "));
         }
         if idx + 1 < titles.len() {
@@ -70,7 +109,12 @@ pub fn render(
     }
     spans.push(Span::styled(" ├", dim));
     if group_closable {
-        spans.push(Span::styled(" [+]", dim));
+        let plus_style = if matches!(hover, TabStripHover::Plus) {
+            plus_hover_style
+        } else {
+            dim
+        };
+        spans.push(Span::styled(" [+]", plus_style));
     }
 
     Paragraph::new(Line::from(spans)).render(area, buf);

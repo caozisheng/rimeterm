@@ -53,7 +53,7 @@ use crate::palette::{
 use crate::pane_registry::PaneRegistry;
 use crate::placeholder_pane::PlaceholderPane;
 use crate::shell_factory::spawn_shell;
-use crate::status_bar::render as render_status_bar;
+use crate::status_bar::{StatusBarHits, StatusBarHover, render as render_status_bar};
 use crate::tab_strip::render as render_tab_strip;
 use crate::terminal::TerminalGuard;
 use crate::viewer::{
@@ -326,6 +326,31 @@ pub(crate) struct HoveredDivider {
     pub rect: Rect,
 }
 
+/// Which non-divider interactive widget the mouse pointer is currently
+/// over. Terminals can't swap the OS cursor into a "clickable" glyph,
+/// so `draw()` overlays a hover style on the matching rect and the
+/// affordance reads as interactive at a glance.
+///
+/// Divider hover keeps its dedicated [`HoveredDivider`] slot because
+/// the seam paint pipeline (`live_hover_overlay`, hint-bar rewrite)
+/// already threads it through several call sites and rewiring it into
+/// this enum would ripple with no user-visible payoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoveredUi {
+    /// `≡ rimeterm` in the status bar — click toggles the app menu.
+    MenuOpener,
+    /// `[×]` in the status bar — click fires `app.quit`.
+    QuitButton,
+    /// A tab label — click activates it. `gid`/`idx` are indexes into
+    /// the group's members().
+    TabActivate { gid: TabGroupId, idx: usize },
+    /// The per-tab `×` close affordance (Open groups, non-pinned tabs).
+    TabClose { gid: TabGroupId, idx: usize },
+    /// The group's trailing `[+]` (Open groups only). Fires the group's
+    /// new-tab command.
+    TabPlus { gid: TabGroupId },
+}
+
 /// Which seam a keyboard resize step is aimed at, relative to the focused cell.
 #[derive(Copy, Clone, Debug)]
 enum ResizeTarget {
@@ -491,6 +516,16 @@ pub struct App {
     /// a divider in `last_dividers`. `Direction` is cached so the
     /// hint / glyph don't need a second lookup.
     hovered_divider: Option<HoveredDivider>,
+    /// Non-divider interactive glyph under the mouse pointer RIGHT NOW
+    /// (menu opener, quit button, tab / close / plus). Painted with a
+    /// hover style in `draw()` so the affordance reads as clickable —
+    /// the terminal can't advertise it via an OS cursor change.
+    hovered_ui: Option<HoveredUi>,
+    /// Status-bar hit rects from the last `draw`. Populated by
+    /// [`crate::status_bar::render`] and consumed by `on_mouse` to
+    /// route clicks on `≡ rimeterm` / `[×]` back into the same
+    /// commands (`app.menu.toggle`, `app.quit`) the keyboard uses.
+    last_status_bar_hits: StatusBarHits,
     /// Populated the moment an agent / external-tool spawn is queued
     /// (via `PaneMutation::OpenAgent`). Drives a hint-bar spinner
     /// (`⣷ Initializing …`) so the user knows the terminal isn't
@@ -863,6 +898,8 @@ impl App {
             last_viewer_rect: None,
             pinned_pane_ids,
             hovered_divider: None,
+            hovered_ui: None,
+            last_status_bar_hits: StatusBarHits::default(),
             pending_spawn: None,
             pane_agent_id: startup_agent_ids.into_iter().collect(),
             active_drag: None,
@@ -939,31 +976,56 @@ impl App {
     }
 
     /// Route `Alt+V` and per-tab viewer keys. Returns `true` when consumed.
+    ///
+    /// Historically this method greedily consumed every key while a
+    /// viewer tab existed in the files group — including keys the user
+    /// pressed while focus was on agents / shells. That blocked
+    /// `Ctrl+T`, tab cycling, `Alt+HJKL`, etc. as soon as the viewer
+    /// opened, which read as "the viewer stole focus for the whole
+    /// app". Now the viewer only consumes keys when it is actually the
+    /// focused pane; `Alt+V` still toggles from anywhere so the user
+    /// can open/close it without hunting for focus.
     fn on_viewer_key(&mut self, key: KeyEvent) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         let alt_v = matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
             && key.modifiers.contains(KeyModifiers::ALT);
 
-        // Check if the active files-group tab is a viewer tab.
+        // Which viewer tab is currently ACTIVE in the files group (the
+        // rendered one). Still needed for the Alt+V toggle: pressing
+        // it from any pane closes whatever viewer is on screen.
         let active_viewer_id = self
             .tree
             .find_tab_group(BUILTIN_FILES)
             .and_then(|g| g.active_pane())
             .filter(|id| self.viewers.contains_key(id));
 
-        if let Some(vid) = active_viewer_id {
-            if alt_v || matches!(key.code, KeyCode::Esc) {
+        // Alt+V: global toggle. Open when no viewer is up; close the
+        // active viewer otherwise. Works regardless of which pane owns
+        // focus so the user has a symmetric shortcut.
+        if alt_v {
+            if let Some(vid) = active_viewer_id {
                 self.close_viewer_tab(vid);
-                return true;
+            } else {
+                self.open_viewer_tab();
             }
-            self.on_viewer_modal_key(vid, key);
             return true;
         }
 
-        if alt_v {
-            self.open_viewer_tab();
-            return true;
+        // Every other viewer-only key (Esc, j/k, PgUp/PgDn, +/-, 0, …)
+        // only fires when the viewer is the FOCUSED pane. Otherwise
+        // the key falls through to the global keymap / focused pane,
+        // so Ctrl+T / Alt+HJKL / typing into agents keeps working with
+        // the viewer still on screen.
+        if let Some(vid) = active_viewer_id {
+            if self.focus.focused_pane() == Some(vid) {
+                if matches!(key.code, KeyCode::Esc) {
+                    self.close_viewer_tab(vid);
+                    return true;
+                }
+                self.on_viewer_modal_key(vid, key);
+                return true;
+            }
         }
         false
     }
@@ -1038,7 +1100,14 @@ impl App {
             drop_pane(&mut self.panes, pane_id);
             return;
         }
-        self.focus.set_focus(pane_id, Some(BUILTIN_FILES));
+        // Preserve the current focus so `Alt+V` from an agents / shells
+        // pane doesn't yank the user out of the pane they were typing
+        // in. Only steal focus when the files group was already active
+        // — that matches the pre-viewer "yazi was focused, now we show
+        // the file it selected" flow.
+        if self.focus.focused_group() == Some(BUILTIN_FILES) {
+            self.focus.set_focus(pane_id, Some(BUILTIN_FILES));
+        }
 
         let mut state = ViewerOverlayState::default();
         let snap_gen = state.open_snapshot(source.clone(), None);
@@ -1349,19 +1418,32 @@ impl App {
             }
         }
 
-        // --- Move (no button): hover tracking for dividers ---
+        // --- Move (no button): hover tracking for dividers + UI glyphs ---
         //
         // Terminals don't expose a hook to change the OS mouse cursor
-        // shape (no ANSI escape covers it), so we mark the seam itself
-        // as interactive: paint it bright and drop `↔ drag to resize`
-        // into the hint bar. Compare-then-set avoids gratuitous
-        // redraws when the pointer slides along the same divider row.
+        // shape (no ANSI escape covers it), so we mark the interactive
+        // widgets themselves: paint them differently and — for
+        // dividers — surface an affordance in the hint bar. Two
+        // independent slots (`hovered_divider`, `hovered_ui`) so the
+        // divider paint pipeline and the widget hover paint don't step
+        // on each other. Compare-then-set on each avoids gratuitous
+        // redraws when the pointer slides along the same cell region.
         if let MouseEventKind::Moved = m.kind {
-            let new_hover = find_hovered_divider(&self.last_dividers, m.column, m.row);
-            if new_hover != self.hovered_divider {
-                self.hovered_divider = new_hover;
-                // Wake the main loop so the seam repaints in the next
-                // frame instead of waiting for the next input event.
+            let new_div = find_hovered_divider(&self.last_dividers, m.column, m.row);
+            let new_ui = self.find_hovered_ui(m.column, m.row);
+            let mut dirty = false;
+            if new_div != self.hovered_divider {
+                self.hovered_divider = new_div;
+                dirty = true;
+            }
+            if new_ui != self.hovered_ui {
+                self.hovered_ui = new_ui;
+                dirty = true;
+            }
+            if dirty {
+                // Wake the main loop so the affordance repaints in
+                // the next frame instead of waiting for the next
+                // input event.
                 let _ = self.redraw_tx.send(());
             }
             return;
@@ -1417,7 +1499,30 @@ impl App {
         //    never steals them.
         // 3. Tab strip → pane focus.
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-            // 1. Divider drag — highest priority.
+            // 0. Status-bar buttons (menu opener `≡ menu`, close `×`).
+            //    Row 0 sits above every pane rect, so this can never
+            //    steal a click that a pane / divider / tab strip owns
+            //    — the rects don't overlap. Handled before divider so
+            //    a divider that somehow reaches row 0 (it doesn't) still
+            //    yields to the more explicit hit.
+            if let Some(r) = self.last_status_bar_hits.menu {
+                if point_in_rect(m.column, m.row, r) {
+                    // Same signal `F10` / `Alt+M` use — `drain_flags`
+                    // picks it up next tick and toggles the menu state
+                    // through a single code path.
+                    self.flags.menu_toggle.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+            if let Some(r) = self.last_status_bar_hits.quit {
+                if point_in_rect(m.column, m.row, r) {
+                    // Same signal `Ctrl+Q` uses — the run loop polls
+                    // `flags.quit` and shuts down cleanly.
+                    self.flags.quit.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+            // 1. Divider drag — highest priority for the pane area.
             if let Some(d) = self
                 .last_dividers
                 .iter()
@@ -1567,6 +1672,56 @@ impl App {
             if let Some(plus) = hits.plus {
                 if point_in_rect(col, row, plus) {
                     return Some(TabStripHit::Plus { gid: *gid });
+                }
+            }
+        }
+        None
+    }
+
+    /// Which interactive glyph the pointer is over, if any. Called by
+    /// the mouse `Moved` handler to update `self.hovered_ui`, which the
+    /// paint pipeline then reads to highlight the widget under the
+    /// cursor. Cheap: two rect checks for the status bar + a walk over
+    /// cached tab strip hits (usually 3 groups × ~5 tabs).
+    ///
+    /// Order mirrors mouse-down dispatch: status bar first (row 0), then
+    /// per-strip close / tab / plus. Never inspects dividers — those
+    /// have their own hover slot (`hovered_divider`) to avoid a two-way
+    /// dependency between the two paint pipelines.
+    fn find_hovered_ui(&self, col: u16, row: u16) -> Option<HoveredUi> {
+        if let Some(r) = self.last_status_bar_hits.menu {
+            if point_in_rect(col, row, r) {
+                return Some(HoveredUi::MenuOpener);
+            }
+        }
+        if let Some(r) = self.last_status_bar_hits.quit {
+            if point_in_rect(col, row, r) {
+                return Some(HoveredUi::QuitButton);
+            }
+        }
+        for (gid, hits) in &self.last_tab_strips {
+            if !point_in_rect(col, row, hits.rect) {
+                continue;
+            }
+            for (idx, r) in &hits.closes {
+                if point_in_rect(col, row, *r) {
+                    return Some(HoveredUi::TabClose {
+                        gid: *gid,
+                        idx: *idx,
+                    });
+                }
+            }
+            for (idx, r) in &hits.tabs {
+                if point_in_rect(col, row, *r) {
+                    return Some(HoveredUi::TabActivate {
+                        gid: *gid,
+                        idx: *idx,
+                    });
+                }
+            }
+            if let Some(plus) = hits.plus {
+                if point_in_rect(col, row, plus) {
+                    return Some(HoveredUi::TabPlus { gid: *gid });
                 }
             }
         }
@@ -1955,7 +2110,13 @@ impl App {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("(workspace)");
-        render_status_bar(vertical[0], buf, ws_label, &self.shell_short);
+        let status_hover = match self.hovered_ui {
+            Some(HoveredUi::MenuOpener) => StatusBarHover::Menu,
+            Some(HoveredUi::QuitButton) => StatusBarHover::Quit,
+            _ => StatusBarHover::None,
+        };
+        self.last_status_bar_hits =
+            render_status_bar(vertical[0], buf, ws_label, &self.shell_short, status_hover);
         // Cache current-frame geometry so mouse hit-tests use the same
         // rects the user is looking at.
         self.last_pane_area = vertical[1];
@@ -2005,7 +2166,8 @@ impl App {
                     .collect();
                 let hits = crate::tab_strip::hit_rects(strip_rect, group, &titles, &closable);
                 self.last_tab_strips.push((gid, hits));
-                render_tab_strip(strip_rect, buf, group, &titles, &closable);
+                let tab_hover = tab_strip_hover_for(gid, self.hovered_ui);
+                render_tab_strip(strip_rect, buf, group, &titles, &closable, tab_hover);
                 if let Some(active_id) = group.active_pane() {
                     if let Some(viewer_state) = self.viewers.get_mut(&active_id) {
                         viewer::render_into_pane(
@@ -2144,15 +2306,21 @@ impl App {
         }
 
         // Suppress the caret when any overlay owns the input focus.
-        let active_is_viewer = self
-            .tree
-            .find_tab_group(BUILTIN_FILES)
-            .and_then(|g| g.active_pane())
+        //
+        // The viewer condition used to fire whenever a viewer tab was
+        // the active files-group tab — but that clobbered the caret
+        // for a focused agent / shell pane while the viewer was
+        // merely visible in the corner. Now it only fires when focus
+        // is actually on the viewer, matching the "viewer only
+        // consumes keys when focused" rule enforced by `on_viewer_key`.
+        let viewer_is_focused = self
+            .focus
+            .focused_pane()
             .is_some_and(|id| self.viewers.contains_key(&id));
         let cursor = if self.menu_state.open
             || self.palette_state.open
             || self.picker_state.open
-            || active_is_viewer
+            || viewer_is_focused
         {
             None
         } else {
@@ -4777,6 +4945,23 @@ pub(crate) fn find_hovered_divider(
             axis: d.visual.axis,
             rect: d.visual.rect,
         })
+}
+
+/// Project the app-wide `HoveredUi` onto a single tab strip's hover
+/// state. Pure — no App state — so it stays unit-testable and dodges
+/// any borrow tangles with the surrounding paint loop (which is
+/// already borrowing `self.tree` mutably to walk groups).
+pub(crate) fn tab_strip_hover_for(
+    gid: TabGroupId,
+    hovered: Option<HoveredUi>,
+) -> crate::tab_strip::TabStripHover {
+    use crate::tab_strip::TabStripHover;
+    match hovered {
+        Some(HoveredUi::TabActivate { gid: g, idx }) if g == gid => TabStripHover::Tab(idx),
+        Some(HoveredUi::TabClose { gid: g, idx }) if g == gid => TabStripHover::Close(idx),
+        Some(HoveredUi::TabPlus { gid: g }) if g == gid => TabStripHover::Plus,
+        _ => TabStripHover::None,
+    }
 }
 
 /// Resolve the current-frame hover overlay: the seam rect + axis to
