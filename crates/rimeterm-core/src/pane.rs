@@ -44,6 +44,13 @@ pub struct PaneRenderCtx<'a> {
     pub focused: bool,
     /// Optional pane-provided title override (else use provider default).
     pub title_override: Option<&'a str>,
+    /// Accent color providers should use when drawing "this pane owns
+    /// focus" affordances (border tint, active caret marker, etc.).
+    /// Resolved by App from the current app-wide theme
+    /// (`Palette::from_theme(theme).border_focused`) so the whole UI
+    /// coordinates on a single accent. Providers that don't paint a
+    /// focus-tinted border can ignore this.
+    pub focus_color: ratatui::style::Color,
 }
 
 /// Outcome of a render pass. Providers can request follow-up actions.

@@ -110,6 +110,10 @@ impl Keymap {
                 KeyCode::Char('j') | KeyCode::Char('J') => {
                     return KeymapOutcome::Run("workspace.focus.down");
                 }
+                // Alt+T: cycle app-wide theme (§C v0.1).
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    return KeymapOutcome::Run("app.theme.cycle");
+                }
                 // Alt+Shift+1..9: jump to Nth tab in focused group.
                 KeyCode::Char(c) if shift => {
                     if let Some(idx) = digit_1_to_9(c) {
@@ -321,6 +325,33 @@ mod tests {
                 KeyModifiers::CONTROL | KeyModifiers::ALT
             )),
             KeymapOutcome::Run("app.resize.toggle")
+        );
+    }
+
+    #[test]
+    fn alt_t_cycles_theme() {
+        // §C v0.1: Alt+T is the app-wide theme cycle. Case-insensitive
+        // on hosts that capitalise under Shift. Ctrl+Alt+T (a common
+        // "new tab" binding on other terminals) must NOT trigger —
+        // that combo is reserved for future keymap growth and Ctrl+T
+        // already binds new-shell-tab.
+        assert_eq!(
+            Keymap::dispatch(key(KeyCode::Char('t'), KeyModifiers::ALT)),
+            KeymapOutcome::Run("app.theme.cycle")
+        );
+        assert_eq!(
+            Keymap::dispatch(key(
+                KeyCode::Char('T'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            )),
+            KeymapOutcome::Run("app.theme.cycle")
+        );
+        assert_ne!(
+            Keymap::dispatch(key(
+                KeyCode::Char('t'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            )),
+            KeymapOutcome::Run("app.theme.cycle")
         );
     }
 }

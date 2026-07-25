@@ -10,7 +10,7 @@ use std::time::Instant;
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
@@ -920,10 +920,15 @@ pub fn render_into_pane(
         return;
     }
     let title = build_title(state);
+    // §C v0.1: viewer chrome tint follows the app-wide theme (same
+    // enum that drives markdown rendering). One `Palette::from_theme`
+    // call per frame; `border_focused` is the state.focus slot which
+    // differs meaningfully across every curated theme.
+    let accent = rimeterm_markdown::Palette::from_theme(markdown_theme).border_focused;
     let block = Block::default()
-        .title(Line::styled(title, Style::default().fg(Color::LightCyan)))
+        .title(Line::styled(title, Style::default().fg(accent)))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::LightCyan));
+        .border_style(Style::default().fg(accent));
     let inner = block.inner(pane_rect);
     // Clear pane cells so any previously-rendered yazi glyphs don't
     // bleed through where the block skips characters (e.g. gaps

@@ -298,14 +298,21 @@ impl SettingsState {
         let inner = block.inner(popup);
         block.render(popup, buf);
 
+        let accent = rimeterm_markdown::Palette::from_theme(self.markdown_theme).border_focused;
         let tab_line = Line::from(vec![
-            Span::styled(" Tools ", tab_style(self.tab == SettingsTab::Tools)),
+            Span::styled(" Tools ", tab_style(self.tab == SettingsTab::Tools, accent)),
             Span::raw("  "),
-            Span::styled(" Agents ", tab_style(self.tab == SettingsTab::Agents)),
+            Span::styled(
+                " Agents ",
+                tab_style(self.tab == SettingsTab::Agents, accent),
+            ),
             Span::raw("  "),
-            Span::styled(" Viewer ", tab_style(self.tab == SettingsTab::Viewer)),
+            Span::styled(
+                " Viewer ",
+                tab_style(self.tab == SettingsTab::Viewer, accent),
+            ),
             Span::raw("  "),
-            Span::styled(" Shell ", tab_style(self.tab == SettingsTab::Shell)),
+            Span::styled(" Shell ", tab_style(self.tab == SettingsTab::Shell, accent)),
             Span::styled(
                 "   [Tab] switch · [r] refresh",
                 Style::default().add_modifier(Modifier::DIM),
@@ -408,10 +415,10 @@ impl SettingsState {
     }
 }
 
-fn tab_style(active: bool) -> Style {
+fn tab_style(active: bool, accent: Color) -> Style {
     if active {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(accent)
             .add_modifier(Modifier::UNDERLINED)
     } else {
         Style::default().add_modifier(Modifier::DIM)

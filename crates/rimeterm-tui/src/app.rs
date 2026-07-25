@@ -81,6 +81,7 @@ struct ActionFlags {
     viewer_close: AtomicBool,
     viewer_open_with_system: AtomicBool,
     viewer_reveal: AtomicBool,
+    theme_cycle: AtomicBool,
 }
 
 /// A mutation the IPC handler queues for the main loop. Each variant carries
@@ -1358,13 +1359,19 @@ impl App {
         }
     }
 
-    /// Apply a new markdown viewer theme. Live: the next frame's
-    /// `markdown_blocks_to_text` call reads `self.viewer_markdown_theme`
-    /// and picks up the change. Persistence to disk is future work —
-    /// runtime state resets to the config value on restart.
+    /// Apply a new app-wide theme (§C v0.1: the same
+    /// `rimeterm_markdown::Theme` enum drives markdown rendering AND
+    /// the app chrome — focused pane border, viewer title/border,
+    /// settings active tab, and the divider hover overlay all consult
+    /// `Palette::from_theme(theme).border_focused` each frame). The
+    /// field name (`viewer_markdown_theme`) predates the app-wide
+    /// promotion; kept for compat since it's threaded through
+    /// `SettingsState` and the F9 picker. Persistence to disk is
+    /// future work — runtime state resets to the config value on
+    /// restart.
     fn set_markdown_theme(&mut self, theme: rimeterm_markdown::Theme) {
         self.viewer_markdown_theme = theme;
-        self.set_hint(format!("markdown viewer theme → {}", theme.label()));
+        self.set_hint(format!("theme → {}", theme.label()));
     }
 
     /// F9 handler: open a pane-scoped menu. Currently only the
@@ -2623,6 +2630,11 @@ impl App {
         // (menu/palette/picker) override to `None` at the end of draw
         // so the caret doesn't leak past them.
         let mut focused_cursor: Option<(u16, u16)> = None;
+        // §C v0.1 app-wide theme accent — one lookup per frame, then
+        // reused for the divider hover overlay and each PaneRenderCtx
+        // so every focus / hover tint agrees on the same slot.
+        let theme_accent =
+            rimeterm_markdown::Palette::from_theme(self.viewer_markdown_theme).border_focused;
 
         // Compute the rect for each *tab group cell*, then split off a 1-row
         // tab strip inside each cell. This is simpler than tracking tab strips
@@ -2683,6 +2695,7 @@ impl App {
                             let ctx = PaneRenderCtx {
                                 focused,
                                 title_override: None,
+                                focus_color: theme_accent,
                             };
                             let outcome = pane.render(pane_rect, buf, &ctx);
                             if focused {
@@ -2719,7 +2732,7 @@ impl App {
             &self.last_dividers,
         );
         if let Some((seam_rect, _)) = live_hover {
-            let style = Style::default().fg(Color::LightYellow);
+            let style = Style::default().fg(theme_accent);
             for y in seam_rect.y..seam_rect.y.saturating_add(seam_rect.height) {
                 for x in seam_rect.x..seam_rect.x.saturating_add(seam_rect.width) {
                     // Defensive: skip cells outside the terminal grid
@@ -3066,6 +3079,22 @@ impl App {
         }
         if f.viewer_reveal.swap(false, Ordering::Relaxed) {
             self.viewer_dispatch_external(ExternalAction::Reveal);
+        }
+        if f.theme_cycle.swap(false, Ordering::Relaxed) {
+            // §C v0.1: rotate through the curated `rimeterm_markdown::Theme::ALL`
+            // sequence. Reuses `set_markdown_theme` so the markdown viewer and
+            // the app chrome share a single source of truth (the same field
+            // `viewer_markdown_theme` drives both since the viewer/chrome wire-in).
+            use rimeterm_markdown::Theme;
+            let all = Theme::ALL;
+            let cur = all
+                .iter()
+                .position(|t| *t == self.viewer_markdown_theme)
+                .unwrap_or(0);
+            let next = all[(cur + 1) % all.len()];
+            self.set_markdown_theme(next);
+            self.settings_state.set_markdown_theme(next);
+            let _ = self.redraw_tx.send(());
         }
     }
 
@@ -4285,6 +4314,13 @@ fn register_commands(
         "Reveal viewer file in system file manager",
         "Open the file's containing folder in the OS file manager",
         flags.viewer_reveal
+    );
+    flag_cmd!(
+        cmds,
+        "app.theme.cycle",
+        "Cycle UI theme",
+        "Alt+T — advance through Default → Dracula → Solarized{Dark,Light} → Nord → Gruvbox{Dark,Light} → GitHub Light",
+        flags.theme_cycle
     );
     flag_cmd!(
         cmds,
