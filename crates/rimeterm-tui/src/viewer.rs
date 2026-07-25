@@ -2361,20 +2361,40 @@ mod code_tests {
         // Full-frame smoke: `render_into_pane` should dispatch to
         // `render_code`, paint the block border, and drop at least the
         // first source line into the buffer.
-        let path = scratch_file("hello.rs", b"fn main() {}\n");
+        //
+        // File name is unique to THIS test to avoid a scratch_file race
+        // with `utf8_source_produces_code_payload`, which also wrote to
+        // `hello.rs` under the same shared per-PID scratch directory.
+        // Windows FS serialisation hid the race locally; Linux CI's
+        // parallel scheduler exposed it after v0.1.15 shuffled the
+        // test-binary ordering.
+        let src_bytes = b"fn main() {}\n";
+        let path = scratch_file("render_smoke.rs", src_bytes);
         let mut state = ViewerOverlayState::default();
         let source = ViewerSource {
             path: path.clone(),
             kind: ViewerKind::Code,
         };
         let snap_gen = state.open_snapshot(source, None);
-        // Simulate the completed worker.
-        state.apply_completion(ViewerCompletion {
-            pane_id: PaneId(0),
-            generation: snap_gen,
-            path,
-            payload: load_code_blocking(&scratch_file("hello.rs", b"fn main() {}\n")),
-        });
+        // Simulate the completed worker. Assert the completion actually
+        // applies — silent `false` returns would leave `state` in
+        // Loading and the row-content check below would fail cryptically
+        // ("row was all spaces") without telling you WHICH invariant
+        // broke.
+        assert!(
+            state.apply_completion(ViewerCompletion {
+                pane_id: PaneId(0),
+                generation: snap_gen,
+                path: path.clone(),
+                payload: load_code_blocking(&path),
+            }),
+            "apply_completion rejected the payload — check scratch_file race / path mismatch"
+        );
+        assert!(
+            matches!(state.status(), ViewerStatus::Ready),
+            "state must be Ready before render, got {:?}",
+            state.status()
+        );
 
         let bounds = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(bounds);
