@@ -2202,6 +2202,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rimeterm-markdown"
+version = "0.1.13"
+dependencies = [
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "syntect",
+ "unicode-width",
+]
+
+[[package]]
 name = "rimeterm-pty"
 version = "0.1.13"
 dependencies = [
@@ -2235,6 +2246,7 @@ dependencies = [
  "rimeterm-config",
  "rimeterm-core",
  "rimeterm-ipc",
+ "rimeterm-markdown",
  "rimeterm-pty",
  "serde",
  "serde_json",

@@ -851,7 +851,16 @@ impl App {
 
         let event_bus = EventBus::default();
         let mut focus = FocusManager::new(event_bus.clone());
-        focus.set_focus(first_id, Some(BUILTIN_SHELLS));
+        // C22.6: default focus lands on the yazi tab so the launch state
+        // matches the pre-launch expectation ("open rimeterm → I can
+        // navigate files immediately"). Falls back to the first shell
+        // when yazi isn't configured (user removed it from
+        // `[files] tabs`) — in that case shells is the only real
+        // interactive surface.
+        match yazi_pane_id {
+            Some(id) => focus.set_focus(id, Some(BUILTIN_FILES)),
+            None => focus.set_focus(first_id, Some(BUILTIN_SHELLS)),
+        }
 
         let flags = Arc::new(ActionFlags::default());
         let snapshot = Arc::new(parking_lot::RwLock::new(WorkspaceSnapshot::default()));
@@ -1449,6 +1458,67 @@ impl App {
     fn on_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
 
+        // --- Active layout drag has the highest priority (C22.6 fix) ---
+        //
+        // An in-progress divider drag MUST beat the viewer takeover
+        // block below: dragging D1 leftward carries the pointer INTO
+        // `last_viewer_rect`, and if the viewer stole the Drag event
+        // `mouse_drag` never fires — the seam gets stuck the moment
+        // the cursor crosses into the viewer's territory. Keeping the
+        // drag pipeline first also matches the pattern for scrollbar
+        // drags inside the viewer itself (state.scrollbar_dragging()
+        // is checked below as `sticky`, but LAYOUT drags need the same
+        // stickiness in a dedicated slot at the App level).
+        if let MouseEventKind::Drag(MouseButton::Left) = m.kind {
+            if self.active_drag.is_some() {
+                self.mouse_drag(m.column, m.row);
+                return;
+            }
+        }
+        if let MouseEventKind::Up(MouseButton::Left) = m.kind {
+            if self.active_drag.take().is_some() {
+                // §19.12.6: on mouse-up the throttler is bypassed so the
+                // final drag size lands exactly on the PTY.
+                self.flush_pending_resizes();
+                // Clear the hover cache: the seam almost certainly moved
+                // under the cursor during the drag, so any pre-drag
+                // `hovered_divider` is stale. The very next `Moved`
+                // event will re-populate it with the current position.
+                if self.hovered_divider.take().is_some() {
+                    let _ = self.redraw_tx.send(());
+                }
+                return;
+            }
+        }
+
+        // --- Left Down on a divider strip → start layout drag (C22.6 fix) ---
+        //
+        // Layout dividers physically overlap the last cell/row of the
+        // "left" child (see `rimeterm_core::layout::collect_dividers`).
+        // For the D1 vertical seam that means the divider column IS
+        // the viewer's rendered right-border column when a viewer tab
+        // is active — `pane_rect`, and therefore `last_viewer_rect`,
+        // covers the entire cell including that border. Without this
+        // check the viewer takeover block below eats the Down, drops
+        // it in `state.on_mouse`'s border-clip branch, and the drag
+        // never begins. Users then perceive subsequent Drag events as
+        // "the scrollbar hijacked my resize" because the scrollbar
+        // sits one column inside the border.
+        //
+        // Structural invariant: dividers own their strip regardless
+        // of what a sibling widget renders underneath.
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            if let Some(d) = self
+                .last_dividers
+                .iter()
+                .find(|d| point_in_rect(m.column, m.row, d.visual.rect))
+                .cloned()
+            {
+                self.start_divider_drag(d, m.column, m.row);
+                return;
+            }
+        }
+
         // While a viewer tab is active in the files group it owns mouse
         // events that land inside the content rect (pane_rect, below the
         // tab strip). Tab-strip clicks fall through to the normal path so
@@ -1473,28 +1543,6 @@ impl App {
                     }
                 }
                 let _ = self.redraw_tx.send(());
-                return;
-            }
-        }
-        // --- Active drag takes precedence ---
-        if let MouseEventKind::Drag(MouseButton::Left) = m.kind {
-            if self.active_drag.is_some() {
-                self.mouse_drag(m.column, m.row);
-                return;
-            }
-        }
-        if let MouseEventKind::Up(MouseButton::Left) = m.kind {
-            if self.active_drag.take().is_some() {
-                // §19.12.6: on mouse-up the throttler is bypassed so the
-                // final drag size lands exactly on the PTY.
-                self.flush_pending_resizes();
-                // Clear the hover cache: the seam almost certainly moved
-                // under the cursor during the drag, so any pre-drag
-                // `hovered_divider` is stale. The very next `Moved`
-                // event will re-populate it with the current position.
-                if self.hovered_divider.take().is_some() {
-                    let _ = self.redraw_tx.send(());
-                }
                 return;
             }
         }

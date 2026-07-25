@@ -1,0 +1,23 @@
+[package]
+name = "rimeterm-markdown"
+version.workspace = true
+edition.workspace = true
+# Inherited from upstream leboiko/markdown-reader (MIT), not the workspace
+# Apache-2.0. See NOTICE.md for attribution + fork history. MIT ↔ Apache-2.0
+# is compatible in the direction we redistribute (Apache §4).
+license = "MIT"
+authors = [
+    "cjzzz <zisheng.cao@protonmail.com>",
+    "leboiko (upstream `markdown-reader` v1.34.75)",
+]
+description = "Markdown + Mermaid + LaTeX pure renderer for rimeterm's Alt+V viewer, extracted from leboiko/markdown-reader"
+
+[lints]
+workspace = true
+
+[dependencies]
+ratatui        = { workspace = true }
+pulldown-cmark = "0.13"
+syntect        = { workspace = true }
+unicode-width  = { workspace = true }
+serde          = { workspace = true }

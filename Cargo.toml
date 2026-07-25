@@ -8,6 +8,7 @@ members = [
     "crates/rimeterm-ipc",
     "crates/rimectl",
     "crates/rimeterm-tui",
+    "crates/rimeterm-markdown",
 ]
 
 [workspace.package]
@@ -25,6 +26,7 @@ rimeterm-core   = { path = "crates/rimeterm-core",   version = "0.1.13" }
 rimeterm-config = { path = "crates/rimeterm-config", version = "0.1.13" }
 rimeterm-pty    = { path = "crates/rimeterm-pty",    version = "0.1.13" }
 rimeterm-tui    = { path = "crates/rimeterm-tui",    version = "0.1.13" }
+rimeterm-markdown = { path = "crates/rimeterm-markdown", version = "0.1.13" }
 
 rimeterm-ipc    = { path = "crates/rimeterm-ipc",    version = "0.1.13" }
 # third-party

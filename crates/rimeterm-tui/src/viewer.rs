@@ -987,22 +987,28 @@ pub fn render_overlay(
 /// a `ratatui::Scrollbar`. Captures layout hints on `state` for the
 /// mouse handler + `copy_selection`.
 ///
-/// C22.5 addendum: fenced code blocks are post-processed through
-/// `syntect` — `tui-markdown 0.3.8` leaves both fence markers and
-/// their contents as plain unstyled lines, and we know from the
-/// probe that the source-line ↔ rendered-line mapping is 1:1 in the
-/// output. That lets us walk the source once, mark the ranges that
-/// live inside fences, and rewrite the corresponding lines in the
-/// `Text` without touching scroll / selection / capture invariants
-/// (line count and column widths are preserved — spans only get new
-/// styles).
+/// **C22.6 (rimeterm-markdown extraction)**: rendering goes through
+/// the vendored `rimeterm-markdown` crate — a MIT-licensed fork of
+/// `leboiko/markdown-reader`'s parser + theme + syntect + LaTeX
+/// pipeline. See `docs/rimterm-markdown-viewer-design.md` for scope.
+///
+/// The crate returns a `Vec<DocBlock>`; we flatten it into a single
+/// `Text` for the existing `Paragraph` / `Scrollbar` plumbing:
+///
+/// - `DocBlock::Text` → append its `text.lines` verbatim (already
+///   syntect-styled for code blocks, LaTeX-approximated for math)
+/// - `DocBlock::Mermaid` → append the raw source lines as a fallback
+///   (proper text-diagram rendering via `mermaid-text` crate is
+///   future work — see design doc §"What we give up")
+/// - `DocBlock::Table` → append a minimal pipe-format representation
+///   (upstream `layout_table` was in the widget layer we didn't
+///   vendor; future work)
 fn render_markdown(state: &mut ViewerOverlayState, inner: Rect, buf: &mut Buffer) {
     if inner.width < 2 || inner.height == 0 {
         return;
     }
     let source = state.markdown().unwrap_or("").to_string();
-    let mut text = tui_markdown::from_str(&source);
-    highlight_code_fences(&source, &mut text);
+    let text = markdown_blocks_to_text(&source);
 
     // Reserve the right-most column for the scrollbar. We split
     // upfront so `content_lines` counting matches the paragraph width
@@ -1072,130 +1078,92 @@ fn render_markdown(state: &mut ViewerOverlayState, inner: Rect, buf: &mut Buffer
     }
 }
 
-/// Rewrite lines inside fenced code blocks of `text` with syntect
-/// syntax colouring (C22.5).
+/// Render a markdown source string into a `ratatui::text::Text` via
+/// `rimeterm-markdown`'s block model, flattening every block kind into
+/// contiguous rows suitable for the existing `Paragraph`/`Scrollbar`
+/// pipeline (C22.6).
 ///
-/// `tui-markdown 0.3.8` renders fenced blocks as plain unstyled lines
-/// preserving the 1:1 source-line ↔ output-line mapping — we exploit
-/// that here to walk `source` linearly, mark which output rows are
-/// **inside** a fence (contents only, not the fence markers), and
-/// rebuild just those rows' spans. Rows outside fences are untouched,
-/// so tui-markdown's own headings/lists/emphasis rendering stands.
+/// Block dispatch:
+/// - `DocBlock::Text` — append its `text.lines` verbatim (already
+///   syntect-styled and LaTeX-approximated by the vendored crate).
+/// - `DocBlock::Mermaid` — surround the raw source with `[mermaid]`
+///   / `[/mermaid]` sentinel lines so the reader can see the diagram
+///   source. Text-diagram rendering (via the sibling `mermaid-text`
+///   crate) is future work; the sentinel path is the design-doc-
+///   documented fallback.
+/// - `DocBlock::Table` — emit a plain pipe-format representation with
+///   a divider row. `layout_table` (fair-share column widths, wide
+///   cell handling) was in the widget layer we did not vendor.
 ///
-/// Fence detection is deliberately CommonMark-lite: opens on a line
-/// whose trimmed content starts with 3+ backticks or tildes, closes
-/// on a line whose trimmed content is exactly the same marker
-/// length. Info string after the opening fence is used as the syntect
-/// language token (e.g. ```` ```rust ```` → syntax "Rust"). Nested
-/// or malformed fences fall through to the untouched pass — never
-/// panic, worst case we simply skip highlighting for that block.
-fn highlight_code_fences<'a>(source: &str, text: &mut Text<'a>) {
-    use syntect::easy::HighlightLines;
+/// A blank line is inserted between distinct block kinds so the
+/// visual separation matches upstream's paragraph gaps.
+fn markdown_blocks_to_text(source: &str) -> Text<'static> {
+    use rimeterm_markdown::{DocBlock, Palette, Theme, render_markdown};
 
-    let (syntax_set, theme_set) = code_highlight::assets();
-    let theme = &theme_set.themes["base16-ocean.dark"];
+    // Default dark theme for now — future work: pick from a rimeterm
+    // config knob `[viewer.markdown] theme = ...`.
+    let theme = Theme::Default;
+    let palette = Palette::from_theme(theme);
+    let blocks = render_markdown(source, &palette, theme);
 
-    // Collect (row_index, language_token) for every source line that
-    // is INSIDE a fence — fence markers themselves are excluded so
-    // the "```rust" and closing "```" retain their default styling
-    // (recognisable as delimiters, not code).
-    #[derive(Copy, Clone)]
-    struct Fence<'a> {
-        marker: char,
-        len: usize,
-        lang: &'a str,
-    }
-    let mut open: Option<Fence<'_>> = None;
-    let mut interior_rows: Vec<(usize, &str)> = Vec::new();
-
-    for (idx, raw) in source.lines().enumerate() {
-        let trimmed = raw.trim_start();
-        match open {
-            None => {
-                // Look for an opening fence.
-                let marker = trimmed.chars().next();
-                if !matches!(marker, Some('`') | Some('~')) {
-                    continue;
-                }
-                let marker = marker.unwrap();
-                let len = trimmed.chars().take_while(|c| *c == marker).count();
-                if len < 3 {
-                    continue;
-                }
-                let info = trimmed[len..].trim();
-                // First whitespace-delimited token is the language.
-                let lang = info.split_whitespace().next().unwrap_or("");
-                open = Some(Fence { marker, len, lang });
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut first = true;
+    for block in &blocks {
+        if !first {
+            lines.push(Line::from(""));
+        }
+        first = false;
+        match block {
+            DocBlock::Text { text, .. } => {
+                lines.extend(text.lines.iter().cloned());
             }
-            Some(fence) => {
-                // Close on a bare marker line of matching kind whose
-                // run length is >= the opener (CommonMark rule). Info
-                // string is not permitted on a closer.
-                let is_close = trimmed.chars().all(|c| c == fence.marker)
-                    && trimmed.chars().count() >= fence.len
-                    && !trimmed.is_empty();
-                if is_close {
-                    open = None;
-                } else {
-                    interior_rows.push((idx, fence.lang));
+            DocBlock::Mermaid { source, .. } => {
+                let dim = Style::default().add_modifier(Modifier::DIM);
+                lines.push(Line::styled("[mermaid]", dim));
+                for raw in source.lines() {
+                    lines.push(Line::from(raw.to_owned()));
                 }
+                lines.push(Line::styled("[/mermaid]", dim));
+            }
+            DocBlock::Table(t) => {
+                lines.extend(table_to_lines(t));
             }
         }
     }
+    Text::from(lines)
+}
 
-    if interior_rows.is_empty() {
-        return;
-    }
-
-    // Rebuild spans for the flagged rows. Group consecutive rows of
-    // the same language into one `HighlightLines` run so parser
-    // state (multi-line strings, block comments) stays coherent.
-    let mut cursor = 0;
-    while cursor < interior_rows.len() {
-        let (_start_row, lang) = interior_rows[cursor];
-        let mut end = cursor + 1;
-        while end < interior_rows.len()
-            && interior_rows[end].1 == lang
-            && interior_rows[end].0 == interior_rows[end - 1].0 + 1
-        {
-            end += 1;
-        }
-        let syntax = if lang.is_empty() {
-            syntax_set.find_syntax_plain_text()
-        } else {
-            syntax_set
-                .find_syntax_by_token(lang)
-                .unwrap_or_else(|| syntax_set.find_syntax_plain_text())
-        };
-        let mut highlighter = HighlightLines::new(syntax, theme);
-        for (row, _) in &interior_rows[cursor..end] {
-            let Some(line) = text.lines.get_mut(*row) else {
-                continue;
-            };
-            // Reconstruct the raw source line by concatenating span
-            // contents — tui-markdown left them verbatim so this is
-            // exactly what syntect would see if we had the raw text.
-            let raw: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            // syntect wants trailing newline for `HighlightLines`.
-            let mut with_nl = raw.clone();
-            with_nl.push('\n');
-            let Ok(styled) = highlighter.highlight_line(&with_nl, syntax_set) else {
-                continue;
-            };
-            let new_spans: Vec<Span<'a>> = styled
-                .into_iter()
-                .map(|(sty, s)| {
-                    let owned = s.trim_end_matches('\n').to_owned();
-                    Span::styled(owned, code_highlight::translate_style(sty))
-                })
-                .filter(|s| !s.content.is_empty())
-                .collect();
-            if !new_spans.is_empty() {
-                *line = Line::from(new_spans);
+/// Render a `rimeterm_markdown::TableBlock` as a plain pipe-format
+/// text block. Cells are joined with `" | "` and truncated only
+/// implicitly by the outer paragraph wrap — no wide-cell modal,
+/// matching what we said we'd give up in the design doc.
+fn table_to_lines(t: &rimeterm_markdown::TableBlock) -> Vec<Line<'static>> {
+    fn render_row(cells: &[rimeterm_markdown::CellSpans]) -> Line<'static> {
+        // Interleave " | " separators between cell span groups.
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(cells.len() * 3 + 1);
+        spans.push(Span::raw("| "));
+        for (i, cell) in cells.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" | "));
             }
+            spans.extend(cell.iter().cloned());
         }
-        cursor = end;
+        spans.push(Span::raw(" |"));
+        Line::from(spans)
     }
+
+    let mut out = Vec::with_capacity(2 + t.rows.len());
+    if !t.headers.is_empty() {
+        out.push(render_row(&t.headers));
+        // Divider: `| --- | --- | ... |` matching column count.
+        let dashes: Vec<rimeterm_markdown::CellSpans> =
+            t.headers.iter().map(|_| vec![Span::raw("---")]).collect();
+        out.push(render_row(&dashes));
+    }
+    for row in &t.rows {
+        out.push(render_row(row));
+    }
+    out
 }
 
 /// Renders a Code / plain-text snapshot into `inner` with syntect
@@ -2194,86 +2162,77 @@ mod markdown_tests {
         assert_eq!(state.close_button_rect, None);
     }
 
+    // --- C22.6: markdown_blocks_to_text (rimeterm-markdown wire-in) ---
+
     #[test]
-    fn highlight_code_fences_preserves_line_count_and_content() {
-        // Invariant: only styles change; line count and per-line
-        // concatenated content match the pre-pass output. Scrollbar
-        // math (`wrapped_line_count`) and selection cell math both
-        // depend on this.
-        let src = "# hi\n\ntext\n\n```rust\nfn f() {}\n```\n\ntrailing\n";
-        let mut text = tui_markdown::from_str(src);
-        let before_line_count = text.lines.len();
-        let before_content: Vec<String> = text
-            .lines
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
-        highlight_code_fences(src, &mut text);
-        assert_eq!(text.lines.len(), before_line_count);
-        let after_content: Vec<String> = text
-            .lines
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
-        assert_eq!(before_content, after_content);
+    fn markdown_blocks_to_text_handles_empty_without_panic() {
+        // Regression guard: the vendored `render_markdown` on empty
+        // input previously produced zero blocks in some upstream
+        // versions; the wrapper must not panic.
+        let text = markdown_blocks_to_text("");
+        // Empty or nearly empty is fine — just not a crash.
+        assert!(text.lines.len() <= 1);
     }
 
     #[test]
-    fn highlight_code_fences_restyles_interior_lines_only() {
-        // Fence markers keep their default style; the interior line
-        // (`fn main() {}`) gains at least one non-default style from
-        // syntect. This is the whole point of the pass.
-        let src = "```rust\nfn main() {}\n```\n";
-        let mut text = tui_markdown::from_str(src);
-        highlight_code_fences(src, &mut text);
-
-        let open_default = text.lines[0]
-            .spans
+    fn markdown_blocks_to_text_styles_code_blocks_via_syntect() {
+        // rimeterm-markdown runs syntect internally against the
+        // configured theme — code block contents must get non-default
+        // styling on at least one span.
+        let text = markdown_blocks_to_text("```rust\nfn main() {}\n```\n");
+        let has_style = text
+            .lines
             .iter()
-            .all(|s| s.style == Style::default());
-        assert!(open_default, "opening fence should not be restyled");
-        let close_default = text.lines[2]
-            .spans
-            .iter()
-            .all(|s| s.style == Style::default());
-        assert!(close_default, "closing fence should not be restyled");
-
-        let interior_has_style = text.lines[1]
-            .spans
-            .iter()
+            .flat_map(|l| l.spans.iter())
             .any(|s| s.style != Style::default());
-        assert!(interior_has_style, "interior line should be highlighted");
+        assert!(has_style, "expected syntect styling somewhere");
     }
 
     #[test]
-    fn highlight_code_fences_handles_no_fences() {
-        // No-op path: source without any fence must be untouched.
-        let src = "# just prose\n\none paragraph.\n";
-        let mut text = tui_markdown::from_str(src);
-        let before: Vec<Vec<Style>> = text
+    fn markdown_blocks_to_text_marks_mermaid_blocks() {
+        // Fallback sentinel — until we wire the `mermaid-text` crate,
+        // Mermaid content is bracketed by `[mermaid]` / `[/mermaid]`.
+        let text = markdown_blocks_to_text("prose\n\n```mermaid\ngraph LR\nA-->B\n```\n\nafter\n");
+        let all: String = text
             .lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.style).collect())
-            .collect();
-        highlight_code_fences(src, &mut text);
-        let after: Vec<Vec<Style>> = text
-            .lines
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.style).collect())
-            .collect();
-        assert_eq!(before, after);
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("[mermaid]"), "missing opening sentinel: {all}");
+        assert!(
+            all.contains("[/mermaid]"),
+            "missing closing sentinel: {all}"
+        );
+        assert!(all.contains("A-->B"), "raw source should still appear");
     }
 
     #[test]
-    fn highlight_code_fences_unclosed_fence_swallows_rest_gracefully() {
-        // An opening fence with no closer: every subsequent line is
-        // treated as interior, but the function must not panic. Line
-        // count invariant still holds.
-        let src = "```rust\nfn a() {}\nfn b() {}\n"; // no close
-        let mut text = tui_markdown::from_str(src);
-        let n = text.lines.len();
-        highlight_code_fences(src, &mut text);
-        assert_eq!(text.lines.len(), n);
+    fn markdown_blocks_to_text_pipe_formats_tables() {
+        // Tables render as GFM pipe-format (headers | divider | rows).
+        // The upstream `layout_table` fair-share widths lived in the
+        // widget layer we didn't vendor — this is the documented
+        // fallback.
+        let text = markdown_blocks_to_text(
+            "| Alpha | Beta |\n|---|---|\n| one | two |\n| three | four |\n",
+        );
+        let all: String = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Cells themselves survive rendering, and the pipe / divider
+        // structure is emitted around them.
+        assert!(
+            all.contains("Alpha"),
+            "missing header cell content: {all:?}"
+        );
+        assert!(all.contains("---"), "missing divider row: {all:?}");
+        assert!(all.contains("one"), "missing body cell content: {all:?}");
+        assert!(all.contains("|"), "missing pipe separator: {all:?}");
     }
 }
 

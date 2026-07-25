@@ -31,6 +31,7 @@ arboard = { workspace = true }
 anyhow = { workspace = true }
 # C20 viewer overlay
 tui-markdown = { workspace = true }
+rimeterm-markdown = { workspace = true }
 ratatui-image = { workspace = true }
 image = { workspace = true }
 # C22 viewer code-highlighting (translation to ratatui styles lives in

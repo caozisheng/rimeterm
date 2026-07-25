@@ -1,0 +1,2368 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use std::ops::Range;
+
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use ratatui::{
+    style::{Modifier, Style},
+    text::{Line, Span, Text},
+};
+use std::cell::Cell;
+use unicode_width::UnicodeWidthStr;
+
+use crate::markdown::{
+    CellSpans, DocBlock, HeadingAnchor, LinkInfo, MermaidBlockId, TableBlock, TableBlockId,
+    TextBlockId, cell_to_string, heading_to_anchor, highlight::highlight_code,
+};
+// Inlined from upstream `src/mermaid.rs` — this crate skips the
+// image-protocol Mermaid cache (see `docs/rimterm-markdown-viewer-design.md`),
+// so the constant lives here rather than in a mermaid module.
+const DEFAULT_MERMAID_HEIGHT: u32 = 20;
+use crate::theme::{Palette, Theme, Tokens};
+
+/// Render a markdown string into a sequence of [`DocBlock`] values.
+///
+/// Mermaid fenced code blocks produce [`DocBlock::Mermaid`] entries; all other
+/// content is grouped into [`DocBlock::Text`] runs. Consecutive text lines are
+/// merged so there is at most one `Text` block between two `Mermaid` blocks.
+///
+/// `DocBlock::Text` blocks carry embedded [`LinkInfo`] and [`HeadingAnchor`]
+/// slices whose `line` fields are relative to the block's start. Callers
+/// convert them to absolute display lines by adding the block's cumulative
+/// offset (see `MarkdownViewState::load`).
+///
+/// Each rendered logical line also carries a 0-indexed source line derived from
+/// pulldown-cmark's byte-offset spans, enabling the viewer cursor to map back
+/// to the exact source line when entering edit mode.
+///
+/// # Arguments
+///
+/// * `content` – raw markdown source.
+/// * `palette` – color palette for the active UI theme.
+/// * `theme` – the active UI theme; used to select the matching syntect
+///   highlighting theme for fenced code blocks.
+pub fn render_markdown(content: &str, palette: &Palette, theme: Theme) -> Vec<DocBlock> {
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_MATH;
+    let parser = Parser::new_ext(content, opts);
+    // Derive tokens from the theme once; the renderer stores them so that
+    // `render_code_block` can read from semantic slots (e.g. `tokens.surface.raised`)
+    // rather than opaque palette field names.
+    let tokens = Tokens::from_theme(theme);
+    let renderer = MdRenderer::new(palette, tokens, theme);
+    renderer.render(content, parser)
+}
+
+// Dormant until sub-phase 6 wires it into the cursor-leave path.
+#[allow(dead_code)]
+/// Re-parse a single block's source slice and produce its replacement [`DocBlock`](s).
+///
+/// Usually returns one block; occasionally more if the slice contains markdown
+/// structure that splits (e.g. the user typed `\n\n` mid-paragraph, producing
+/// two separate paragraphs).
+///
+/// # Byte-range contract
+///
+/// `byte_offset_in_doc` is the absolute byte offset where `slice` starts in
+/// the full document.  The fixup pass inside [`render_markdown`] sets each
+/// returned block's `source_byte_start`/`source_byte_end` relative to the
+/// *slice* (i.e. in `0..slice.len()`).  After calling `render_markdown` this
+/// function shifts those slice-local ranges to absolute offsets by adding
+/// `byte_offset_in_doc`, so callers receive blocks whose byte ranges sit
+/// directly inside `[byte_offset_in_doc, byte_offset_in_doc + slice.len())`.
+///
+/// Used by hybrid mode's cursor-leave logic: after the user edits a block, we
+/// re-parse just that slice and splice the result back into `MarkdownViewState`.
+/// Sub-phase 6 wires the splice; this sub-phase (3) only exposes the operation.
+///
+/// # Arguments
+///
+/// * `slice`             — raw markdown source of the block being re-parsed.
+/// * `byte_offset_in_doc` — byte offset of `slice` within the full document.
+/// * `palette`           — color palette for the active UI theme.
+/// * `theme`             — active UI theme; selects the syntect highlighting theme.
+pub fn render_block_from_slice(
+    slice: &str,
+    byte_offset_in_doc: usize,
+    palette: &crate::theme::Palette,
+    theme: crate::theme::Theme,
+) -> Vec<crate::markdown::DocBlock> {
+    let mut blocks = render_markdown(slice, palette, theme);
+    // Shift every block's byte range from slice-local to absolute document
+    // offsets so the caller can splice them into the full block list without
+    // any further arithmetic.
+    for block in &mut blocks {
+        block.shift_byte_range(byte_offset_in_doc);
+    }
+    blocks
+}
+
+/// Pre-compute line-start byte offsets for `content`.
+///
+/// `line_boundaries[i]` is the byte offset where line `i` starts (0-indexed).
+/// There is always at least one entry: `line_boundaries[0] == 0`.
+fn build_line_boundaries(content: &str) -> Vec<usize> {
+    let mut boundaries = vec![0];
+    for (i, b) in content.as_bytes().iter().enumerate() {
+        if *b == b'\n' {
+            boundaries.push(i + 1);
+        }
+    }
+    boundaries
+}
+
+/// Given a byte offset into the source, return the 0-indexed source line.
+///
+/// Uses a binary search into the pre-computed `boundaries` slice.
+fn byte_offset_to_line(offset: usize, boundaries: &[usize]) -> u32 {
+    match boundaries.binary_search(&offset) {
+        // Exact match: the offset is itself the start of a line.
+        Ok(i) => crate::cast::u32_sat(i),
+        // No exact match: `i` is the insertion point — the line that started
+        // before `offset` is at index `i - 1`.
+        Err(i) => crate::cast::u32_sat(i.saturating_sub(1)),
+    }
+}
+
+// ── Internal renderer ────────────────────────────────────────────────────────
+
+#[allow(clippy::struct_excessive_bools)]
+struct MdRenderer {
+    /// Accumulates lines for the current `Text` block.
+    lines: Vec<Line<'static>>,
+    /// Completed blocks emitted so far.
+    blocks: Vec<DocBlock>,
+    current_spans: Vec<Span<'static>>,
+    style_stack: Vec<Style>,
+    list_depth: usize,
+    list_counters: Vec<Option<u64>>,
+    in_code_block: bool,
+    /// `Some(lang)` when inside a fenced block — `None` for indented blocks.
+    code_block_lang: Option<String>,
+    code_block_content: Vec<String>,
+    in_heading: bool,
+    heading_level: u8,
+    in_blockquote: bool,
+    in_table: bool,
+    table_alignments: Vec<pulldown_cmark::Alignment>,
+    table_row: Vec<CellSpans>,
+    table_rows: Vec<Vec<CellSpans>>,
+    table_header_row: Option<Vec<CellSpans>>,
+    table_header: bool,
+    /// URL of the link currently being rendered; set on `Start(Link)`, cleared
+    /// on `TagEnd::Link` after recording the span range.
+    current_link_url: Option<String>,
+    /// Byte-column at which the current link's text begins in `current_spans`.
+    /// Measured as the sum of span content lengths before the link started.
+    link_col_start: u16,
+    /// Links collected within the current pending `Text` block (block-relative).
+    pending_links: Vec<LinkInfo>,
+    /// Accumulated text of the heading currently being rendered.
+    heading_text: String,
+    /// Heading anchors accumulated for the current pending `Text` block.
+    pending_heading_anchors: Vec<HeadingAnchor>,
+    /// Syntect theme name corresponding to the active UI theme. Used to
+    /// resolve the correct token colors when highlighting fenced code blocks.
+    syntax_theme_name: &'static str,
+    /// Semantic design tokens for the active theme. All per-element colors are
+    /// read directly from these slots rather than cached per-field copies, so
+    /// the sourcing decisions (e.g. `surface.raised` for code-block backgrounds)
+    /// are visible at every call site.
+    tokens: Tokens,
+
+    // ── Source-line tracking ─────────────────────────────────────────────────
+    /// Start byte offset of each source line: `line_boundaries[i]` is the byte
+    /// offset where line `i` begins. Built once from `content` at render start.
+    line_boundaries: Vec<usize>,
+    /// 0-indexed source line of the most-recently processed event.
+    /// Updated before dispatching each `(event, span)` pair.
+    current_source_line: u32,
+    /// Parallel to `self.lines` — one entry per rendered logical line.
+    /// Invariant: `current_source_lines.len() == lines.len()` after every
+    /// `flush_line` / `push_blank_line` call.
+    current_source_lines: Vec<u32>,
+    /// Byte offset of the opening fence of the current code block.
+    /// Set on `Start(Tag::CodeBlock)` from `span.start`.
+    code_block_fence_offset: Option<usize>,
+    /// 0-indexed source line where the current code block's opening fence sits.
+    code_block_start_line: u32,
+    /// 0-indexed source line where the current table's opening row sits.
+    table_start_line: u32,
+    /// Source line of the table row currently being accumulated.
+    /// Captured from `Start(Tag::TableRow)`'s `span.start`.
+    current_table_row_source_line: u32,
+    /// Source lines for every logical row in the current table.
+    /// Index 0 is the header row; indices `1..=table_rows.len()` are body rows.
+    /// Flushed into `TableBlock::row_source_lines` in `emit_table_block`.
+    table_row_source_lines: Vec<u32>,
+}
+
+impl MdRenderer {
+    fn new(palette: &Palette, tokens: Tokens, theme: Theme) -> Self {
+        Self {
+            lines: Vec::new(),
+            blocks: Vec::new(),
+            current_spans: Vec::new(),
+            style_stack: vec![Style::default().fg(palette.foreground)],
+            list_depth: 0,
+            list_counters: Vec::new(),
+            in_code_block: false,
+            code_block_lang: None,
+            code_block_content: Vec::new(),
+            in_heading: false,
+            heading_level: 0,
+            in_blockquote: false,
+            in_table: false,
+            table_alignments: Vec::new(),
+            table_row: Vec::new(),
+            table_rows: Vec::new(),
+            table_header_row: None,
+            table_header: false,
+            current_link_url: None,
+            link_col_start: 0,
+            pending_links: Vec::new(),
+            heading_text: String::new(),
+            pending_heading_anchors: Vec::new(),
+            syntax_theme_name: theme.syntax_theme_name(),
+            tokens,
+            line_boundaries: Vec::new(),
+            current_source_line: 0,
+            current_source_lines: Vec::new(),
+            code_block_fence_offset: None,
+            code_block_start_line: 0,
+            table_start_line: 0,
+            current_table_row_source_line: 0,
+            table_row_source_lines: Vec::new(),
+        }
+    }
+
+    fn current_style(&self) -> Style {
+        self.style_stack.last().copied().unwrap_or_default()
+    }
+
+    fn push_style(&mut self, modifier: Style) {
+        let base = self.current_style();
+        self.style_stack.push(base.patch(modifier));
+    }
+
+    fn pop_style(&mut self) {
+        if self.style_stack.len() > 1 {
+            self.style_stack.pop();
+        }
+    }
+
+    fn flush_line(&mut self) {
+        if self.in_table {
+            return;
+        }
+        let spans = std::mem::take(&mut self.current_spans);
+        if self.in_blockquote && !self.in_code_block {
+            let mut bq_spans = vec![Span::styled(
+                "│ ".to_string(),
+                Style::default().fg(self.tokens.list.block_quote_border),
+            )];
+            bq_spans.extend(spans);
+            self.lines.push(Line::from(bq_spans));
+        } else {
+            self.lines.push(Line::from(spans));
+        }
+        // Maintain the parallel source_lines invariant.
+        self.current_source_lines.push(self.current_source_line);
+    }
+
+    fn push_blank_line(&mut self) {
+        if self.in_table {
+            return;
+        }
+        self.lines.push(Line::from(""));
+        // Blank lines inherit the source line of the surrounding context.
+        self.current_source_lines.push(self.current_source_line);
+    }
+
+    /// Drain `self.lines` into a `DocBlock::Text` if there are any pending lines.
+    ///
+    /// Any links and heading anchors accumulated are moved into the block;
+    /// their `line` fields are already relative to this block's start.
+    ///
+    /// Invariant: `source_lines.len() == text.lines.len()` is enforced by a
+    /// debug assertion before pushing the block.
+    #[allow(clippy::similar_names)]
+    fn flush_text_block(&mut self) {
+        if self.lines.is_empty() {
+            // Drop orphaned source_lines that accumulated without any matching
+            // rendered line (can happen around pure-table sections).
+            self.current_source_lines.clear();
+        } else {
+            let lines = std::mem::take(&mut self.lines);
+            let source_lines = std::mem::take(&mut self.current_source_lines);
+            let links = std::mem::take(&mut self.pending_links);
+            let heading_anchors = std::mem::take(&mut self.pending_heading_anchors);
+            // In debug builds, catch any mismatch between rendered lines and
+            // their source-line annotations immediately.
+            debug_assert_eq!(
+                lines.len(),
+                source_lines.len(),
+                "source_lines length {} != lines length {}",
+                source_lines.len(),
+                lines.len(),
+            );
+            // Derive a stable id from a hash of (rendered_text_content, lines.len()).
+            //
+            // Intentionally does NOT hash `source_lines`: when an upstream edit
+            // shifts all downstream blocks' source line numbers, their rendered
+            // content is unchanged and so their ids remain stable. This keeps the
+            // wrap-layout cache valid for unedited blocks during live editing.
+            let id = {
+                let mut h = DefaultHasher::new();
+                for line in &lines {
+                    for span in &line.spans {
+                        span.content.hash(&mut h);
+                    }
+                }
+                lines.len().hash(&mut h);
+                TextBlockId(h.finish())
+            };
+            // wrapped_height starts at the logical line count — a no-wrap
+            // safe upper bound. update_text_layouts replaces it with the true
+            // wrapped count once the layout width is known.
+            let logical_count = crate::cast::u32_sat(lines.len());
+            // Byte ranges are populated by the post-render fixup pass in `render`;
+            // set to 0 here as sentinels that the fixup will overwrite.
+            self.blocks.push(DocBlock::Text {
+                id,
+                text: Text::from(lines),
+                links,
+                heading_anchors,
+                source_lines,
+                wrapped_height: Cell::new(logical_count),
+                source_byte_start: 0,
+                source_byte_end: 0,
+            });
+        }
+    }
+
+    /// Sum of the display widths of all spans currently in `current_spans`.
+    ///
+    /// Used to compute `col_start` / `col_end` for link hit-testing. We use
+    /// char count rather than byte count because ratatui column positions are
+    /// character-based; for ASCII-only link text this is identical to byte count.
+    fn current_col_width(&self) -> u16 {
+        self.current_spans
+            .iter()
+            .map(|s| crate::cast::u16_sat(s.content.chars().count()))
+            .sum()
+    }
+
+    /// Drive the render loop.
+    ///
+    /// `content` is the raw markdown string; it is used to build the
+    /// `line_boundaries` table for byte-offset-to-line translation.
+    /// `parser` is the pulldown-cmark parser constructed from the same string.
+    #[allow(clippy::too_many_lines)]
+    fn render(mut self, content: &str, parser: Parser) -> Vec<DocBlock> {
+        // Build the line boundary table once.  O(n) in the source length.
+        self.line_boundaries = build_line_boundaries(content);
+
+        // Use the offset iterator so every event carries a byte-range into
+        // the original source, letting us map events back to source lines.
+        for (event, span) in parser.into_offset_iter() {
+            // Stamp the current source line from the event's start offset
+            // before dispatching.  All `lines.push` paths below inherit this.
+            //
+            // Skip End events: their span starts at the *opening* of the
+            // block (e.g. `End(Paragraph)` for a multi-line paragraph spans
+            // 0..N, so `span.start` resets us to the first source line).
+            // When `TagEnd::Paragraph` then calls `flush_line` to emit the
+            // trailing accumulated spans (the last source line of the
+            // paragraph), it should record the line where that text
+            // *actually lives*, not where the paragraph began. Leaving
+            // `current_source_line` at whatever the last inline event
+            // (Text / SoftBreak / Code) set it to gives the correct value.
+            if !matches!(event, Event::End(_)) {
+                self.current_source_line = byte_offset_to_line(span.start, &self.line_boundaries);
+            }
+
+            match event {
+                Event::Start(tag) => self.start_tag(tag, &span),
+                Event::End(tag) => self.end_tag(tag, &span),
+                Event::Text(text) => self.handle_text(&text),
+                Event::Code(code) => {
+                    let style = self
+                        .current_style()
+                        .fg(self.tokens.syntax.inline_code)
+                        .add_modifier(Modifier::BOLD);
+                    self.current_spans
+                        .push(Span::styled(format!("`{code}`"), style));
+                    // Inline code inside a heading must contribute to
+                    // `heading_text` so the slug includes its content.
+                    // Without this, `### \`kg.nodes\`` slugs to "" instead
+                    // of "kgnodes" and TOC links like `[\`kg.nodes\`](#kgnodes)`
+                    // silently drop out of the link picker.
+                    if self.in_heading {
+                        self.heading_text.push_str(&code);
+                    }
+                }
+                Event::SoftBreak => {
+                    // Preserve the source line break instead of joining the
+                    // two sides with a space. Joining produced a single
+                    // ratatui `Line` per paragraph that `Paragraph::wrap`
+                    // would then word-wrap into N visual rows, but
+                    // `block.height()` (which drives scroll math) only ever
+                    // counted it as one logical line. The mismatch made
+                    // tables and following text shift on screen as the user
+                    // scrolled, "revealing" lines that were previously
+                    // hidden behind the wrap overflow.
+                    //
+                    // Inside a link we still emit a space — `LinkInfo` can
+                    // only describe a single rendered line, so splitting
+                    // would orphan the second half. Inside a table cell we
+                    // also keep the space because cells render as joined
+                    // strings via the table layout, not via flush_line.
+                    // Inside a list item we keep the space because the
+                    // bullet/indent prefix is only emitted on `Tag::Item`;
+                    // splitting would leave the continuation line at
+                    // column 0 instead of aligning under the marker.
+                    let in_list = self.list_depth > 0;
+                    if self.current_link_url.is_some() || self.in_table || in_list {
+                        self.current_spans
+                            .push(Span::styled(" ".to_string(), self.current_style()));
+                    } else {
+                        self.flush_line();
+                    }
+                }
+                Event::HardBreak => {
+                    self.flush_line();
+                }
+                Event::Rule => {
+                    self.flush_line();
+                    self.lines.push(Line::from(Span::styled(
+                        "─".repeat(60),
+                        Style::default().fg(self.tokens.text.muted),
+                    )));
+                    // Rule line and the blank after it both map to current source line.
+                    self.current_source_lines.push(self.current_source_line);
+                    self.push_blank_line();
+                }
+                Event::TaskListMarker(checked) => {
+                    let marker = if checked { "☑ " } else { "☐ " };
+                    self.current_spans.push(Span::styled(
+                        marker.to_string(),
+                        Style::default().fg(self.tokens.list.task_marker),
+                    ));
+                }
+                Event::InlineMath(math) => {
+                    // Convert LaTeX to Unicode approximation and render
+                    // inline, styled like inline code but in italic so
+                    // readers can tell math from code at a glance.
+                    let rendered = crate::markdown::math::latex_to_unicode(&math);
+                    let style = self
+                        .current_style()
+                        .fg(self.tokens.syntax.inline_code)
+                        .add_modifier(Modifier::ITALIC);
+                    self.current_spans.push(Span::styled(rendered, style));
+                }
+                Event::DisplayMath(math) => {
+                    // Convert LaTeX to Unicode and render as a bordered
+                    // block labelled "math", mirroring the code-block
+                    // frame.
+                    let rendered = crate::markdown::math::latex_to_unicode(&math);
+                    self.flush_line();
+                    let border_style = Style::default().fg(self.tokens.syntax.code_border);
+                    let math_style = Style::default()
+                        .fg(self.tokens.syntax.code_fg)
+                        .bg(self.tokens.surface.raised)
+                        .add_modifier(Modifier::ITALIC);
+                    let math_lines: Vec<&str> = rendered.lines().collect();
+                    let max_width = math_lines
+                        .iter()
+                        .map(|l| UnicodeWidthStr::width(*l))
+                        .max()
+                        .unwrap_or(0)
+                        .max(20);
+                    let inner_width = max_width + 1;
+                    let label = " math ";
+
+                    self.push_blank_line();
+                    // Top border with "math" label.
+                    self.lines.push(Line::from(vec![
+                        Span::styled("╭".to_string(), border_style),
+                        Span::styled(
+                            label.to_string(),
+                            Style::default()
+                                .fg(self.tokens.syntax.inline_code)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(
+                                "{}╮",
+                                "─".repeat(inner_width + 1 - label.len().min(inner_width))
+                            ),
+                            border_style,
+                        ),
+                    ]));
+                    self.current_source_lines.push(self.current_source_line);
+                    // Content lines.
+                    for line in &math_lines {
+                        self.lines.push(Line::from(vec![
+                            Span::styled(
+                                "│ ".to_string(),
+                                Style::default()
+                                    .fg(self.tokens.syntax.code_border)
+                                    .bg(self.tokens.surface.raised),
+                            ),
+                            Span::styled(format!("{line:<inner_width$}"), math_style),
+                            Span::styled(
+                                "│".to_string(),
+                                Style::default()
+                                    .fg(self.tokens.syntax.code_border)
+                                    .bg(self.tokens.surface.raised),
+                            ),
+                        ]));
+                        self.current_source_lines.push(self.current_source_line);
+                    }
+                    // Bottom border.
+                    self.lines.push(Line::from(Span::styled(
+                        format!("╰{}╯", "─".repeat(inner_width + 1)),
+                        border_style,
+                    )));
+                    self.current_source_lines.push(self.current_source_line);
+                    self.push_blank_line();
+                }
+                _ => {}
+            }
+        }
+        if !self.current_spans.is_empty() {
+            self.flush_line();
+        }
+        self.flush_text_block();
+
+        // ── Post-render fixup: assign contiguous byte ranges ──────────────────
+        //
+        // This invariant is load-bearing for sub-phase 4's cursor-byte-offset →
+        // block-index lookup: every byte in `0..source.len()` must belong to
+        // exactly one block, with no gaps and no overlaps.
+        //
+        // Strategy: use each Text block's first `source_lines` entry to derive
+        // an approximate byte start via the line-boundary table, then make the
+        // ranges contiguous by clamping each block's end to the next block's
+        // start. For the first block, force `source_byte_start = 0`. For the
+        // last block, force `source_byte_end = source.len()`.
+        //
+        // Blocks are already emitted in document order; no sort is needed.
+        // The defensive sort is omitted because re-ordering could invalidate
+        // the `source_lines` invariant (they're also in document order).
+        let source_len = crate::cast::u32_sat(content.len());
+        let boundaries = &self.line_boundaries;
+
+        // First pass: set a raw byte_start for each block from its first
+        // source line. When the recorded source_line is past the last
+        // boundary, the block represents content past EOF (e.g. a trailing
+        // blank line synthesised after a mermaid fence at end-of-file). Use
+        // `content.len()` as the fallback so the contiguity loop pins the
+        // preceding block's end to the true end-of-source rather than 0.
+        let eof_byte = content.len();
+        for block in &mut self.blocks {
+            let raw_start = match block {
+                DocBlock::Text { source_lines, .. } => source_lines
+                    .first()
+                    .and_then(|&l| boundaries.get(l as usize).copied())
+                    .unwrap_or(eof_byte),
+                DocBlock::Mermaid { source_line, .. } => boundaries
+                    .get(*source_line as usize)
+                    .copied()
+                    .unwrap_or(eof_byte),
+                DocBlock::Table(t) => boundaries
+                    .get(t.source_line as usize)
+                    .copied()
+                    .unwrap_or(eof_byte),
+            };
+            match block {
+                DocBlock::Text {
+                    source_byte_start, ..
+                } => *source_byte_start = crate::cast::u32_sat(raw_start),
+                DocBlock::Mermaid {
+                    source_byte_start, ..
+                } => *source_byte_start = crate::cast::u32_sat(raw_start),
+                DocBlock::Table(t) => t.source_byte_start = crate::cast::u32_sat(raw_start),
+            }
+        }
+
+        // Ensure first block starts at 0.
+        if let Some(first) = self.blocks.first_mut() {
+            match first {
+                DocBlock::Text {
+                    source_byte_start, ..
+                } => *source_byte_start = 0,
+                DocBlock::Mermaid {
+                    source_byte_start, ..
+                } => *source_byte_start = 0,
+                DocBlock::Table(t) => t.source_byte_start = 0,
+            }
+        }
+
+        // Second pass: make ranges contiguous. Each block's end = next block's
+        // start; the last block's end = source.len().
+        let n = self.blocks.len();
+        for i in 0..n {
+            let next_start = if i + 1 < n {
+                match &self.blocks[i + 1] {
+                    DocBlock::Text {
+                        source_byte_start, ..
+                    } => *source_byte_start,
+                    DocBlock::Mermaid {
+                        source_byte_start, ..
+                    } => *source_byte_start,
+                    DocBlock::Table(t) => t.source_byte_start,
+                }
+            } else {
+                source_len
+            };
+            match &mut self.blocks[i] {
+                DocBlock::Text {
+                    source_byte_end, ..
+                } => *source_byte_end = next_start,
+                DocBlock::Mermaid {
+                    source_byte_end, ..
+                } => *source_byte_end = next_start,
+                DocBlock::Table(t) => t.source_byte_end = next_start,
+            }
+        }
+
+        self.blocks
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::match_same_arms)]
+    fn start_tag(&mut self, tag: Tag, span: &Range<usize>) {
+        match tag {
+            Tag::Heading { level, .. } => {
+                self.in_heading = true;
+                self.heading_level = level as u8;
+                self.heading_text.clear();
+                let color = match level {
+                    pulldown_cmark::HeadingLevel::H1 => self.tokens.heading.h1,
+                    pulldown_cmark::HeadingLevel::H2 => self.tokens.heading.h2,
+                    pulldown_cmark::HeadingLevel::H3 => self.tokens.heading.h3,
+                    _ => self.tokens.heading.other,
+                };
+                let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+                if level == pulldown_cmark::HeadingLevel::H1 {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                self.push_style(style);
+                let prefix = match level {
+                    pulldown_cmark::HeadingLevel::H1 => "█ ",
+                    pulldown_cmark::HeadingLevel::H2 => "▌ ",
+                    pulldown_cmark::HeadingLevel::H3 => "▎ ",
+                    _ => "  ",
+                };
+                self.current_spans
+                    .push(Span::styled(prefix.to_string(), self.current_style()));
+            }
+            Tag::Paragraph => {}
+            Tag::BlockQuote(_) => {
+                self.in_blockquote = true;
+                self.push_style(Style::default().fg(self.tokens.list.block_quote_fg));
+            }
+            Tag::CodeBlock(kind) => {
+                self.in_code_block = true;
+                self.code_block_lang = match &kind {
+                    CodeBlockKind::Fenced(lang) => {
+                        let s = lang.trim().to_lowercase();
+                        if s.is_empty() { None } else { Some(s) }
+                    }
+                    CodeBlockKind::Indented => None,
+                };
+                self.code_block_content.clear();
+                // Record the fence's byte offset and resolve its source line.
+                self.code_block_fence_offset = Some(span.start);
+                self.code_block_start_line = byte_offset_to_line(span.start, &self.line_boundaries);
+                // Only flush if there are pending inline spans — an unconditional
+                // flush_line() would push an empty line into self.lines, which then
+                // creates a spurious empty DocBlock::Text when the preceding element
+                // already called flush_text_block() (per-element granularity).
+                if !self.current_spans.is_empty() {
+                    self.flush_line();
+                }
+            }
+            Tag::List(start) => {
+                self.list_depth += 1;
+                self.list_counters.push(start);
+            }
+            Tag::Item => {
+                // Flush any content held on the still-open line before
+                // we push a new bullet. Without this, the FIRST nested
+                // item under a parent ends up concatenated to the
+                // parent's line (its preceding `TagEnd::Item` hasn't
+                // fired yet — the parent is still mid-item, with its
+                // text already in `current_spans`). Subsequent nested
+                // items work because each one IS preceded by the prior
+                // sibling's `TagEnd::Item` flush.
+                if !self.current_spans.is_empty() {
+                    self.flush_line();
+                }
+                let indent = "  ".repeat(self.list_depth.saturating_sub(1));
+                let bullet = if let Some(counter) = self.list_counters.last_mut() {
+                    if let Some(n) = counter {
+                        let bullet = format!("{indent}{n}. ");
+                        *n += 1;
+                        bullet
+                    } else {
+                        let marker = match self.list_depth {
+                            1 => "•",
+                            2 => "◦",
+                            _ => "▪",
+                        };
+                        format!("{indent}{marker} ")
+                    }
+                } else {
+                    format!("{indent}• ")
+                };
+                self.current_spans.push(Span::styled(
+                    bullet,
+                    Style::default().fg(self.tokens.list.marker),
+                ));
+            }
+            Tag::Emphasis => {
+                self.push_style(Style::default().add_modifier(Modifier::ITALIC));
+            }
+            Tag::Strong => {
+                self.push_style(Style::default().add_modifier(Modifier::BOLD));
+            }
+            Tag::Strikethrough => {
+                self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT));
+            }
+            Tag::Link { dest_url, .. } => {
+                self.link_col_start = self.current_col_width();
+                self.current_link_url = Some(dest_url.into_string());
+                self.push_style(
+                    Style::default()
+                        .fg(self.tokens.accent.link)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
+            }
+            Tag::Table(alignments) => {
+                self.in_table = true;
+                self.table_alignments = alignments;
+                self.table_rows.clear();
+                self.table_header_row = None;
+                self.table_start_line = byte_offset_to_line(span.start, &self.line_boundaries);
+                self.flush_line();
+            }
+            Tag::TableHead => {
+                self.table_header = true;
+                self.table_row.clear();
+                // pulldown-cmark does NOT emit `Tag::TableRow` for a table's
+                // header — the header's cells live directly inside
+                // `TableHead`. Capture the source line here so `TagEnd::TableHead`
+                // has the right value to push onto `table_row_source_lines`.
+                self.current_table_row_source_line =
+                    byte_offset_to_line(span.start, &self.line_boundaries);
+            }
+            Tag::TableRow => {
+                self.table_row.clear();
+                // Capture the source line for body rows so we can map the
+                // cursor back to the exact markdown row when entering edit
+                // mode or jumping from search.
+                self.current_table_row_source_line =
+                    byte_offset_to_line(span.start, &self.line_boundaries);
+            }
+            Tag::TableCell => {}
+            _ => {}
+        }
+    }
+
+    fn end_tag(&mut self, tag: TagEnd, span: &Range<usize>) {
+        match tag {
+            TagEnd::Heading(_) => {
+                self.pop_style();
+                // Record the anchor before flushing; `self.lines.len()` is the
+                // 0-based index of the line we are about to push.
+                let anchor = heading_to_anchor(&self.heading_text);
+                self.pending_heading_anchors.push(HeadingAnchor {
+                    anchor,
+                    line: crate::cast::u32_sat(self.lines.len()),
+                    level: self.heading_level,
+                });
+                self.flush_line();
+                // Blank line is part of this heading's block (visual separator),
+                // then flush so each heading gets its own DocBlock::Text.
+                self.push_blank_line();
+                self.flush_text_block();
+                self.in_heading = false;
+                self.heading_text.clear();
+            }
+            TagEnd::Paragraph => {
+                self.flush_line();
+                // Blank line belongs to this paragraph's block, then flush so
+                // each paragraph is a separate DocBlock::Text.
+                self.push_blank_line();
+                self.flush_text_block();
+            }
+            TagEnd::BlockQuote(_) => {
+                self.in_blockquote = false;
+                self.pop_style();
+                // Blank line belongs to this blockquote's block, then flush so
+                // each blockquote is a separate DocBlock::Text.
+                self.push_blank_line();
+                self.flush_text_block();
+            }
+            TagEnd::CodeBlock => {
+                let lang = self.code_block_lang.as_deref();
+                let is_mermaid = lang == Some("mermaid")
+                    || (lang.is_none_or(str::is_empty)
+                        && looks_like_mermaid(&self.code_block_content));
+                // Advance `current_source_line` past the closing fence before
+                // emitting. Without this, the trailing `push_blank_line()` in
+                // `emit_mermaid_block` (and the subsequent text block's first
+                // `source_lines` entry) would anchor at the last diagram-content
+                // line — pinning the next block's `source_byte_start` *inside*
+                // the fence and starving the mermaid block's range of its
+                // content + closing fence. `span.end` is the byte offset right
+                // after the closing fence's newline.
+                // pulldown-cmark's End(CodeBlock) span ends at the byte just
+                // past the closing fence's last `` ` `` (excluding the trailing
+                // newline). `span.end - 1` is therefore the last byte of the
+                // closing fence; its line is the closing-fence line. The line
+                // *after* the closing fence is the right anchor for the
+                // trailing `push_blank_line()` so the next text block's
+                // `source_byte_start` lands past the fence (instead of pinning
+                // it inside, which would starve the mermaid block of its own
+                // content + closing fence in the contiguity-fixup pass).
+                let closing_fence_line =
+                    byte_offset_to_line(span.end.saturating_sub(1), &self.line_boundaries);
+                self.current_source_line = closing_fence_line.saturating_add(1);
+                if is_mermaid {
+                    self.emit_mermaid_block();
+                } else {
+                    self.render_code_block();
+                    // Flush so each fenced code block is its own DocBlock::Text.
+                    // `render_code_block` already appended the trailing blank line
+                    // (visual separator), so the blank is part of this block.
+                    // Mermaid already calls flush_text_block inside emit_mermaid_block.
+                    self.flush_text_block();
+                }
+                self.in_code_block = false;
+                self.code_block_lang = None;
+            }
+            TagEnd::List(_) => {
+                self.list_depth = self.list_depth.saturating_sub(1);
+                self.list_counters.pop();
+                if self.list_depth == 0 {
+                    // Blank line belongs to this list's block, then flush so the
+                    // outermost list is its own DocBlock::Text. Nested list closes
+                    // (list_depth > 0 after decrement) must NOT flush — nested
+                    // lists must stay in a single block with their parent.
+                    self.push_blank_line();
+                    self.flush_text_block();
+                }
+            }
+            TagEnd::Item => {
+                self.flush_line();
+            }
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
+                self.pop_style();
+            }
+            TagEnd::Link => {
+                self.pop_style();
+                if let Some(url) = self.current_link_url.take() {
+                    let col_end = self.current_col_width();
+                    // Collect the visible text from spans added since link start.
+                    let text: String = self
+                        .current_spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                        .chars()
+                        .skip(self.link_col_start as usize)
+                        .collect();
+                    self.pending_links.push(LinkInfo {
+                        line: crate::cast::u32_sat(self.lines.len()),
+                        col_start: self.link_col_start,
+                        col_end,
+                        url,
+                        text,
+                    });
+                }
+            }
+            TagEnd::Table => {
+                self.emit_table_block();
+                self.in_table = false;
+            }
+            TagEnd::TableHead => {
+                self.table_header_row = Some(self.table_row.clone());
+                // Record the header row's source line before clearing the flag.
+                self.table_row_source_lines
+                    .push(self.current_table_row_source_line);
+                self.table_header = false;
+            }
+            TagEnd::TableRow if !self.table_header => {
+                self.table_rows.push(self.table_row.clone());
+                // Record the body row's source line (header is already recorded
+                // in TagEnd::TableHead above).
+                self.table_row_source_lines
+                    .push(self.current_table_row_source_line);
+            }
+            TagEnd::TableCell => {
+                let cell_spans: CellSpans = self.current_spans.drain(..).collect();
+                self.table_row.push(cell_spans);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_text(&mut self, text: &str) {
+        if self.in_code_block {
+            for line in text.split('\n') {
+                self.code_block_content.push(line.to_string());
+            }
+            if self.code_block_content.last().is_some_and(String::is_empty) {
+                self.code_block_content.pop();
+            }
+        } else {
+            if self.in_heading {
+                self.heading_text.push_str(text);
+            }
+            self.current_spans
+                .push(Span::styled(text.to_string(), self.current_style()));
+        }
+    }
+
+    /// Flush accumulated code lines as a `DocBlock::Mermaid`, preceded by any
+    /// pending text lines as a `DocBlock::Text`.
+    fn emit_mermaid_block(&mut self) {
+        self.flush_text_block();
+
+        let source = self.code_block_content.join("\n");
+        self.code_block_content.clear();
+
+        let id = MermaidBlockId(hash_str(&source));
+        // Byte ranges are populated by the post-render fixup pass in `render`;
+        // set to 0 here as sentinels that the fixup will overwrite.
+        self.blocks.push(DocBlock::Mermaid {
+            id,
+            source,
+            cell_height: Cell::new(DEFAULT_MERMAID_HEIGHT),
+            // The fence line is the canonical source position for the block.
+            source_line: self.code_block_start_line,
+            source_byte_start: 0,
+            source_byte_end: 0,
+        });
+        // Blank line after the diagram (will open a new Text block).
+        self.push_blank_line();
+    }
+
+    fn render_code_block(&mut self) {
+        // `tokens.syntax.code_border` — the chrome color for fenced code boxes.
+        let border_style = Style::default().fg(self.tokens.syntax.code_border);
+
+        // Capture the fence's source line before any mutable borrows below.
+        let code_start_line = self.code_block_start_line;
+
+        // Widths are measured in display cells, not bytes, so that lines
+        // containing multi-byte characters (em dashes, CJK, emoji, …) align
+        // with the box frame drawn around them.
+        let max_width = self
+            .code_block_content
+            .iter()
+            .map(|l| UnicodeWidthStr::width(l.as_str()))
+            .max()
+            .unwrap_or(0)
+            .max(20);
+        let inner_width = max_width + 1;
+
+        // Join lines with newlines so syntect sees a complete source text.
+        // highlight_code returns one TokenLine per source line.
+        let source = self.code_block_content.join("\n");
+        let token_lines = highlight_code(
+            &source,
+            self.code_block_lang.as_deref(),
+            self.syntax_theme_name,
+            // `tokens.syntax.code_fg` — default foreground for unhighlighted tokens.
+            self.tokens.syntax.code_fg,
+            // `tokens.surface.raised` — code blocks share the raised surface tier
+            // with popups and the status bar; see `Syntax` doc in tokens.rs.
+            self.tokens.surface.raised,
+        );
+
+        // Blank line before the box — maps to whatever was current before the block.
+        self.push_blank_line();
+
+        // Top border maps to the fence line.
+        self.lines.push(Line::from(Span::styled(
+            format!("╭{}╮", "─".repeat(inner_width + 1)),
+            border_style,
+        )));
+        self.current_source_lines.push(code_start_line);
+
+        // One rendered line per source line.
+        // Layout per line (matching the original single-span format):
+        //   "│ " <highlighted tokens padded to inner_width> "│"
+        //
+        // The tokens together have `line.len()` visible bytes.  We pad the gap
+        // between the last token and the right border with spaces using the
+        // same background color, so the box aligns regardless of token count.
+        for (i, (src_line, token_line)) in self
+            .code_block_content
+            .iter()
+            .zip(token_lines.iter())
+            .enumerate()
+        {
+            let line_width = UnicodeWidthStr::width(src_line.as_str());
+            let pad_len = inner_width.saturating_sub(line_width);
+
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(token_line.len() + 3);
+
+            // Left border + leading space (border color for `│`, surface.raised for
+            // the space so it blends with the token background).
+            spans.push(Span::styled(
+                "│ ".to_string(),
+                Style::default()
+                    .fg(self.tokens.syntax.code_border)
+                    .bg(self.tokens.surface.raised),
+            ));
+
+            // Syntax-highlighted token spans.
+            for (text, style) in token_line {
+                spans.push(Span::styled(text.clone(), *style));
+            }
+
+            // Padding to align right border.
+            if pad_len > 0 {
+                spans.push(Span::styled(
+                    " ".repeat(pad_len),
+                    Style::default().bg(self.tokens.surface.raised),
+                ));
+            }
+
+            // Right border.
+            spans.push(Span::styled(
+                "│".to_string(),
+                Style::default()
+                    .fg(self.tokens.syntax.code_border)
+                    .bg(self.tokens.surface.raised),
+            ));
+
+            self.lines.push(Line::from(spans));
+            // Content line i (0-indexed) lives one source line after the fence.
+            self.current_source_lines
+                .push(code_start_line + 1 + crate::cast::u32_sat(i));
+        }
+
+        // Bottom border maps to the line after the last content line.
+        let bottom_source_line =
+            code_start_line + 1 + crate::cast::u32_sat(self.code_block_content.len());
+        self.lines.push(Line::from(Span::styled(
+            format!("╰{}╯", "─".repeat(inner_width + 1)),
+            border_style,
+        )));
+        self.current_source_lines.push(bottom_source_line);
+
+        self.code_block_content.clear();
+        self.push_blank_line();
+    }
+
+    fn emit_table_block(&mut self) {
+        let headers = self.table_header_row.take().unwrap_or_default();
+        let rows = std::mem::take(&mut self.table_rows);
+        let row_source_lines = std::mem::take(&mut self.table_row_source_lines);
+        let alignments = std::mem::take(&mut self.table_alignments);
+
+        let num_cols = headers
+            .len()
+            .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+
+        if num_cols == 0 {
+            return;
+        }
+
+        let mut natural_widths = vec![0usize; num_cols];
+        for (i, cell) in headers.iter().enumerate() {
+            natural_widths[i] = natural_widths[i].max(crate::text_layout::measure(cell) as usize);
+        }
+        for row in &rows {
+            for (i, cell) in row.iter().enumerate() {
+                if i < num_cols {
+                    natural_widths[i] =
+                        natural_widths[i].max(crate::text_layout::measure(cell) as usize);
+                }
+            }
+        }
+        // Minimum column width of 1 so borders are always valid.
+        for w in &mut natural_widths {
+            *w = (*w).max(1);
+        }
+
+        // Hash the flattened text content for a stable, content-derived id.
+        let mut content_bytes = Vec::new();
+        for h in &headers {
+            content_bytes.extend_from_slice(cell_to_string(h).as_bytes());
+        }
+        for row in &rows {
+            for cell in row {
+                content_bytes.extend_from_slice(cell_to_string(cell).as_bytes());
+            }
+        }
+        let id = TableBlockId(hash_bytes(&content_bytes));
+
+        // Pessimistic height: top + header + separator + rows + bottom.
+        // layout_table will refine this on first draw; this seeds the scrolling math.
+        let rendered_height = (crate::cast::u32_sat(rows.len()) + 3).max(3);
+
+        self.flush_text_block();
+        // Byte ranges are populated by the post-render fixup pass in `render`;
+        // set to 0 here as sentinels that the fixup will overwrite.
+        self.blocks.push(DocBlock::Table(TableBlock {
+            id,
+            headers,
+            rows,
+            alignments,
+            natural_widths,
+            rendered_height,
+            source_line: self.table_start_line,
+            row_source_lines,
+            source_byte_start: 0,
+            source_byte_end: 0,
+        }));
+        self.push_blank_line();
+    }
+}
+
+fn hash_str(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+fn hash_bytes(b: &[u8]) -> u64 {
+    let mut h = DefaultHasher::new();
+    b.hash(&mut h);
+    h.finish()
+}
+
+/// Heuristic: does an untagged code block look like Mermaid source?
+///
+/// Triggered for ` ``` ` fences with no language tag (a common
+/// authoring mistake — the user expected `` ```mermaid `` to render
+/// the diagram). We match on the first non-empty line starting with
+/// one of Mermaid's diagram-declaration keywords AND followed by
+/// mermaid-typical syntax — for `graph`/`flowchart` that means a
+/// direction token (TD/TB/BT/LR/RL); for the others a colon or
+/// whitespace+identifier is enough. This avoids false positives on
+/// legitimate JS/TS lines like `graph = {};` or `import { graph }`.
+fn looks_like_mermaid(content: &[String]) -> bool {
+    let first = content
+        .iter()
+        .find(|line| !line.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    // Diagrams that take a flow direction as the next token.
+    const DIRECTIONAL: &[&str] = &["graph", "flowchart"];
+    const DIRECTIONS: &[&str] = &["TD", "TB", "BT", "LR", "RL"];
+    for kw in DIRECTIONAL {
+        if let Some(rest) = first.strip_prefix(kw) {
+            // After the keyword we expect whitespace + a direction
+            // (most common), or a semicolon (compact one-line form
+            // `graph LR; A --> B`). Reject anything else — `graph =`
+            // and friends fall through here.
+            let rest = rest.trim_start();
+            for dir in DIRECTIONS {
+                if rest == *dir
+                    || rest.starts_with(&format!("{dir} "))
+                    || rest.starts_with(&format!("{dir};"))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    // Diagrams whose declaration keyword stands alone on the first
+    // line. Strict equality (no trailing chars) to avoid catching
+    // English sentences like "sequenceDiagram is great". Users who
+    // write the rare single-line variants (e.g. `pie title Pets`)
+    // need to add the explicit ` ```mermaid ` tag — that's a fair
+    // ask for an unambiguous heuristic.
+    const STANDALONE: &[&str] = &[
+        "sequenceDiagram",
+        "stateDiagram-v2",
+        "stateDiagram",
+        "erDiagram",
+        "classDiagram",
+        "pie",
+        "gantt",
+        "journey",
+        "gitGraph",
+        "mindmap",
+        "timeline",
+        "quadrantChart",
+        "requirementDiagram",
+        "C4Context",
+        "C4Container",
+        "C4Component",
+        "C4Dynamic",
+    ];
+    if STANDALONE.iter().any(|kw| first == *kw) {
+        return true;
+    }
+    // For `pie`-style declarations that put the title on the same
+    // line, also accept the pattern `pie title "..."` and
+    // `pie showData ...` since those are common Mermaid forms.
+    if first.starts_with("pie title ")
+        || first.starts_with("pie showData")
+        || first.starts_with("gantt dateFormat ")
+    {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::Theme;
+
+    fn default_palette() -> Palette {
+        Palette::from_theme(Theme::Default)
+    }
+
+    /// Helper: render a fenced code block and extract all rendered lines
+    /// (including borders) from the first Text block.
+    fn render_code_block_lines(lang: &str, code: &str) -> Vec<Line<'static>> {
+        let md = format!("```{lang}\n{code}\n```\n");
+        let blocks = render_markdown(&md, &default_palette(), Theme::Default);
+        match blocks
+            .into_iter()
+            .find(|b| matches!(b, DocBlock::Text { .. }))
+        {
+            Some(DocBlock::Text { text, .. }) => text.lines,
+            _ => panic!("expected a Text block"),
+        }
+    }
+
+    /// Untagged ``` fence whose first non-empty line is a Mermaid
+    /// diagram-declaration should render as a Mermaid block, not a
+    /// plain code block. Catches the common authoring mistake of
+    /// writing ``` instead of ```mermaid.
+    ///
+    /// The heuristic is intentionally tight (see `looks_like_mermaid`):
+    /// `graph` / `flowchart` need an explicit direction token next;
+    /// the standalone declarations (`sequenceDiagram`, `erDiagram`,
+    /// etc.) need to be the entire first line. This avoids false
+    /// positives on English prose or JS.
+    #[test]
+    fn untagged_mermaid_syntax_renders_as_mermaid_block() {
+        let cases = [
+            "graph TD\n    A --> B",
+            "stateDiagram-v2\n    [*] --> Active",
+            "sequenceDiagram\n    Alice->>Bob: hi",
+            "erDiagram\n    A ||--o{ B : has",
+            "pie title Pets\n    \"Dogs\" : 10",
+            "pie showData title Pets\n    \"Dogs\" : 10",
+            "flowchart LR\n    A --> B",
+            "graph LR; A --> B", // semicolon-on-same-line form
+        ];
+        for src in cases {
+            let md = format!("```\n{src}\n```\n");
+            let blocks = render_markdown(&md, &default_palette(), Theme::Default);
+            assert!(
+                blocks.iter().any(|b| matches!(b, DocBlock::Mermaid { .. })),
+                "expected a Mermaid block for source:\n{src}\n\nblocks: {blocks:?}",
+            );
+        }
+    }
+
+    /// Plain code in an untagged fence must NOT be detected as Mermaid
+    /// — false positives would silently break legitimate code blocks.
+    #[test]
+    fn plain_code_in_untagged_fence_stays_a_code_block() {
+        let cases = [
+            "let x = 42;",                  // Rust
+            "fn main() {}",                 // Rust
+            "graph = {};",                  // JS object containing word "graph"
+            "sequenceDiagram is great",     // doc-style sentence
+            "// comment about graph TD",    // comment
+            "import { graph } from 'lib';", // import statement
+        ];
+        for src in cases {
+            let md = format!("```\n{src}\n```\n");
+            let blocks = render_markdown(&md, &default_palette(), Theme::Default);
+            assert!(
+                !blocks.iter().any(|b| matches!(b, DocBlock::Mermaid { .. })),
+                "false positive: plain text was detected as Mermaid:\n{src}\n\nblocks: {blocks:?}",
+            );
+        }
+    }
+
+    /// A Rust fenced code block must produce content lines that contain more
+    /// than one span with distinct foreground colors, confirming that
+    /// highlighting was applied.
+    #[test]
+    fn rust_code_block_spans_have_distinct_colors() {
+        let lines = render_code_block_lines("rust", "let x: i32 = 42;");
+
+        // Skip blank lines and border lines; find the first content line.
+        let content_line = lines.iter().find(|l| {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            text.starts_with("│ ") && !text.starts_with("│ ─") && text.contains("let")
+        });
+
+        let content_line = content_line.expect("expected a content line containing 'let'");
+        assert!(
+            content_line.spans.len() > 2,
+            "expected more than 2 spans on a highlighted Rust line, got {}",
+            content_line.spans.len(),
+        );
+
+        let colors: std::collections::HashSet<ratatui::style::Color> = content_line
+            .spans
+            .iter()
+            .filter_map(|s| s.style.fg)
+            // Exclude border spans (code_border color).
+            .filter(|c| *c != default_palette().code_border)
+            .collect();
+        assert!(
+            colors.len() > 1,
+            "expected multiple distinct token colors on a Rust line, got {colors:?}",
+        );
+    }
+
+    /// A fenced block with no language tag must produce content lines that have
+    /// a single foreground color (plain-text fallback).
+    #[test]
+    fn no_language_code_block_is_single_color() {
+        let lines = render_code_block_lines("", "hello world\nsome code");
+
+        let content_lines: Vec<&Line<'static>> = lines
+            .iter()
+            .filter(|l| {
+                let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                // Content lines start with "│ " but are not box borders.
+                text.starts_with("│ ") && !text.starts_with("╭") && !text.starts_with("╰")
+            })
+            .collect();
+
+        assert!(!content_lines.is_empty(), "expected content lines");
+
+        for line in content_lines {
+            // Collect token-span colors (excluding border characters).
+            let colors: std::collections::HashSet<ratatui::style::Color> = line
+                .spans
+                .iter()
+                .filter(|s| !s.content.contains('│'))
+                .filter_map(|s| s.style.fg)
+                .collect();
+            assert!(
+                colors.len() <= 1,
+                "expected at most one token color for plain-text fallback, got {colors:?}",
+            );
+        }
+    }
+
+    /// An unknown language tag must not panic and must produce output.
+    #[test]
+    fn unknown_language_does_not_panic() {
+        let lines = render_code_block_lines("notalang", "some code here");
+        assert!(
+            !lines.is_empty(),
+            "expected rendered lines for unknown language",
+        );
+    }
+
+    /// The right border `│` must be at the same visual column position as it
+    /// would be in the old single-span rendering, for a known ASCII input.
+    ///
+    /// With `max_width = max(len("hello world"), 20) = 20` and
+    /// `inner_width = 21`, the full line is:
+    ///   "│ " + 21 chars padded + "│"  = 2 + 21 + 1 = 24 chars.
+    #[test]
+    fn right_border_aligns_at_expected_column() {
+        let lines = render_code_block_lines("", "hello world");
+
+        // Find the first content line (not blank, not top/bottom border).
+        let content_line = lines.iter().find(|l| {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            text.starts_with("│ ") && !text.starts_with("╭") && !text.starts_with("╰")
+        });
+
+        let content_line = content_line.expect("expected a content line");
+
+        // Concatenate all span text to get the full rendered line.
+        let full_text: String = content_line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+
+        // inner_width = max(11, 20) + 1 = 21; full line = "│ " + 21 chars + "│"
+        let expected_len = 2 + 21 + 1; // = 24
+        assert_eq!(
+            full_text.chars().count(),
+            expected_len,
+            "expected line length {expected_len}, got {} for line: {full_text:?}",
+            full_text.chars().count(),
+        );
+        assert!(
+            full_text.ends_with('│'),
+            "line must end with right border '│': {full_text:?}",
+        );
+    }
+
+    /// Multi-byte characters (em dash is 3 bytes / 1 display cell) must not
+    /// shift the right border: every content line in a mixed-width block must
+    /// have the same display width, measured in cells.
+    #[test]
+    fn right_border_aligns_with_multi_byte_chars() {
+        use unicode_width::UnicodeWidthStr;
+
+        // One ASCII line and one em-dash line; the ASCII line is longer in
+        // cells so it determines `max_width`.
+        let src = "hello world this is a long line\n    /// short — comment";
+        let lines = render_code_block_lines("", src);
+
+        let content_lines: Vec<&Line<'static>> = lines
+            .iter()
+            .filter(|l| {
+                let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                text.starts_with("│ ") && !text.starts_with("╭") && !text.starts_with("╰")
+            })
+            .collect();
+
+        assert!(
+            content_lines.len() >= 2,
+            "expected at least two content lines, got {}",
+            content_lines.len(),
+        );
+
+        let widths: Vec<usize> = content_lines
+            .iter()
+            .map(|l| {
+                let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                UnicodeWidthStr::width(text.as_str())
+            })
+            .collect();
+
+        let first = widths[0];
+        for (i, w) in widths.iter().enumerate() {
+            assert_eq!(
+                *w, first,
+                "line {i} has display width {w}, expected {first} (right border misaligned)",
+            );
+        }
+    }
+
+    /// Nested list items must each render on their own line. Regression
+    /// guard for a bug where the FIRST nested item under each parent was
+    /// concatenated to the parent's line (because `Tag::Item` didn't
+    /// flush the parent's still-open content line before pushing the
+    /// nested bullet). Subsequent nested items rendered correctly
+    /// because the prior sibling's `TagEnd::Item` flushed for them.
+    #[test]
+    fn nested_list_items_each_get_own_line() {
+        let md = "\
+- Top one
+  - Nested one-A
+  - Nested one-B
+  - Nested one-C
+- Top two
+  - Nested two-A
+  - Nested two-B
+";
+        let blocks = render_markdown(md, &default_palette(), Theme::Default);
+        let DocBlock::Text { text, .. } = blocks
+            .iter()
+            .find(|b| matches!(b, DocBlock::Text { .. }))
+            .unwrap()
+        else {
+            panic!("expected a Text block");
+        };
+        // Build a map of (line text, count) so we can assert each
+        // bullet is its own line. Stripping markers and whitespace.
+        let line_strs: Vec<String> = text
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        // Each of the 7 list items should appear on a SEPARATE line.
+        // (There may be a trailing blank line after the list — that's
+        // fine.)
+        for label in [
+            "Top one",
+            "Nested one-A",
+            "Nested one-B",
+            "Nested one-C",
+            "Top two",
+            "Nested two-A",
+            "Nested two-B",
+        ] {
+            let containing_lines: Vec<&String> =
+                line_strs.iter().filter(|l| l.contains(label)).collect();
+            assert_eq!(
+                containing_lines.len(),
+                1,
+                "expected `{label}` on exactly one line; found {}: {:?}\n\nfull lines:\n{}",
+                containing_lines.len(),
+                containing_lines,
+                line_strs.join("\n"),
+            );
+            // The line containing the label must NOT contain any OTHER
+            // bullet's text — the bug-symptom was concatenated bullets.
+            let line = containing_lines[0];
+            for other in [
+                "Top one",
+                "Nested one-A",
+                "Nested one-B",
+                "Nested one-C",
+                "Top two",
+                "Nested two-A",
+                "Nested two-B",
+            ] {
+                if other != label {
+                    assert!(
+                        !line.contains(other),
+                        "line for `{label}` also contains `{other}`: {line:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    // ── Phase 1: source-line plumbing tests ──────────────────────────────────
+
+    /// For every `DocBlock::Text`, `source_lines` must be the same length as
+    /// `text.lines` — the invariant enforced by `flush_text_block`.
+    #[test]
+    fn source_lines_parallel_to_text_lines() {
+        let md = "Line 1\nLine 2\n\nLine 4\n";
+        let blocks = render_markdown(md, &default_palette(), Theme::Default);
+        for block in &blocks {
+            if let DocBlock::Text {
+                text, source_lines, ..
+            } = block
+            {
+                assert_eq!(
+                    text.lines.len(),
+                    source_lines.len(),
+                    "source_lines length {} != text.lines length {}",
+                    source_lines.len(),
+                    text.lines.len(),
+                );
+            }
+        }
+    }
+
+    /// A heading on line 0 should emit its own block mapping to source line 0.
+    /// A paragraph starting on line 2 (after blank line) should emit its own
+    /// block mapping to source line 2.  With per-element granularity the two
+    /// are now separate `DocBlock::Text` values.
+    #[test]
+    fn source_lines_map_paragraph_correctly() {
+        let md = "# Title\n\nParagraph text\n";
+        let blocks = render_markdown(md, &default_palette(), Theme::Default);
+
+        // Locate the block whose first rendered line contains the heading prefix.
+        let heading_block = blocks.iter().find(|b| {
+            if let DocBlock::Text { text, .. } = b {
+                text.lines
+                    .iter()
+                    .any(|l| l.spans.iter().any(|s| s.content.contains("Title")))
+            } else {
+                false
+            }
+        });
+        let heading_block = heading_block.expect("expected a Text block containing 'Title'");
+        let DocBlock::Text { source_lines, .. } = heading_block else {
+            panic!("expected Text block");
+        };
+        // The heading is the very first rendered line in its block — source line 0.
+        assert_eq!(source_lines[0], 0, "heading should map to source line 0");
+
+        // Locate the block containing the paragraph text.
+        let para_block = blocks.iter().find(|b| {
+            if let DocBlock::Text { text, .. } = b {
+                text.lines
+                    .iter()
+                    .any(|l| l.spans.iter().any(|s| s.content.contains("Paragraph")))
+            } else {
+                false
+            }
+        });
+        let para_block = para_block.expect("expected a Text block containing 'Paragraph'");
+        let DocBlock::Text {
+            text, source_lines, ..
+        } = para_block
+        else {
+            panic!("expected Text block");
+        };
+        let para_idx = text
+            .lines
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.contains("Paragraph")))
+            .expect("expected a 'Paragraph' line");
+        // Paragraph starts after "# Title\n\n", i.e., on source line 2.
+        assert_eq!(
+            source_lines[para_idx], 2,
+            "paragraph should map to source line 2"
+        );
+    }
+
+    /// A paragraph whose source spans three lines (separated by single
+    /// newlines, not blank lines) must render as three rendered lines, not
+    /// one joined line. The viewer's scroll math counts logical lines, but
+    /// `Paragraph::wrap` would visually wrap a joined line into multiple
+    /// rows — the mismatch made tables and following text shift on screen
+    /// during scrolling. Preserving source line breaks keeps logical and
+    /// visual line counts aligned for the common prose case.
+    #[test]
+    fn soft_breaks_preserve_source_line_count() {
+        let md = "line one\nline two\nline three\n";
+        let blocks = render_markdown(md, &default_palette(), Theme::Default);
+        let text_block = blocks
+            .iter()
+            .find(|b| matches!(b, DocBlock::Text { .. }))
+            .expect("expected a Text block");
+        let DocBlock::Text {
+            text, source_lines, ..
+        } = text_block
+        else {
+            panic!("expected Text block");
+        };
+        // Three source lines + one trailing blank from TagEnd::Paragraph.
+        let content_lines: Vec<&str> = text
+            .lines
+            .iter()
+            .filter(|l| l.spans.iter().any(|s| !s.content.trim().is_empty()))
+            .map(|l| {
+                let s = l
+                    .spans
+                    .iter()
+                    .map(|sp| sp.content.as_ref())
+                    .collect::<String>();
+                Box::leak(s.into_boxed_str()) as &str
+            })
+            .collect();
+        assert_eq!(content_lines, vec!["line one", "line two", "line three"]);
+        // Each rendered content line should map back to its own source line.
+        let positions: Vec<u32> = text
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.spans.iter().any(|s| !s.content.trim().is_empty()))
+            .map(|(i, _)| source_lines[i])
+            .collect();
+        assert_eq!(positions, vec![0, 1, 2]);
+    }
+
+    /// A link whose visible text spans a soft break must remain a single
+    /// rendered line so its `LinkInfo` (line + col range) stays valid. The
+    /// soft break inside the link is rendered as a space.
+    #[test]
+    fn soft_break_inside_link_stays_joined() {
+        let md = "[two\nwords](http://example.com)\n";
+        let blocks = render_markdown(md, &default_palette(), Theme::Default);
+        let text_block = blocks
+            .iter()
+            .find(|b| matches!(b, DocBlock::Text { .. }))
+            .expect("expected a Text block");
+        let DocBlock::Text { text, links, .. } = text_block else {
+            panic!("expected Text block");
+        };
+        // The link's visible text is on a single rendered line.
+        assert_eq!(links.len(), 1);
+        let link = &links[0];
+        let line = &text.lines[link.line as usize];
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            rendered.contains("two words"),
+            "link text should be joined with a space; got {rendered:?}",
+        );
+    }
+
+    /// The top border of a code block maps to the fence line (0), each content
+    /// line maps to the fence line + 1 + its 0-based index, and the bottom
+    /// border maps to the line after the last content line.
+    #[test]
+    fn code_block_borders_map_to_fence() {
+        // Source layout:
+        //   line 0: ```rust
+        //   line 1: let x = 1;
+        //   line 2: let y = 2;
+        //   line 3: ```
+        let md = "```rust\nlet x = 1;\nlet y = 2;\n```\n";
+        let blocks = render_markdown(md, &default_palette(), Theme::Default);
+        let text_block = blocks
+            .iter()
+            .find(|b| matches!(b, DocBlock::Text { .. }))
+            .expect("expected a Text block");
+        let DocBlock::Text {
+            text, source_lines, ..
+        } = text_block
+        else {
+            panic!("expected Text block");
+        };
+
+        // Find the top border line (starts with '╭').
+        let top_idx = text
+            .lines
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.starts_with('╭')))
+            .expect("top border not found");
+        assert_eq!(
+            source_lines[top_idx], 0,
+            "top border should map to fence line (0)"
+        );
+
+        // Content lines immediately follow; their source lines are 1 and 2.
+        assert_eq!(
+            source_lines[top_idx + 1],
+            1,
+            "first content line should map to source line 1"
+        );
+        assert_eq!(
+            source_lines[top_idx + 2],
+            2,
+            "second content line should map to source line 2"
+        );
+
+        // Bottom border.
+        let bot_idx = text
+            .lines
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.starts_with('╰')))
+            .expect("bottom border not found");
+        assert_eq!(
+            source_lines[bot_idx], 3,
+            "bottom border should map to source line 3"
+        );
+    }
+
+    /// A table block's `source_line` should be 0 when the table starts at the
+    /// beginning of the document.
+    #[test]
+    fn table_captures_start_line() {
+        let md = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let blocks = render_markdown(md, &default_palette(), Theme::Default);
+        let table = blocks
+            .iter()
+            .find(|b| matches!(b, DocBlock::Table(_)))
+            .expect("expected a Table block");
+        let DocBlock::Table(t) = table else { panic!() };
+        assert_eq!(t.source_line, 0, "table source_line should be 0");
+    }
+
+    /// A mermaid block's `source_line` should be 0 when the fence starts at
+    /// the beginning of the document.
+    #[test]
+    fn mermaid_captures_start_line() {
+        let md = "```mermaid\ngraph LR\nA-->B\n```\n";
+        let blocks = render_markdown(md, &default_palette(), Theme::Default);
+        let mermaid = blocks
+            .iter()
+            .find(|b| matches!(b, DocBlock::Mermaid { .. }))
+            .expect("expected a Mermaid block");
+        let DocBlock::Mermaid { source_line, .. } = mermaid else {
+            panic!()
+        };
+        assert_eq!(*source_line, 0, "mermaid source_line should be 0");
+    }
+
+    /// Text before a code block keeps its own source lines in a separate block;
+    /// the code block content lines report source lines relative to the fence
+    /// opening in their own block.  With per-element granularity, the intro
+    /// paragraph and the fenced code block are distinct `DocBlock::Text` values.
+    #[test]
+    fn text_before_code_block() {
+        // Source layout:
+        //   line 0: Intro
+        //   line 1: (blank)
+        //   line 2: ```rust
+        //   line 3: fn main() {}
+        //   line 4: ```
+        let md = "Intro\n\n```rust\nfn main() {}\n```\n";
+        let blocks = render_markdown(md, &default_palette(), Theme::Default);
+
+        // Find the block that contains "Intro" — the paragraph block.
+        let intro_block = blocks
+            .iter()
+            .find(|b| {
+                if let DocBlock::Text { text, .. } = b {
+                    text.lines
+                        .iter()
+                        .any(|l| l.spans.iter().any(|s| s.content.contains("Intro")))
+                } else {
+                    false
+                }
+            })
+            .expect("expected a Text block containing 'Intro'");
+        let DocBlock::Text {
+            text: intro_text,
+            source_lines: intro_source_lines,
+            ..
+        } = intro_block
+        else {
+            panic!("expected Text block");
+        };
+
+        // The first rendered line is "Intro" — source line 0.
+        let intro_idx = intro_text
+            .lines
+            .iter()
+            .position(|l| l.spans.iter().any(|s| s.content.contains("Intro")))
+            .expect("intro line not found");
+        assert_eq!(
+            intro_source_lines[intro_idx], 0,
+            "intro should map to source line 0"
+        );
+
+        // Find the block that contains the rendered code box (its own block now).
+        let code_block = blocks
+            .iter()
+            .find(|b| {
+                if let DocBlock::Text { text, .. } = b {
+                    text.lines.iter().any(|l| {
+                        let joined: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                        joined.contains("fn main") || joined.contains("fn")
+                    })
+                } else {
+                    false
+                }
+            })
+            .expect("expected a Text block containing code content");
+        let DocBlock::Text {
+            text: code_text,
+            source_lines: code_source_lines,
+            ..
+        } = code_block
+        else {
+            panic!("expected Text block");
+        };
+
+        // Find the first content line inside the code box.
+        let content_idx = code_text
+            .lines
+            .iter()
+            .position(|l| {
+                let joined: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                joined.contains("fn main") || joined.contains("fn")
+            })
+            .expect("code content line not found");
+        // Content line 0 inside the box → source line 3 (fence=2, content=2+1=3).
+        assert_eq!(
+            code_source_lines[content_idx], 3,
+            "first code content line should map to source line 3"
+        );
+    }
+
+    // ── table row_source_lines ───────────────────────────────────────────────
+
+    /// Rendering a 2-column table with a header and two body rows must produce
+    /// `row_source_lines` of length 3 (header + 2 body rows) and correctly
+    /// map each row to its markdown source line.
+    ///
+    /// Markdown input (0-indexed lines):
+    ///   0: | A | B |
+    ///   1: |---|---|
+    ///   2: | 1 | 2 |
+    ///   3: | 3 | 4 |
+    #[test]
+    fn table_captures_row_source_lines() {
+        let md = "| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
+        let p = default_palette();
+        let blocks = render_markdown(md, &p, crate::theme::Theme::Default);
+        let table = blocks
+            .iter()
+            .find_map(|b| {
+                if let DocBlock::Table(t) = b {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .expect("expected a Table block");
+
+        // Header is on source line 0; body rows on lines 2 and 3.
+        // (line 1 is the `|---|---|` separator, which is not a data row.)
+        assert_eq!(
+            table.row_source_lines,
+            vec![0, 2, 3],
+            "row_source_lines mismatch: {:#?}",
+            table.row_source_lines
+        );
+    }
+
+    /// A header-only table (no body rows) must produce exactly one entry in
+    /// `row_source_lines`.
+    #[test]
+    fn table_header_source_line_captured() {
+        let md = "| A | B |\n|---|---|\n";
+        let p = default_palette();
+        let blocks = render_markdown(md, &p, crate::theme::Theme::Default);
+        let table = blocks
+            .iter()
+            .find_map(|b| {
+                if let DocBlock::Table(t) = b {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .expect("expected a Table block");
+
+        assert_eq!(
+            table.row_source_lines,
+            vec![0],
+            "header-only table must have exactly one entry"
+        );
+    }
+
+    /// Regression test for a header-row tracking bug: when a table was
+    /// preceded by other content, the header's source line was recorded as
+    /// 0 instead of the header line's real source position. The root cause
+    /// was that pulldown-cmark does NOT emit `Tag::TableRow` for the
+    /// header — the header's cells live directly inside `Tag::TableHead` —
+    /// so the header's `current_table_row_source_line` was never updated
+    /// from its initial zero.
+    #[test]
+    fn table_header_source_line_not_anchored_to_zero_when_preceded_by_text() {
+        // Source layout:
+        //   0: # Title
+        //   1: (blank)
+        //   2: Some intro paragraph.
+        //   3: (blank)
+        //   4: | A | B |
+        //   5: |---|---|
+        //   6: | 1 | 2 |
+        let md = "# Title\n\nSome intro paragraph.\n\n| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let p = default_palette();
+        let blocks = render_markdown(md, &p, crate::theme::Theme::Default);
+        let table = blocks
+            .iter()
+            .find_map(|b| {
+                if let DocBlock::Table(t) = b {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .expect("expected a Table block");
+
+        assert_eq!(
+            table.row_source_lines,
+            vec![4, 6],
+            "header must be on source line 4 (not 0); body row on 6",
+        );
+    }
+
+    // ── mermaid source_line_at precision ────────────────────────────────────
+
+    /// `source_line_at` must map each cursor row inside a mermaid block to
+    /// the corresponding source line (fence + 1 + `row_offset`), clamped to the
+    /// last content line.
+    ///
+    /// Markdown input (0-indexed lines):
+    ///   0: ```mermaid
+    ///   1: graph LR
+    ///   2: A-->B
+    ///   3: C-->D
+    ///   4: ```
+    ///   5: (blank after fence)
+    #[test]
+    fn mermaid_source_line_precise_per_row() {
+        use super::DEFAULT_MERMAID_HEIGHT;
+        use crate::markdown::source_line_at;
+        use std::cell::Cell;
+
+        // Construct the block manually; the renderer collapses the content
+        // into a single `source` string.
+        let blocks = vec![DocBlock::Mermaid {
+            id: crate::markdown::MermaidBlockId(0),
+            source: "graph LR\nA-->B\nC-->D".to_string(), // 3 content lines
+            cell_height: Cell::new(DEFAULT_MERMAID_HEIGHT),
+            source_line: 0, // fence is on line 0
+            source_byte_start: 0,
+            source_byte_end: 0,
+        }];
+
+        let tl = std::collections::HashMap::new();
+        let bl = std::collections::HashMap::new();
+        // local == 0 → fence line
+        assert_eq!(source_line_at(&blocks, 0, &tl, &bl), 0, "fence row");
+        // local == 1 → first content line: fence + 1 + 0 = 1
+        assert_eq!(source_line_at(&blocks, 1, &tl, &bl), 1, "content[0]");
+        // local == 2 → second content line: fence + 1 + 1 = 2
+        assert_eq!(source_line_at(&blocks, 2, &tl, &bl), 2, "content[1]");
+        // local == 3 → third content line: fence + 1 + 2 = 3
+        assert_eq!(source_line_at(&blocks, 3, &tl, &bl), 3, "content[2]");
+        // local == 4 → clamped to last content (index 2): fence + 1 + 2 = 3
+        assert_eq!(
+            source_line_at(&blocks, 4, &tl, &bl),
+            3,
+            "clamped past last content"
+        );
+    }
+
+    // ── render_block_from_slice ──────────────────────────────────────────────
+
+    #[test]
+    fn render_block_from_slice_returns_one_block_for_simple_paragraph() {
+        let slice = "Hello, world.\n";
+        let blocks = render_block_from_slice(slice, 0, &default_palette(), Theme::Default);
+        assert_eq!(blocks.len(), 1, "expected exactly one block");
+        assert!(
+            matches!(blocks[0], DocBlock::Text { .. }),
+            "expected a Text block"
+        );
+    }
+
+    #[test]
+    fn render_block_from_slice_returns_multiple_blocks_for_split_input() {
+        // A mermaid fence embedded between two paragraphs forces the renderer
+        // to emit at least two blocks: the Text block before the fence and the
+        // Mermaid block (plus any trailing Text block).
+        let slice = "First paragraph.\n\n```mermaid\ngraph LR\nA-->B\n```\n\nSecond paragraph.\n";
+        let blocks = render_block_from_slice(slice, 0, &default_palette(), Theme::Default);
+        assert!(
+            blocks.len() >= 2,
+            "expected at least 2 blocks (Text + Mermaid), got {}: {blocks:?}",
+            blocks.len(),
+        );
+        assert!(
+            blocks.iter().any(|b| matches!(b, DocBlock::Text { .. })),
+            "expected at least one Text block"
+        );
+        assert!(
+            blocks.iter().any(|b| matches!(b, DocBlock::Mermaid { .. })),
+            "expected a Mermaid block"
+        );
+    }
+
+    #[test]
+    fn render_block_from_slice_byte_ranges_are_absolute() {
+        let slice = "Hello.\n";
+        let offset = 100usize;
+        let blocks = render_block_from_slice(slice, offset, &default_palette(), Theme::Default);
+        assert!(!blocks.is_empty());
+        // Every block's byte start must be >= the absolute offset.
+        for block in &blocks {
+            let (start, end) = match block {
+                DocBlock::Text {
+                    source_byte_start,
+                    source_byte_end,
+                    ..
+                } => (*source_byte_start as usize, *source_byte_end as usize),
+                DocBlock::Mermaid {
+                    source_byte_start,
+                    source_byte_end,
+                    ..
+                } => (*source_byte_start as usize, *source_byte_end as usize),
+                DocBlock::Table(t) => (t.source_byte_start as usize, t.source_byte_end as usize),
+            };
+            assert!(
+                start >= offset,
+                "source_byte_start {start} must be >= offset {offset}"
+            );
+            assert!(
+                end <= offset + slice.len(),
+                "source_byte_end {end} must be <= offset + slice.len() ({})",
+                offset + slice.len()
+            );
+        }
+        // First block starts exactly at the offset and last block ends at offset + slice.len().
+        let first_start = match &blocks[0] {
+            DocBlock::Text {
+                source_byte_start, ..
+            } => *source_byte_start as usize,
+            DocBlock::Mermaid {
+                source_byte_start, ..
+            } => *source_byte_start as usize,
+            DocBlock::Table(t) => t.source_byte_start as usize,
+        };
+        let last_end = match blocks.last().unwrap() {
+            DocBlock::Text {
+                source_byte_end, ..
+            } => *source_byte_end as usize,
+            DocBlock::Mermaid {
+                source_byte_end, ..
+            } => *source_byte_end as usize,
+            DocBlock::Table(t) => t.source_byte_end as usize,
+        };
+        assert_eq!(first_start, offset, "first block must start at the offset");
+        assert_eq!(
+            last_end,
+            offset + slice.len(),
+            "last block must end at offset + slice.len()"
+        );
+    }
+
+    #[test]
+    fn render_block_from_slice_for_mermaid_block() {
+        let slice = "```mermaid\ngraph LR\nA-->B\n```\n";
+        let blocks = render_block_from_slice(slice, 0, &default_palette(), Theme::Default);
+        assert!(
+            blocks.iter().any(|b| matches!(b, DocBlock::Mermaid { .. })),
+            "expected a Mermaid block, got: {blocks:?}"
+        );
+        let mermaid_block = blocks
+            .iter()
+            .find(|b| matches!(b, DocBlock::Mermaid { .. }))
+            .unwrap();
+        if let DocBlock::Mermaid { source, .. } = mermaid_block {
+            assert!(
+                source.contains("graph LR"),
+                "mermaid source should contain 'graph LR', got: {source:?}"
+            );
+        }
+    }
+
+    /// Regression: the mermaid block's `source_byte_start..source_byte_end` must
+    /// span the *entire* fenced region — opening fence, content, AND closing
+    /// fence. Previously the byte-range fixup pinned the next block's start
+    /// inside the fence (because `current_source_line` lagged on the last
+    /// diagram-content line), so the mermaid byte range covered only the
+    /// opening fence line. Hybrid mode then showed an incomplete raw view.
+    #[test]
+    fn mermaid_byte_range_covers_full_fence_with_trailing_paragraph() {
+        let source = "intro paragraph\n\n```mermaid\ngraph LR\nA-->B\n```\n\ntrailing paragraph\n";
+        let blocks = render_block_from_slice(source, 0, &default_palette(), Theme::Default);
+        let mermaid = blocks
+            .iter()
+            .find(|b| matches!(b, DocBlock::Mermaid { .. }))
+            .expect("expected a Mermaid block");
+        let DocBlock::Mermaid {
+            source_byte_start,
+            source_byte_end,
+            ..
+        } = mermaid
+        else {
+            unreachable!()
+        };
+        let start = *source_byte_start as usize;
+        let end = *source_byte_end as usize;
+        let slice = &source[start..end];
+        assert!(
+            slice.starts_with("```mermaid"),
+            "mermaid byte range must start at the opening fence, got: {slice:?}"
+        );
+        assert!(
+            slice.contains("graph LR") && slice.contains("A-->B"),
+            "mermaid byte range must include diagram content, got: {slice:?}"
+        );
+        assert!(
+            slice.trim_end().ends_with("```"),
+            "mermaid byte range must include the closing fence, got: {slice:?}"
+        );
+    }
+
+    /// Same regression but when the mermaid block is the *last* block in the
+    /// document (no trailing paragraph to pin its end). The contiguity
+    /// invariant guarantees the last block's end == source.len(), but earlier
+    /// the trailing `push_blank_line()` would still emit a stray empty Text
+    /// block whose start landed inside the fence.
+    #[test]
+    fn mermaid_byte_range_covers_full_fence_when_last_block() {
+        let source = "intro\n\n```mermaid\ngraph LR\nA-->B\n```\n";
+        let blocks = render_block_from_slice(source, 0, &default_palette(), Theme::Default);
+        let mermaid = blocks
+            .iter()
+            .find(|b| matches!(b, DocBlock::Mermaid { .. }))
+            .expect("expected a Mermaid block");
+        let DocBlock::Mermaid {
+            source_byte_start,
+            source_byte_end,
+            ..
+        } = mermaid
+        else {
+            unreachable!()
+        };
+        let start = *source_byte_start as usize;
+        let end = *source_byte_end as usize;
+        let slice = &source[start..end];
+        assert!(
+            slice.starts_with("```mermaid"),
+            "mermaid byte range must start at the opening fence, got: {slice:?}"
+        );
+        assert!(
+            slice.trim_end().ends_with("```"),
+            "mermaid byte range must include the closing fence, got: {slice:?}"
+        );
+    }
+
+    // ── Per-element block granularity (sub-phase 10) ─────────────────────────
+
+    /// Each `# Heading` must produce its own `DocBlock::Text` so hybrid mode
+    /// reveals only the heading under the cursor, not the entire document.
+    ///
+    /// Input: two headings separated by a blank line.  Expected output: at
+    /// least 2 Text blocks (one per heading); the contiguity invariant must hold.
+    #[test]
+    fn heading_emits_own_text_block() {
+        let md = "# H1\n\n# H2\n";
+        let blocks = render_markdown(md, &default_palette(), Theme::Default);
+
+        let text_blocks: Vec<&DocBlock> = blocks
+            .iter()
+            .filter(|b| matches!(b, DocBlock::Text { .. }))
+            .collect();
+        assert!(
+            text_blocks.len() >= 2,
+            "expected at least 2 Text blocks for 2 headings, got {}",
+            text_blocks.len(),
+        );
+
+        // Each heading must appear in its own block.
+        let has_h1 = |b: &&DocBlock| {
+            if let DocBlock::Text { text, .. } = b {
+                text.lines
+                    .iter()
+                    .any(|l| l.spans.iter().any(|s| s.content.contains("H1")))
+            } else {
+                false
+            }
+        };
+        let has_h2 = |b: &&DocBlock| {
+            if let DocBlock::Text { text, .. } = b {
+                text.lines
+                    .iter()
+                    .any(|l| l.spans.iter().any(|s| s.content.contains("H2")))
+            } else {
+                false
+            }
+        };
+        let h1_block = text_blocks.iter().find(|b| has_h1(b));
+        let h2_block = text_blocks.iter().find(|b| has_h2(b));
+        assert!(h1_block.is_some(), "expected a block containing H1");
+        assert!(h2_block.is_some(), "expected a block containing H2");
+
+        // H1 and H2 must be in different blocks.
+        let h1_idx = blocks.iter().position(|b| has_h1(&b)).unwrap();
+        let h2_idx = blocks.iter().position(|b| has_h2(&b)).unwrap();
+        assert_ne!(
+            h1_idx, h2_idx,
+            "H1 and H2 must be in separate DocBlock::Text values"
+        );
+
+        // Contiguity: each block's end == next block's start.
+        for i in 0..blocks.len().saturating_sub(1) {
+            let end_i = match &blocks[i] {
+                DocBlock::Text {
+                    source_byte_end, ..
+                } => *source_byte_end,
+                DocBlock::Mermaid {
+                    source_byte_end, ..
+                } => *source_byte_end,
+                DocBlock::Table(t) => t.source_byte_end,
+            };
+            let start_next = match &blocks[i + 1] {
+                DocBlock::Text {
+                    source_byte_start, ..
+                } => *source_byte_start,
+                DocBlock::Mermaid {
+                    source_byte_start, ..
+                } => *source_byte_start,
+                DocBlock::Table(t) => t.source_byte_start,
+            };
+            assert_eq!(
+                end_i,
+                start_next,
+                "contiguity broken between block[{i}] (end={end_i}) and block[{}] (start={start_next})",
+                i + 1,
+            );
+        }
+    }
+
+    /// A paragraph followed by a heading followed by another paragraph must
+    /// produce at least 3 separate `DocBlock::Text` values so each element is
+    /// independently addressable in hybrid mode.
+    #[test]
+    fn paragraph_and_heading_split_into_separate_blocks() {
+        let md = "Para.\n\n# Heading\n\nPara2.\n";
+        let blocks = render_markdown(md, &default_palette(), Theme::Default);
+
+        let text_blocks: Vec<&DocBlock> = blocks
+            .iter()
+            .filter(|b| matches!(b, DocBlock::Text { .. }))
+            .collect();
+        assert!(
+            text_blocks.len() >= 3,
+            "expected at least 3 Text blocks (para + heading + para), got {}",
+            text_blocks.len(),
+        );
+
+        let block_containing = |needle: &str| {
+            blocks.iter().position(|b| {
+                if let DocBlock::Text { text, .. } = b {
+                    text.lines
+                        .iter()
+                        .any(|l| l.spans.iter().any(|s| s.content.contains(needle)))
+                } else {
+                    false
+                }
+            })
+        };
+
+        let para_idx = block_containing("Para.").expect("expected block containing 'Para.'");
+        let heading_idx = block_containing("Heading").expect("expected block containing 'Heading'");
+        let para2_idx = block_containing("Para2.").expect("expected block containing 'Para2.'");
+
+        assert_ne!(
+            para_idx, heading_idx,
+            "paragraph and heading must be in separate blocks"
+        );
+        assert_ne!(
+            heading_idx, para2_idx,
+            "heading and para2 must be in separate blocks"
+        );
+        assert_ne!(
+            para_idx, para2_idx,
+            "para and para2 must be in separate blocks"
+        );
+    }
+
+    /// A nested list must stay in a single `DocBlock::Text` — inner list closes
+    /// must not flush.  The outermost list close is the only flush point.
+    #[test]
+    fn nested_list_stays_in_single_block() {
+        let md = "- a\n  - a1\n  - a2\n- b\n";
+        let blocks = render_markdown(md, &default_palette(), Theme::Default);
+
+        let text_blocks: Vec<&DocBlock> = blocks
+            .iter()
+            .filter(|b| matches!(b, DocBlock::Text { .. }))
+            .collect();
+
+        // All list items (outer + nested) must be in exactly one Text block.
+        assert_eq!(
+            text_blocks.len(),
+            1,
+            "nested list must produce exactly 1 Text block, got {}; blocks: {:#?}",
+            text_blocks.len(),
+            blocks,
+        );
+
+        // All four items must appear in that one block.
+        let DocBlock::Text { text, .. } = text_blocks[0] else {
+            panic!("expected Text block");
+        };
+        let all_content: String = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        for item in ["a", "a1", "a2", "b"] {
+            assert!(
+                all_content.contains(item),
+                "expected '{item}' in list block; content: {all_content:?}",
+            );
+        }
+    }
+}
