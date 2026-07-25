@@ -496,7 +496,11 @@ pub struct App {
     last_menu_popup_rect: Option<Rect>,
     last_picker_popup_rect: Option<Rect>,
     last_settings_popup_rect: Option<Rect>,
+    /// Popup rect of the acknowledgement overlay, cached last frame
+    /// so `on_mouse` can detect click-outside without recomputing.
+    last_ack_popup_rect: Option<Rect>,
     settings_state: crate::settings::SettingsState,
+    ack_state: crate::acknowledgement::AckOverlayState,
     flags: Arc<ActionFlags>,
     should_quit: bool,
     /// Transient status-bar hint (e.g. "Ctrl+T rejected: files is fixed").
@@ -932,6 +936,8 @@ impl App {
             last_menu_popup_rect: None,
             last_picker_popup_rect: None,
             last_settings_popup_rect: None,
+            last_ack_popup_rect: None,
+            ack_state: crate::acknowledgement::AckOverlayState::default(),
             flags,
             should_quit: false,
             hint: None,
@@ -1312,6 +1318,8 @@ impl App {
         self.settings_state.open();
         self.settings_state
             .set_markdown_theme(self.viewer_markdown_theme);
+        self.settings_state
+            .set_current_shell(self.shell_choice.clone());
         let _ = self.redraw_tx.send(());
     }
 
@@ -1331,6 +1339,13 @@ impl App {
             SettingsAction::SetMarkdownTheme(theme) => {
                 self.set_markdown_theme(theme);
                 self.settings_state.set_markdown_theme(theme);
+                let _ = self.redraw_tx.send(());
+            }
+            SettingsAction::SetShell(shell) => {
+                let label = shell.display_label();
+                self.shell_choice = shell.clone();
+                self.settings_state.set_current_shell(shell);
+                self.set_hint(format!("shell → {label} (applies to new shell tabs)"));
                 let _ = self.redraw_tx.send(());
             }
             SettingsAction::Tool { .. } | SettingsAction::Agent { .. } => {
@@ -1363,6 +1378,7 @@ impl App {
             || self.palette_state.open
             || self.picker_state.open
             || self.settings_state.open
+            || self.ack_state.open
         {
             return;
         }
@@ -1535,6 +1551,18 @@ impl App {
         // too: with an overlay open the user should close it first;
         // opening or closing the viewer while a picker is visible
         // would produce a confusing z-order.
+        // ACK overlay is checked FIRST because it's a purely-modal
+        // credits popup — every other overlay can wait behind it.
+        if self.ack_state.open {
+            let page_rows = self
+                .last_ack_popup_rect
+                .map(|r| r.height.saturating_sub(2))
+                .unwrap_or(20);
+            if self.ack_state.handle_key(key, page_rows) {
+                let _ = self.redraw_tx.send(());
+                return;
+            }
+        }
         if self.menu_state.open {
             match menu_key(&mut self.menu_state, &self.menu, key) {
                 MenuKeyOutcome::Run(cmd) => {
@@ -1761,15 +1789,27 @@ impl App {
                 self.handle_picker_mouse(m.column, m.row);
                 return;
             }
+            if self.ack_state.open {
+                // Click-outside closes; click-inside is swallowed.
+                if let Some(popup) = self.last_ack_popup_rect {
+                    if !point_in_rect(m.column, m.row, popup) {
+                        self.ack_state.close();
+                        let _ = self.redraw_tx.send(());
+                    }
+                }
+                return;
+            }
         }
         // Any non-Down mouse event while an overlay is open is
         // swallowed silently so scroll / drag doesn't leak past.
-        if (self.menu_state.open || self.settings_state.open || self.picker_state.open)
+        if (self.menu_state.open
+            || self.settings_state.open
+            || self.picker_state.open
+            || self.ack_state.open)
             && !matches!(m.kind, MouseEventKind::Moved)
         {
             return;
         }
-
         // --- Active layout drag has the highest priority (C22.6 fix) ---
         //
         // An in-progress divider drag MUST beat the viewer takeover
@@ -2770,6 +2810,15 @@ impl App {
             self.settings_state.render(area, buf);
             self.last_settings_popup_rect = Some(rect);
         }
+        // ACK renders LAST so it sits on top of everything else while
+        // it's open (menu / palette / picker / settings all disable
+        // themselves via their own guards, but z-order is documented
+        // here explicitly for anyone adding a new overlay).
+        if self.ack_state.open {
+            let rect = self.ack_state.popup_rect(area);
+            self.ack_state.render(area, buf);
+            self.last_ack_popup_rect = Some(rect);
+        }
 
         // Suppress the caret when any overlay owns the input focus.
         //
@@ -2787,6 +2836,7 @@ impl App {
             || self.palette_state.open
             || self.picker_state.open
             || self.settings_state.open
+            || self.ack_state.open
             || viewer_is_focused
         {
             None
@@ -3002,8 +3052,8 @@ impl App {
             self.open_settings_overlay();
         }
         if f.acknowledgement.swap(false, Ordering::Relaxed) {
-            info!("app.acknowledgement fired (v0.1 stub: log only)");
-            self.set_hint("Acknowledgement will open ACKNOWLEDGEMENTS.md (M3+)".into());
+            self.ack_state.open();
+            let _ = self.redraw_tx.send(());
         }
         if f.viewer_open.swap(false, Ordering::Relaxed) {
             self.open_viewer_tab();

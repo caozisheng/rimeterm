@@ -148,6 +148,14 @@ const ASSETS: &[(ToolBucket, Asset)] = &[
             ownership: Ownership::Seed,
         },
     ),
+    (
+        ToolBucket::Yazi,
+        Asset {
+            rel_path: "theme.toml",
+            bytes: include_bytes!("../../../assets/yazi/seeds/theme.toml"),
+            ownership: Ownership::Seed,
+        },
+    ),
     // gitui — user-owned seeds only (no bundled plugin).
     (
         ToolBucket::Gitui,
@@ -547,9 +555,9 @@ mod tests {
             let report = materialize_configs("1.0.0");
             assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
             assert!(report.seeds_kept.is_empty());
-            // 9 managed (3 plugins × main.lua/README.md/LICENSE) + 6 seeds.
+            // 9 managed (3 plugins × main.lua/README.md/LICENSE) + 7 seeds.
             assert_eq!(report.managed_rewritten.len(), 9);
-            assert_eq!(report.seeds_written.len(), 6);
+            assert_eq!(report.seeds_written.len(), 7);
 
             // Every file must exist on disk.
             assert!(
@@ -578,7 +586,7 @@ mod tests {
             assert!(report.errors.is_empty());
             assert!(report.managed_rewritten.is_empty(), "managed must stick");
             assert!(report.seeds_written.is_empty(), "seeds must stick");
-            assert_eq!(report.seeds_kept.len(), 6);
+            assert_eq!(report.seeds_kept.len(), 7);
 
             // User's edit is preserved.
             assert_eq!(std::fs::read_to_string(&seed).unwrap(), "-- user edit\n");
@@ -600,7 +608,7 @@ mod tests {
             let report = materialize_configs("1.0.1");
             assert!(report.errors.is_empty());
             assert_eq!(report.managed_rewritten.len(), 9, "plugin dir rewritten");
-            assert_eq!(report.seeds_kept.len(), 6, "all seeds kept");
+            assert_eq!(report.seeds_kept.len(), 7, "all seeds kept");
 
             // Plugin was restored to bundled bytes.
             let restored = std::fs::read(&plugin).unwrap();

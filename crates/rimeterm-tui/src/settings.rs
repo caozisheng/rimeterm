@@ -11,6 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use rimeterm_config::tools::DetectedTool;
+use rimeterm_pty::ShellChoice;
 use rimeterm_pty::agent_registry::DetectedAgent;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -20,6 +21,11 @@ pub enum SettingsTab {
     /// C22.6: Alt+V viewer knobs. Currently only the markdown theme
     /// picker lives here.
     Viewer,
+    /// System shell picker: choose which shell (`pwsh` / `powershell` /
+    /// `cmd` / `bash` / `fish` / …) is spawned when the user opens a
+    /// new shell tab. Rows are populated by
+    /// [`rimeterm_pty::detect_all_shells`].
+    Shell,
 }
 
 impl Default for SettingsTab {
@@ -48,23 +54,50 @@ pub enum SettingsAction {
     /// live (next viewer frame picks it up) + persists it to the
     /// current-workspace state store.
     SetMarkdownTheme(rimeterm_markdown::Theme),
+    /// User picked a new system shell. App swaps `self.shell_choice`;
+    /// existing shell tabs keep their PTY, next new shell inherits.
+    SetShell(ShellChoice),
     Refresh,
     Close,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SettingsState {
     pub open: bool,
     pub tab: SettingsTab,
     pub cursor: usize,
     pub tools: Vec<DetectedTool>,
     pub agents: Vec<DetectedAgent>,
+    /// Populated by [`Self::refresh`] on open. Empty if the host has
+    /// no shells at all (extremely unusual).
+    pub shells: Vec<ShellChoice>,
     pub busy: Option<String>,
     /// C22.6: theme currently applied in the markdown viewer, shown as
     /// the highlighted row when the Viewer tab is active. Callers seed
     /// this via `set_markdown_theme` before opening the overlay so the
     /// initial cursor lands on the "current" row.
     pub markdown_theme: rimeterm_markdown::Theme,
+    /// Shell currently in use, seeded from `App::shell_choice` right
+    /// before opening the overlay. Drives the Shell tab's cursor snap
+    /// + the ● marker on the "current" row. Defaults to
+    /// [`ShellChoice::None`] which never matches — safe fallback.
+    pub current_shell: ShellChoice,
+}
+
+impl Default for SettingsState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            tab: SettingsTab::default(),
+            cursor: 0,
+            tools: Vec::new(),
+            agents: Vec::new(),
+            shells: Vec::new(),
+            busy: None,
+            markdown_theme: rimeterm_markdown::Theme::default(),
+            current_shell: ShellChoice::None,
+        }
+    }
 }
 
 impl SettingsState {
@@ -82,6 +115,13 @@ impl SettingsState {
         self.markdown_theme = theme;
     }
 
+    /// Seed the "current" shell so the Shell tab highlights the row
+    /// matching what's actually spawning new shells. Called from
+    /// `App::open_settings_overlay` right after `open()`.
+    pub fn set_current_shell(&mut self, shell: ShellChoice) {
+        self.current_shell = shell;
+    }
+
     pub fn close(&mut self) {
         self.open = false;
         self.busy = None;
@@ -90,6 +130,14 @@ impl SettingsState {
     pub fn refresh(&mut self) {
         self.tools = rimeterm_config::tools::detect_all();
         self.agents = rimeterm_pty::agent_registry::detect_all();
+        // Same hint list App uses to build its own initial choice, so
+        // the picker rows always contain the currently-active shell.
+        let hints: &[String] = if cfg!(windows) {
+            &rimeterm_config::CoreConfig::default().shell_win
+        } else {
+            &rimeterm_config::CoreConfig::default().shell_unix
+        };
+        self.shells = rimeterm_pty::detect_all_shells(hints);
         self.cursor = self.cursor.min(self.row_count().saturating_sub(1));
     }
 
@@ -98,6 +146,7 @@ impl SettingsState {
             SettingsTab::Tools => self.tools.len(),
             SettingsTab::Agents => self.agents.len(),
             SettingsTab::Viewer => rimeterm_markdown::Theme::ALL.len(),
+            SettingsTab::Shell => self.shells.len(),
         }
     }
 
@@ -117,20 +166,22 @@ impl SettingsState {
         match key.code {
             KeyCode::Esc => Some(SettingsAction::Close),
             KeyCode::Tab => {
-                // Cycle Tools → Agents → Viewer → Tools.
+                // Cycle Tools → Agents → Viewer → Shell → Tools.
                 self.tab = match self.tab {
                     SettingsTab::Tools => SettingsTab::Agents,
                     SettingsTab::Agents => SettingsTab::Viewer,
-                    SettingsTab::Viewer => SettingsTab::Tools,
+                    SettingsTab::Viewer => SettingsTab::Shell,
+                    SettingsTab::Shell => SettingsTab::Tools,
                 };
                 self.reset_cursor_for_tab();
                 None
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.tab = match self.tab {
-                    SettingsTab::Tools => SettingsTab::Viewer,
+                    SettingsTab::Tools => SettingsTab::Shell,
                     SettingsTab::Agents => SettingsTab::Tools,
                     SettingsTab::Viewer => SettingsTab::Agents,
+                    SettingsTab::Shell => SettingsTab::Viewer,
                 };
                 self.reset_cursor_for_tab();
                 None
@@ -139,7 +190,8 @@ impl SettingsState {
                 self.tab = match self.tab {
                     SettingsTab::Tools => SettingsTab::Agents,
                     SettingsTab::Agents => SettingsTab::Viewer,
-                    SettingsTab::Viewer => SettingsTab::Tools,
+                    SettingsTab::Viewer => SettingsTab::Shell,
+                    SettingsTab::Shell => SettingsTab::Tools,
                 };
                 self.reset_cursor_for_tab();
                 None
@@ -173,6 +225,11 @@ impl SettingsState {
                 .get(self.cursor)
                 .copied()
                 .map(SettingsAction::SetMarkdownTheme),
+            SettingsTab::Shell => self
+                .shells
+                .get(self.cursor)
+                .cloned()
+                .map(SettingsAction::SetShell),
         }
     }
 
@@ -186,6 +243,11 @@ impl SettingsState {
             SettingsTab::Viewer => rimeterm_markdown::Theme::ALL
                 .iter()
                 .position(|t| *t == self.markdown_theme)
+                .unwrap_or(0),
+            SettingsTab::Shell => self
+                .shells
+                .iter()
+                .position(|s| s.path() == self.current_shell.path())
                 .unwrap_or(0),
         };
     }
@@ -231,7 +293,7 @@ impl SettingsState {
         };
         Clear.render(popup, buf);
         let block = Block::default()
-            .title(" Settings · Tools / Agents / Viewer ")
+            .title(" Settings · Tools / Agents / Viewer / Shell ")
             .borders(Borders::ALL);
         let inner = block.inner(popup);
         block.render(popup, buf);
@@ -242,6 +304,8 @@ impl SettingsState {
             Span::styled(" Agents ", tab_style(self.tab == SettingsTab::Agents)),
             Span::raw("  "),
             Span::styled(" Viewer ", tab_style(self.tab == SettingsTab::Viewer)),
+            Span::raw("  "),
+            Span::styled(" Shell ", tab_style(self.tab == SettingsTab::Shell)),
             Span::styled(
                 "   [Tab] switch · [r] refresh",
                 Style::default().add_modifier(Modifier::DIM),
@@ -303,6 +367,34 @@ impl SettingsState {
                     };
                     let text = format!(" {marker} {}", theme.label());
                     lines.push(Line::styled(text, row_style(idx == self.cursor)));
+                }
+            }
+            SettingsTab::Shell => {
+                lines.push(Line::styled(
+                    " ↑/↓ select   [Enter] use for NEW shell tabs (existing shells unchanged)",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                if self.shells.is_empty() {
+                    lines.push(Line::styled(
+                        "  no shell detected — check [core].shell_win / shell_unix in config",
+                        Style::default().fg(Color::Yellow),
+                    ));
+                } else {
+                    for (idx, shell) in self.shells.iter().enumerate() {
+                        let marker = if shell.path() == self.current_shell.path()
+                            && shell.path().is_some()
+                        {
+                            "●"
+                        } else {
+                            " "
+                        };
+                        let path_str = shell
+                            .path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(unresolved)".to_string());
+                        let text = format!(" {marker} {:<16} {}", shell.display_label(), path_str);
+                        lines.push(Line::styled(text, row_style(idx == self.cursor)));
+                    }
                 }
             }
         }
@@ -375,13 +467,15 @@ mod tests {
 
     #[test]
     fn tab_cycle_visits_viewer() {
-        // Tools → Agents → Viewer → Tools
+        // Tools → Agents → Viewer → Shell → Tools
         let mut state = SettingsState::default();
         state.open = true;
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Agents);
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Viewer);
+        state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Shell);
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Tools);
     }
