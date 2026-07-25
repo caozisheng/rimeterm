@@ -85,6 +85,11 @@ pub enum PickerAnchor {
     /// Center on the given draw area (usually the whole terminal rect).
     #[default]
     Centered,
+    /// Center inside a specific rect (e.g. a pane). Used by the F9
+    /// pane menu so the popup lands over the viewer, not over the
+    /// whole workspace. `popup_rect` measures against this rect
+    /// instead of the caller-supplied `area`.
+    CenteredOn(Rect),
     /// Anchor so the top-left corner sits at `(x, y)`, clipping the popup
     /// to fit inside `bounds`. The popup grows down-right by default;
     /// if that would overflow it flips up / left. Used by the right-click
@@ -222,6 +227,18 @@ pub fn popup_rect(area: Rect, state: &PickerState) -> Rect {
             let height = ideal_h.min(area.height.saturating_sub(2));
             let x = area.x + area.width.saturating_sub(width) / 2;
             let y = area.y + area.height.saturating_sub(height) / 2;
+            Rect {
+                x,
+                y,
+                width,
+                height,
+            }
+        }
+        PickerAnchor::CenteredOn(rect) => {
+            let width = ideal_w.min(rect.width.saturating_sub(2)).max(4);
+            let height = ideal_h.min(rect.height.saturating_sub(2)).max(3);
+            let x = rect.x + rect.width.saturating_sub(width) / 2;
+            let y = rect.y + rect.height.saturating_sub(height) / 2;
             Rect {
                 x,
                 y,

@@ -34,6 +34,7 @@ pub struct Config {
     pub files: FilesConfig,
     pub sysmon: SysmonConfig,
     pub mouse: MouseConfig,
+    pub viewer: ViewerConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -73,6 +74,37 @@ impl Default for UiConfig {
         Self {
             theme: "rime-cold".into(),
             follow_system_theme: true,
+        }
+    }
+}
+
+/// Alt+V modal viewer settings (§C22 / C22.6). Currently only the
+/// markdown sub-viewer has knobs; code and image viewers get their
+/// values from other places (Palette::Default, ratatui-image protocol).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ViewerConfig {
+    pub markdown: ViewerMarkdownConfig,
+}
+
+/// Markdown viewer knobs. `theme` is stored as a string here rather
+/// than as `rimeterm_markdown::Theme` because doing so would drag
+/// `ratatui + syntect + pulldown-cmark` into the config crate's build
+/// graph — the App layer parses this string via
+/// `crate::viewer_theme::parse_theme` (defined in rimeterm-tui) at
+/// startup, falling back to `"default"` on unknown values.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ViewerMarkdownConfig {
+    /// One of: `default`, `dracula`, `solarized_dark`, `solarized_light`,
+    /// `nord`, `gruvbox_dark`, `gruvbox_light`, `github_light`.
+    pub theme: String,
+}
+
+impl Default for ViewerMarkdownConfig {
+    fn default() -> Self {
+        Self {
+            theme: "default".into(),
         }
     }
 }

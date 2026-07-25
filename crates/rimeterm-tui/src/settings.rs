@@ -17,6 +17,9 @@ use rimeterm_pty::agent_registry::DetectedAgent;
 pub enum SettingsTab {
     Tools,
     Agents,
+    /// C22.6: Alt+V viewer knobs. Currently only the markdown theme
+    /// picker lives here.
+    Viewer,
 }
 
 impl Default for SettingsTab {
@@ -34,8 +37,17 @@ pub enum ToolAction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SettingsAction {
-    Tool { name: String, action: ToolAction },
-    Agent { id: String },
+    Tool {
+        name: String,
+        action: ToolAction,
+    },
+    Agent {
+        id: String,
+    },
+    /// C22.6: user picked a new markdown viewer theme. App applies it
+    /// live (next viewer frame picks it up) + persists it to the
+    /// current-workspace state store.
+    SetMarkdownTheme(rimeterm_markdown::Theme),
     Refresh,
     Close,
 }
@@ -48,6 +60,11 @@ pub struct SettingsState {
     pub tools: Vec<DetectedTool>,
     pub agents: Vec<DetectedAgent>,
     pub busy: Option<String>,
+    /// C22.6: theme currently applied in the markdown viewer, shown as
+    /// the highlighted row when the Viewer tab is active. Callers seed
+    /// this via `set_markdown_theme` before opening the overlay so the
+    /// initial cursor lands on the "current" row.
+    pub markdown_theme: rimeterm_markdown::Theme,
 }
 
 impl SettingsState {
@@ -56,6 +73,13 @@ impl SettingsState {
         self.tab = SettingsTab::Tools;
         self.cursor = 0;
         self.refresh();
+    }
+
+    /// C22.6: seed the "current" theme so the Viewer tab highlights
+    /// the active row when the overlay opens. Callers do this from
+    /// `App::open_settings_overlay` right after `open()`.
+    pub fn set_markdown_theme(&mut self, theme: rimeterm_markdown::Theme) {
+        self.markdown_theme = theme;
     }
 
     pub fn close(&mut self) {
@@ -73,6 +97,7 @@ impl SettingsState {
         match self.tab {
             SettingsTab::Tools => self.tools.len(),
             SettingsTab::Agents => self.agents.len(),
+            SettingsTab::Viewer => rimeterm_markdown::Theme::ALL.len(),
         }
     }
 
@@ -92,21 +117,31 @@ impl SettingsState {
         match key.code {
             KeyCode::Esc => Some(SettingsAction::Close),
             KeyCode::Tab => {
+                // Cycle Tools → Agents → Viewer → Tools.
                 self.tab = match self.tab {
                     SettingsTab::Tools => SettingsTab::Agents,
-                    SettingsTab::Agents => SettingsTab::Tools,
+                    SettingsTab::Agents => SettingsTab::Viewer,
+                    SettingsTab::Viewer => SettingsTab::Tools,
                 };
-                self.cursor = 0;
+                self.reset_cursor_for_tab();
                 None
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.tab = SettingsTab::Tools;
-                self.cursor = 0;
+                self.tab = match self.tab {
+                    SettingsTab::Tools => SettingsTab::Viewer,
+                    SettingsTab::Agents => SettingsTab::Tools,
+                    SettingsTab::Viewer => SettingsTab::Agents,
+                };
+                self.reset_cursor_for_tab();
                 None
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                self.tab = SettingsTab::Agents;
-                self.cursor = 0;
+                self.tab = match self.tab {
+                    SettingsTab::Tools => SettingsTab::Agents,
+                    SettingsTab::Agents => SettingsTab::Viewer,
+                    SettingsTab::Viewer => SettingsTab::Tools,
+                };
+                self.reset_cursor_for_tab();
                 None
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -134,7 +169,25 @@ impl SettingsState {
                     id: agent.id.to_string(),
                 })
             }),
+            SettingsTab::Viewer => rimeterm_markdown::Theme::ALL
+                .get(self.cursor)
+                .copied()
+                .map(SettingsAction::SetMarkdownTheme),
         }
+    }
+
+    /// Snap the cursor to the "current" row on tab switch. For Tools
+    /// / Agents that's row 0; for Viewer that's the row matching
+    /// `self.markdown_theme` so opening the tab lands on the active
+    /// theme (visual confirmation of what's applied).
+    fn reset_cursor_for_tab(&mut self) {
+        self.cursor = match self.tab {
+            SettingsTab::Tools | SettingsTab::Agents => 0,
+            SettingsTab::Viewer => rimeterm_markdown::Theme::ALL
+                .iter()
+                .position(|t| *t == self.markdown_theme)
+                .unwrap_or(0),
+        };
     }
 
     fn tool_action(&self, action: ToolAction) -> Option<SettingsAction> {
@@ -144,6 +197,22 @@ impl SettingsState {
                 name: tool.name.to_string(),
                 action,
             })
+    }
+
+    /// Compute the popup rect for the current draw area. Extracted
+    /// so App::on_mouse can hit-test the overlay without duplicating
+    /// the sizing math from `render`.
+    pub fn popup_rect(&self, area: Rect) -> Rect {
+        let width = area.width.min(92).max(40);
+        let height = area.height.min(28).max(8);
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        let y = area.y + area.height.saturating_sub(height) / 2;
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -162,7 +231,7 @@ impl SettingsState {
         };
         Clear.render(popup, buf);
         let block = Block::default()
-            .title(" Settings · Tools / Agents ")
+            .title(" Settings · Tools / Agents / Viewer ")
             .borders(Borders::ALL);
         let inner = block.inner(popup);
         block.render(popup, buf);
@@ -171,6 +240,8 @@ impl SettingsState {
             Span::styled(" Tools ", tab_style(self.tab == SettingsTab::Tools)),
             Span::raw("  "),
             Span::styled(" Agents ", tab_style(self.tab == SettingsTab::Agents)),
+            Span::raw("  "),
+            Span::styled(" Viewer ", tab_style(self.tab == SettingsTab::Viewer)),
             Span::styled(
                 "   [Tab] switch · [r] refresh",
                 Style::default().add_modifier(Modifier::DIM),
@@ -217,6 +288,21 @@ impl SettingsState {
                         row_suffix(text, agent.is_available()),
                         row_style(idx == self.cursor),
                     ));
+                }
+            }
+            SettingsTab::Viewer => {
+                lines.push(Line::styled(
+                    " ↑/↓ select   [Enter] apply theme to markdown viewer",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                for (idx, theme) in rimeterm_markdown::Theme::ALL.iter().enumerate() {
+                    let marker = if *theme == self.markdown_theme {
+                        "●"
+                    } else {
+                        " "
+                    };
+                    let text = format!(" {marker} {}", theme.label());
+                    lines.push(Line::styled(text, row_style(idx == self.cursor)));
                 }
             }
         }
@@ -285,5 +371,60 @@ mod tests {
             state.handle_key(key(KeyCode::Esc)),
             Some(SettingsAction::Close)
         );
+    }
+
+    #[test]
+    fn tab_cycle_visits_viewer() {
+        // Tools → Agents → Viewer → Tools
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Agents);
+        state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Viewer);
+        state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Tools);
+    }
+
+    #[test]
+    fn viewer_tab_enter_returns_set_theme_action() {
+        // Cursor at row 0 of Viewer tab → SetMarkdownTheme(Theme::ALL[0]).
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Viewer;
+        state.cursor = 1; // Dracula
+        let action = state.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            action,
+            Some(SettingsAction::SetMarkdownTheme(
+                rimeterm_markdown::Theme::ALL[1]
+            ))
+        );
+    }
+
+    #[test]
+    fn reset_cursor_for_viewer_lands_on_current_theme() {
+        // set_markdown_theme(GruvboxDark) + switch to Viewer → cursor
+        // snaps to GruvboxDark's index in Theme::ALL.
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.set_markdown_theme(rimeterm_markdown::Theme::GruvboxDark);
+        // Move to Viewer tab via l (right).
+        state.tab = SettingsTab::Agents;
+        state.handle_key(key(KeyCode::Char('l'))); // Agents → Viewer
+        assert_eq!(state.tab, SettingsTab::Viewer);
+        let expected = rimeterm_markdown::Theme::ALL
+            .iter()
+            .position(|t| *t == rimeterm_markdown::Theme::GruvboxDark)
+            .unwrap();
+        assert_eq!(state.cursor, expected);
+    }
+
+    #[test]
+    fn viewer_row_count_matches_theme_all_len() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Viewer;
+        assert_eq!(state.row_count(), rimeterm_markdown::Theme::ALL.len());
     }
 }

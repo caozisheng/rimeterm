@@ -65,6 +65,7 @@ use crate::viewer::{
 struct ActionFlags {
     quit: AtomicBool,
     menu_toggle: AtomicBool,
+    pane_menu_toggle: AtomicBool,
     palette_toggle: AtomicBool,
     shells_new: AtomicBool,
     shells_close: AtomicBool,
@@ -479,6 +480,23 @@ pub struct App {
     /// when the terminal has no graphics protocol). Cloned per protocol
     /// build inside `viewer::render_overlay`.
     viewer_picker: Option<ratatui_image::picker::Picker>,
+    /// Selected theme for the Alt+V markdown viewer (C22.6). Loaded
+    /// from `[viewer.markdown] theme` at startup; mutated at runtime
+    /// via the Settings overlay (F10) or the pane menu (F9). Unknown
+    /// config values fall back to `Theme::Default`.
+    viewer_markdown_theme: rimeterm_markdown::Theme,
+    /// Settings overlay state (Tools / Agents / Viewer tabs). Toggled
+    /// by the `app.settings` flag (F10 → Settings menu item or the
+    /// bare `,` key hint from the app menu).
+    /// Popup rects cached from the last draw so `on_mouse` can hit-
+    /// test them without recomputing. Reset to `None` when the
+    /// respective overlay is closed. Values persist for one frame
+    /// past the close so a mouse-up on the picker (that triggered
+    /// the close) doesn't fall through to the pane underneath.
+    last_menu_popup_rect: Option<Rect>,
+    last_picker_popup_rect: Option<Rect>,
+    last_settings_popup_rect: Option<Rect>,
+    settings_state: crate::settings::SettingsState,
     flags: Arc<ActionFlags>,
     should_quit: bool,
     /// Transient status-bar hint (e.g. "Ctrl+T rejected: files is fixed").
@@ -882,6 +900,7 @@ impl App {
         // build an image protocol. Halfblocks fallback keeps the viewer
         // usable everywhere.
         let viewer_picker = ratatui_image::picker::Picker::from_query_stdio().ok();
+        let viewer_markdown_theme = parse_markdown_theme(&config.viewer.markdown.theme);
 
         Ok(Self {
             active_root: workspace_root.clone(),
@@ -908,6 +927,11 @@ impl App {
             viewer_completion_tx,
             viewer_completion_rx,
             viewer_picker,
+            viewer_markdown_theme,
+            settings_state: crate::settings::SettingsState::default(),
+            last_menu_popup_rect: None,
+            last_picker_popup_rect: None,
+            last_settings_popup_rect: None,
             flags,
             should_quit: false,
             hint: None,
@@ -1082,31 +1106,83 @@ impl App {
                     self.close_viewer_tab(vid);
                     return true;
                 }
-                self.on_viewer_modal_key(vid, key);
-                return true;
+                if self.on_viewer_modal_key(vid, key) {
+                    return true;
+                }
+                // Anything the modal doesn't claim (F9 / F10 / F1 /
+                // Ctrl+T / Alt+HJKL / Ctrl+Q …) falls through to the
+                // global keymap. The viewer being focused must not
+                // black-hole every keystroke — it's a modal for its
+                // own scroll/zoom keys, not a keyboard prison.
             }
         }
         false
     }
 
-    fn on_viewer_modal_key(&mut self, vid: PaneId, key: KeyEvent) {
-        use crossterm::event::KeyCode;
-        let Some(state) = self.viewers.get_mut(&vid) else {
-            return;
-        };
-        match key.code {
-            KeyCode::Down | KeyCode::Char('j') => state.scroll_markdown(1),
-            KeyCode::Up | KeyCode::Char('k') => state.scroll_markdown(-1),
-            KeyCode::PageDown => state.scroll_markdown(10),
-            KeyCode::PageUp => state.scroll_markdown(-10),
-            KeyCode::Home | KeyCode::Char('g') => state.scroll_markdown(i32::MIN),
-            KeyCode::End | KeyCode::Char('G') => state.scroll_markdown(i32::MAX),
-            KeyCode::Char('+') | KeyCode::Char('=') => state.nudge_image_scale(1),
-            KeyCode::Char('-') => state.nudge_image_scale(-1),
-            KeyCode::Char('0') => state.reset_image_scale(),
-            _ => {}
+    /// Handle a key while the viewer is the focused pane. Returns
+    /// `true` when the key was consumed by the modal (scroll / zoom
+    /// / selection); `false` when it should fall through to the
+    /// global keymap (F-keys, chords with Ctrl / Alt, etc.).
+    ///
+    /// **Contract**: any key with `Ctrl` or `Alt` in its modifiers
+    /// is a global chord and MUST NOT be intercepted. Bare arrow
+    /// keys and unmodified character keys are the only ones the
+    /// modal is allowed to see.
+    fn on_viewer_modal_key(&mut self, vid: PaneId, key: KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Global chord? Fall through immediately.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
         }
-        let _ = self.redraw_tx.send(());
+        let Some(state) = self.viewers.get_mut(&vid) else {
+            return false;
+        };
+        let consumed = match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.scroll_markdown(1);
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.scroll_markdown(-1);
+                true
+            }
+            KeyCode::PageDown => {
+                state.scroll_markdown(10);
+                true
+            }
+            KeyCode::PageUp => {
+                state.scroll_markdown(-10);
+                true
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                state.scroll_markdown(i32::MIN);
+                true
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                state.scroll_markdown(i32::MAX);
+                true
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                state.nudge_image_scale(1);
+                true
+            }
+            KeyCode::Char('-') => {
+                state.nudge_image_scale(-1);
+                true
+            }
+            KeyCode::Char('0') => {
+                state.reset_image_scale();
+                true
+            }
+            _ => false,
+        };
+        if consumed {
+            let _ = self.redraw_tx.send(());
+        }
+        consumed
     }
 
     /// Open a new viewer tab in the files group for the last yazi selection.
@@ -1229,11 +1305,200 @@ impl App {
         let _ = self.redraw_tx.send(());
     }
 
+    /// Open the Settings overlay (F10 → Settings, or the `,` key from
+    /// the app menu). Refreshes tool/agent detection and seeds the
+    /// Viewer tab's cursor with the currently-applied markdown theme.
+    fn open_settings_overlay(&mut self) {
+        self.settings_state.open();
+        self.settings_state
+            .set_markdown_theme(self.viewer_markdown_theme);
+        let _ = self.redraw_tx.send(());
+    }
+
+    /// Consume a Settings overlay action. Called from the key path
+    /// after `SettingsState::handle_key` returns `Some(_)`.
+    fn apply_settings_action(&mut self, action: crate::settings::SettingsAction) {
+        use crate::settings::SettingsAction;
+        match action {
+            SettingsAction::Close => {
+                self.settings_state.close();
+                let _ = self.redraw_tx.send(());
+            }
+            SettingsAction::Refresh => {
+                self.settings_state.refresh();
+                let _ = self.redraw_tx.send(());
+            }
+            SettingsAction::SetMarkdownTheme(theme) => {
+                self.set_markdown_theme(theme);
+                self.settings_state.set_markdown_theme(theme);
+                let _ = self.redraw_tx.send(());
+            }
+            SettingsAction::Tool { .. } | SettingsAction::Agent { .. } => {
+                // Tool install/upgrade/uninstall + agent picker are
+                // pre-existing paths from C19 that aren't wired to a
+                // command yet — surface a hint so the row click isn't
+                // silently dropped.
+                self.set_hint("Tool/Agent actions not wired yet (C22.6 scope)".into());
+            }
+        }
+    }
+
+    /// Apply a new markdown viewer theme. Live: the next frame's
+    /// `markdown_blocks_to_text` call reads `self.viewer_markdown_theme`
+    /// and picks up the change. Persistence to disk is future work —
+    /// runtime state resets to the config value on restart.
+    fn set_markdown_theme(&mut self, theme: rimeterm_markdown::Theme) {
+        self.viewer_markdown_theme = theme;
+        self.set_hint(format!("markdown viewer theme → {}", theme.label()));
+    }
+
+    /// F9 handler: open a pane-scoped menu. Currently only the
+    /// markdown viewer has entries (theme picker); everything else
+    /// gets a hint. Future: extend per pane kind (shell, agent, …).
+    fn toggle_pane_menu(&mut self) {
+        // If any overlay is already up (menu, palette, picker,
+        // settings), F9 is a no-op — behave like the other overlays'
+        // toggle semantics.
+        if self.menu_state.open
+            || self.palette_state.open
+            || self.picker_state.open
+            || self.settings_state.open
+        {
+            return;
+        }
+        let focused_is_md_viewer = self
+            .focus
+            .focused_pane()
+            .and_then(|id| self.viewers.get(&id))
+            .and_then(|s| s.snapshot())
+            .is_some_and(|src| src.kind == crate::viewer::ViewerKind::Markdown);
+        if !focused_is_md_viewer {
+            self.set_hint("F9 pane menu: no actions for this pane (C22.6)".into());
+            return;
+        }
+        self.open_markdown_theme_picker();
+    }
+
+    /// Open the markdown theme picker. Reused from both the Settings
+    /// overlay's Viewer tab (via the palette-style action) and the F9
+    /// pane menu path. Uses `PickerState` — same widget as the agent
+    /// picker — so users get familiar navigation (`↑↓`, `Enter`).
+    fn open_markdown_theme_picker(&mut self) {
+        use crate::picker::PickerEntry;
+        let current = self.viewer_markdown_theme;
+        let entries: Vec<PickerEntry> = rimeterm_markdown::Theme::ALL
+            .iter()
+            .map(|t| {
+                let marker = if *t == current { "● " } else { "  " };
+                let label = format!("{marker}{}", t.label());
+                // Intent tag `md.theme:<snake>` decoded in run_context_intent.
+                let tag = format!("md.theme:{}", theme_intent_slug(*t));
+                PickerEntry::intent(label, tag)
+            })
+            .collect();
+        // Anchor the popup on the viewer pane's content rect
+        // (`last_viewer_rect`, set by draw when a viewer tab renders)
+        // so F9 centers over the viewer instead of the whole
+        // workspace. Falls back to the workspace-centered default
+        // when we haven't captured a viewer rect yet (very first
+        // frame after opening).
+        if let Some(vr) = self.last_viewer_rect {
+            self.picker_state.open_with_anchor(
+                "Markdown viewer theme",
+                entries,
+                crate::picker::PickerAnchor::CenteredOn(vr),
+            );
+        } else {
+            self.picker_state
+                .open_with("Markdown viewer theme", entries);
+        }
+        let _ = self.redraw_tx.send(());
+    }
+
     fn apply_viewer_completion(&mut self, completion: ViewerCompletion) {
         if let Some(state) = self.viewers.get_mut(&completion.pane_id) {
             if state.apply_completion(completion) {
                 let _ = self.redraw_tx.send(());
             }
+        }
+    }
+
+    /// Route a Left Down while the app menu is open. Inside the
+    /// popup: hit-test to an item and run its command. Outside:
+    /// close the menu. Separator rows are no-ops (they still swallow
+    /// the click — the menu stays open).
+    fn handle_menu_mouse(&mut self, col: u16, row: u16) {
+        let Some(popup) = self.last_menu_popup_rect else {
+            return;
+        };
+        if !point_in_rect(col, row, popup) {
+            self.menu_state.toggle();
+            let _ = self.redraw_tx.send(());
+            return;
+        }
+        let inner_y = popup.y.saturating_add(1);
+        let hit_row = row.saturating_sub(inner_y);
+        let mut visual: u16 = 0;
+        for (idx, item) in self.menu.items.iter().enumerate() {
+            if item.separator_before {
+                if visual == hit_row {
+                    return;
+                }
+                visual += 1;
+            }
+            if visual == hit_row {
+                let cmd = item.command;
+                self.menu_state.cursor = idx;
+                if let Err(e) = self.commands.run(cmd) {
+                    warn!(command = cmd, error = %e, "menu command failed via mouse");
+                }
+                return;
+            }
+            visual += 1;
+        }
+    }
+
+    /// Route a Left Down while the picker is open. Inside the popup:
+    /// snap cursor to the clicked row and fire its action. Outside:
+    /// close the picker.
+    fn handle_picker_mouse(&mut self, col: u16, row: u16) {
+        let Some(popup) = self.last_picker_popup_rect else {
+            return;
+        };
+        if !point_in_rect(col, row, popup) {
+            self.picker_state.close();
+            let _ = self.redraw_tx.send(());
+            return;
+        }
+        let inner_y = popup.y.saturating_add(1);
+        if row < inner_y {
+            return;
+        }
+        let idx = (row - inner_y) as usize;
+        if idx >= self.picker_state.entries.len() {
+            return;
+        }
+        let entry = &self.picker_state.entries[idx];
+        if !entry.action.is_enabled() {
+            return;
+        }
+        self.picker_state.cursor = idx;
+        if let Some(action) = self.picker_state.selected_action() {
+            self.picker_state.close();
+            self.run_picker_action(action);
+        }
+    }
+
+    /// Route a Left Down while the Settings overlay is open.
+    /// Outside the popup closes the overlay. Inside-popup clicks are
+    /// swallowed (full tab / row hit-testing is future work).
+    fn handle_settings_mouse(&mut self, col: u16, row: u16) {
+        let Some(popup) = self.last_settings_popup_rect else {
+            return;
+        };
+        if !point_in_rect(col, row, popup) {
+            self.settings_state.close();
+            let _ = self.redraw_tx.send(());
         }
     }
 
@@ -1260,9 +1525,16 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        if self.on_viewer_key(key) {
-            return;
-        }
+        // Overlay priority: any open overlay (app menu / settings /
+        // picker / palette) owns the keyboard while it's up. The
+        // viewer's own modal handler (`on_viewer_key`) MUST run
+        // AFTER these — otherwise the viewer eats bare Up/Down/Enter
+        // for its scroll bindings and the overlay never sees them.
+        //
+        // Alt+V (viewer toggle) is deliberately downstream of these
+        // too: with an overlay open the user should close it first;
+        // opening or closing the viewer while a picker is visible
+        // would produce a confusing z-order.
         if self.menu_state.open {
             match menu_key(&mut self.menu_state, &self.menu, key) {
                 MenuKeyOutcome::Run(cmd) => {
@@ -1274,7 +1546,12 @@ impl App {
             }
             return;
         }
-
+        if self.settings_state.open {
+            if let Some(action) = self.settings_state.handle_key(key) {
+                self.apply_settings_action(action);
+            }
+            return;
+        }
         if self.picker_state.open {
             match crate::picker::handle_key(&mut self.picker_state, key) {
                 crate::picker::PickerOutcome::Run(action) => {
@@ -1284,7 +1561,6 @@ impl App {
             }
             return;
         }
-
         if self.palette_state.open {
             let entries = self.command_entries();
             match palette_key(&mut self.palette_state, &entries, key) {
@@ -1297,7 +1573,11 @@ impl App {
             }
             return;
         }
-
+        // Viewer's own modal keys only fire once every overlay is
+        // closed — see on_viewer_key's contract for the exact key set.
+        if self.on_viewer_key(key) {
+            return;
+        }
         if self.resize_mode {
             self.on_resize_key(key);
             return;
@@ -1457,6 +1737,38 @@ impl App {
     /// 4. Down on empty space (unlikely) — no-op.
     fn on_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+
+        // --- Overlay priority: menu / settings / picker own mouse ---
+        //
+        // If a popup is up, the click either lands inside (route to
+        // the overlay for hit-testing) or outside (close). The click
+        // MUST NOT fall through to the pane underneath — a click
+        // through a menu into a pane is one of the most confusing
+        // UI failures possible in a TUI.
+        //
+        // Palette handled by its own path below (it renders fullscreen
+        // and captures its own input).
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            if self.menu_state.open {
+                self.handle_menu_mouse(m.column, m.row);
+                return;
+            }
+            if self.settings_state.open {
+                self.handle_settings_mouse(m.column, m.row);
+                return;
+            }
+            if self.picker_state.open {
+                self.handle_picker_mouse(m.column, m.row);
+                return;
+            }
+        }
+        // Any non-Down mouse event while an overlay is open is
+        // swallowed silently so scroll / drag doesn't leak past.
+        if (self.menu_state.open || self.settings_state.open || self.picker_state.open)
+            && !matches!(m.kind, MouseEventKind::Moved)
+        {
+            return;
+        }
 
         // --- Active layout drag has the highest priority (C22.6 fix) ---
         //
@@ -2021,6 +2333,12 @@ impl App {
             }
             return;
         }
+        if let Some(slug) = intent.strip_prefix("md.theme:") {
+            let theme = parse_markdown_theme(slug);
+            self.set_markdown_theme(theme);
+            self.settings_state.set_markdown_theme(theme);
+            return;
+        }
         // yazi.copy.path: copy the last hovered yazi file path to the
         // clipboard. Emitted by the right-click context menu on the left
         // (files) column — a convenience so the user can grab yazi's
@@ -2312,6 +2630,7 @@ impl App {
                             pane_rect,
                             buf,
                             self.viewer_picker.as_ref(),
+                            self.viewer_markdown_theme,
                         );
                         // Viewer content owns this rect for mouse events.
                         // Tab-strip clicks are excluded — `strip_rect`
@@ -2428,9 +2747,13 @@ impl App {
             .style(hint_style)
             .render(vertical[2], buf);
 
+        self.last_menu_popup_rect = None;
+        self.last_picker_popup_rect = None;
+        self.last_settings_popup_rect = None;
         if self.menu_state.open {
             let rect = menu_rect(area, &self.menu);
             render_menu(rect, buf, &self.menu_state, &self.menu);
+            self.last_menu_popup_rect = Some(rect);
         }
         if self.palette_state.open {
             let rect = palette_rect(area);
@@ -2440,6 +2763,12 @@ impl App {
         if self.picker_state.open {
             let rect = crate::picker::popup_rect(area, &self.picker_state);
             crate::picker::render(rect, buf, &self.picker_state);
+            self.last_picker_popup_rect = Some(rect);
+        }
+        if self.settings_state.open {
+            let rect = self.settings_state.popup_rect(area);
+            self.settings_state.render(area, buf);
+            self.last_settings_popup_rect = Some(rect);
         }
 
         // Suppress the caret when any overlay owns the input focus.
@@ -2457,6 +2786,7 @@ impl App {
         let cursor = if self.menu_state.open
             || self.palette_state.open
             || self.picker_state.open
+            || self.settings_state.open
             || viewer_is_focused
         {
             None
@@ -2610,6 +2940,9 @@ impl App {
 
     fn drain_flags(&mut self) {
         let f = Arc::clone(&self.flags);
+        if f.pane_menu_toggle.swap(false, Ordering::Relaxed) {
+            self.toggle_pane_menu();
+        }
         if f.menu_toggle.swap(false, Ordering::Relaxed) {
             self.menu_state.toggle();
         }
@@ -2666,8 +2999,7 @@ impl App {
             self.set_hint(msg.into());
         }
         if f.settings.swap(false, Ordering::Relaxed) {
-            info!("app.settings fired (v0.1 stub: log only)");
-            self.set_hint("Settings will open the config in a system editor (M3+)".into());
+            self.open_settings_overlay();
         }
         if f.acknowledgement.swap(false, Ordering::Relaxed) {
             info!("app.acknowledgement fired (v0.1 stub: log only)");
@@ -3854,6 +4186,13 @@ fn register_commands(
         "Toggle app menu",
         "F10 / Alt+M",
         flags.menu_toggle
+    );
+    flag_cmd!(
+        cmds,
+        "app.pane_menu.toggle",
+        "Toggle pane menu",
+        "F9 — context-scoped actions for the focused pane",
+        flags.pane_menu_toggle
     );
     flag_cmd!(
         cmds,
@@ -5376,6 +5715,50 @@ fn next_shell_number(members: &[PaneId], panes: &PaneRegistry) -> usize {
 /// performed — two logically-equal-but-syntactically-different paths
 /// stay distinct, matching what the tab title (basename) would show
 /// the user anyway.
+/// Inverse of [`parse_markdown_theme`]: produce the intent-tag slug
+/// used in `md.theme:<slug>` picker entries. Keeping this separate
+/// (rather than piggybacking on `Theme::label()`) ensures the tag is
+/// URL-friendly + matches what `parse_markdown_theme` accepts.
+pub(crate) fn theme_intent_slug(t: rimeterm_markdown::Theme) -> &'static str {
+    use rimeterm_markdown::Theme;
+    match t {
+        Theme::Default => "default",
+        Theme::Dracula => "dracula",
+        Theme::SolarizedDark => "solarized_dark",
+        Theme::SolarizedLight => "solarized_light",
+        Theme::Nord => "nord",
+        Theme::GruvboxDark => "gruvbox_dark",
+        Theme::GruvboxLight => "gruvbox_light",
+        Theme::GithubLight => "github_light",
+    }
+}
+
+/// Parse a `[viewer.markdown] theme` config value into a typed
+/// `rimeterm_markdown::Theme`. Unknown values (typos, stale enum
+/// members from a downgrade) fall back to `Theme::Default` with a
+/// warning so the app boots regardless. Case-insensitive to make
+/// hand-editing the TOML forgiving.
+pub(crate) fn parse_markdown_theme(s: &str) -> rimeterm_markdown::Theme {
+    use rimeterm_markdown::Theme;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "default" | "" => Theme::Default,
+        "dracula" => Theme::Dracula,
+        "solarized_dark" | "solarized-dark" => Theme::SolarizedDark,
+        "solarized_light" | "solarized-light" => Theme::SolarizedLight,
+        "nord" => Theme::Nord,
+        "gruvbox_dark" | "gruvbox-dark" => Theme::GruvboxDark,
+        "gruvbox_light" | "gruvbox-light" => Theme::GruvboxLight,
+        "github_light" | "github-light" => Theme::GithubLight,
+        other => {
+            warn!(
+                value = other,
+                "unknown [viewer.markdown] theme; falling back to Default"
+            );
+            Theme::Default
+        }
+    }
+}
+
 fn find_open_viewer_for_path(
     viewers: &std::collections::HashMap<PaneId, ViewerOverlayState>,
     path: &std::path::Path,
@@ -6529,6 +6912,32 @@ mod tests {
     }
 
     // --- Right-arrow shortcut gating ---------------------------------
+
+    // --- Markdown theme parsing (C22.6) --------------------------------
+
+    #[test]
+    fn parse_markdown_theme_accepts_all_variant_slugs_and_variants() {
+        use rimeterm_markdown::Theme;
+        for t in Theme::ALL {
+            let slug = theme_intent_slug(*t);
+            assert_eq!(parse_markdown_theme(slug), *t, "roundtrip failed for {t:?}");
+        }
+    }
+
+    #[test]
+    fn parse_markdown_theme_accepts_kebab_case_from_toml() {
+        use rimeterm_markdown::Theme;
+        assert_eq!(parse_markdown_theme("solarized-dark"), Theme::SolarizedDark);
+        assert_eq!(parse_markdown_theme("solarized_dark"), Theme::SolarizedDark);
+        assert_eq!(parse_markdown_theme("Gruvbox_Light"), Theme::GruvboxLight);
+    }
+
+    #[test]
+    fn parse_markdown_theme_unknown_falls_back_to_default() {
+        use rimeterm_markdown::Theme;
+        assert_eq!(parse_markdown_theme("no-such-theme"), Theme::Default);
+        assert_eq!(parse_markdown_theme(""), Theme::Default);
+    }
 
     fn selection(path: &str) -> viewer::SelectionSnapshot {
         viewer::SelectionSnapshot {

@@ -129,6 +129,12 @@ impl Keymap {
         if matches!(key.code, KeyCode::F(10)) {
             return KeymapOutcome::Run("app.menu.toggle");
         }
+        // F9: pane menu (context-sensitive to the focused pane; markdown
+        // viewers get a "Markdown Theme" entry, others get a hint that
+        // no pane-scoped actions are available yet).
+        if matches!(key.code, KeyCode::F(9)) {
+            return KeymapOutcome::Run("app.pane_menu.toggle");
+        }
         if matches!(key.code, KeyCode::Char('m') | KeyCode::Char('M'))
             && key.modifiers.contains(KeyModifiers::ALT)
         {

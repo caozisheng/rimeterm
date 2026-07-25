@@ -914,6 +914,7 @@ pub fn render_into_pane(
     pane_rect: Rect,
     buf: &mut Buffer,
     picker: Option<&ratatui_image::picker::Picker>,
+    markdown_theme: rimeterm_markdown::Theme,
 ) {
     if !state.is_open() {
         return;
@@ -958,7 +959,7 @@ pub fn render_into_pane(
         (ViewerStatus::Loading, _) => render_message(inner, buf, "Loading…"),
         (ViewerStatus::Error(msg), _) => render_message(inner, buf, &msg),
         (ViewerStatus::Ready, Some(ViewerKind::Markdown)) => {
-            render_markdown(state, inner, buf);
+            render_markdown(state, inner, buf, markdown_theme);
         }
         (ViewerStatus::Ready, Some(ViewerKind::Code)) => {
             render_code(state, inner, buf);
@@ -980,7 +981,13 @@ pub fn render_overlay(
     buf: &mut Buffer,
     picker: Option<&ratatui_image::picker::Picker>,
 ) {
-    render_into_pane(state, bounds, buf, picker);
+    render_into_pane(
+        state,
+        bounds,
+        buf,
+        picker,
+        rimeterm_markdown::Theme::Default,
+    );
 }
 
 /// Renders Markdown into `inner`, reserving the right-most column for
@@ -1003,12 +1010,17 @@ pub fn render_overlay(
 /// - `DocBlock::Table` → append a minimal pipe-format representation
 ///   (upstream `layout_table` was in the widget layer we didn't
 ///   vendor; future work)
-fn render_markdown(state: &mut ViewerOverlayState, inner: Rect, buf: &mut Buffer) {
+fn render_markdown(
+    state: &mut ViewerOverlayState,
+    inner: Rect,
+    buf: &mut Buffer,
+    theme: rimeterm_markdown::Theme,
+) {
     if inner.width < 2 || inner.height == 0 {
         return;
     }
     let source = state.markdown().unwrap_or("").to_string();
-    let text = markdown_blocks_to_text(&source);
+    let text = markdown_blocks_to_text(&source, theme);
 
     // Reserve the right-most column for the scrollbar. We split
     // upfront so `content_lines` counting matches the paragraph width
@@ -1097,12 +1109,9 @@ fn render_markdown(state: &mut ViewerOverlayState, inner: Rect, buf: &mut Buffer
 ///
 /// A blank line is inserted between distinct block kinds so the
 /// visual separation matches upstream's paragraph gaps.
-fn markdown_blocks_to_text(source: &str) -> Text<'static> {
-    use rimeterm_markdown::{DocBlock, Palette, Theme, render_markdown};
+fn markdown_blocks_to_text(source: &str, theme: rimeterm_markdown::Theme) -> Text<'static> {
+    use rimeterm_markdown::{DocBlock, Palette, render_markdown};
 
-    // Default dark theme for now — future work: pick from a rimeterm
-    // config knob `[viewer.markdown] theme = ...`.
-    let theme = Theme::Default;
     let palette = Palette::from_theme(theme);
     let blocks = render_markdown(source, &palette, theme);
 
@@ -2148,7 +2157,13 @@ mod markdown_tests {
         );
         let bounds = Rect::new(4, 2, 30, 12);
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 20));
-        render_into_pane(&mut state, bounds, &mut buf, None);
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
 
         // The three cells that used to host `[×]` must now be part of
         // the plain top border (`─`) or the corner (`┐`).
@@ -2169,7 +2184,7 @@ mod markdown_tests {
         // Regression guard: the vendored `render_markdown` on empty
         // input previously produced zero blocks in some upstream
         // versions; the wrapper must not panic.
-        let text = markdown_blocks_to_text("");
+        let text = markdown_blocks_to_text("", rimeterm_markdown::Theme::Default);
         // Empty or nearly empty is fine — just not a crash.
         assert!(text.lines.len() <= 1);
     }
@@ -2179,7 +2194,10 @@ mod markdown_tests {
         // rimeterm-markdown runs syntect internally against the
         // configured theme — code block contents must get non-default
         // styling on at least one span.
-        let text = markdown_blocks_to_text("```rust\nfn main() {}\n```\n");
+        let text = markdown_blocks_to_text(
+            "```rust\nfn main() {}\n```\n",
+            rimeterm_markdown::Theme::Default,
+        );
         let has_style = text
             .lines
             .iter()
@@ -2192,7 +2210,10 @@ mod markdown_tests {
     fn markdown_blocks_to_text_marks_mermaid_blocks() {
         // Fallback sentinel — until we wire the `mermaid-text` crate,
         // Mermaid content is bracketed by `[mermaid]` / `[/mermaid]`.
-        let text = markdown_blocks_to_text("prose\n\n```mermaid\ngraph LR\nA-->B\n```\n\nafter\n");
+        let text = markdown_blocks_to_text(
+            "prose\n\n```mermaid\ngraph LR\nA-->B\n```\n\nafter\n",
+            rimeterm_markdown::Theme::Default,
+        );
         let all: String = text
             .lines
             .iter()
@@ -2216,6 +2237,7 @@ mod markdown_tests {
         // fallback.
         let text = markdown_blocks_to_text(
             "| Alpha | Beta |\n|---|---|\n| one | two |\n| three | four |\n",
+            rimeterm_markdown::Theme::Default,
         );
         let all: String = text
             .lines
@@ -2360,7 +2382,13 @@ mod code_tests {
 
         let bounds = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(bounds);
-        render_into_pane(&mut state, bounds, &mut buf, None);
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
 
         // Border corner visible at (0,0).
         assert_eq!(buf[(0, 0)].symbol(), "┌");
