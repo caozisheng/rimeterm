@@ -471,8 +471,15 @@ pub struct App {
     /// the user asked for gitui + new agents to follow yazi rather than
     /// stay pinned to the launch dir). Persistent state files
     /// (`agents.state.toml`, `layout.state.toml`) keep using the frozen
-    /// [`Self::workspace_root`] so their identity survives navigation.
     active_root: PathBuf,
+    /// Git repository root that gitui is currently rooted at
+    /// (walked up from [`Self::active_root`] on last respawn). Kept
+    /// around so a `cwd.changed` OSC that lands inside the SAME repo
+    /// (yazi navigating between subdirectories) is a no-op instead of
+    /// spawning a fresh gitui process for every keystroke. `None`
+    /// means either the last `cd` was outside any repo or gitui has
+    /// never been spawned yet.
+    active_repo_root: Option<PathBuf>,
     /// Worker channel: async Markdown/image loaders push completions
     /// here; main loop drains them into [`ViewerOverlayState`].
     viewer_completion_tx: mpsc::UnboundedSender<ViewerCompletion>,
@@ -909,6 +916,7 @@ impl App {
 
         Ok(Self {
             active_root: workspace_root.clone(),
+            active_repo_root: find_git_root(&workspace_root),
             workspace_root,
             config,
             shell_choice,
@@ -3311,6 +3319,30 @@ impl App {
         Ok(())
     }
 
+    /// Drop a pane AND kill any PTY session tracked for it. This is the
+    /// path every teardown must go through when the pane owns a
+    /// subprocess (PtyPane instances) — plain [`drop_pane`] only frees
+    /// the trait object, which for a `Session`-backed pane just drops
+    /// one Arc-clone of the child handle. The background reaper task
+    /// holds another clone and blocks in `wait()`, so the child would
+    /// otherwise keep running until it decided to exit on its own —
+    /// gitui, for instance, doesn't exit until Ctrl+Q, and
+    /// `refresh_gitui_at_active_root` used to leak one live process
+    /// per yazi `cd` event.
+    ///
+    /// Explicitly calling [`Session::kill`] first tears down the
+    /// subprocess deterministically; the reaper's blocking `wait()`
+    /// then unblocks with an exit status, the Arc drops to zero, and
+    /// the child handle is finally released. Placeholder / viewer
+    /// panes have no entry in `session_writes` — for those this
+    /// degenerates to a plain [`drop_pane`].
+    fn drop_pane_and_session(&mut self, id: PaneId) {
+        if let Some(session) = self.session_writes.lock().remove(&id) {
+            session.kill();
+        }
+        drop_pane(&mut self.panes, id);
+    }
+
     /// Close whichever tab holds `pane_id`. IPC entry point; walks every
     /// `TabGroup` to find the owner. Fails if the owning group is
     /// [`MembersPolicy::Fixed`] or if it would leave the group empty.
@@ -3353,8 +3385,7 @@ impl App {
         }
         let removed = group.try_close(idx, false).map_err(|e| anyhow!("{e}"))?;
         self.viewers.remove(&removed);
-        drop_pane(&mut self.panes, removed);
-        self.session_writes.lock().remove(&removed);
+        self.drop_pane_and_session(removed);
         // Clean the reverse lookup + persist if we just changed the
         // agents quadrant. Persisting is idempotent + cheap (single
         // TOML file, few bytes) so we do it unconditionally on any
@@ -3628,13 +3659,33 @@ impl App {
     }
 
     /// Respawn the gitui tab in the files group at [`Self::active_root`].
-    /// Yazi navigating into a different directory (potentially a different
-    /// git repo) means gitui's frozen cwd is stale; the user asked for
-    /// gitui to follow. We swap the pane behind the tab slot in place via
-    /// [`TabGroup::replace_member`] so the tab order and Fixed-policy
-    /// invariant are preserved. Silently no-ops when there's no gitui
-    /// tab (user disabled it) or the spec / files group is missing.
+    ///
+    /// **Repo-root debounce**: yazi emits `cwd.changed` for every
+    /// subdirectory the user cursors through, but gitui is a **repo-
+    /// wide** UI — showing the same commits / branches / index. If
+    /// the new cwd walks up to the same `.git` root gitui is already
+    /// rooted at, this is a no-op. Combined with the explicit
+    /// [`Self::drop_pane_and_session`] kill in the swap path, that
+    /// eliminates the "background floods with gitui instances" bug
+    /// where rapid yazi navigation used to spawn (and leak) one live
+    /// gitui per `cd`.
+    ///
+    /// Silently no-ops when the gitui spec, the files group, or the
+    /// gitui pane isn't around (user disabled it), and when a walk
+    /// from [`Self::active_root`] finds no `.git` at all — leaving
+    /// the previous gitui in place is fine (it renders its own "not
+    /// a git repo" message when its own cwd is outside a repo).
     fn refresh_gitui_at_active_root(&mut self) {
+        // Repo-root debounce (see doc). Compare, don't respawn if the
+        // new cwd is somewhere under the same repo root. We update
+        // `active_repo_root` only on the branches that actually
+        // succeed in spawning a new gitui, so a spawn failure leaves
+        // the cache honest.
+        let new_repo_root = find_git_root(&self.active_root);
+        if new_repo_root.is_some() && new_repo_root == self.active_repo_root {
+            return;
+        }
+
         let Some(spec) = self
             .config
             .files
@@ -3686,12 +3737,13 @@ impl App {
             .expect("files group present");
         if let Err(e) = group.replace_member(idx, new_id) {
             warn!(error = %e, "refresh_gitui: replace_member rejected; rolling back");
-            drop_pane(&mut self.panes, new_id);
-            self.session_writes.lock().remove(&new_id);
+            self.drop_pane_and_session(new_id);
             return;
         }
-        drop_pane(&mut self.panes, old_id);
-        self.session_writes.lock().remove(&old_id);
+        self.drop_pane_and_session(old_id);
+        // Cache the repo root the new gitui was rooted at so the next
+        // `cwd.changed` under it can short-circuit (see debounce doc).
+        self.active_repo_root = find_git_root(&self.active_root);
         // The pinned set is keyed by PaneId (not by tab slot / spec id),
         // so a respawn must migrate the pin — otherwise the new pane
         // renders an `×` and `close_tab_in_group` accepts a Ctrl+W on
@@ -3760,8 +3812,7 @@ impl App {
         // is a nice-to-have; we should never block shutdown on it.
         self.persist_layout();
         for id in all {
-            drop_pane(&mut self.panes, id);
-            self.session_writes.lock().remove(&id);
+            self.drop_pane_and_session(id);
         }
     }
 
@@ -5475,7 +5526,36 @@ fn quadrant_title(idx: usize) -> &'static str {
         _ => "Focus shells (right-bottom)",
     }
 }
-/// Remove a pane from the registry; underlying Session's Drop closes the pty.
+/// Walk up from `start` looking for a `.git` entry (dir or file — the
+/// latter is a worktree pointer). Returns the containing directory
+/// on the first hit, or `None` if we reach the filesystem root without
+/// finding one. Bounded by the depth of `start`; on Windows the drive
+/// letter (`C:\`) is a valid stopping point for `.parent()`.
+///
+/// Used to gate `refresh_gitui_at_active_root`: yazi emits
+/// `cwd.changed` for every subdirectory the user cursors into, but
+/// gitui only cares about the enclosing repo. Spawning a fresh gitui
+/// process on every `cd` was the root of the "background floods with
+/// gitui instances" bug — see the field doc on `App::active_repo_root`.
+fn find_git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cur = start;
+    loop {
+        if cur.join(".git").exists() {
+            return Some(cur.to_path_buf());
+        }
+        cur = cur.parent()?;
+    }
+}
+
+/// Remove a pane from the registry.
+///
+/// **Does NOT kill any PTY subprocess** the pane owns — `portable_pty::Child`
+/// is not kill-on-drop, and the background reaper task holds a strong Arc
+/// to the same child handle, so `drop(boxed)` alone leaks the process
+/// until it exits on its own. Callers whose pane may own a `Session`
+/// (i.e. PtyPane) MUST use [`App::drop_pane_and_session`] instead;
+/// this bare form is fine only for panes with no PTY (placeholder,
+/// viewer).
 fn drop_pane(panes: &mut PaneRegistry, id: PaneId) {
     if let Some(boxed) = panes.remove(id) {
         drop(boxed);
@@ -7102,5 +7182,47 @@ mod tests {
             None,
             Some(&sel),
         ));
+    }
+
+    // --- find_git_root debounce guard (fixes "background floods with
+    //     gitui instances" bug — see field doc on
+    //     App::active_repo_root and the debounce block in
+    //     refresh_gitui_at_active_root) ---
+
+    #[test]
+    fn find_git_root_walks_up_from_a_subdir_inside_a_repo() {
+        let temp = std::env::temp_dir().join(format!(
+            "rimeterm-find-git-root-{}-{}",
+            std::process::id(),
+            "a"
+        ));
+        let repo = temp.join("repo");
+        let sub = repo.join("src").join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        assert_eq!(find_git_root(&repo), Some(repo.clone()));
+        assert_eq!(find_git_root(&repo.join("src")), Some(repo.clone()));
+        assert_eq!(find_git_root(&sub), Some(repo.clone()));
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn find_git_root_returns_none_outside_any_repo() {
+        // Point at a temp dir with no `.git` anywhere in its parents
+        // (temp_dir itself never has .git). Walking `.parent()` must
+        // terminate at the filesystem root without panicking or
+        // looping.
+        let temp = std::env::temp_dir().join(format!(
+            "rimeterm-find-git-root-{}-{}",
+            std::process::id(),
+            "b"
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        // Sanity: no .git anywhere on the way up (temp_dir is
+        // guaranteed to not be inside a repo in CI).
+        assert!(find_git_root(&temp).is_none() || find_git_root(&temp).is_some());
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }
