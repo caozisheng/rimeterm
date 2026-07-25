@@ -412,7 +412,7 @@ fn tab_style(active: bool) -> Style {
     if active {
         Style::default()
             .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            .add_modifier(Modifier::UNDERLINED)
     } else {
         Style::default().add_modifier(Modifier::DIM)
     }

@@ -296,7 +296,7 @@ pub fn render(area: Rect, buf: &mut Buffer, state: &PickerState) {
     block.render(area, buf);
 
     let disabled = Style::default().add_modifier(Modifier::DIM);
-    let selected = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    let selected = Style::default().add_modifier(Modifier::REVERSED);
     let note_style = Style::default().fg(Color::DarkGray);
 
     for (idx, entry) in state.entries.iter().take(inner.height as usize).enumerate() {

@@ -63,18 +63,16 @@ pub fn render(
     };
     let mut spans: Vec<Span<'_>> = Vec::with_capacity(group.len() * 3 + 3);
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let active_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    let active_style = Style::default().add_modifier(Modifier::REVERSED);
     // Non-active tab hover: bold + underline so it clearly reads as
     // clickable without overpowering the active tab's REVERSED look.
-    let tab_hover_style = Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let tab_hover_style = Style::default().add_modifier(Modifier::UNDERLINED);
     // Close-button hover: red + bold. Same red as viewer's own `[×]`,
     // matching the "closing does something destructive" convention.
-    let close_hover_style = Style::default()
-        .fg(Color::LightRed)
-        .add_modifier(Modifier::BOLD);
+    let close_hover_style = Style::default().fg(Color::LightRed);
     // Plus-button hover: undim + bold. `[+]` is a positive action so we
     // stop at "obviously clickable" without borrowing the destructive red.
-    let plus_hover_style = Style::default().add_modifier(Modifier::BOLD);
+    let plus_hover_style = Style::default();
 
     spans.push(Span::styled(" ┤ ", dim));
     for (idx, title) in titles.iter().enumerate() {

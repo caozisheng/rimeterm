@@ -89,7 +89,7 @@ impl PaneProvider for PlaceholderPane {
         let marker = if ctx.focused { "▶ " } else { "  " };
         let heading = format!(" {}{} {} ", marker, self.icon, self.title);
         let border_style = if ctx.focused {
-            Style::default().fg(self.color).add_modifier(Modifier::BOLD)
+            Style::default().fg(self.color)
         } else {
             Style::default()
                 .fg(Color::DarkGray)
@@ -115,7 +115,7 @@ impl PaneProvider for PlaceholderPane {
         let mut body: Vec<Line<'_>> = Vec::with_capacity(2 + rest.len());
         body.push(Line::from(Span::styled(
             first,
-            Style::default().fg(self.color).add_modifier(Modifier::BOLD),
+            Style::default().fg(self.color),
         )));
         if !rest.is_empty() {
             body.push(Line::from(""));
@@ -133,7 +133,7 @@ impl PaneProvider for PlaceholderPane {
             body.push(Line::from(""));
             body.push(Line::from(Span::styled(
                 "[I] Install now",
-                Style::default().fg(self.color).add_modifier(Modifier::BOLD),
+                Style::default().fg(self.color),
             )));
         }
         // Center the whole block when it's a single-line hint (aesthetic

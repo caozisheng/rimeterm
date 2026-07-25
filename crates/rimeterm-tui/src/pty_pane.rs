@@ -464,9 +464,7 @@ impl PaneProvider for PtyPane {
         let marker = if ctx.focused { "▶ " } else { "  " };
         let title = format!(" {}🐚 {} ", marker, self.title);
         let border_style = if ctx.focused {
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::LightCyan)
         } else {
             Style::default()
                 .fg(Color::DarkGray)

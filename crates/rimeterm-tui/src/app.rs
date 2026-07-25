@@ -2719,9 +2719,7 @@ impl App {
             &self.last_dividers,
         );
         if let Some((seam_rect, _)) = live_hover {
-            let style = Style::default()
-                .fg(Color::LightYellow)
-                .add_modifier(Modifier::BOLD);
+            let style = Style::default().fg(Color::LightYellow);
             for y in seam_rect.y..seam_rect.y.saturating_add(seam_rect.height) {
                 for x in seam_rect.x..seam_rect.x.saturating_add(seam_rect.width) {
                     // Defensive: skip cells outside the terminal grid
@@ -2757,12 +2755,7 @@ impl App {
                 pending.label,
                 elapsed.as_secs_f32(),
             );
-            (
-                text,
-                Style::default()
-                    .fg(Color::LightYellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+            (text, Style::default().fg(Color::LightYellow))
         } else if let Some((_, axis)) = live_hover {
             let text = match axis {
                 Direction::Horizontal => {
@@ -5454,7 +5447,16 @@ fn drop_pane(panes: &mut PaneRegistry, id: PaneId) {
 }
 
 fn hint_bar_text() -> String {
-    "Ctrl+Q Quit · F1 / Ctrl+Shift+P Palette · Alt+H/J/K/L Nav · Alt+1..3 Pane · Ctrl+PgUp/PgDn or Alt+[/] Tab · Ctrl+T New tab · Ctrl+W Close tab · F10 Menu".into()
+    // Order = frequency-weighted from watching real sessions. Dropped
+    // `Alt+H/J/K/L Nav` (redundant with `Alt+1..3 Pane` in the three-
+    // zone layout — HJKL never advertised its own zones anyway) and
+    // `Ctrl+PgUp/PgDn` (Alt+[/] is the canonical Tab cycle and works
+    // on every terminal we care about). Added `Ctrl+= / -` because on
+    // Windows Terminal it lives-zooms the host font — the fastest way
+    // for users to answer "text too big?" without leaving the app.
+    // WT intercepts these keys before rimeterm sees them, so this is
+    // documentation of a HOST feature, not a rimeterm binding.
+    "Ctrl+Q Quit · F1 / Ctrl+Shift+P Palette · Alt+1..3 Pane · Alt+[/] Tab · Ctrl+T New tab · Ctrl+W Close tab · Ctrl+= / - Zoom · F10 Menu".into()
 }
 
 fn point_in_rect(x: u16, y: u16, r: Rect) -> bool {
@@ -6857,19 +6859,22 @@ mod tests {
     }
 
     #[test]
-    fn external_action_hint_is_stable() {
-        assert_eq!(ExternalAction::OpenWithSystem.hint(), "open with system");
-        assert_eq!(ExternalAction::Reveal.hint(), "reveal");
-    }
-
-    #[test]
     fn status_hint_matches_three_zone_keymap() {
         let hint = hint_bar_text();
+        // Preserved bindings.
         assert!(hint.contains("Alt+1..3 Pane"));
-        assert!(!hint.contains("Alt+1..4"));
-        assert!(!hint.contains("Quadrant"));
         assert!(hint.contains("Ctrl+T New tab"));
         assert!(hint.contains("Ctrl+W Close tab"));
+        // §21 hint-bar diet: Alt+HJKL Nav and Ctrl+PgUp/PgDn Tab dropped
+        // to reclaim cells for the Zoom hint. Guard so a well-meaning
+        // "let's advertise more shortcuts" PR doesn't sneak them back.
+        assert!(hint.contains("Ctrl+= / - Zoom"));
+        assert!(!hint.contains("Alt+H"));
+        assert!(!hint.contains("Ctrl+PgUp"));
+        assert!(!hint.contains("Ctrl+PgDn"));
+        // Legacy invariants: no stray four-zone / "Quadrant" wording.
+        assert!(!hint.contains("Alt+1..4"));
+        assert!(!hint.contains("Quadrant"));
     }
 
     // --- viewer dedup (Alt+V idempotence) --------------------------

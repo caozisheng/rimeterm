@@ -921,18 +921,9 @@ pub fn render_into_pane(
     }
     let title = build_title(state);
     let block = Block::default()
-        .title(Line::styled(
-            title,
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ))
+        .title(Line::styled(title, Style::default().fg(Color::LightCyan)))
         .borders(Borders::ALL)
-        .border_style(
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .border_style(Style::default().fg(Color::LightCyan));
     let inner = block.inner(pane_rect);
     // Clear pane cells so any previously-rendered yazi glyphs don't
     // bleed through where the block skips characters (e.g. gaps

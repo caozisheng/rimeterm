@@ -72,7 +72,7 @@ pub fn render(
     // ≡ menu opener. Bold by default (design §19.13.1: "hover 变粗").
     // Reverse on hover so it clearly reads as clickable even against
     // dark backgrounds where bold alone is hard to spot.
-    let mut menu_style = Style::default().add_modifier(Modifier::BOLD);
+    let mut menu_style = Style::default();
     if matches!(hover, StatusBarHover::Menu) {
         menu_style = menu_style.add_modifier(Modifier::REVERSED);
     }
@@ -88,9 +88,7 @@ pub fn render(
 
     // Quit button. Red so it's unambiguous as a "close app" affordance;
     // reversed on hover for the same visibility reason as the menu.
-    let mut quit_style = Style::default()
-        .fg(Color::LightRed)
-        .add_modifier(Modifier::BOLD);
+    let mut quit_style = Style::default().fg(Color::LightRed);
     if matches!(hover, StatusBarHover::Quit) {
         quit_style = quit_style.add_modifier(Modifier::REVERSED);
     }
