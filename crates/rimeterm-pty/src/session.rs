@@ -130,6 +130,18 @@ type Listener = alacritty_terminal::event::VoidListener;
 #[allow(dead_code)] // events_tx clones are kept for future subscribers
 pub struct Session {
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    /// Independent killer handle cloned off the child at spawn time.
+    ///
+    /// The reaper task holds `child`'s mutex inside a blocking
+    /// `wait()` for the child's entire lifetime, so any code path
+    /// that tries to `child.lock().kill()` — the shape `Session::kill`
+    /// used to have — deadlocks against the reaper on interactive
+    /// TUIs (gitui, shells) that never exit on their own.
+    /// `portable_pty::ChildKiller::clone_killer` hands us a separate
+    /// object that talks to the same OS process handle without
+    /// needing exclusive access to the `Child`; storing it here lets
+    /// [`Self::kill`] fire regardless of what the reaper is doing.
+    killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     term: Arc<Mutex<Term<Listener>>>,
     /// Writer end for stdin. `None` after the child exits.
@@ -197,6 +209,7 @@ impl Session {
             &dims,
             alacritty_terminal::event::VoidListener,
         )));
+        let killer = child.clone_killer();
         let child = Arc::new(Mutex::new(child));
         let master = Arc::new(Mutex::new(pair.master));
 
@@ -240,6 +253,7 @@ impl Session {
         Ok((
             Self {
                 child,
+                killer: Arc::new(Mutex::new(killer)),
                 master,
                 term,
                 writer: writer_shared,
@@ -319,10 +333,17 @@ impl Session {
         self.with_term(|t| (t.columns() as u16, t.screen_lines() as u16))
     }
 
-    /// Best-effort kill for `Ctrl+Q` shutdown. Ignores errors — reaper will log.
+    /// Best-effort kill for shutdown / respawn (`drop_pane_and_session`).
+    ///
+    /// Uses the independent killer handle so we never race the reaper
+    /// task that lives inside `child.lock().wait()`. Errors are
+    /// swallowed: killing a process that already exited returns an
+    /// OS-specific "no such process" error which we don't want to log
+    /// noisily, and the reaper will surface any real exit status
+    /// through `SessionOutput::Exited` anyway.
     pub fn kill(&self) {
-        let mut guard = self.child.lock();
-        let _ = guard.kill();
+        let mut k = self.killer.lock();
+        let _ = k.kill();
     }
 }
 

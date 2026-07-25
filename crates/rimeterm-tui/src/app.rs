@@ -3676,13 +3676,32 @@ impl App {
     /// the previous gitui in place is fine (it renders its own "not
     /// a git repo" message when its own cwd is outside a repo).
     fn refresh_gitui_at_active_root(&mut self) {
-        // Repo-root debounce (see doc). Compare, don't respawn if the
-        // new cwd is somewhere under the same repo root. We update
-        // `active_repo_root` only on the branches that actually
-        // succeed in spawning a new gitui, so a spawn failure leaves
-        // the cache honest.
+        // Repo-root debounce.
+        //
+        // Rules:
+        // 1. Same repo (yazi cursoring around inside one project) —
+        //    obvious no-op.
+        // 2. Leaving all repos (yazi navigating to a non-repo dir like
+        //    `~/Downloads`) — ALSO a no-op. Keeping the previous
+        //    gitui rooted at the last real repo is friendlier than
+        //    spawning a fresh gitui at a non-repo dir (gitui errors
+        //    out immediately in that case, and each respawn is
+        //    expensive; on Windows the freshly-killed old process
+        //    plus a spinning-up new one showed up as the "app
+        //    freezes when leaving the git folder" symptom before
+        //    this guard tightened). We still track the transition by
+        //    updating the cache so re-entering a repo respawns.
+        // 3. Fresh repo — respawn (falls through).
+        //
+        // `active_repo_root` is written only on the success path so a
+        // spawn failure leaves the cache honest and the NEXT event has
+        // another chance to respawn.
         let new_repo_root = find_git_root(&self.active_root);
-        if new_repo_root.is_some() && new_repo_root == self.active_repo_root {
+        if new_repo_root == self.active_repo_root {
+            return;
+        }
+        if new_repo_root.is_none() {
+            self.active_repo_root = None;
             return;
         }
 
