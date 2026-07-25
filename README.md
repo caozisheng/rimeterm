@@ -2,8 +2,10 @@
 
 **A TUI-native terminal built for coding agents.** Runs inside your existing terminal (Windows Terminal / WezTerm / kitty / iTerm2 / Alacritty) and multiplexes PTY sessions like tmux — but with an agent-shaped hole in the middle.
 
-<img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/49228a02-2158-4072-ade4-eb5016145f0b" />
-<img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/2d557055-3336-495b-a696-09d56bc7e2d0" />
+<img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/0af3a44d-0991-4b26-81cf-2163c2198d11" />
+
+<img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/b64823c6-cf82-484b-88a3-685f814f5558" />
+
 
 | | |
 |---|---|
