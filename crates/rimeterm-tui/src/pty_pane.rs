@@ -9,10 +9,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Widget};
+use ratatui::widgets::{
+    Block, Borders, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
+};
 use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
 use rimeterm_pty::{Decision, ResizeThrottle, Session};
 
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color as AlacColor, NamedColor};
@@ -135,6 +138,12 @@ pub struct PtyPane {
     /// - `Some(false)` → drag started in "local selection" mode;
     ///   every subsequent `Drag` / `Up` extends / commits the selection.
     drag_forward_active: Option<bool>,
+    /// True only for agent and interactive shell panes.
+    scrollback_enabled: bool,
+    /// Last rendered local scrollbar hit target. Present only while focused with history.
+    scrollbar_rect: Option<Rect>,
+    /// Keeps scrollbar ownership through Left drag/up events.
+    scrollbar_drag: bool,
 }
 
 impl PtyPane {
@@ -153,6 +162,9 @@ impl PtyPane {
             right_click_paste: false,
             yazi_layout: None,
             drag_forward_active: None,
+            scrollback_enabled: false,
+            scrollbar_rect: None,
+            scrollbar_drag: false,
         }
     }
 
@@ -510,46 +522,40 @@ impl PaneProvider for PtyPane {
         // a phantom character in the second column while still letting
         // the underlying `set_char` cover both cells visually (ratatui
         // widens automatically for wide chars written via `set_char`).
-        let (vt_cursor_row, vt_cursor_col, vt_hide_cursor) = self.session.with_term(|term| {
-            let inner_cols = inner.width as usize;
-            let inner_rows = inner.height as usize;
-            for indexed in term.grid().display_iter() {
-                let row = indexed.point.line.0;
-                let col = indexed.point.column.0;
-                // display_iter yields scrollback lines with negative
-                // `.line.0` — clamp to visible viewport (0..inner_h).
-                if row < 0 {
-                    continue;
+        let (vt_cursor_row, vt_cursor_col, vt_hide_cursor, history_size, display_offset) =
+            self.session.with_term(|term| {
+                let inner_cols = inner.width as usize;
+                let inner_rows = inner.height as usize;
+                let display_offset = term.grid().display_offset();
+                let history_size = term.total_lines().saturating_sub(term.screen_lines());
+                for indexed in term.grid().display_iter() {
+                    let Some(row_u) =
+                        viewport_row(indexed.point.line.0, display_offset, inner_rows)
+                    else {
+                        continue;
+                    };
+                    let col = indexed.point.column.0;
+                    if col >= inner_cols {
+                        continue;
+                    }
+                    if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                        || indexed.cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+                    {
+                        continue;
+                    }
+                    let cell_x = inner.x + col as u16;
+                    let cell_y = inner.y + row_u as u16;
+                    let target = &mut buf[(cell_x, cell_y)];
+                    let ch = indexed.cell.c;
+                    target.set_char(if ch == '\0' { ' ' } else { ch });
+                    target.set_style(alac_cell_style(indexed.cell));
                 }
-                let row_u = row as usize;
-                if row_u >= inner_rows || col >= inner_cols {
-                    continue;
-                }
-                // Skip the trailing half of a wide char / any leading
-                // spacer — we already painted the leading half.
-                if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                    || indexed.cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    continue;
-                }
-                let cell_x = inner.x + col as u16;
-                let cell_y = inner.y + row_u as u16;
-                let target = &mut buf[(cell_x, cell_y)];
-                let ch = indexed.cell.c;
-                // '\0' is alacritty's empty-cell sentinel. Render as
-                // space so the buffer isn't full of holes for ratatui's
-                // diff engine.
-                target.set_char(if ch == '\0' { ' ' } else { ch });
-                target.set_style(alac_cell_style(indexed.cell));
-            }
-            let point = term.grid().cursor.point;
-            let hide = !term.mode().contains(TermMode::SHOW_CURSOR);
-            // alacritty line can be negative for scrollback rows;
-            // clamp for the caret query.
-            let r = point.line.0.max(0) as u16;
-            let c = point.column.0 as u16;
-            (r, c, hide)
-        });
+                let point = term.grid().cursor.point;
+                let hide = !term.mode().contains(TermMode::SHOW_CURSOR) || display_offset > 0;
+                let r = point.line.0.max(0) as u16;
+                let c = point.column.0 as u16;
+                (r, c, hide, history_size, display_offset)
+            });
 
         // Only the focused pane owns the caret. Unfocused shells still
         // update their alacritty cursor as output arrives, but the OS caret
@@ -578,6 +584,31 @@ impl PaneProvider for PtyPane {
                     }
                 }
             }
+        }
+
+        self.scrollbar_rect = None;
+        if self.scrollback_enabled
+            && should_show_scrollbar(ctx.focused, history_size)
+            && inner.width > 0
+            && inner.height > 0
+        {
+            let scrollbar_rect = Rect {
+                x: inner.x.saturating_add(inner.width.saturating_sub(1)),
+                y: inner.y,
+                width: 1,
+                height: inner.height,
+            };
+            let position = history_size.saturating_sub(display_offset);
+            let mut state = ScrollbarState::new(history_size.saturating_add(inner.height as usize))
+                .position(position)
+                .viewport_content_length(inner.height as usize);
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .render(scrollbar_rect, buf, &mut state);
+            self.scrollbar_rect = Some(scrollbar_rect);
+        } else {
+            self.scrollbar_drag = false;
         }
 
         RenderOutcome {
@@ -618,7 +649,11 @@ impl PaneProvider for PtyPane {
             // Don't `return true` — the child might want Esc too
             // (e.g. vim mode-switch). Just consumed the highlight.
         }
-        if let Some(bytes) = encode_key(key) {
+        let bytes = encode_key(key);
+        if should_snap_to_bottom(self.scrollback_enabled, bytes.as_deref()) {
+            self.session.scroll_to_offset(0);
+        }
+        if let Some(bytes) = bytes {
             let _ = self.session.write(&bytes);
             true
         } else {
@@ -628,6 +663,18 @@ impl PaneProvider for PtyPane {
 
     fn has_active_selection(&self) -> bool {
         self.selection.is_active()
+    }
+
+    fn scrollbar_dragging(&self) -> bool {
+        self.scrollbar_drag
+    }
+
+    fn set_scrollback_enabled(&mut self, on: bool) {
+        self.scrollback_enabled = on;
+        if !on {
+            self.scrollbar_rect = None;
+            self.scrollbar_drag = false;
+        }
     }
 
     fn wants_mouse_priority(&self, shift_held: bool) -> bool {
@@ -666,6 +713,26 @@ impl PaneProvider for PtyPane {
             && !matches!(ev.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
         {
             return false;
+        }
+        if self.scrollback_enabled
+            && matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .scrollbar_rect
+                .is_some_and(|r| point_in_rect(ev.column, ev.row, r))
+        {
+            self.scrollbar_drag = true;
+            self.drag_forward_active = None;
+            self.selection.clear();
+            self.scroll_to_scrollbar_row(ev.row);
+            return true;
+        }
+        if matches!(ev.kind, MouseEventKind::Drag(MouseButton::Left)) && self.scrollbar_drag {
+            self.scroll_to_scrollbar_row(ev.row);
+            return true;
+        }
+        if matches!(ev.kind, MouseEventKind::Up(MouseButton::Left)) && self.scrollbar_drag {
+            self.scrollbar_drag = false;
+            return true;
         }
 
         // Shift always forces local ownership so users can select text
@@ -727,6 +794,14 @@ impl PaneProvider for PtyPane {
         // wanders left into the file lists.
         let sel_rect = self.local_selection_rect(outer_rect);
         match ev.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.scrollback_enabled => {
+                if let Some(lines) = wheel_scroll_lines(ev.kind) {
+                    self.selection.clear();
+                    self.session.scroll_lines(lines);
+                    return true;
+                }
+                false
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(cell) =
                     self.selection_cell_from_rect(ev.column, ev.row, outer_rect, sel_rect)
@@ -822,6 +897,15 @@ impl PtyPane {
             self.mouse_passthrough,
             self.child_wants_mouse(),
         )
+    }
+
+    fn scroll_to_scrollbar_row(&mut self, row: u16) {
+        let Some(rect) = self.scrollbar_rect else {
+            return;
+        };
+        let history_size = self.session.scroll_metrics().history_size;
+        let offset = scrollbar_offset_for_row(row, rect.y, rect.height, history_size);
+        self.session.scroll_to_offset(offset);
     }
 }
 
@@ -989,6 +1073,7 @@ fn alac_color(color: AlacColor, foreground: bool) -> Option<Color> {
             NamedColor::Yellow | NamedColor::DimYellow => Color::Yellow,
             NamedColor::Blue | NamedColor::DimBlue => Color::Blue,
             NamedColor::Magenta | NamedColor::DimMagenta => Color::Magenta,
+
             NamedColor::Cyan | NamedColor::DimCyan => Color::Cyan,
             NamedColor::White | NamedColor::DimWhite => Color::Gray,
             NamedColor::BrightBlack => Color::DarkGray,
@@ -1005,6 +1090,40 @@ fn alac_color(color: AlacColor, foreground: bool) -> Option<Color> {
         AlacColor::Spec(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
         AlacColor::Indexed(i) => Color::Indexed(i),
     })
+}
+
+fn should_snap_to_bottom(scrollback_enabled: bool, encoded_key: Option<&[u8]>) -> bool {
+    scrollback_enabled && encoded_key.is_some()
+}
+
+fn wheel_scroll_lines(kind: MouseEventKind) -> Option<i32> {
+    match kind {
+        MouseEventKind::ScrollUp => Some(3),
+        MouseEventKind::ScrollDown => Some(-3),
+        _ => None,
+    }
+}
+
+fn should_show_scrollbar(focused: bool, history_size: usize) -> bool {
+    focused && history_size > 0
+}
+
+fn scrollbar_offset_for_row(row: u16, top: u16, height: u16, history_size: usize) -> usize {
+    if height <= 1 {
+        return history_size;
+    }
+    let bottom = top.saturating_add(height.saturating_sub(1));
+    let row = row.clamp(top, bottom);
+    let from_top = usize::from(row.saturating_sub(top));
+    let span = usize::from(height - 1);
+    history_size.saturating_sub((from_top * history_size + span / 2) / span)
+}
+
+fn viewport_row(line: i32, display_offset: usize, viewport_height: usize) -> Option<usize> {
+    let row = i64::from(line) + i64::try_from(display_offset).unwrap_or(i64::MAX);
+    usize::try_from(row)
+        .ok()
+        .filter(|row| *row < viewport_height)
 }
 
 /// Inset the outer pane rect by 1 cell on every side to match the block
@@ -1279,6 +1398,13 @@ mod mouse_tests {
     }
 
     #[test]
+    fn encoded_key_snaps_enabled_scrollback_to_live_bottom() {
+        assert!(should_snap_to_bottom(true, Some(b"x")));
+        assert!(!should_snap_to_bottom(false, Some(b"x")));
+        assert!(!should_snap_to_bottom(true, None));
+    }
+
+    #[test]
     fn on_mouse_ignores_clicks_on_border() {
         // ev.column/row on the border cells should NOT produce forwarded bytes.
         // We can't easily construct a live PtyPane in a unit test, but the
@@ -1368,6 +1494,41 @@ mod mouse_tests {
             height: 0,
         };
         assert_eq!(translate_cursor(true, false, collapsed, 0, 0), None);
+    }
+
+    #[test]
+    fn wheel_scrolls_three_lines_per_notch() {
+        assert_eq!(wheel_scroll_lines(MouseEventKind::ScrollUp), Some(3));
+        assert_eq!(wheel_scroll_lines(MouseEventKind::ScrollDown), Some(-3));
+    }
+
+    #[test]
+    fn horizontal_wheel_does_not_move_history() {
+        assert_eq!(wheel_scroll_lines(MouseEventKind::ScrollLeft), None);
+    }
+
+    #[test]
+    fn scrollbar_only_shows_for_focused_pane_with_history() {
+        assert!(should_show_scrollbar(true, 1));
+        assert!(!should_show_scrollbar(false, 1));
+        assert!(!should_show_scrollbar(true, 0));
+    }
+
+    #[test]
+    fn scrollbar_top_maps_to_oldest_history() {
+        assert_eq!(scrollbar_offset_for_row(10, 10, 5, 100), 100);
+    }
+
+    #[test]
+    fn scrollbar_bottom_maps_to_live_output() {
+        assert_eq!(scrollbar_offset_for_row(14, 10, 5, 100), 0);
+    }
+
+    #[test]
+    fn scrolled_grid_lines_map_into_visible_rows() {
+        assert_eq!(viewport_row(-7, 7, 10), Some(0));
+        assert_eq!(viewport_row(2, 7, 10), Some(9));
+        assert_eq!(viewport_row(3, 7, 10), None);
     }
 
     // --- §19.14 YaziLayout math ---

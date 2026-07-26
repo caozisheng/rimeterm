@@ -18,7 +18,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use alacritty_terminal::event::EventListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config as TermConfig, Term};
@@ -148,6 +148,14 @@ pub struct Session {
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     /// Notification channel for `SessionOutput::*`.
     events_tx: mpsc::UnboundedSender<SessionOutput>,
+}
+
+/// Immutable terminal scrollback state for rendering a viewport control.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScrollMetrics {
+    pub history_size: usize,
+    pub display_offset: usize,
+    pub screen_lines: usize,
 }
 
 impl Session {
@@ -305,6 +313,22 @@ impl Session {
         f(&t)
     }
 
+    /// Move the terminal viewport by `lines` relative to the live bottom.
+    /// Positive values move into older history; negative values move toward live output.
+    pub fn scroll_lines(&self, lines: i32) {
+        scroll_term_lines(&mut self.term.lock(), lines);
+    }
+
+    /// Set the terminal viewport offset, where zero is the live bottom.
+    pub fn scroll_to_offset(&self, offset: usize) {
+        scroll_term_to_offset(&mut self.term.lock(), offset);
+    }
+
+    /// Snapshot the metrics needed to render and position a scrollbar.
+    pub fn scroll_metrics(&self) -> ScrollMetrics {
+        term_scroll_metrics(&self.term.lock())
+    }
+
     /// Snapshot the grid contents as a plain string, optionally trimmed to
     /// the last `rows` visible rows. Walks alacritty's `display_iter`
     /// (which honors the current display offset and hides scrollback
@@ -344,6 +368,27 @@ impl Session {
     pub fn kill(&self) {
         let mut k = self.killer.lock();
         let _ = k.kill();
+    }
+}
+
+fn scroll_term_lines<L: EventListener>(term: &mut Term<L>, lines: i32) {
+    term.scroll_display(Scroll::Delta(lines));
+}
+
+fn scroll_term_to_offset<L: EventListener>(term: &mut Term<L>, offset: usize) {
+    let current = term.grid().display_offset();
+    let delta =
+        i64::try_from(offset).unwrap_or(i64::MAX) - i64::try_from(current).unwrap_or(i64::MAX);
+    let delta = delta.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    term.scroll_display(Scroll::Delta(delta));
+}
+
+fn term_scroll_metrics<L>(term: &Term<L>) -> ScrollMetrics {
+    let screen_lines = term.screen_lines();
+    ScrollMetrics {
+        history_size: term.total_lines().saturating_sub(screen_lines),
+        display_offset: term.grid().display_offset(),
+        screen_lines,
     }
 }
 
@@ -497,6 +542,56 @@ mod term_to_string_tests {
         let lines: Vec<&str> = s.lines().collect();
         assert_eq!(lines.first().map(|l| l.trim_end()), Some("a"));
         assert_eq!(lines.get(1).map(|l| l.trim_end()), Some("b"));
+    }
+}
+
+#[cfg(test)]
+mod scrollback_tests {
+    use super::*;
+
+    fn term_with_history() -> Term<Listener> {
+        let dims = TermDims {
+            columns: 8,
+            screen_lines: 3,
+        };
+        let mut term = Term::new(
+            TermConfig::default(),
+            &dims,
+            alacritty_terminal::event::VoidListener,
+        );
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, b"0\r\n1\r\n2\r\n3\r\n4\r\n5");
+        term
+    }
+
+    #[test]
+    fn scroll_lines_clamps_at_history_top() {
+        let mut term = term_with_history();
+        scroll_term_lines(&mut term, i32::MAX);
+        let metrics = term_scroll_metrics(&term);
+        assert_eq!(metrics.display_offset, metrics.history_size);
+    }
+
+    #[test]
+    fn scroll_to_offset_reaches_live_bottom() {
+        let mut term = term_with_history();
+        scroll_term_lines(&mut term, 3);
+        scroll_term_to_offset(&mut term, 0);
+        assert_eq!(term_scroll_metrics(&term).display_offset, 0);
+    }
+
+    #[test]
+    fn scroll_metrics_reports_history_offset_and_viewport() {
+        let mut term = term_with_history();
+        scroll_term_lines(&mut term, 2);
+        assert_eq!(
+            term_scroll_metrics(&term),
+            ScrollMetrics {
+                history_size: 3,
+                display_offset: 2,
+                screen_lines: 3,
+            }
+        );
     }
 }
 

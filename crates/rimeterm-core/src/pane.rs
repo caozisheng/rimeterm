@@ -129,6 +129,19 @@ pub trait PaneProvider: Send + 'static {
         false
     }
 
+    /// Whether this pane currently owns an active local scrollbar drag.
+    /// The app uses this to keep delivering Drag/Up after the pointer leaves
+    /// the pane rectangle. Default is false for non-scrollable providers.
+    fn scrollbar_dragging(&self) -> bool {
+        false
+    }
+
+    /// Enable terminal-history scrolling for agent and interactive shell panes.
+    /// Default is a no-op; only PTY providers implement it.
+    fn set_scrollback_enabled(&mut self, on: bool) {
+        let _ = on;
+    }
+
     /// Deliver a kernel event this pane subscribed to.
     fn on_event(&mut self, ev: &KernelEvent) {
         let _ = ev;

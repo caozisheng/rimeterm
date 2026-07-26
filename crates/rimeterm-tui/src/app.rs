@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use crossterm::event::{Event, EventStream, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyEvent, KeyEventKind, MouseEventKind};
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -682,6 +682,7 @@ impl App {
             // `[mouse] right_click_paste = false`.
             if let Some(pane) = panes.get_mut(id) {
                 pane.set_right_click_paste(config.mouse.right_click_paste);
+                pane.set_scrollback_enabled(true);
             }
             agents_members.push(id);
             // Try to map the config spec id back to a registry entry so
@@ -726,6 +727,7 @@ impl App {
                                     // §19.14.4: match the config-path setup.
                                     if let Some(pane) = panes.get_mut(pane_id) {
                                         pane.set_right_click_paste(config.mouse.right_click_paste);
+                                        pane.set_scrollback_enabled(true);
                                     }
                                     agents_members.push(pane_id);
                                     startup_agent_ids.push((pane_id, spec.id));
@@ -817,6 +819,7 @@ impl App {
         // shells-group tab.
         if let Some(pane) = panes.get_mut(first_id) {
             pane.set_right_click_paste(config.mouse.right_click_paste);
+            pane.set_scrollback_enabled(true);
         }
         shells_members.push(first_id);
 
@@ -2094,10 +2097,35 @@ impl App {
             self.focus_pane_at(m.column, m.row);
         }
 
+        if matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_)) {
+            if let Some(pane_id) = self.focus.focused_pane() {
+                let dragging = self
+                    .panes
+                    .get(pane_id)
+                    .is_some_and(|pane| pane.scrollbar_dragging());
+                if dragging {
+                    if let Some((_, outer_rect)) = self
+                        .last_pane_outer_rects
+                        .iter()
+                        .find(|(id, _)| *id == pane_id)
+                        .copied()
+                    {
+                        if let Some(pane) = self.panes.get_mut(pane_id) {
+                            let _ = pane.on_mouse(m, outer_rect);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
         // --- Drag / Up / Scroll on a pane rect: forward as SGR to child ---
         let Some((pane_id, outer_rect)) = self.pane_outer_at(m.column, m.row) else {
             return;
         };
+        if !should_route_pane_mouse(m.kind, pane_id, self.focus.focused_pane()) {
+            return;
+        }
         if let Some(pane) = self.panes.get_mut(pane_id) {
             let _ = pane.on_mouse(m, outer_rect);
         }
@@ -3246,6 +3274,7 @@ impl App {
         // paste policy as startup ones. Config is source of truth.
         if let Some(pane) = self.panes.get_mut(new_id) {
             pane.set_right_click_paste(self.config.mouse.right_click_paste);
+            pane.set_scrollback_enabled(true);
         }
 
         let group = self.tree.find_tab_group_mut(gid).expect("group present");
@@ -3300,6 +3329,7 @@ impl App {
         // paste policy as startup ones.
         if let Some(pane) = self.panes.get_mut(new_id) {
             pane.set_right_click_paste(self.config.mouse.right_click_paste);
+            pane.set_scrollback_enabled(true);
         }
         self.pane_agent_id.insert(new_id, spec.id);
 
@@ -6015,9 +6045,20 @@ fn should_hijack_right_for_viewer(
     selection.is_some()
 }
 
+fn should_route_pane_mouse(kind: MouseEventKind, hit: PaneId, focused: Option<PaneId>) -> bool {
+    !matches!(
+        kind,
+        MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+    ) || focused == Some(hit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::MouseButton;
 
     #[test]
     fn classify_hint_maps_all_error_variants_to_non_empty_string() {
@@ -6039,6 +6080,30 @@ mod tests {
     fn classify_hint_too_large_includes_size_and_cap() {
         let msg = classify_hint(viewer::ClassifyError::TooLarge { size: 42, cap: 10 });
         assert!(msg.contains("42") && msg.contains("10"), "got {msg}");
+    }
+
+    #[test]
+    fn wheel_routes_only_to_focused_pane() {
+        let focused = PaneId(1);
+        assert!(should_route_pane_mouse(
+            MouseEventKind::ScrollUp,
+            focused,
+            Some(focused)
+        ));
+        assert!(!should_route_pane_mouse(
+            MouseEventKind::ScrollDown,
+            PaneId(2),
+            Some(focused)
+        ));
+    }
+
+    #[test]
+    fn non_wheel_mouse_routing_is_unchanged() {
+        assert!(should_route_pane_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            PaneId(2),
+            Some(PaneId(1))
+        ));
     }
     #[test]
     fn neighbor_group_navigates_left_right() {
