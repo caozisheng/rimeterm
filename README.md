@@ -2,6 +2,10 @@
 
 **A TUI-native terminal built for coding agents.** Runs inside your existing terminal (Windows Terminal / WezTerm / kitty / iTerm2 / Alacritty) and multiplexes PTY sessions like tmux — but with an agent-shaped hole in the middle.
 
+<img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/0af3a44d-0991-4b26-81cf-2163c2198d11" />
+
+<img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/b64823c6-cf82-484b-88a3-685f814f5558" />
+
 ## Why
 
 Coding agents (Codex, Claude Code, `omp`, …) live in the terminal but the terminal wasn't built for them. `tmux` treats an agent as just another shell; every other TUI multiplexer treats it as a chat window bolted on. rimeterm inverts that: **the agent is a first-class pane**, sitting next to the file manager and shells that give it the context it needs.
