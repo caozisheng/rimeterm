@@ -1,59 +1,59 @@
 #!/usr/bin/env bash
 #
-# Pre-commit hook: auto-format staged Rust files before the commit is
-# created, so every commit lands fmt-clean and CI's `cargo fmt --all
-# --check` never has anything to fix.
+# Pre-commit hook: reject the commit when the workspace isn't
+# `cargo fmt`-clean, mirroring what CI's `cargo fmt --all --check`
+# does. Runs when there's at least one staged Rust file — no cost
+# on doc / config-only commits.
 #
 # Install once per clone:
 #   git config core.hooksPath .githooks
-# (the hook is committed, so every contributor gets it)
+# (the hook is committed, so every contributor gets it after that)
 #
-# What it does:
-#   1. Collect staged *.rs files (nothing else — keeps the hook fast and
-#      avoids touching non-Rust changes in the same commit).
-#   2. Runs `cargo fmt` on just those files (rustfmt accepts paths).
-#   3. Re-stages the formatted output so the about-to-be-created commit
-#      includes the formatting.
-#   4. If rustfmt isn't installed (rare — it ships with every rustup
-#      toolchain), warn and continue rather than blocking the commit.
+# Why "check the whole workspace" instead of "format only staged
+# files":
+#   1. Matches CI 1:1 — if this hook is green, the CI fmt gate is
+#      guaranteed green. No skew.
+#   2. Catches drift outside the diff. `cargo fmt` normalizes the
+#      *file*, not "the changed lines", so a staged edit next to an
+#      already-unformatted region would land a commit that CI
+#      rejects — exactly the failure mode this hook is meant to
+#      prevent.
+#   3. Sidesteps the Windows PATH split. Git for Windows launches
+#      hooks through msys bash whose `$PATH` doesn't include rustup's
+#      shim directory. `command -v rustfmt` therefore fails and the
+#      previous hook version silently skipped ("rustfmt not found").
+#      Calling `cargo fmt` reaches rustfmt through cargo's own
+#      shim, which msys bash finds because Git for Windows inherits
+#      Windows `%PATH%` — where `~/.cargo/bin/cargo.exe` lives.
 #
-# Skip with `git commit --no-verify` when you genuinely need to commit
-# unformatted code (e.g. a WIP snapshot).
+# Skip with `git commit --no-verify` when you genuinely need to
+# commit unformatted code (e.g. a WIP snapshot pushed to a branch).
 
 set -euo pipefail
 
-# Gather staged .rs files. `--diff-filter=d` drops deleted files (rustfmt
-# can't format what's gone); the pathspec limits to Rust sources.
-staged=$(git diff --cached --name-only --diff-filter=d -- '*.rs')
-
-if [ -z "$staged" ]; then
+# Only run when the commit actually touches Rust. --diff-filter=d
+# drops deletions (they can't be unformatted).
+if ! git diff --cached --name-only --diff-filter=d -- '*.rs' | grep -q .; then
     exit 0
 fi
 
-if ! command -v rustfmt >/dev/null 2>&1; then
-    echo "pre-commit: rustfmt not found — skipping format (install via rustup component add rustfmt)" >&2
+if ! command -v cargo >/dev/null 2>&1; then
+    # No cargo means no rustfmt either. Warn instead of blocking so
+    # someone editing a doc string on a machine without a toolchain
+    # can still commit.
+    echo "pre-commit: cargo not on PATH — skipping fmt check (install via https://rustup.rs)" >&2
     exit 0
 fi
 
-# Format each staged Rust file in place. rustfmt honors rustfmt.toml /
-# edition from the manifest, so output matches `cargo fmt`.
-# shellcheck disable=SC2086  # we want word-splitting on the file list
-fmt_changed=0
-for f in $staged; do
-    if [ -f "$f" ]; then
-        # Capture whether rustfmt rewrote anything by comparing before/after.
-        before=$(cat "$f")
-        rustfmt --edition 2024 "$f" 2>/dev/null || true
-        after=$(cat "$f")
-        if [ "$before" != "$after" ]; then
-            git add "$f"
-            fmt_changed=1
-        fi
-    fi
-done
-
-if [ "$fmt_changed" -eq 1 ]; then
-    echo "pre-commit: reformatted staged Rust files (cargo fmt) and re-staged them" >&2
+# `--all` covers every workspace member; `-- --check` makes rustfmt
+# report diffs and exit non-zero instead of rewriting files. Output
+# goes straight to the user so they see the exact hunks CI would
+# flag.
+if ! cargo fmt --all -- --check; then
+    echo "" >&2
+    echo "pre-commit: workspace is not fmt-clean. Run 'cargo fmt --all' and re-commit." >&2
+    echo "            (or 'git commit --no-verify' to bypass.)" >&2
+    exit 1
 fi
 
 exit 0

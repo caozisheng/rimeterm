@@ -487,10 +487,9 @@ impl SettingsState {
                         Style::default().add_modifier(Modifier::DIM),
                     ));
                     let status = match self.integration_installed {
-                        Some(true) => Span::styled(
-                            " status: installed",
-                            Style::default().fg(Color::Green),
-                        ),
+                        Some(true) => {
+                            Span::styled(" status: installed", Style::default().fg(Color::Green))
+                        }
                         Some(false) => Span::styled(
                             " status: not installed",
                             Style::default().fg(Color::Yellow),

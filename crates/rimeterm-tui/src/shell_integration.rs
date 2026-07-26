@@ -65,8 +65,7 @@ pub(crate) fn probe() -> Option<bool> {
 /// exe path that was registered on success (handy for the hint bar).
 #[cfg(windows)]
 pub(crate) fn install() -> Result<std::path::PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("current_exe: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     // Canonicalize to resolve symlinks / `.\..\` noise so re-running
     // rimeterm from a different spawn location doesn't leave stale
     // registry entries pointing at the previous exe. THEN strip the
@@ -93,8 +92,7 @@ pub(crate) fn install() -> Result<std::path::PathBuf, String> {
 
         // Verb: default value = menu label, `Icon` = exe (Explorer
         // extracts the first icon resource).
-        reg_add_default(&verb_key, MENU_LABEL)
-            .map_err(|e| format!("write {verb_key}: {e}"))?;
+        reg_add_default(&verb_key, MENU_LABEL).map_err(|e| format!("write {verb_key}: {e}"))?;
         reg_add_value(&verb_key, "Icon", &exe_str)
             .map_err(|e| format!("write {verb_key}\\Icon: {e}"))?;
 
