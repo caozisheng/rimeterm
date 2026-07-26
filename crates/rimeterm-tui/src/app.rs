@@ -1357,6 +1357,37 @@ impl App {
                 self.set_hint(format!("shell → {label} (applies to new shell tabs)"));
                 let _ = self.redraw_tx.send(());
             }
+            SettingsAction::InstallContextMenu => {
+                match crate::shell_integration::install() {
+                    Ok(exe) => {
+                        self.settings_state.set_integration_installed(Some(true));
+                        self.set_hint(format!("context menu → installed ({})", exe.display()));
+                    }
+                    Err(err) => {
+                        // Re-probe: the write may have partially
+                        // succeeded before the failure, so trust the
+                        // registry over the return value.
+                        self.settings_state
+                            .set_integration_installed(crate::shell_integration::probe());
+                        self.set_hint(format!("context menu install failed: {err}"));
+                    }
+                }
+                let _ = self.redraw_tx.send(());
+            }
+            SettingsAction::UninstallContextMenu => {
+                match crate::shell_integration::uninstall() {
+                    Ok(()) => {
+                        self.settings_state.set_integration_installed(Some(false));
+                        self.set_hint("context menu → uninstalled".into());
+                    }
+                    Err(err) => {
+                        self.settings_state
+                            .set_integration_installed(crate::shell_integration::probe());
+                        self.set_hint(format!("context menu uninstall failed: {err}"));
+                    }
+                }
+                let _ = self.redraw_tx.send(());
+            }
             SettingsAction::Tool { .. } | SettingsAction::Agent { .. } => {
                 // Tool install/upgrade/uninstall + agent picker are
                 // pre-existing paths from C19 that aren't wired to a

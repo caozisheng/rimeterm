@@ -16,6 +16,7 @@ pub mod pty_pane;
 pub mod pty_selection;
 pub mod settings;
 pub mod shell_factory;
+pub(crate) mod shell_integration;
 pub mod status_bar;
 pub mod tab_strip;
 pub mod terminal;

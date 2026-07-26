@@ -13,7 +13,7 @@
 | **CI** | [![CI](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/caozisheng/rimeterm/actions/workflows/ci.yml) Linux · macOS · Windows |
 | **Releases** | [Latest](https://github.com/caozisheng/rimeterm/releases/latest) — archives + `.msi` / `.deb` / `.pkg` installers, essentials bundled |
 | **MSRV** | Rust 1.90 (edition 2024) |
-| **Status** | v0.1.15 — app-wide theme picker (`Alt+T` cycles Default / Dracula / Solarized / Nord / Gruvbox / GitHub Light) + chrome polish |
+| **Status** | v0.1.17 — Settings › Integration: one-click "Open with rimeterm here" Explorer right-click entry on Windows (HKCU, no admin) |
 
 ---
 

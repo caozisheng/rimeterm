@@ -26,6 +26,12 @@ pub enum SettingsTab {
     /// new shell tab. Rows are populated by
     /// [`rimeterm_pty::detect_all_shells`].
     Shell,
+    /// OS-shell integration: install / uninstall the "Open with
+    /// rimeterm here" right-click entry on Explorer folder + folder
+    /// background. Windows-only for now (writes HKCU registry
+    /// entries — no admin needed); other platforms render a
+    /// "not supported" notice.
+    Integration,
 }
 
 impl Default for SettingsTab {
@@ -57,6 +63,12 @@ pub enum SettingsAction {
     /// User picked a new system shell. App swaps `self.shell_choice`;
     /// existing shell tabs keep their PTY, next new shell inherits.
     SetShell(ShellChoice),
+    /// Register the "Open with rimeterm here" Explorer right-click
+    /// entry (Windows: HKCU registry write, no admin).
+    InstallContextMenu,
+    /// Remove the "Open with rimeterm here" Explorer right-click
+    /// entry (Windows: HKCU registry delete).
+    UninstallContextMenu,
     Refresh,
     Close,
 }
@@ -82,6 +94,12 @@ pub struct SettingsState {
     /// + the ● marker on the "current" row. Defaults to
     /// [`ShellChoice::None`] which never matches — safe fallback.
     pub current_shell: ShellChoice,
+    /// Whether the OS-shell right-click integration is currently
+    /// installed. `None` when unknown / not yet probed, `Some(true)`
+    /// when the registry entry exists, `Some(false)` when it doesn't
+    /// (or the platform isn't supported). Refreshed by
+    /// [`Self::refresh`] and after each install / uninstall.
+    pub integration_installed: Option<bool>,
 }
 
 impl Default for SettingsState {
@@ -96,6 +114,7 @@ impl Default for SettingsState {
             busy: None,
             markdown_theme: rimeterm_markdown::Theme::default(),
             current_shell: ShellChoice::None,
+            integration_installed: None,
         }
     }
 }
@@ -138,7 +157,15 @@ impl SettingsState {
             &rimeterm_config::CoreConfig::default().shell_unix
         };
         self.shells = rimeterm_pty::detect_all_shells(hints);
+        self.integration_installed = crate::shell_integration::probe();
         self.cursor = self.cursor.min(self.row_count().saturating_sub(1));
+    }
+
+    /// Reflect the outcome of an install / uninstall action so the
+    /// Integration tab's status marker updates without a full refresh.
+    /// Called by `App::apply_settings_action`.
+    pub fn set_integration_installed(&mut self, installed: Option<bool>) {
+        self.integration_installed = installed;
     }
 
     fn row_count(&self) -> usize {
@@ -147,6 +174,16 @@ impl SettingsState {
             SettingsTab::Agents => self.agents.len(),
             SettingsTab::Viewer => rimeterm_markdown::Theme::ALL.len(),
             SettingsTab::Shell => self.shells.len(),
+            // Integration: two rows on Windows (Install / Uninstall);
+            // on other platforms zero rows — the body is a static
+            // "not supported" notice.
+            SettingsTab::Integration => {
+                if cfg!(windows) {
+                    2
+                } else {
+                    0
+                }
+            }
         }
     }
 
@@ -166,22 +203,24 @@ impl SettingsState {
         match key.code {
             KeyCode::Esc => Some(SettingsAction::Close),
             KeyCode::Tab => {
-                // Cycle Tools → Agents → Viewer → Shell → Tools.
+                // Cycle Tools → Agents → Viewer → Shell → Integration → Tools.
                 self.tab = match self.tab {
                     SettingsTab::Tools => SettingsTab::Agents,
                     SettingsTab::Agents => SettingsTab::Viewer,
                     SettingsTab::Viewer => SettingsTab::Shell,
-                    SettingsTab::Shell => SettingsTab::Tools,
+                    SettingsTab::Shell => SettingsTab::Integration,
+                    SettingsTab::Integration => SettingsTab::Tools,
                 };
                 self.reset_cursor_for_tab();
                 None
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.tab = match self.tab {
-                    SettingsTab::Tools => SettingsTab::Shell,
+                    SettingsTab::Tools => SettingsTab::Integration,
                     SettingsTab::Agents => SettingsTab::Tools,
                     SettingsTab::Viewer => SettingsTab::Agents,
                     SettingsTab::Shell => SettingsTab::Viewer,
+                    SettingsTab::Integration => SettingsTab::Shell,
                 };
                 self.reset_cursor_for_tab();
                 None
@@ -191,7 +230,8 @@ impl SettingsState {
                     SettingsTab::Tools => SettingsTab::Agents,
                     SettingsTab::Agents => SettingsTab::Viewer,
                     SettingsTab::Viewer => SettingsTab::Shell,
-                    SettingsTab::Shell => SettingsTab::Tools,
+                    SettingsTab::Shell => SettingsTab::Integration,
+                    SettingsTab::Integration => SettingsTab::Tools,
                 };
                 self.reset_cursor_for_tab();
                 None
@@ -230,6 +270,18 @@ impl SettingsState {
                 .get(self.cursor)
                 .cloned()
                 .map(SettingsAction::SetShell),
+            // Row 0 = Install, row 1 = Uninstall on Windows; other
+            // platforms have no rows so the match arm is dead.
+            SettingsTab::Integration => {
+                if !cfg!(windows) {
+                    return None;
+                }
+                match self.cursor {
+                    0 => Some(SettingsAction::InstallContextMenu),
+                    1 => Some(SettingsAction::UninstallContextMenu),
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -249,6 +301,16 @@ impl SettingsState {
                 .iter()
                 .position(|s| s.path() == self.current_shell.path())
                 .unwrap_or(0),
+            // Integration: snap to Uninstall when already installed
+            // so Enter defaults to the "toggle" action; otherwise
+            // snap to Install.
+            SettingsTab::Integration => {
+                if self.integration_installed == Some(true) {
+                    1
+                } else {
+                    0
+                }
+            }
         };
     }
 
@@ -293,7 +355,7 @@ impl SettingsState {
         };
         Clear.render(popup, buf);
         let block = Block::default()
-            .title(" Settings · Tools / Agents / Viewer / Shell ")
+            .title(" Settings · Tools / Agents / Viewer / Shell / Integration ")
             .borders(Borders::ALL);
         let inner = block.inner(popup);
         block.render(popup, buf);
@@ -313,6 +375,11 @@ impl SettingsState {
             ),
             Span::raw("  "),
             Span::styled(" Shell ", tab_style(self.tab == SettingsTab::Shell, accent)),
+            Span::raw("  "),
+            Span::styled(
+                " Integration ",
+                tab_style(self.tab == SettingsTab::Integration, accent),
+            ),
             Span::styled(
                 "   [Tab] switch · [r] refresh",
                 Style::default().add_modifier(Modifier::DIM),
@@ -404,6 +471,57 @@ impl SettingsState {
                     }
                 }
             }
+            SettingsTab::Integration => {
+                if !cfg!(windows) {
+                    lines.push(Line::styled(
+                        "  right-click integration is Windows-only for now",
+                        Style::default().fg(Color::Yellow),
+                    ));
+                    lines.push(Line::styled(
+                        "  (macOS / Linux integrations planned — track in the roadmap)",
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                } else {
+                    lines.push(Line::styled(
+                        " ↑/↓ select   [Enter] apply · adds \"Open with rimeterm here\" to Explorer",
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                    let status = match self.integration_installed {
+                        Some(true) => Span::styled(
+                            " status: installed",
+                            Style::default().fg(Color::Green),
+                        ),
+                        Some(false) => Span::styled(
+                            " status: not installed",
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        None => Span::styled(
+                            " status: unknown",
+                            Style::default().add_modifier(Modifier::DIM),
+                        ),
+                    };
+                    lines.push(Line::from(vec![status]));
+                    lines.push(Line::raw(""));
+                    let rows = [
+                        ("Install context menu entry", 0usize),
+                        ("Uninstall context menu entry", 1usize),
+                    ];
+                    for (label, idx) in rows {
+                        let marker = match (idx, self.integration_installed) {
+                            (1, Some(true)) => "●",
+                            (0, Some(false)) => "●",
+                            _ => " ",
+                        };
+                        let text = format!(" {marker} {label}");
+                        lines.push(Line::styled(text, row_style(idx == self.cursor)));
+                    }
+                    lines.push(Line::raw(""));
+                    lines.push(Line::styled(
+                        "  writes HKCU\\Software\\Classes\\Directory\\... — no admin required",
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
+            }
         }
         if let Some(busy) = &self.busy {
             lines.push(Line::styled(
@@ -473,8 +591,8 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycle_visits_viewer() {
-        // Tools → Agents → Viewer → Shell → Tools
+    fn tab_cycle_visits_every_tab() {
+        // Tools → Agents → Viewer → Shell → Integration → Tools
         let mut state = SettingsState::default();
         state.open = true;
         state.handle_key(key(KeyCode::Tab));
@@ -484,7 +602,17 @@ mod tests {
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Shell);
         state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Integration);
+        state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Tools);
+    }
+
+    #[test]
+    fn left_arrow_wraps_from_tools_to_integration() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(state.tab, SettingsTab::Integration);
     }
 
     #[test]
@@ -527,5 +655,71 @@ mod tests {
         state.open = true;
         state.tab = SettingsTab::Viewer;
         assert_eq!(state.row_count(), rimeterm_markdown::Theme::ALL.len());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn integration_row_count_on_windows_is_two() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Integration;
+        assert_eq!(state.row_count(), 2);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn integration_row_count_off_windows_is_zero() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Integration;
+        assert_eq!(state.row_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn integration_enter_returns_install_when_cursor_zero() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Integration;
+        state.cursor = 0;
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter)),
+            Some(SettingsAction::InstallContextMenu)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn integration_enter_returns_uninstall_when_cursor_one() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Integration;
+        state.cursor = 1;
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter)),
+            Some(SettingsAction::UninstallContextMenu)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn integration_reset_cursor_prefers_uninstall_when_installed() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.set_integration_installed(Some(true));
+        state.tab = SettingsTab::Shell;
+        state.handle_key(key(KeyCode::Char('l'))); // Shell → Integration
+        assert_eq!(state.tab, SettingsTab::Integration);
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn integration_enter_off_windows_is_noop() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Integration;
+        state.cursor = 0;
+        assert_eq!(state.handle_key(key(KeyCode::Enter)), None);
     }
 }

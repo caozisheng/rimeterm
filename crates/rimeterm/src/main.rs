@@ -5,7 +5,12 @@
 //!    env filter). Stderr is deliberately avoided because the TUI runs
 //!    in the alt-screen and stray writes to the terminal show up on
 //!    top of the rendered UI.
-//! 2. Resolve workspace root (CWD).
+//! 2. Resolve workspace root. Order:
+//!    - First positional CLI argument, if present and a directory.
+//!      This is the entry point the Windows "Open with rimeterm here"
+//!      Explorer context-menu integration uses — Explorer passes the
+//!      target folder via `%V`.
+//!    - Otherwise `std::env::current_dir()`.
 //! 3. Load config: repo `<root>/.rimeterm/config.toml` → user → default.
 //! 4. Hand off to [`rimeterm_tui::App::run`].
 
@@ -22,7 +27,7 @@ use tracing_subscriber::EnvFilter;
 fn main() -> Result<()> {
     init_tracing();
 
-    let workspace_root = std::env::current_dir()?;
+    let workspace_root = resolve_workspace_root()?;
     let config = load_config(&workspace_root)?;
 
     // C21.5: materialize bundled configs (yazi bridge + all seeds) into
@@ -84,6 +89,28 @@ fn main() -> Result<()> {
         let app = App::new(workspace_root, config)?;
         app.run().await
     })
+}
+
+/// Pick the workspace root: first positional argument that resolves
+/// to an existing directory, otherwise the process CWD.
+///
+/// The argv path takes precedence so the Windows "Open with rimeterm
+/// here" Explorer context-menu entry — which invokes
+/// `rimeterm.exe "<folder>"` — lands in the clicked folder even when
+/// Explorer's spawn CWD points elsewhere (e.g. the `Directory` verb
+/// running from `%SystemRoot%\System32`). Non-existent paths and
+/// non-directory paths fall through to CWD so a fat-fingered arg
+/// still boots cleanly.
+fn resolve_workspace_root() -> Result<PathBuf> {
+    if let Some(arg) = std::env::args_os().nth(1) {
+        let candidate = PathBuf::from(&arg);
+        if candidate.is_dir() {
+            // Canonicalize so downstream `.rimeterm/` lookups and the
+            // status-bar `workspace:` label see an absolute path.
+            return Ok(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+        }
+    }
+    Ok(std::env::current_dir()?)
 }
 
 fn init_tracing() {
