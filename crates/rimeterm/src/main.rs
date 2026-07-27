@@ -107,10 +107,41 @@ fn resolve_workspace_root() -> Result<PathBuf> {
         if candidate.is_dir() {
             // Canonicalize so downstream `.rimeterm/` lookups and the
             // status-bar `workspace:` label see an absolute path.
-            return Ok(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+            return Ok(canonicalize_workspace_root(candidate));
         }
     }
     Ok(std::env::current_dir()?)
+}
+
+fn canonicalize_workspace_root(candidate: PathBuf) -> PathBuf {
+    let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+    PathBuf::from(rimeterm_config::paths::strip_extended_prefix(
+        canonical.to_string_lossy().as_ref(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn canonicalize_workspace_root_matches_plain_canonical_path() {
+        let current = std::env::current_dir().expect("current directory");
+        let canonical = std::fs::canonicalize(&current).expect("canonical current directory");
+        let expected = PathBuf::from(rimeterm_config::paths::strip_extended_prefix(
+            canonical.to_string_lossy().as_ref(),
+        ));
+
+        assert_eq!(canonicalize_workspace_root(current), expected);
+
+        let rendered = canonicalize_workspace_root(
+            std::env::current_dir().expect("current directory for rendered path"),
+        )
+        .to_string_lossy()
+        .into_owned();
+        assert!(!rendered.starts_with(r"\\?\"), "got {rendered}");
+    }
 }
 
 fn init_tracing() {

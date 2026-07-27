@@ -108,10 +108,6 @@ pub fn plugin_bin_dirs() -> Vec<PathBuf> {
     out.sort();
     out
 }
-
-/// `~/.rimeterm/yazi/` — rimeterm-owned Yazi config sandbox (C21.5).
-///
-/// `spawn_external` for yazi injects `YAZI_CONFIG_HOME=<this dir>`. Users
 /// may edit `init.lua` / `yazi.toml` freely; the `plugins/` subdir under
 /// this path is rewritten by rimeterm on version bumps.
 pub fn yazi_config_dir() -> Option<PathBuf> {
@@ -180,6 +176,28 @@ pub fn augmented_path_env() -> Option<(String, String)> {
 /// v0.1 does NOT walk upward to find `.git`; caller passes the workspace root.
 pub fn repo_config_file(workspace_root: &std::path::Path) -> PathBuf {
     workspace_root.join(".rimeterm").join("config.toml")
+}
+
+/// Strip the Win32 extended-length path prefix (`\\?\`) when present.
+///
+/// `std::fs::canonicalize` returns extended paths on Windows. Normalize
+/// them before passing a path to external tools that expect conventional
+/// drive-letter or UNC syntax.
+#[cfg(windows)]
+pub fn strip_extended_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// Return `path` unchanged on platforms without Win32 extended paths.
+#[cfg(not(windows))]
+pub fn strip_extended_prefix(path: &str) -> String {
+    path.to_string()
 }
 
 #[cfg(test)]
@@ -355,5 +373,32 @@ mod tests {
                 None => unsafe { std::env::remove_var("PATH") },
             }
         });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_extended_prefix_removes_drive_prefix() {
+        assert_eq!(
+            strip_extended_prefix(r"\\?\C:\Users\z\workspace"),
+            r"C:\Users\z\workspace"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_extended_prefix_converts_unc_prefix() {
+        assert_eq!(
+            strip_extended_prefix(r"\\?\UNC\server\share\workspace"),
+            r"\\server\share\workspace"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_extended_prefix_preserves_plain_path() {
+        assert_eq!(
+            strip_extended_prefix(r"C:\Users\z\workspace"),
+            r"C:\Users\z\workspace"
+        );
     }
 }

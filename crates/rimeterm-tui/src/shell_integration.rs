@@ -78,7 +78,7 @@ pub(crate) fn install() -> Result<std::path::PathBuf, String> {
     // path) is kept as-is because rewriting THAT to bare `\\server\`
     // is a lossless normalization Explorer accepts.
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    let exe_str = strip_extended_prefix(exe.to_string_lossy().as_ref());
+    let exe_str = rimeterm_config::paths::strip_extended_prefix(exe.to_string_lossy().as_ref());
 
     // Explorer substitutes `%V` with the target folder. For the
     // Directory verb `%V` is the clicked folder; for the Background
@@ -101,21 +101,6 @@ pub(crate) fn install() -> Result<std::path::PathBuf, String> {
             .map_err(|e| format!("write {command_key}: {e}"))?;
     }
     Ok(std::path::PathBuf::from(exe_str))
-}
-
-/// Drop the Win32 extended-length path prefix (`\\?\`) if present,
-/// leaving a plain drive-letter or UNC path Explorer can hand to
-/// CreateProcess. `\\?\UNC\server\share\file` collapses to
-/// `\\server\share\file`.
-#[cfg(windows)]
-fn strip_extended_prefix(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        path.to_string()
-    }
 }
 
 #[cfg(not(windows))]
@@ -236,33 +221,6 @@ mod tests {
         // On CI without registry access it may return None; on any
         // supported platform it returns Some(_).
         let _ = probe();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn strip_extended_prefix_drive_letter() {
-        assert_eq!(
-            strip_extended_prefix(r"\\?\C:\Users\z\rimeterm.exe"),
-            r"C:\Users\z\rimeterm.exe"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn strip_extended_prefix_unc() {
-        assert_eq!(
-            strip_extended_prefix(r"\\?\UNC\server\share\bin\rimeterm.exe"),
-            r"\\server\share\bin\rimeterm.exe"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn strip_extended_prefix_plain_path_untouched() {
-        assert_eq!(
-            strip_extended_prefix(r"C:\Program Files\rimeterm\rimeterm.exe"),
-            r"C:\Program Files\rimeterm\rimeterm.exe"
-        );
     }
 
     #[cfg(not(windows))]
