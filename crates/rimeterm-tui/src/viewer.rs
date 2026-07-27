@@ -16,7 +16,7 @@ use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
     Widget, Wrap,
 };
-use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
+use rimeterm_core::pane::PaneId;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::pty_selection::{Cell as SelCell, SelectionState};
@@ -821,6 +821,15 @@ impl ViewerOverlayState {
     pub fn selection_active(&self) -> bool {
         self.selection.is_active()
     }
+
+    /// Rect the `[×]` close button covers on the last-drawn viewer.
+    /// `None` before the first render or when the pane was too
+    /// narrow to fit the affordance. Used by the App's mouse
+    /// dispatcher to route Down(Left) hits that land on the border
+    /// row (outside `text_area`) back to `on_mouse`.
+    pub fn close_button_rect(&self) -> Option<Rect> {
+        self.close_button_rect
+    }
 }
 
 /// Blocking Markdown reader used by the tokio worker (§19.11.3). Enforces
@@ -936,10 +945,13 @@ pub fn render_into_pane(
     ratatui::widgets::Clear.render(pane_rect, buf);
     block.render(pane_rect, buf);
 
-    // Close affordance lives on the tab strip's `×` (files group is now
-    // an Open policy; viewer tabs are closable). We deliberately do NOT
-    // paint an in-viewer [×] anymore.
-    state.close_button_rect = None;
+    // §C24: viewer is now a modal overlay rather than a tab, so
+    // it must offer an in-frame close affordance. Paint `[×]` in
+    // the top-right corner (over the border) and cache the rect
+    // so `on_mouse` can act on Down(Left) hits. Falls back to
+    // `None` when the pane is too narrow to fit the 3-cell
+    // affordance without overlapping the title.
+    state.close_button_rect = paint_close_button(pane_rect, buf, accent);
 
     // Reset frame-scoped state before deciding how to fill inner.
     state.text_area = None;
@@ -984,6 +996,37 @@ pub fn render_overlay(
         picker,
         rimeterm_markdown::Theme::Default,
     );
+}
+
+/// Overwrite the three top-right cells of `pane_rect` with `[×]`
+/// tinted `accent`, returning the rect the button covers. Returns
+/// `None` when the pane is too narrow (< 4 cells wide) — nothing is
+/// painted and `on_mouse` skips the close hit test that frame.
+fn paint_close_button(
+    pane_rect: Rect,
+    buf: &mut Buffer,
+    accent: ratatui::style::Color,
+) -> Option<Rect> {
+    // Need at least 1 header row and room for `[×]` after the last
+    // corner cell (so the block's top-right border char isn't
+    // clobbered — the affordance sits one cell inward).
+    if pane_rect.width < 5 || pane_rect.height < 1 {
+        return None;
+    }
+    let rect = Rect {
+        x: pane_rect.x + pane_rect.width - 4,
+        y: pane_rect.y,
+        width: 3,
+        height: 1,
+    };
+    let style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+    for (offset, ch) in ['[', '×', ']'].iter().enumerate() {
+        let x = rect.x + offset as u16;
+        let cell = &mut buf[(x, rect.y)];
+        cell.set_char(*ch);
+        cell.set_style(style);
+    }
+    Some(rect)
 }
 
 /// Renders Markdown into `inner`, reserving the right-most column for
@@ -1546,43 +1589,6 @@ fn render_message(area: Rect, buf: &mut Buffer, msg: &str) {
         .render(area, buf);
 }
 
-/// Lightweight pane provider that occupies a tab slot in the files group.
-/// The actual rendering is done by `render_into_pane` using the matching
-/// `ViewerOverlayState` in `App::viewers`. This struct only carries the
-/// stable id and the tab title (the file's basename).
-pub struct ViewerPane {
-    id: PaneId,
-    title: String,
-}
-
-impl ViewerPane {
-    pub fn new(title: String) -> Self {
-        Self {
-            id: PaneId::next(),
-            title,
-        }
-    }
-}
-
-impl PaneProvider for ViewerPane {
-    fn id(&self) -> PaneId {
-        self.id
-    }
-
-    fn title(&self) -> &str {
-        &self.title
-    }
-
-    fn caps(&self) -> PaneCaps {
-        PaneCaps::default()
-    }
-
-    fn render(&mut self, _area: Rect, _buf: &mut Buffer, _ctx: &PaneRenderCtx) -> RenderOutcome {
-        // App renders viewer content directly via render_into_pane.
-        RenderOutcome::default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2139,10 +2145,10 @@ mod markdown_tests {
     }
 
     #[test]
-    fn render_into_pane_does_not_draw_in_viewer_close_button() {
-        // The viewer no longer paints its own `[×]` — closing is
-        // handled by the tab strip's `×` affordance now that viewer
-        // instances live as tabs in the files group.
+    fn render_into_pane_draws_close_button_and_reports_rect() {
+        // §C24: the viewer is a modal overlay (not a tab) so it
+        // MUST paint its own `[×]` in the top-right corner and
+        // publish the hit rect for the mouse dispatcher.
         let mut state = ViewerOverlayState::default();
         state.open_snapshot(
             ViewerSource {
@@ -2161,16 +2167,15 @@ mod markdown_tests {
             rimeterm_markdown::Theme::Default,
         );
 
-        // The three cells that used to host `[×]` must now be part of
-        // the plain top border (`─`) or the corner (`┐`).
+        // Expected `[×]` sits one cell inside the top-right corner.
         let button_x = bounds.x + bounds.width - 4;
-        for dx in 0..3 {
-            let sym = buf[(button_x + dx, bounds.y)].symbol();
-            assert_ne!(sym, "[", "unexpected `[` at dx={dx}");
-            assert_ne!(sym, "×", "unexpected `×` at dx={dx}");
-            assert_ne!(sym, "]", "unexpected `]` at dx={dx}");
-        }
-        assert_eq!(state.close_button_rect, None);
+        assert_eq!(buf[(button_x, bounds.y)].symbol(), "[");
+        assert_eq!(buf[(button_x + 1, bounds.y)].symbol(), "×");
+        assert_eq!(buf[(button_x + 2, bounds.y)].symbol(), "]");
+        assert_eq!(
+            state.close_button_rect,
+            Some(Rect::new(button_x, bounds.y, 3, 1)),
+        );
     }
 
     // --- C22.6: markdown_blocks_to_text (rimeterm-markdown wire-in) ---

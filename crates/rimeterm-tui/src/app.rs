@@ -1,19 +1,24 @@
-//! M2 App wiring — the three-zone workspace.
+//! M2 App wiring — the four-zone workspace (§C24).
 //!
-//! Layout matches §19.1 (new 3-zone design):
+//! Layout:
 //!
 //! ```text
 //! ┌ ≡ rimeterm ─── workspace ─── shell: pwsh 7 ─┐
 //! │ ┤ files ├ …           │ ┤ agents ├ …       │
-//! │  (yazi/viewer/gitui)  │  (omp/pi/…)        │
-//! │                       ├────────────────────┤
-//! │                       │ ┤ shells ├ …       │
-//! │                       │  (bottom/shell-1)  │
+//! │  (yazi)               │  (omp/pi/…)        │
+//! │                       │                    │
+//! ├───────────────────────┼────────────────────┤
+//! │ ┤ git ├ …             │ ┤ shells ├ …       │
+//! │  (gitui)              │  (bottom/shell-1)  │
 //! └ hint bar ──────────────────────────────────┘
 //! ```
 //!
-//! Left pane is full-height; right column splits into agents (top) and shells (bottom).
-//! The shells group contains bottom as the first tab, followed by shell tabs.
+//! Both columns split vertically: files/git stack on the left,
+//! agents/shells on the right. The shells group contains bottom as
+//! the first tab, followed by shell tabs. The Alt+V viewer is now a
+//! modal overlay covering the ENTIRE left column (files+git) rather
+//! than a tab in the files group; it dismisses via `[×]`, bare `←`,
+//! `Esc`, or a second `Alt+V`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,7 +40,8 @@ use rimeterm_core::focus::FocusManager;
 use rimeterm_core::layout::{LayoutNode, LayoutTree};
 use rimeterm_core::pane::{PaneId, PaneProvider, PaneRenderCtx};
 use rimeterm_core::tabs::{
-    BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS, MembersPolicy, PaneKind, TabGroup, TabGroupId,
+    BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_GIT, BUILTIN_SHELLS, MembersPolicy, PaneKind, TabGroup,
+    TabGroupId,
 };
 use rimeterm_pty::{ShellChoice, detect_default_shell};
 use tokio::sync::mpsc;
@@ -365,29 +371,41 @@ enum ResizeTarget {
 /// For a focused group, tell the app which split path + boundary + sign to
 /// apply a keyboard resize step to.
 ///
-/// 3-zone layout:
-/// - files : left column (no vertical split). `Horizontal` moves the root seam.
+/// 4-zone layout (§C24):
+/// - files : left column, top. `Horizontal` moves the root seam;
+///   `Vertical` moves the left column seam (boundary 0) with +sign.
+/// - git   : left column, bottom. Same as files but `Vertical` sign flipped.
 /// - agents: right column, top. `Horizontal` moves root seam (sign flipped).
-///   `Vertical` moves the right column seam (boundary 0).
+///   `Vertical` moves the right column seam (boundary 0) with +sign.
 /// - shells: right column, bottom. Same as agents but `Vertical` sign flipped.
 fn resize_target_for_group(
     gid: rimeterm_core::TabGroupId,
     target: ResizeTarget,
 ) -> Option<(rimeterm_core::layout::SplitPath, usize, u16, f32)> {
     use rimeterm_core::layout::SplitPath;
-    use rimeterm_core::{BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS};
+    use rimeterm_core::{BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_GIT, BUILTIN_SHELLS};
     match (gid, target) {
-        // Horizontal: adjust left/right column boundary
-        (g, ResizeTarget::Horizontal) if g == BUILTIN_FILES => Some((SplitPath::root(), 0, 0, 1.0)),
-        (g, ResizeTarget::Horizontal) if g == BUILTIN_AGENTS => {
-            Some((SplitPath::root(), 0, 0, -1.0))
+        // Horizontal: adjust left/right column boundary. Left column
+        // groups (files/git) grow rightward with a positive delta; the
+        // right column groups (agents/shells) grow leftward, so their
+        // sign flips.
+        (g, ResizeTarget::Horizontal) if g == BUILTIN_FILES || g == BUILTIN_GIT => {
+            Some((SplitPath::root(), 0, 0, 1.0))
         }
-        (g, ResizeTarget::Horizontal) if g == BUILTIN_SHELLS => {
+        (g, ResizeTarget::Horizontal) if g == BUILTIN_AGENTS || g == BUILTIN_SHELLS => {
             Some((SplitPath::root(), 0, 0, -1.0))
         }
 
-        // Vertical: only right column has vertical split
-        // FILES has no vertical neighbor, so no vertical resize
+        // Vertical: each column has its own vertical split. Left
+        // column split lives at path [0]; right column at path [1].
+        // The "top" group in each column grows downward with a
+        // positive delta; the "bottom" group flips the sign.
+        (g, ResizeTarget::Vertical) if g == BUILTIN_FILES => {
+            Some((SplitPath::root().push(0), 0, 0, 1.0))
+        }
+        (g, ResizeTarget::Vertical) if g == BUILTIN_GIT => {
+            Some((SplitPath::root().push(0), 0, 0, -1.0))
+        }
         (g, ResizeTarget::Vertical) if g == BUILTIN_AGENTS => {
             Some((SplitPath::root().push(1), 0, 0, 1.0))
         }
@@ -402,12 +420,15 @@ fn resize_target_for_group(
 /// this group is focused.
 fn paths_for_group(gid: rimeterm_core::TabGroupId) -> Vec<rimeterm_core::layout::SplitPath> {
     use rimeterm_core::layout::SplitPath;
-    use rimeterm_core::{BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_SHELLS};
+    use rimeterm_core::{BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_GIT, BUILTIN_SHELLS};
 
     match gid {
-        // Left column (FILES): no vertical split, only root
-        g if g == BUILTIN_FILES => vec![SplitPath::root()],
-        // Right column (AGENTS/SHELLS): root + right column's vertical split
+        // Left column groups reset both the root seam and their own
+        // (path=[0]) vertical seam so `=` on either restores both.
+        g if g == BUILTIN_FILES || g == BUILTIN_GIT => {
+            vec![SplitPath::root(), SplitPath::root().push(0)]
+        }
+        // Right column groups: root + right column's vertical split.
         g if g == BUILTIN_AGENTS || g == BUILTIN_SHELLS => {
             vec![SplitPath::root(), SplitPath::root().push(1)]
         }
@@ -451,15 +472,30 @@ pub struct App {
     /// mid-runtime factory calls (new_shell_tab_in / new_agent_tab_in)
     /// can hand a fresh clone to newly-spawned children.
     osc_tx: mpsc::UnboundedSender<(PaneId, String)>,
-    /// C20: per-tab viewer states, keyed by the viewer tab's PaneId.
-    /// Each entry is created when a viewer tab opens and removed when it closes.
-    viewers: std::collections::HashMap<PaneId, ViewerOverlayState>,
+    /// §C24: The viewer is a single modal overlay (not a tab). Only
+    /// one file can be previewed at a time; opening a new one
+    /// replaces the previous snapshot. Occupies the entire left
+    /// column (both files + git groups) while open.
+    viewer: ViewerOverlayState,
+    /// True while the viewer overlay owns the keyboard (bare arrow
+    /// keys, j/k/PgUp/PgDn/+/-/0/g/G). Set when opening from the
+    /// left column (yazi / gitui), cleared on close so focus can
+    /// hand back to `viewer.return_focus`. When `false`, the
+    /// overlay renders but consumes only its close chords (bare
+    /// ←, Esc, Alt+V) — user can keep typing in agents/shells.
+    viewer_focused: bool,
     /// PaneId of the yazi tab in the files group, if any. Cached at
-    /// startup so `close_viewer_tab` can restore focus to yazi
-    /// specifically instead of whatever `TabGroup::try_close`'s
-    /// shifted-index heuristic picks (usually gitui). `None` when the
-    /// user has removed yazi from `files.tabs` in their config.
+    /// startup so `close_viewer_overlay` can restore focus to yazi
+    /// specifically. `None` when the user has removed yazi from
+    /// `[files] tabs` in their config — in that case a placeholder
+    /// occupies the slot and focus falls back to whatever the
+    /// viewer captured on open.
     yazi_pane_id: Option<PaneId>,
+    /// PaneId of the gitui tab in the git group, if any. Symmetric
+    /// to `yazi_pane_id` and consulted by `refresh_gitui_at_active_root`
+    /// to locate the pane it must replace when `cwd.changed` walks
+    /// into a fresh repo.
+    gitui_pane_id: Option<PaneId>,
     /// Last `file.selected` from the active files:yazi tab. Consumed by
     /// `Alt+V` to freeze a snapshot.
     last_yazi_selection: Option<SelectionSnapshot>,
@@ -529,11 +565,11 @@ pub struct App {
     /// `pane.render` received). Different from `LayoutTree::compute_rects`
     /// output, which returns the full quadrant cell including its tab strip.
     last_pane_outer_rects: Vec<(PaneId, Rect)>,
-    /// Content rect of the currently active viewer tab (pane_rect after
-    /// tab strip stripped off). Set during `draw` when a viewer tab is
-    /// active in the files group; `None` otherwise. Used by `on_mouse`
-    /// to route clicks/scroll inside this rect to the viewer state
-    /// while letting tab-strip clicks fall through to the normal path.
+    /// Content rect of the viewer overlay (pane_rect minus the top
+    /// title/border row). Set during `draw` when the viewer overlay
+    /// is open; `None` otherwise. Used by `on_mouse` to route
+    /// clicks/scroll inside this rect to the viewer state instead
+    /// of the pane underneath.
     last_viewer_rect: Option<Rect>,
     /// §19.10.1 addendum: PaneIds whose tab strip must NOT show `×`
     /// and whose `close_tab_in_group` path rejects even a valid index.
@@ -609,16 +645,17 @@ impl App {
             std::collections::HashSet::new();
 
         let mut files_members = Vec::new();
+        let mut git_members = Vec::new();
         let mut yazi_pane_id: Option<PaneId> = None;
+        let mut gitui_pane_id: Option<PaneId> = None;
         for spec in &config.files.tabs {
-            let icon = match spec.id.as_str() {
-                "gitui" => "🌿",
-                _ => "📁",
-            };
-            let color = match spec.id.as_str() {
-                "gitui" => Color::Green,
-                _ => Color::Cyan,
-            };
+            // Route by tool id: gitui lives in its own bottom-left group
+            // (§C24), everything else stays with yazi in the top-left
+            // files group.
+            let is_gitui = spec.id == "gitui";
+            let icon = if is_gitui { "🌿" } else { "📁" };
+            let color = if is_gitui { Color::Green } else { Color::Cyan };
+            let kind_label = if is_gitui { "git" } else { "files" };
             let id = build_external_pane(
                 &mut panes,
                 &session_writes,
@@ -628,12 +665,12 @@ impl App {
                 osc_tx.clone(),
                 icon,
                 color,
-                "files",
+                kind_label,
             )?;
-            // Left column (files) panes are mouse-passthrough: the file
-            // lists + dividers forward to yazi / gitui as SGR bytes.
-            // D1/D2 dividers still drag because on_mouse checks dividers
-            // before pane-priority.
+            // Left column (files/git) panes are mouse-passthrough: the
+            // file lists + dividers forward to yazi / gitui as SGR bytes.
+            // Dividers still drag because on_mouse checks them BEFORE
+            // pane-priority.
             //
             // The yazi tab additionally gets `set_yazi_layout`: this is
             // NOT a ratio estimate anymore — it's a flag that turns on
@@ -650,14 +687,52 @@ impl App {
                     pane.set_yazi_layout(Some(config.mouse.yazi_layout));
                 }
             }
-            if spec.id == "yazi" {
-                // First-seen wins: if the user configured multiple yazi
-                // tabs (unusual but legal), close-restore focus targets
-                // the leftmost one, matching tab-strip reading order.
-                yazi_pane_id.get_or_insert(id);
+            if is_gitui {
+                gitui_pane_id.get_or_insert(id);
+                git_members.push(id);
+            } else {
+                if spec.id == "yazi" {
+                    // First-seen wins: if the user configured multiple yazi
+                    // tabs (unusual but legal), close-restore focus targets
+                    // the leftmost one, matching tab-strip reading order.
+                    yazi_pane_id.get_or_insert(id);
+                }
+                files_members.push(id);
             }
+            // Pin every left-column tool so × never appears and Ctrl+W
+            // is rejected even if a group's policy grows to Open later.
+            pinned_pane_ids.insert(id);
+        }
+
+        // The layout tree can't host an empty tab group (TabGroup::new
+        // panics on empty members). If the user removed yazi or gitui
+        // from `[files] tabs`, drop in a Placeholder so the pane still
+        // exists — the group is now Fixed anyway, so the placeholder
+        // sits there permanently until the user restores its config.
+        if files_members.is_empty() {
+            let placeholder = PlaceholderPane::new(
+                "files",
+                "No files tool configured. Add `[[files.tabs]]` with `id = \"yazi\"` to config.toml."
+                    .to_string(),
+                "📁",
+                Color::Cyan,
+            );
+            let id = placeholder.id();
+            panes.insert(Box::new(placeholder));
             files_members.push(id);
-            // Pin yazi/gitui so × never appears and Ctrl+W is rejected.
+            pinned_pane_ids.insert(id);
+        }
+        if git_members.is_empty() {
+            let placeholder = PlaceholderPane::new(
+                "git",
+                "No git tool configured. Add `[[files.tabs]]` with `id = \"gitui\"` to config.toml."
+                    .to_string(),
+                "🌿",
+                Color::Green,
+            );
+            let id = placeholder.id();
+            panes.insert(Box::new(placeholder));
+            git_members.push(id);
             pinned_pane_ids.insert(id);
         }
 
@@ -824,11 +899,21 @@ impl App {
         shells_members.push(first_id);
 
         // Groups.
+        // Left column: yazi (top) + gitui (bottom). Both are Fixed —
+        // no × / + affordance; the viewer is now a modal overlay
+        // rather than a tab (§C24), so nothing ever needs to be
+        // added or closed inside these groups.
         let files = TabGroup::new(
             BUILTIN_FILES,
             files_members,
-            MembersPolicy::Open { max: 16 },
-            PaneKind::Viewer,
+            MembersPolicy::Fixed,
+            PaneKind::Files,
+        );
+        let git = TabGroup::new(
+            BUILTIN_GIT,
+            git_members,
+            MembersPolicy::Fixed,
+            PaneKind::Files,
         );
         let agents = TabGroup::new(
             BUILTIN_AGENTS,
@@ -843,15 +928,21 @@ impl App {
             PaneKind::Shell,
         );
 
-        // Layout: horizontal split (left | right), right column is a vertical split.
-        // Left pane is full-height (files group: yazi/viewer/gitui toggle).
-        // Right splits into agents (top 55%) and shells (bottom 45%, contains bottom tab + shells).
-        // Ratios match §19.2 new design: 0.35 / 0.65 cols, 0.55 / 0.45 right rows.
+        // Layout (§C24 4-zone): root Horizontal split, each column
+        // Vertical. Left column stacks files (top) over git (bottom);
+        // right column stacks agents (top) over shells (bottom).
+        // Root ratio 0.35/0.65 keeps the pre-refactor column widths;
+        // both inner columns default to 0.5/0.5 so users see a fair
+        // split until they drag a divider.
         let root = LayoutNode::split(
             Direction::Horizontal,
             vec![0.35, 0.65],
             vec![
-                LayoutNode::tabs(files), // Left: single pane, full-height
+                LayoutNode::split(
+                    Direction::Vertical,
+                    vec![0.5, 0.5],
+                    vec![LayoutNode::tabs(files), LayoutNode::tabs(git)],
+                ),
                 LayoutNode::split(
                     Direction::Vertical,
                     vec![0.55, 0.45],
@@ -937,8 +1028,10 @@ impl App {
             redraw_rx,
             osc_rx,
             osc_tx,
-            viewers: std::collections::HashMap::new(),
+            viewer: ViewerOverlayState::default(),
+            viewer_focused: false,
             yazi_pane_id,
+            gitui_pane_id,
             last_yazi_selection: None,
             viewer_completion_tx,
             viewer_completion_rx,
@@ -1055,24 +1148,16 @@ impl App {
 
         let alt_v = matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
             && key.modifiers.contains(KeyModifiers::ALT);
+        let overlay_open = self.viewer.is_open();
 
-        // Which viewer tab is currently ACTIVE in the files group (the
-        // rendered one). Still needed for the Alt+V toggle: pressing
-        // it from any pane closes whatever viewer is on screen.
-        let active_viewer_id = self
-            .tree
-            .find_tab_group(BUILTIN_FILES)
-            .and_then(|g| g.active_pane())
-            .filter(|id| self.viewers.contains_key(id));
-
-        // Alt+V: global toggle. Open when no viewer is up; close the
-        // active viewer otherwise. Works regardless of which pane owns
-        // focus so the user has a symmetric shortcut.
+        // Alt+V: global toggle. Open when the overlay is idle; close
+        // it otherwise. Works regardless of which pane owns focus so
+        // the user has a symmetric shortcut.
         if alt_v {
-            if let Some(vid) = active_viewer_id {
-                self.close_viewer_tab(vid);
+            if overlay_open {
+                self.close_viewer_overlay();
             } else {
-                self.open_viewer_tab();
+                self.open_viewer_overlay();
             }
             return true;
         }
@@ -1083,12 +1168,7 @@ impl App {
         // "right = enter" navigation is untouched. Any modifier
         // (Ctrl/Shift/Alt) also falls through — we only steal the
         // bare-arrow case, matching Alt+V's "no other key does this".
-        //
-        // The stat happens on the key path but is a single syscall
-        // (<1 ms on every supported filesystem) and only fires when
-        // yazi is the focused pane AND the user hit `→` — it will
-        // not run on every keystroke.
-        if matches!(key.code, KeyCode::Right) && key.modifiers.is_empty() {
+        if matches!(key.code, KeyCode::Right) && key.modifiers.is_empty() && !overlay_open {
             if should_hijack_right_for_viewer(
                 self.yazi_pane_id,
                 self.focus.focused_pane(),
@@ -1100,53 +1180,48 @@ impl App {
                     .and_then(|s| std::fs::metadata(&s.path).ok())
                     .is_some_and(|m| m.is_file());
                 if sel_is_file {
-                    self.open_viewer_tab();
+                    self.open_viewer_overlay();
                     return true;
                 }
             }
         }
 
-        // Every other viewer-only key (Esc, j/k, PgUp/PgDn, +/-, 0, …)
-        // only fires when the viewer is the FOCUSED pane. Otherwise
-        // the key falls through to the global keymap / focused pane,
-        // so Ctrl+T / Alt+HJKL / typing into agents keeps working with
-        // the viewer still on screen.
-        if let Some(vid) = active_viewer_id {
-            if self.focus.focused_pane() == Some(vid) {
-                // `Esc` and bare `←` both close the viewer — the
-                // arrow is symmetric with C22's `→ = open` shortcut
-                // when the yazi cursor lands on a file. Any modifier
-                // on `←` (Shift/Ctrl/Alt) falls through to the modal
-                // handler so future keymap growth (e.g. horizontal
-                // panning) doesn't get pre-empted.
-                let bare_left = matches!(key.code, KeyCode::Left) && key.modifiers.is_empty();
-                if matches!(key.code, KeyCode::Esc) || bare_left {
-                    self.close_viewer_tab(vid);
-                    return true;
-                }
-                if self.on_viewer_modal_key(vid, key) {
-                    return true;
-                }
-                // Anything the modal doesn't claim (F9 / F10 / F1 /
-                // Ctrl+T / Alt+HJKL / Ctrl+Q …) falls through to the
-                // global keymap. The viewer being focused must not
-                // black-hole every keystroke — it's a modal for its
-                // own scroll/zoom keys, not a keyboard prison.
+        // When the viewer overlay is up:
+        //   - bare `←` and `Esc` always close (matches C22's `→ = open`)
+        //     regardless of which pane owns focus, because the overlay
+        //     visually covers the left column and the user expects the
+        //     dismiss chord to work as long as they can see it.
+        //   - other modal keys (j/k/PgUp/PgDn/g/G/+/-/0) only fire when
+        //     `viewer_focused` is true (i.e. the overlay was opened
+        //     from yazi/gitui so keys route to it). Otherwise the user
+        //     is typing into agents/shells and their keystrokes must
+        //     reach that pane.
+        if overlay_open {
+            let bare_left = matches!(key.code, KeyCode::Left) && key.modifiers.is_empty();
+            if matches!(key.code, KeyCode::Esc) || bare_left {
+                self.close_viewer_overlay();
+                return true;
             }
+            if self.viewer_focused && self.on_viewer_modal_key(key) {
+                return true;
+            }
+            // Anything the modal doesn't claim (F9 / F10 / F1 / Ctrl+T
+            // / Alt+HJKL / Ctrl+Q …) falls through to the global
+            // keymap. The overlay must not black-hole every keystroke.
         }
         false
     }
 
-    /// Handle a key while the viewer is the focused pane. Returns
-    /// `true` when the key was consumed by the modal (scroll / zoom
-    /// / selection); `false` when it should fall through to the
-    /// global keymap (F-keys, chords with Ctrl / Alt, etc.).
+    /// Handle a key while the viewer overlay owns modal focus. Returns
+    /// `true` when the key was consumed by the modal (scroll / zoom /
+    /// selection); `false` when it should fall through to the global
+    /// keymap (F-keys, chords with Ctrl / Alt, etc.).
     ///
-    /// **Contract**: any key with `Ctrl` or `Alt` in its modifiers
-    /// is a global chord and MUST NOT be intercepted. Bare arrow
-    /// keys and unmodified character keys are the only ones the
-    /// modal is allowed to see.
-    fn on_viewer_modal_key(&mut self, vid: PaneId, key: KeyEvent) -> bool {
+    /// **Contract**: any key with `Ctrl` or `Alt` in its modifiers is
+    /// a global chord and MUST NOT be intercepted. Bare arrow keys
+    /// and unmodified character keys are the only ones the modal is
+    /// allowed to see.
+    fn on_viewer_modal_key(&mut self, key: KeyEvent) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
         // Global chord? Fall through immediately.
         if key
@@ -1155,9 +1230,10 @@ impl App {
         {
             return false;
         }
-        let Some(state) = self.viewers.get_mut(&vid) else {
+        if !self.viewer.is_open() {
             return false;
-        };
+        }
+        let state = &mut self.viewer;
         let consumed = match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
                 state.scroll_markdown(1);
@@ -1203,8 +1279,13 @@ impl App {
         consumed
     }
 
-    /// Open a new viewer tab in the files group for the last yazi selection.
-    fn open_viewer_tab(&mut self) {
+    /// Open the modal viewer overlay for the last yazi selection
+    /// (§C24). The overlay is a single, path-dedup'd surface that
+    /// covers the entire left column while it's open. Unlike the
+    /// pre-refactor "viewer tab", it's NOT a member of any tab
+    /// group — the viewer state lives on the App and `draw()`
+    /// paints it on top of the files+git groups.
+    fn open_viewer_overlay(&mut self) {
         let Some(selection) = self.last_yazi_selection.clone() else {
             self.set_hint("viewer: no active-yazi selection yet — hover a file first".into());
             return;
@@ -1231,56 +1312,42 @@ impl App {
             }
         };
 
-        // Dedup: if a viewer tab already displays this exact path,
-        // focus it instead of stacking a second copy. Path equality is
-        // sufficient because `classify_source` never rewrites the path
-        // and Yazi hands us absolute paths. `snapshot()` is `None`
-        // only in the closed state, which is unreachable here (viewers
-        // stay in the map until explicit close).
-        if let Some(existing) = find_open_viewer_for_path(&self.viewers, &source.path) {
-            if let Err(e) = self.focus_pane_by_id(existing) {
-                warn!(error = %e, "viewer dedup: focus_pane_by_id failed");
-            }
+        // Dedup: if the overlay is already showing this exact path,
+        // do nothing rather than reload from scratch. Path equality
+        // is sufficient because `classify_source` never rewrites the
+        // path and Yazi hands us absolute paths.
+        if self
+            .viewer
+            .snapshot()
+            .is_some_and(|s| s.path == source.path)
+        {
             let _ = self.redraw_tx.send(());
             return;
         }
-        // Build a lightweight pane provider for the tab slot.
-        let title = source
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("viewer")
-            .to_string();
-        let pane = viewer::ViewerPane::new(title);
-        let pane_id = pane.id();
-        self.panes.insert(Box::new(pane));
 
-        let group = match self.tree.find_tab_group_mut(BUILTIN_FILES) {
-            Some(g) => g,
-            None => {
-                drop_pane(&mut self.panes, pane_id);
-                return;
-            }
-        };
-        if let Err(e) = group.try_add(pane_id, PaneKind::Viewer) {
-            self.set_hint(format!("⛔ viewer: {e}"));
-            drop_pane(&mut self.panes, pane_id);
-            return;
-        }
-        // Preserve the current focus so `Alt+V` from an agents / shells
-        // pane doesn't yank the user out of the pane they were typing
-        // in. Only steal focus when the files group was already active
-        // — that matches the pre-viewer "yazi was focused, now we show
-        // the file it selected" flow.
-        if self.focus.focused_group() == Some(BUILTIN_FILES) {
-            self.focus.set_focus(pane_id, Some(BUILTIN_FILES));
-        }
+        // Only capture modal focus when the overlay was invoked from
+        // the left column (yazi / gitui). Otherwise the user is
+        // typing in agents/shells and Alt+V shouldn't steal keys —
+        // the overlay renders but only ← / Esc / Alt+V dismiss.
+        let focused_group = self.focus.focused_group();
+        self.viewer_focused = matches!(
+            focused_group,
+            Some(g) if g == BUILTIN_FILES || g == BUILTIN_GIT
+        );
 
-        let mut state = ViewerOverlayState::default();
-        let snap_gen = state.open_snapshot(source.clone(), None);
-        self.viewers.insert(pane_id, state);
+        // `return_focus` is used by `close_viewer_overlay` to land
+        // the caret back where it started. Prefer the exact pane
+        // that had focus so a follow-up close returns cleanly.
+        let return_focus = self.focus.focused_pane();
+
+        let snap_gen = self.viewer.open_snapshot(source.clone(), return_focus);
 
         let tx = self.viewer_completion_tx.clone();
+        // The completion channel keys off (pane_id, generation). Now
+        // that the viewer has no pane, seed the field with a zeroed
+        // PaneId — `apply_viewer_completion` ignores it and matches
+        // on generation alone.
+        let pane_id = PaneId(0);
         tokio::task::spawn_blocking(move || {
             let payload = match source.kind {
                 ViewerKind::Markdown => viewer::load_markdown_blocking(&source.path),
@@ -1297,27 +1364,19 @@ impl App {
         let _ = self.redraw_tx.send(());
     }
 
-    /// Close the viewer tab with the given pane id and return focus to
-    /// the yazi tab. `close_pane_by_id`'s default is to focus whichever
-    /// tab `TabGroup::try_close` shifted into place (usually gitui — the
-    /// only pinned non-yazi tab in the files group), which is the wrong
-    /// answer for the Alt+V flow: the user came from yazi, they should
-    /// land back on yazi. Falls back to the default when yazi isn't
-    /// configured or has been removed since startup.
-    fn close_viewer_tab(&mut self, pane_id: PaneId) {
-        self.viewers.remove(&pane_id);
-        // close_pane_by_id handles tab removal, focus restore, and pane drop.
-        if let Err(e) = self.close_pane_by_id(pane_id) {
-            warn!(error = %e, "close_viewer_tab: close_pane_by_id failed");
-            let _ = self.redraw_tx.send(());
-            return;
-        }
-        if let Some(yazi_id) = self.yazi_pane_id {
-            // The pane may have been removed from the group since
-            // startup (config reload path is TODO but could exist);
-            // `focus_pane_by_id` fails cleanly in that case.
-            if let Err(e) = self.focus_pane_by_id(yazi_id) {
-                warn!(error = %e, "close_viewer_tab: return-focus to yazi failed");
+    /// Close the viewer overlay and return focus to whatever pane
+    /// had it when the overlay opened. Falls back to yazi (if
+    /// configured) then leaves focus untouched.
+    fn close_viewer_overlay(&mut self) {
+        let return_focus = self.viewer.close();
+        self.viewer_focused = false;
+        // Prefer the exact pane captured at open. If that pane has
+        // since been dropped, fall back to yazi so the user still
+        // lands somewhere sensible.
+        let target = return_focus.or(self.yazi_pane_id);
+        if let Some(id) = target {
+            if let Err(e) = self.focus_pane_by_id(id) {
+                warn!(error = %e, "close_viewer_overlay: return-focus failed");
             }
         }
         let _ = self.redraw_tx.send(());
@@ -1431,12 +1490,11 @@ impl App {
         {
             return;
         }
-        let focused_is_md_viewer = self
-            .focus
-            .focused_pane()
-            .and_then(|id| self.viewers.get(&id))
-            .and_then(|s| s.snapshot())
-            .is_some_and(|src| src.kind == crate::viewer::ViewerKind::Markdown);
+        let focused_is_md_viewer = self.viewer.is_open()
+            && self
+                .viewer
+                .snapshot()
+                .is_some_and(|src| src.kind == crate::viewer::ViewerKind::Markdown);
         if !focused_is_md_viewer {
             self.set_hint("F9 pane menu: no actions for this pane (C22.6)".into());
             return;
@@ -1481,10 +1539,8 @@ impl App {
     }
 
     fn apply_viewer_completion(&mut self, completion: ViewerCompletion) {
-        if let Some(state) = self.viewers.get_mut(&completion.pane_id) {
-            if state.apply_completion(completion) {
-                let _ = self.redraw_tx.send(());
-            }
+        if self.viewer.apply_completion(completion) {
+            let _ = self.redraw_tx.send(());
         }
     }
 
@@ -1569,14 +1625,8 @@ impl App {
 
     /// Handle the platform side of `viewer.open-with-system` / `viewer.reveal`.
     fn viewer_dispatch_external(&mut self, action: ExternalAction) {
-        // Use the active viewer tab in the files group, if any.
-        let source = self
-            .tree
-            .find_tab_group(BUILTIN_FILES)
-            .and_then(|g| g.active_pane())
-            .and_then(|id| self.viewers.get(&id))
-            .and_then(|s| s.snapshot())
-            .map(|s| s.path.clone());
+        // Use the currently-open viewer overlay's snapshot, if any.
+        let source = self.viewer.snapshot().map(|s| s.path.clone());
         let Some(path) = source else {
             self.set_hint("viewer: nothing open".into());
             return;
@@ -1920,28 +1970,35 @@ impl App {
             }
         }
 
-        // While a viewer tab is active in the files group it owns mouse
-        // events that land inside the content rect (pane_rect, below the
-        // tab strip). Tab-strip clicks fall through to the normal path so
-        // the user can switch away from the viewer by clicking another tab.
-        let active_viewer_id = self
-            .tree
-            .find_tab_group(BUILTIN_FILES)
-            .and_then(|g| g.active_pane())
-            .filter(|id| self.viewers.contains_key(id));
-        if let Some(vid) = active_viewer_id {
-            let state = self.viewers.get(&vid);
+        // While the viewer overlay is open it owns mouse events that
+        // land inside its content rect (§C24). The `[×]` close button
+        // and border area are covered by `state.on_mouse`'s own
+        // hit-tests, so we also include the outer-border cells (the
+        // full `overlay_rect`) here — otherwise a click on `[×]`
+        // would fall through to the yazi/gitui panes underneath.
+        //
+        // Sticky drag: even if the pointer wanders off the overlay
+        // mid-drag (selection or scrollbar), keep routing to the
+        // viewer until the button releases so we don't drop the
+        // selection endpoint.
+        if self.viewer.is_open() {
             let sticky = matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
-                && state.is_some_and(|s| s.selection_active() || s.scrollbar_dragging());
+                && (self.viewer.selection_active() || self.viewer.scrollbar_dragging());
             let in_content = self
                 .last_viewer_rect
                 .is_some_and(|r| point_in_rect(m.column, m.row, r));
-            if in_content || sticky {
-                if let Some(state) = self.viewers.get_mut(&vid) {
-                    let _ = state.on_mouse(m);
-                    if state.take_close_request() {
-                        self.close_viewer_tab(vid);
-                    }
+            // Also cover the top border row so a click on the `[×]`
+            // close button lands in the viewer's mouse handler (the
+            // button sits on the border, above `last_viewer_rect`).
+            let on_close_button = matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                && self
+                    .viewer
+                    .close_button_rect()
+                    .is_some_and(|r| point_in_rect(m.column, m.row, r));
+            if in_content || sticky || on_close_button {
+                let _ = self.viewer.on_mouse(m);
+                if self.viewer.take_close_request() {
+                    self.close_viewer_overlay();
                 }
                 let _ = self.redraw_tx.send(());
                 return;
@@ -2285,11 +2342,10 @@ impl App {
 
     /// Close whichever tab the user clicked `×` on. Delegates to
     /// `close_pane_by_id` so Open-group last-member protection kicks
-    /// in identically for every tab kind, EXCEPT when the target is
-    /// a viewer tab: those go through `close_viewer_tab` so the
-    /// yazi-return-focus policy (§C22.3) applies uniformly across
-    /// every close gesture — mouse `×`, `Alt+V`, `Esc`, IPC-driven
-    /// `tab.close` intents from the palette.
+    /// in identically for every tab kind. (§C24: the viewer is a
+    /// modal overlay now, not a tab, so no special-case is needed
+    /// here — the overlay dismisses via its own `[×]` in
+    /// `close_viewer_overlay`.)
     fn close_tab_at(&mut self, gid: TabGroupId, idx: usize) {
         let Some(pane_id) = self
             .tree
@@ -2298,10 +2354,6 @@ impl App {
         else {
             return;
         };
-        if self.viewers.contains_key(&pane_id) {
-            self.close_viewer_tab(pane_id);
-            return;
-        }
         if let Err(e) = self.close_pane_by_id(pane_id) {
             self.set_hint(format!("⛔ {}", e));
         }
@@ -2706,7 +2758,7 @@ impl App {
         // Compute the rect for each *tab group cell*, then split off a 1-row
         // tab strip inside each cell. This is simpler than tracking tab strips
         // as separate layout nodes and keeps the LayoutTree pure.
-        let group_ids = [BUILTIN_FILES, BUILTIN_AGENTS, BUILTIN_SHELLS];
+        let group_ids = [BUILTIN_FILES, BUILTIN_GIT, BUILTIN_AGENTS, BUILTIN_SHELLS];
         for gid in group_ids {
             let Some(cell) = group_cell_rect(&self.tree, vertical[1], gid) else {
                 continue;
@@ -2743,33 +2795,53 @@ impl App {
                 let tab_hover = tab_strip_hover_for(gid, self.hovered_ui);
                 render_tab_strip(strip_rect, buf, group, &titles, &closable, tab_hover);
                 if let Some(active_id) = group.active_pane() {
-                    if let Some(viewer_state) = self.viewers.get_mut(&active_id) {
-                        viewer::render_into_pane(
-                            viewer_state,
-                            pane_rect,
-                            buf,
-                            self.viewer_picker.as_ref(),
-                            self.viewer_markdown_theme,
-                        );
-                        // Viewer content owns this rect for mouse events.
-                        // Tab-strip clicks are excluded — `strip_rect`
-                        // lives above and stays with the normal path.
-                        self.last_viewer_rect = Some(pane_rect);
-                    } else {
-                        self.last_pane_outer_rects.push((active_id, pane_rect));
-                        if let Some(pane) = self.panes.get_mut(active_id) {
-                            let focused = self.focus.focused_pane() == Some(active_id);
-                            let ctx = PaneRenderCtx {
-                                focused,
-                                title_override: None,
-                                focus_color: theme_accent,
-                            };
-                            let outcome = pane.render(pane_rect, buf, &ctx);
-                            if focused {
-                                focused_cursor = outcome.cursor;
-                            }
+                    self.last_pane_outer_rects.push((active_id, pane_rect));
+                    if let Some(pane) = self.panes.get_mut(active_id) {
+                        let focused = self.focus.focused_pane() == Some(active_id);
+                        let ctx = PaneRenderCtx {
+                            focused,
+                            title_override: None,
+                            focus_color: theme_accent,
+                        };
+                        let outcome = pane.render(pane_rect, buf, &ctx);
+                        if focused {
+                            focused_cursor = outcome.cursor;
                         }
                     }
+                }
+            }
+        }
+
+        // §C24: the viewer overlay covers the ENTIRE left column
+        // (files+git stacked). We paint it AFTER the group loop so
+        // it lands on top of yazi and gitui with edges aligned to
+        // the outer left column rect. `render_into_pane` calls
+        // `Clear.render(pane_rect, buf)` first, so any leftover
+        // yazi/gitui glyphs underneath are wiped in the same pass.
+        if self.viewer.is_open() {
+            let left_col_rect = split_parent_rect(
+                &self.tree,
+                vertical[1],
+                &rimeterm_core::layout::SplitPath::root().push(0),
+            );
+            if let Some(rect) = left_col_rect {
+                viewer::render_into_pane(
+                    &mut self.viewer,
+                    rect,
+                    buf,
+                    self.viewer_picker.as_ref(),
+                    self.viewer_markdown_theme,
+                );
+                // The pane below the border is what mouse events
+                // route to. Match `render_into_pane`'s inner rect:
+                // one cell inset all around for the border.
+                if rect.width >= 2 && rect.height >= 2 {
+                    self.last_viewer_rect = Some(Rect {
+                        x: rect.x + 1,
+                        y: rect.y + 1,
+                        width: rect.width - 2,
+                        height: rect.height - 2,
+                    });
                 }
             }
         }
@@ -2894,23 +2966,18 @@ impl App {
         }
 
         // Suppress the caret when any overlay owns the input focus.
-        //
-        // The viewer condition used to fire whenever a viewer tab was
-        // the active files-group tab — but that clobbered the caret
-        // for a focused agent / shell pane while the viewer was
-        // merely visible in the corner. Now it only fires when focus
-        // is actually on the viewer, matching the "viewer only
-        // consumes keys when focused" rule enforced by `on_viewer_key`.
-        let viewer_is_focused = self
-            .focus
-            .focused_pane()
-            .is_some_and(|id| self.viewers.contains_key(&id));
+        // Menu / palette / picker / settings / ack all own their own
+        // caret slot, so their opening should hide any pane caret
+        // underneath. The viewer overlay follows the same rule but
+        // only when `viewer_focused` is set — otherwise the user is
+        // still typing into an agents/shells pane and its caret
+        // must remain visible even with the overlay on screen.
         let cursor = if self.menu_state.open
             || self.palette_state.open
             || self.picker_state.open
             || self.settings_state.open
             || self.ack_state.open
-            || viewer_is_focused
+            || (self.viewer.is_open() && self.viewer_focused)
         {
             None
         } else {
@@ -3129,16 +3196,11 @@ impl App {
             let _ = self.redraw_tx.send(());
         }
         if f.viewer_open.swap(false, Ordering::Relaxed) {
-            self.open_viewer_tab();
+            self.open_viewer_overlay();
         }
         if f.viewer_close.swap(false, Ordering::Relaxed) {
-            if let Some(vid) = self
-                .tree
-                .find_tab_group(BUILTIN_FILES)
-                .and_then(|g| g.active_pane())
-                .filter(|id| self.viewers.contains_key(id))
-            {
-                self.close_viewer_tab(vid);
+            if self.viewer.is_open() {
+                self.close_viewer_overlay();
             }
         }
         if f.viewer_open_with_system.swap(false, Ordering::Relaxed) {
@@ -3206,11 +3268,14 @@ impl App {
     }
 
     fn focus_quadrant(&mut self, quad: usize) {
-        // 3-zone layout: 1=left (files), 2=right-top (agents), 3=right-bottom (shells)
+        // 4-zone layout (§C24):
+        //   1 = files  (left-top)   2 = git    (left-bottom)
+        //   3 = agents (right-top)  4 = shells (right-bottom)
         let gid = match quad {
             1 => BUILTIN_FILES,
-            2 => BUILTIN_AGENTS,
-            3 => BUILTIN_SHELLS,
+            2 => BUILTIN_GIT,
+            3 => BUILTIN_AGENTS,
+            4 => BUILTIN_SHELLS,
             _ => return,
         };
         self.focus_group(gid);
@@ -3445,7 +3510,6 @@ impl App {
             }
         }
         let removed = group.try_close(idx, false).map_err(|e| anyhow!("{e}"))?;
-        self.viewers.remove(&removed);
         self.drop_pane_and_session(removed);
         // Clean the reverse lookup + persist if we just changed the
         // agents quadrant. Persisting is idempotent + cheap (single
@@ -3731,7 +3795,7 @@ impl App {
     /// where rapid yazi navigation used to spawn (and leak) one live
     /// gitui per `cd`.
     ///
-    /// Silently no-ops when the gitui spec, the files group, or the
+    /// Silently no-ops when the gitui spec, the git group, or the
     /// gitui pane isn't around (user disabled it), and when a walk
     /// from [`Self::active_root`] finds no `.git` at all — leaving
     /// the previous gitui in place is fine (it renders its own "not
@@ -3776,14 +3840,22 @@ impl App {
         else {
             return;
         };
-        let Some(group) = self.tree.find_tab_group(BUILTIN_FILES) else {
+        // Look for gitui inside the BUILTIN_GIT group (§C24 4-zone).
+        // Fallback to a title-substring search inside the group so a
+        // pane whose title was renamed via IPC still gets refreshed.
+        let Some(pane_id) = self.gitui_pane_id else {
             return;
         };
-        let Some((idx, old_id)) = group.members().iter().copied().enumerate().find(|(_, id)| {
-            self.panes
-                .get(*id)
-                .is_some_and(|p| p.title().to_ascii_lowercase().contains("gitui"))
-        }) else {
+        let Some(group) = self.tree.find_tab_group(BUILTIN_GIT) else {
+            return;
+        };
+        let Some((idx, old_id)) = group
+            .members()
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, id)| *id == pane_id)
+        else {
             return;
         };
 
@@ -3798,7 +3870,7 @@ impl App {
             self.osc_tx.clone(),
             icon,
             color,
-            "files",
+            "git",
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -3806,15 +3878,15 @@ impl App {
                 return;
             }
         };
-        // gitui respawns into the left (files) column — same passthrough
-        // policy as the initial spawn.
+        // gitui respawns into the left-bottom (git) group — same
+        // passthrough policy as the initial spawn.
         if let Some(pane) = self.panes.get_mut(new_id) {
             pane.set_mouse_passthrough(true);
         }
         let group = self
             .tree
-            .find_tab_group_mut(BUILTIN_FILES)
-            .expect("files group present");
+            .find_tab_group_mut(BUILTIN_GIT)
+            .expect("git group present");
         if let Err(e) = group.replace_member(idx, new_id) {
             warn!(error = %e, "refresh_gitui: replace_member rejected; rolling back");
             self.drop_pane_and_session(new_id);
@@ -3832,10 +3904,13 @@ impl App {
         // so we `remove` unconditionally and `insert` unconditionally.
         self.pinned_pane_ids.remove(&old_id);
         self.pinned_pane_ids.insert(new_id);
+        // Update the cached gitui id so the next `cwd.changed` finds
+        // the fresh pane (the old id is now stale in the registry).
+        self.gitui_pane_id = Some(new_id);
         // If gitui was the focused pane, keep focus on the new one so the
         // user's cursor doesn't get orphaned on a dropped PaneId.
         if self.focus.focused_pane() == Some(old_id) {
-            self.focus.set_focus(new_id, Some(BUILTIN_FILES));
+            self.focus.set_focus(new_id, Some(BUILTIN_GIT));
         }
     }
 
@@ -4320,27 +4395,31 @@ pub(crate) fn format_agent_picker_hint() -> String {
     lines.join("\n")
 }
 
-/// Map (current_group, direction) → neighbor group in the 3-zone layout.
+/// Map (current_group, direction) → neighbor group in the 4-zone layout.
 /// Returns `None` if the move would go out of bounds.
 ///
-/// 3-zone layout (§19.1 new design):
-///   ┌ files (full-height) │ agents ┐
-///   │                     │ shells ┤
+/// 4-zone layout (§C24):
+///   ┌ files │ agents ┐
+///   ├ git   │ shells ┤
 ///
 /// Directions: 1=left, 2=right, 3=up, 4=down.
 fn neighbor_group(from: TabGroupId, dir: usize) -> Option<TabGroupId> {
     let same = from;
     let out = match (dir, from) {
-        // Left/Right: horizontal navigation
+        // Left/Right: horizontal navigation between columns. Match
+        // vertical row (top-left ↔ top-right, bottom-left ↔ bottom-right)
+        // so the pointer stays in the same row when hopping columns.
         (1, g) if g == BUILTIN_AGENTS => BUILTIN_FILES,
-        (1, g) if g == BUILTIN_SHELLS => BUILTIN_FILES,
+        (1, g) if g == BUILTIN_SHELLS => BUILTIN_GIT,
         (2, g) if g == BUILTIN_FILES => BUILTIN_AGENTS,
+        (2, g) if g == BUILTIN_GIT => BUILTIN_SHELLS,
 
-        // Up/Down: only within right column
+        // Up/Down: within a column.
+        (3, g) if g == BUILTIN_GIT => BUILTIN_FILES,
+        (4, g) if g == BUILTIN_FILES => BUILTIN_GIT,
         (3, g) if g == BUILTIN_SHELLS => BUILTIN_AGENTS,
         (4, g) if g == BUILTIN_AGENTS => BUILTIN_SHELLS,
 
-        // Left column (FILES) has no up/down neighbors
         // Out of bounds cases return same (filtered below)
         _ => same,
     };
@@ -5290,11 +5369,12 @@ pub(crate) fn parse_layout_reset_args(
     }
     let gid = match group {
         "files" => rimeterm_core::BUILTIN_FILES,
+        "git" => rimeterm_core::BUILTIN_GIT,
         "agents" => rimeterm_core::BUILTIN_AGENTS,
         "shells" => rimeterm_core::BUILTIN_SHELLS,
         other => {
             return Err(format!(
-                "unknown group `{other}` (expected: files, sysmon, agents, shells)"
+                "unknown group `{other}` (expected: files, git, agents, shells)"
             ));
         }
     };
@@ -5601,8 +5681,9 @@ fn tab_goto_title(index: usize) -> &'static str {
 
 fn quadrant_title(idx: usize) -> &'static str {
     match idx {
-        0 => "Focus files (left)",
-        1 => "Focus agents (right-top)",
+        0 => "Focus files (left-top)",
+        1 => "Focus git (left-bottom)",
+        2 => "Focus agents (right-top)",
         _ => "Focus shells (right-bottom)",
     }
 }
@@ -5644,7 +5725,7 @@ fn drop_pane(panes: &mut PaneRegistry, id: PaneId) {
 
 fn hint_bar_text() -> String {
     // Order = frequency-weighted from watching real sessions. Dropped
-    // `Alt+H/J/K/L Nav` (redundant with `Alt+1..3 Pane` in the three-
+    // `Alt+H/J/K/L Nav` (redundant with `Alt+1..4 Pane` in the four-
     // zone layout — HJKL never advertised its own zones anyway) and
     // `Ctrl+PgUp/PgDn` (Alt+[/] is the canonical Tab cycle and works
     // on every terminal we care about). Added `Ctrl+= / -` because on
@@ -5652,7 +5733,7 @@ fn hint_bar_text() -> String {
     // for users to answer "text too big?" without leaving the app.
     // WT intercepts these keys before rimeterm sees them, so this is
     // documentation of a HOST feature, not a rimeterm binding.
-    "Ctrl+Q Quit · F1 / Ctrl+Shift+P Palette · Alt+1..3 Pane · Alt+[/] Tab · Ctrl+T New tab · Ctrl+W Close tab · Ctrl+= / - Zoom · F10 Menu".into()
+    "Ctrl+Q Quit · F1 / Ctrl+Shift+P Palette · Alt+1..4 Pane · Alt+[/] Tab · Ctrl+T New tab · Ctrl+W Close tab · Ctrl+= / - Zoom · F10 Menu".into()
 }
 
 fn point_in_rect(x: u16, y: u16, r: Rect) -> bool {
@@ -5728,6 +5809,7 @@ pub(crate) fn live_hover_overlay(
 fn parse_group_id(s: &str) -> Option<TabGroupId> {
     match s {
         "files" => Some(BUILTIN_FILES),
+        "git" => Some(BUILTIN_GIT),
         "agents" => Some(BUILTIN_AGENTS),
         "shells" => Some(BUILTIN_SHELLS),
         _ => None,
@@ -5800,10 +5882,10 @@ fn min_size_floors(
     // §19.8 defaults: yazi/sysmon 24 cols · agents/shells 32 cols · viewer 48
     //                 rows: 6 (sysmon/shells) · 8 (yazi) · 10 (agents) · 12 (viewer)
     let floors_cells: [u16; 2] = match path.0.as_slice() {
-        // Root split: two columns. Left = files/sysmon (24), right = agents/shells (32).
+        // Root split: two columns. Left = files/git (24), right = agents/shells (32).
         [] => [24, 32],
-        // Left column vertical split: files above sysmon.
-        [0] => [8, 6],
+        // Left column vertical split: files (yazi) above git (gitui).
+        [0] => [8, 8],
         // Right column vertical split: agents above shells.
         [1] => [10, 6],
         _ => [1, 1],
@@ -5951,18 +6033,6 @@ fn next_shell_number(members: &[PaneId], panes: &PaneRegistry) -> usize {
     max + 1
 }
 
-/// Return the PaneId of an already-open viewer tab whose snapshot
-/// path equals `path`, or `None` when no viewer holds it. Extracted
-/// from [`App::open_viewer_tab`] so the dedup rule is unit-testable
-/// without spinning up a full `App`.
-///
-/// Path equality is by-value (`PathBuf: Eq`): fine because
-/// `viewer::classify_source` preserves the caller's path verbatim and
-/// Yazi's `file.selected` events carry absolute paths. Normalization
-/// (`.` / `..` collapse, symlink resolution) is deliberately NOT
-/// performed — two logically-equal-but-syntactically-different paths
-/// stay distinct, matching what the tab title (basename) would show
-/// the user anyway.
 /// Inverse of [`parse_markdown_theme`]: produce the intent-tag slug
 /// used in `md.theme:<slug>` picker entries. Keeping this separate
 /// (rather than piggybacking on `Theme::label()`) ensures the tag is
@@ -6005,15 +6075,6 @@ pub(crate) fn parse_markdown_theme(s: &str) -> rimeterm_markdown::Theme {
             Theme::Default
         }
     }
-}
-
-fn find_open_viewer_for_path(
-    viewers: &std::collections::HashMap<PaneId, ViewerOverlayState>,
-    path: &std::path::Path,
-) -> Option<PaneId> {
-    viewers
-        .iter()
-        .find_map(|(id, st)| st.snapshot().filter(|s| s.path == path).map(|_| *id))
 }
 
 /// Predicate for the C22 `→` shortcut: return `true` when the
@@ -6107,42 +6168,45 @@ mod tests {
     }
     #[test]
     fn neighbor_group_navigates_left_right() {
-        // 3-zone: files ←→ agents/shells
+        // 4-zone: files↔agents (top row), git↔shells (bottom row).
         assert_eq!(neighbor_group(BUILTIN_AGENTS, 1), Some(BUILTIN_FILES));
-        assert_eq!(neighbor_group(BUILTIN_SHELLS, 1), Some(BUILTIN_FILES));
+        assert_eq!(neighbor_group(BUILTIN_SHELLS, 1), Some(BUILTIN_GIT));
         assert_eq!(neighbor_group(BUILTIN_FILES, 2), Some(BUILTIN_AGENTS));
+        assert_eq!(neighbor_group(BUILTIN_GIT, 2), Some(BUILTIN_SHELLS));
     }
 
     #[test]
     fn neighbor_group_navigates_up_down() {
-        // 3-zone: up/down only within right column
+        // 4-zone: up/down within each column.
         assert_eq!(neighbor_group(BUILTIN_AGENTS, 4), Some(BUILTIN_SHELLS));
         assert_eq!(neighbor_group(BUILTIN_SHELLS, 3), Some(BUILTIN_AGENTS));
-
-        // FILES has no up/down neighbors
-        assert_eq!(neighbor_group(BUILTIN_FILES, 3), None);
-        assert_eq!(neighbor_group(BUILTIN_FILES, 4), None);
+        assert_eq!(neighbor_group(BUILTIN_FILES, 4), Some(BUILTIN_GIT));
+        assert_eq!(neighbor_group(BUILTIN_GIT, 3), Some(BUILTIN_FILES));
     }
 
     #[test]
     fn neighbor_group_rejects_out_of_bounds() {
-        // Going down from bottom-right has no neighbor.
+        // Going down from bottom-* has no neighbor.
         assert_eq!(neighbor_group(BUILTIN_SHELLS, 4), None);
+        assert_eq!(neighbor_group(BUILTIN_GIT, 4), None);
+        // Going up from top-* has no neighbor.
+        assert_eq!(neighbor_group(BUILTIN_AGENTS, 3), None);
+        assert_eq!(neighbor_group(BUILTIN_FILES, 3), None);
         // Going left from left column has no neighbor.
         assert_eq!(neighbor_group(BUILTIN_FILES, 1), None);
+        assert_eq!(neighbor_group(BUILTIN_GIT, 1), None);
         // Going right from right column has no neighbor.
         assert_eq!(neighbor_group(BUILTIN_AGENTS, 2), None);
         assert_eq!(neighbor_group(BUILTIN_SHELLS, 2), None);
-        // Going up from top-right has no neighbor.
-        assert_eq!(neighbor_group(BUILTIN_AGENTS, 3), None);
     }
 
     #[test]
     fn resize_target_maps_group_to_split_path() {
         use rimeterm_core::layout::SplitPath;
-        // 3-zone layout: left full-height, right split vertically
+        // 4-zone layout: each column split vertically. Horizontal
+        // resize moves the root seam; vertical moves the column seam.
 
-        // Horizontal resize: all groups can adjust left/right boundary
+        // Left column groups: horizontal +sign, vertical path [0]
         let (path, boundary, _, sign) =
             resize_target_for_group(BUILTIN_FILES, ResizeTarget::Horizontal).unwrap();
         assert_eq!(path, SplitPath::root());
@@ -6150,16 +6214,20 @@ mod tests {
         assert!(sign > 0.0);
 
         let (path, _, _, sign) =
+            resize_target_for_group(BUILTIN_FILES, ResizeTarget::Vertical).unwrap();
+        assert_eq!(path, SplitPath::root().push(0));
+        assert!(sign > 0.0);
+
+        let (path, _, _, sign) =
+            resize_target_for_group(BUILTIN_GIT, ResizeTarget::Vertical).unwrap();
+        assert_eq!(path, SplitPath::root().push(0));
+        assert!(sign < 0.0);
+
+        // Right column groups: horizontal -sign, vertical path [1]
+        let (path, _, _, sign) =
             resize_target_for_group(BUILTIN_AGENTS, ResizeTarget::Horizontal).unwrap();
         assert_eq!(path, SplitPath::root());
         assert!(sign < 0.0);
-
-        // Vertical resize: only right column groups can adjust up/down
-        // FILES has no vertical split, so returns None
-        assert_eq!(
-            resize_target_for_group(BUILTIN_FILES, ResizeTarget::Vertical),
-            None
-        );
 
         let (path, _, _, sign) =
             resize_target_for_group(BUILTIN_AGENTS, ResizeTarget::Vertical).unwrap();
@@ -6175,13 +6243,20 @@ mod tests {
     #[test]
     fn paths_for_group_returns_column_split_and_root() {
         use rimeterm_core::layout::SplitPath;
-        // 3-zone: column 1 (right) has both root and its own split
+        // 4-zone: right column has root + own vertical split.
         assert_eq!(
             paths_for_group(BUILTIN_AGENTS),
             vec![SplitPath::root(), SplitPath::root().push(1)]
         );
-        // Column 0 (left, FILES) has no vertical split, only root
-        assert_eq!(paths_for_group(BUILTIN_FILES), vec![SplitPath::root()]);
+        // Left column has root + its own vertical split at path [0].
+        assert_eq!(
+            paths_for_group(BUILTIN_FILES),
+            vec![SplitPath::root(), SplitPath::root().push(0)]
+        );
+        assert_eq!(
+            paths_for_group(BUILTIN_GIT),
+            vec![SplitPath::root(), SplitPath::root().push(0)]
+        );
     }
 
     #[test]
@@ -6709,6 +6784,7 @@ mod tests {
     fn layout_reset_valid_group_ids_all_map() {
         for (raw, expected) in [
             ("files", rimeterm_core::BUILTIN_FILES),
+            ("git", rimeterm_core::BUILTIN_GIT),
             ("agents", rimeterm_core::BUILTIN_AGENTS),
             ("shells", rimeterm_core::BUILTIN_SHELLS),
         ] {
@@ -7090,111 +7166,21 @@ mod tests {
     }
 
     #[test]
-    fn status_hint_matches_three_zone_keymap() {
+    fn status_hint_matches_four_zone_keymap() {
         let hint = hint_bar_text();
         // Preserved bindings.
-        assert!(hint.contains("Alt+1..3 Pane"));
+        assert!(hint.contains("Alt+1..4 Pane"));
         assert!(hint.contains("Ctrl+T New tab"));
         assert!(hint.contains("Ctrl+W Close tab"));
         // §21 hint-bar diet: Alt+HJKL Nav and Ctrl+PgUp/PgDn Tab dropped
-        // to reclaim cells for the Zoom hint. Guard so a well-meaning
-        // "let's advertise more shortcuts" PR doesn't sneak them back.
+        // to reclaim cells for the Zoom hint.
         assert!(hint.contains("Ctrl+= / - Zoom"));
         assert!(!hint.contains("Alt+H"));
         assert!(!hint.contains("Ctrl+PgUp"));
         assert!(!hint.contains("Ctrl+PgDn"));
-        // Legacy invariants: no stray four-zone / "Quadrant" wording.
-        assert!(!hint.contains("Alt+1..4"));
+        // Legacy invariant: the 3-zone label must not sneak back in.
+        assert!(!hint.contains("Alt+1..3"));
         assert!(!hint.contains("Quadrant"));
-    }
-
-    // --- viewer dedup (Alt+V idempotence) --------------------------
-
-    fn viewer_state_for(path: &str, kind: viewer::ViewerKind) -> viewer::ViewerOverlayState {
-        let mut st = viewer::ViewerOverlayState::default();
-        st.open_snapshot(
-            viewer::ViewerSource {
-                path: std::path::PathBuf::from(path),
-                kind,
-            },
-            None,
-        );
-        st
-    }
-
-    #[test]
-    fn find_open_viewer_returns_none_on_empty_map() {
-        let viewers = std::collections::HashMap::new();
-        assert_eq!(
-            find_open_viewer_for_path(&viewers, std::path::Path::new("/a/README.md")),
-            None,
-        );
-    }
-
-    #[test]
-    fn find_open_viewer_matches_by_full_path_not_basename() {
-        // Two different files with the same basename must NOT dedup:
-        // dedup keys off full path so `a/foo.rs` and `b/foo.rs` open
-        // in separate tabs.
-        let mut viewers = std::collections::HashMap::new();
-        let a_id = PaneId::next();
-        let b_id = PaneId::next();
-        viewers.insert(
-            a_id,
-            viewer_state_for("/a/foo.rs", viewer::ViewerKind::Code),
-        );
-        viewers.insert(
-            b_id,
-            viewer_state_for("/b/foo.rs", viewer::ViewerKind::Code),
-        );
-
-        assert_eq!(
-            find_open_viewer_for_path(&viewers, std::path::Path::new("/a/foo.rs")),
-            Some(a_id),
-        );
-        assert_eq!(
-            find_open_viewer_for_path(&viewers, std::path::Path::new("/b/foo.rs")),
-            Some(b_id),
-        );
-        assert_eq!(
-            find_open_viewer_for_path(&viewers, std::path::Path::new("/c/foo.rs")),
-            None,
-        );
-    }
-
-    #[test]
-    fn find_open_viewer_ignores_snapshot_kind() {
-        // Dedup is path-based, so hovering a Markdown that's already
-        // open as a viewer tab still hits, even if the caller's fresh
-        // classification would produce a different kind (impossible in
-        // practice — `classify_source` is deterministic — but the
-        // helper's contract must not depend on kind).
-        let mut viewers = std::collections::HashMap::new();
-        let id = PaneId::next();
-        viewers.insert(
-            id,
-            viewer_state_for("/x/notes.md", viewer::ViewerKind::Markdown),
-        );
-        assert_eq!(
-            find_open_viewer_for_path(&viewers, std::path::Path::new("/x/notes.md")),
-            Some(id),
-        );
-    }
-
-    #[test]
-    fn find_open_viewer_skips_closed_snapshots() {
-        // A viewer that has been closed but not yet removed from the
-        // map (transient state during shutdown) has `snapshot()` ==
-        // None and MUST NOT match.
-        let mut viewers = std::collections::HashMap::new();
-        let id = PaneId::next();
-        let mut st = viewer_state_for("/x/notes.md", viewer::ViewerKind::Markdown);
-        st.close();
-        viewers.insert(id, st);
-        assert_eq!(
-            find_open_viewer_for_path(&viewers, std::path::Path::new("/x/notes.md")),
-            None,
-        );
     }
 
     // --- Right-arrow shortcut gating ---------------------------------

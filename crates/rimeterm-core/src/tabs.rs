@@ -24,6 +24,7 @@ impl TabGroupId {
 /// Built-in group ids the default workspace ships with.
 /// See §19.10.7 / §19.10.9 of the design doc.
 pub const BUILTIN_FILES: TabGroupId = TabGroupId::from_static("files");
+pub const BUILTIN_GIT: TabGroupId = TabGroupId::from_static("git");
 pub const BUILTIN_SYSMON: TabGroupId = TabGroupId::from_static("sysmon");
 pub const BUILTIN_AGENTS: TabGroupId = TabGroupId::from_static("agents");
 pub const BUILTIN_SHELLS: TabGroupId = TabGroupId::from_static("shells");

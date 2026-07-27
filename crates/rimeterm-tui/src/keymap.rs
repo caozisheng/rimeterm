@@ -120,7 +120,7 @@ impl Keymap {
                         return KeymapOutcome::Run(tab_goto_command_id(idx));
                     }
                 }
-                // Alt+1..3: direct jump in the three-zone layout (§19.4).
+                // Alt+1..4: direct jump in the four-zone layout (§C24).
                 KeyCode::Char(c) => {
                     if let Some(cmd) = quadrant_command(c) {
                         return KeymapOutcome::Run(cmd);
@@ -155,21 +155,23 @@ fn digit_1_to_9(c: char) -> Option<usize> {
     }
 }
 
-/// Map Alt+1..3 to the three-zone focus commands. Returns `None` for other
+/// Map Alt+1..4 to the four-zone focus commands. Returns `None` for other
 /// characters so the caller can fall through.
 fn quadrant_command(c: char) -> Option<CommandId> {
     Some(match c {
         '1' => "workspace.focus.quadrant.1",
         '2' => "workspace.focus.quadrant.2",
         '3' => "workspace.focus.quadrant.3",
+        '4' => "workspace.focus.quadrant.4",
         _ => return None,
     })
 }
 
-pub const QUADRANT_COMMANDS: [CommandId; 3] = [
+pub const QUADRANT_COMMANDS: [CommandId; 4] = [
     "workspace.focus.quadrant.1",
     "workspace.focus.quadrant.2",
     "workspace.focus.quadrant.3",
+    "workspace.focus.quadrant.4",
 ];
 /// Map an index 0..=8 to a stable command id string. We pre-declare them so
 /// the palette can enumerate everything.
@@ -299,11 +301,12 @@ mod tests {
     }
 
     #[test]
-    fn alt_1_to_3_jumps_to_three_zones_and_alt_4_falls_through() {
+    fn alt_1_to_4_jumps_to_four_zones() {
         for (c, expected) in [
             ('1', "workspace.focus.quadrant.1"),
             ('2', "workspace.focus.quadrant.2"),
             ('3', "workspace.focus.quadrant.3"),
+            ('4', "workspace.focus.quadrant.4"),
         ] {
             assert_eq!(
                 Keymap::dispatch(key(KeyCode::Char(c), KeyModifiers::ALT)),
@@ -311,9 +314,9 @@ mod tests {
             );
         }
         assert_eq!(
-            Keymap::dispatch(key(KeyCode::Char('4'), KeyModifiers::ALT)),
+            Keymap::dispatch(key(KeyCode::Char('5'), KeyModifiers::ALT)),
             KeymapOutcome::Passthrough,
-            "three-zone layout must not advertise or consume Alt+4"
+            "four-zone layout must not consume Alt+5"
         );
     }
 
