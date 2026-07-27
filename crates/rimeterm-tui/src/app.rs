@@ -490,13 +490,14 @@ pub struct App {
     /// replaces the previous snapshot. Occupies the entire left
     /// column (both files + git groups) while open.
     viewer: ViewerOverlayState,
-    /// True while the viewer overlay owns the keyboard (bare arrow
-    /// keys, j/k/PgUp/PgDn/+/-/0/g/G). Set when opening from the
-    /// left column (yazi / gitui), cleared on close so focus can
-    /// hand back to `viewer.return_focus`. When `false`, the
-    /// overlay renders but consumes only its close chords (bare
-    /// ←, Esc, Alt+V) — user can keep typing in agents/shells.
-    viewer_focused: bool,
+    /// **Derived state** — computed via [`Self::viewer_owns_caret`].
+    /// This field is now unused as a runtime signal (kept only to
+    /// avoid rippling the struct layout while the migration lands).
+    /// Its previous role — a cached "invoked from left column" flag —
+    /// went stale whenever the user changed focus after opening the
+    /// viewer (v0.1.23 BUG-2 residual: shell/agent cursor stopped
+    /// blinking because Alt+HJKL never refreshed this cache). All
+    /// call sites now read `Self::viewer_owns_caret` instead.
     /// PaneId of the yazi tab in the files group, if any. Cached at
     /// startup so `close_viewer_overlay` can restore focus to yazi
     /// specifically. `None` when the user has removed yazi from
@@ -1111,7 +1112,6 @@ impl App {
             osc_rx,
             osc_tx,
             viewer: ViewerOverlayState::default(),
-            viewer_focused: false,
             yazi_pane_id,
             gitui_pane_id,
             last_yazi_selection: None,
@@ -1355,7 +1355,7 @@ impl App {
                 self.close_viewer_overlay();
                 return true;
             }
-            if self.viewer_focused && self.on_viewer_modal_key(key) {
+            if self.viewer_owns_caret() && self.on_viewer_modal_key(key) {
                 return true;
             }
             // Anything the modal doesn't claim (F9 / F10 / F1 / Ctrl+T
@@ -1478,15 +1478,11 @@ impl App {
             return;
         }
 
-        // Only capture modal focus when the overlay was invoked from
-        // the left column (yazi / gitui). Otherwise the user is
-        // typing in agents/shells and Alt+V shouldn't steal keys —
-        // the overlay renders but only ← / Esc / Alt+V dismiss.
-        let focused_group = self.focus.focused_group();
-        self.viewer_focused = matches!(
-            focused_group,
-            Some(g) if g == BUILTIN_FILES || g == BUILTIN_GIT
-        );
+        // BUG-2 followup: no cached "invoked from left column" flag —
+        // `viewer_owns_caret()` derives the same signal from live
+        // focus state every read, so Alt+HJKL between panes while
+        // the viewer is open now correctly hands the OS caret to the
+        // freshly-focused pane and its blinking resumes.
 
         // `return_focus` is used by `close_viewer_overlay` to land
         // the caret back where it started. Prefer the exact pane
@@ -1516,13 +1512,33 @@ impl App {
         });
         let _ = self.redraw_tx.send(());
     }
+    /// BUG-2 followup fix: returns `true` when the viewer overlay
+    /// currently owns the OS caret (blinking cursor). Computed from
+    /// live focus state instead of a stored flag, so switching focus
+    /// via Alt+HJKL or clicking a right-column pane immediately
+    /// releases the caret to that pane and its blinking resumes.
+    ///
+    /// Rules:
+    /// - viewer must be open,
+    /// - focus must be on the left column (files / git group).
+    ///
+    /// If either fails, the viewer is a passive overlay and the
+    /// underlying pane keeps the caret.
+    pub(crate) fn viewer_owns_caret(&self) -> bool {
+        if !self.viewer.is_open() {
+            return false;
+        }
+        matches!(
+            self.focus.focused_group(),
+            Some(g) if g == BUILTIN_FILES || g == BUILTIN_GIT
+        )
+    }
 
     /// Close the viewer overlay and return focus to whatever pane
     /// had it when the overlay opened. Falls back to yazi (if
     /// configured) then leaves focus untouched.
     fn close_viewer_overlay(&mut self) {
         let return_focus = self.viewer.close();
-        self.viewer_focused = false;
         // Prefer the exact pane captured at open. If that pane has
         // since been dropped, fall back to yazi so the user still
         // lands somewhere sensible.
@@ -3138,7 +3154,7 @@ impl App {
             settings_open: self.settings_state.open,
             ack_open: self.ack_state.open,
             viewer_open: self.viewer.is_open(),
-            viewer_focused: self.viewer_focused,
+            viewer_focused: self.viewer_owns_caret(),
             focused_cursor,
         });
 

@@ -2,6 +2,8 @@
 
 **A TUI-native terminal built for coding agents.** Runs inside your existing terminal (Windows Terminal / WezTerm / kitty / iTerm2 / Alacritty) and multiplexes PTY sessions like tmux — but with an agent-shaped hole in the middle.
 
+> Built for one workflow — mine. The 4-pane layout below mirrors how I actually code all day: files on the left, agent + shell on the right, git status glancing back at me. No off-the-shelf terminal or multiplexer does this out of the box, so I ended up assembling one from `yazi` + `gitui` + `bottom` + whichever coding agent I'm using this week. Sharing in case someone else's habits look like mine.
+
 <img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/a524d1d5-e9c8-4895-8ef6-40cd4f1ab0e3" />
 
 <img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/50f41ee0-202a-4c1a-b9ed-096f5ce8337d" />
@@ -15,11 +17,12 @@ The whole thing is scriptable — a companion CLI (`rimectl`) speaks JSON over a
 
 ## The layout
 
-One screen, three zones:
+One screen, four panes in a 2×2 grid:
 
-- **Left** — file manager (yazi) full-height, with a markdown / image viewer overlay for the file under the cursor.
-- **Right-top** — coding agent picked at runtime from whatever's on `$PATH`.
-- **Right-bottom** — system monitor + shell tabs (pwsh / bash / fish).
+- **Top-left** — file manager (yazi), with a modal Alt+V viewer for the file under the cursor (markdown / code / image).
+- **Bottom-left** — git status (gitui), auto-refreshed when the workspace repo changes (external commits, agent rebases, etc.).
+- **Top-right** — coding agent picked at runtime from whatever's on `$PATH` (Claude Code, Codex, `omp`, `pi`, …).
+- **Bottom-right** — system monitor (bottom) as the pinned first tab, plus interactive shells (pwsh / bash / fish) in subsequent tabs.
 
 Every zone is tabbed and hot-swappable. Layout ratios and agent choice persist per workspace.
 
@@ -46,19 +49,6 @@ node bootstrap-essentials.mjs
 ```
 
 Then run `rimeterm` from any terminal.
-
-## Recent changes
-
-### 0.1.23 — every pane shows its cursor
-
-- **BUG-2 fix** — `PtyPane` now paints a **cell-level reverse-video cursor block** at every render, independent of focus. Previously the only visible cursor was the OS caret owned by the focused pane, so opening the Alt+V viewer (which takes the caret) made shell/agent panes look "dead". Now every PTY keeps a visible cursor block regardless of which overlay is on screen — matching tmux / wezterm / foot behaviour. See `overlay_cursor_cell` in `crates/rimeterm-tui/src/pty_pane.rs`.
-
-### 0.1.22 — viewer perf + gitui refresh
-
-- **Viewer** — parsed Markdown and syntect state are cached per snapshot (checkpoints every 500 lines) and the selection-mode buffer capture only fires when a selection is actually active. Scrolling a large `.md` / `.rs` in the Alt+V viewer is now flat-CPU. See `docs/rimeterm-upgrade-design.md` §P1.
-- **gitui refresh** — a bare `F5` now force-respawns the gitui pane at the current workspace root, and an `.git/`-scoped `notify` watcher (300 ms debounce + 500 ms settle window) auto-refreshes it after external `git commit` / `checkout` / rebase from a sibling shell. Eliminates the "gitui shows stale HEAD" and "gitui flickers wildly after switching folders" reports.
-- **Renderer** — `PtyPane::render` skips the full `alacritty::display_iter` blit when the terminal has no damage and nothing tracked has changed (focus / area / scroll / selection). The main loop also skips `Terminal::draw()` on idle 16 ms ticks. Idle rimeterm CPU drops from ~3 % to ~0.1 %.
-- **BUG-2 guard** — `decide_frame_cursor` is now a pure function with regression tests locking in "viewer overlay MUST NOT hide the shell/agent caret when it was invoked from the right column".
 
 ## More
 
