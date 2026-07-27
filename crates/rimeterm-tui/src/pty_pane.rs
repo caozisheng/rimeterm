@@ -708,6 +708,29 @@ impl PaneProvider for PtyPane {
             // active selection to overwrite it).
             self.last_render = None;
         }
+
+        // BUG-2 fix: paint a cell-level cursor overlay so each PTY
+        // pane keeps a visible cursor block regardless of focus. The
+        // focused pane also gets the OS caret via `RenderOutcome.cursor`
+        // above; the unfocused panes (or every pane while the viewer
+        // overlay owns the OS caret) get JUST this reverse-video cell.
+        //
+        // Painted AFTER `snapshot_inner` on purpose: the cache holds
+        // the raw grid, so when the cursor moves next frame the fast
+        // path blits a clean background and we re-apply the overlay
+        // at the fresh coordinates. No ghost cursor left behind.
+        //
+        // Painted BEFORE we return the OutcomeCursor so the OS caret
+        // and the cell overlay agree on the same coordinate — the OS
+        // caret sits on top and blinks; underneath it, the reverse
+        // cell keeps the unfocused-pane cursor visible.
+        if let Some((cx, cy)) =
+            overlay_cursor_cell(vt_hide_cursor, inner, vt_cursor_row, vt_cursor_col)
+        {
+            let target = &mut buf[(cx, cy)];
+            let style = target.style().add_modifier(Modifier::REVERSED);
+            target.set_style(style);
+        }
         self.last_display_offset = display_offset;
         self.last_focused = ctx.focused;
         self.last_selection_active = selection_active_now;
@@ -1312,6 +1335,40 @@ pub(crate) fn translate_cursor(
     Some((inner.x + col, inner.y + row))
 }
 
+/// BUG-2 fix: decide whether the PTY pane should paint a cell-level
+/// cursor overlay (reverse-video block at `(row, col)` inside `inner`).
+///
+/// This mirrors tmux / wezterm / foot behaviour: every pane shows a
+/// visible cursor cell regardless of focus, so users can still see
+/// where each shell / agent is sitting when another pane (or the
+/// viewer overlay) owns the OS caret.
+///
+/// Returns `Some((abs_x, abs_y))` when the overlay should paint;
+/// `None` when the child hid the caret (DECTCEM `ESC[?25l`) or the
+/// cursor lives outside the rendered viewport (scrollback / mid-resize).
+///
+/// Notably, `focused` is NOT a gate here — that's the whole point.
+/// The focused pane already has the OS caret painted on top of this
+/// cell; the unfocused panes get JUST the reverse-video block, which
+/// is the visible "cursor still here" affordance.
+pub(crate) fn overlay_cursor_cell(
+    hide_cursor: bool,
+    inner: Rect,
+    row: u16,
+    col: u16,
+) -> Option<(u16, u16)> {
+    if hide_cursor {
+        return None;
+    }
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    if row >= inner.height || col >= inner.width {
+        return None;
+    }
+    Some((inner.x + col, inner.y + row))
+}
+
 /// True when `(x, y)` lies inside `r` (inclusive left/top, exclusive
 /// right/bottom, matching everywhere else in the app).
 pub(crate) fn point_in_rect(x: u16, y: u16, r: Rect) -> bool {
@@ -1630,6 +1687,49 @@ mod mouse_tests {
             height: 0,
         };
         assert_eq!(translate_cursor(true, false, collapsed, 0, 0), None);
+    }
+
+    // --- overlay_cursor_cell (BUG-2 fix: cell-level cursor overlay) ---
+
+    #[test]
+    fn overlay_paints_regardless_of_focus() {
+        // The whole point of BUG-2: unfocused panes still get a visible
+        // cursor block. `overlay_cursor_cell` has no `focused` argument.
+        assert_eq!(overlay_cursor_cell(false, inner_10x5(), 2, 3), Some((6, 6)));
+    }
+
+    #[test]
+    fn overlay_none_when_child_hid_cursor() {
+        // DECTCEM ESC[?25l suppresses BOTH the OS caret and the cell
+        // overlay — otherwise a full-screen curses TUI (vim, less) would
+        // sprout a ghost reverse-cell block on its own hidden-cursor line.
+        assert_eq!(overlay_cursor_cell(true, inner_10x5(), 2, 3), None);
+    }
+
+    #[test]
+    fn overlay_none_when_grid_pos_outside_inner_after_resize() {
+        // Same clamp rule as translate_cursor — a stale cursor from a
+        // pre-shrink frame must never paint past the pane border.
+        assert_eq!(overlay_cursor_cell(false, inner_10x5(), 8, 0), None);
+        assert_eq!(overlay_cursor_cell(false, inner_10x5(), 0, 20), None);
+    }
+
+    #[test]
+    fn overlay_none_when_inner_rect_collapsed() {
+        let collapsed = Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 5,
+        };
+        assert_eq!(overlay_cursor_cell(false, collapsed, 0, 0), None);
+        let collapsed = Rect {
+            x: 0,
+            y: 0,
+            width: 5,
+            height: 0,
+        };
+        assert_eq!(overlay_cursor_cell(false, collapsed, 0, 0), None);
     }
 
     #[test]

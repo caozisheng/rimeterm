@@ -49,6 +49,10 @@ Then run `rimeterm` from any terminal.
 
 ## Recent changes
 
+### 0.1.23 — every pane shows its cursor
+
+- **BUG-2 fix** — `PtyPane` now paints a **cell-level reverse-video cursor block** at every render, independent of focus. Previously the only visible cursor was the OS caret owned by the focused pane, so opening the Alt+V viewer (which takes the caret) made shell/agent panes look "dead". Now every PTY keeps a visible cursor block regardless of which overlay is on screen — matching tmux / wezterm / foot behaviour. See `overlay_cursor_cell` in `crates/rimeterm-tui/src/pty_pane.rs`.
+
 ### 0.1.22 — viewer perf + gitui refresh
 
 - **Viewer** — parsed Markdown and syntect state are cached per snapshot (checkpoints every 500 lines) and the selection-mode buffer capture only fires when a selection is actually active. Scrolling a large `.md` / `.rs` in the Alt+V viewer is now flat-CPU. See `docs/rimeterm-upgrade-design.md` §P1.
