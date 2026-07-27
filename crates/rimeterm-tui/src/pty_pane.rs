@@ -144,6 +144,33 @@ pub struct PtyPane {
     scrollbar_rect: Option<Rect>,
     /// Keeps scrollbar ownership through Left drag/up events.
     scrollbar_drag: bool,
+    /// P0-2: cached snapshot of the last painted inner region.
+    /// Reused as the fast path when nothing that would change the
+    /// pane's on-screen output has moved: no alacritty damage, same
+    /// area, same focus, same selection state, same scroll offset,
+    /// same block-border color. A `Buffer.clone()` blit into the
+    /// frame's buffer is O(cells) memcpy vs the `display_iter` walk
+    /// with its per-cell style translation.
+    ///
+    /// `None` on the very first render, after a resize, or after any
+    /// tracked-state divergence. Rebuilt to the new inner rect on the
+    /// next full paint.
+    last_render: Option<Buffer>,
+    /// P0-2: scroll offset the last time the grid was painted.
+    /// Alacritty's damage tracking flags "user scrolled the viewport"
+    /// via `mark_fully_damaged` inside `scroll_display`, but we
+    /// double-check here so a race between the read-loop's damage
+    /// reset and our render can't leak a stale offset.
+    last_display_offset: usize,
+    /// P0-2: focus state at the time of the last paint. Focus flips
+    /// change the border color and the `▶` title marker — repaint.
+    last_focused: bool,
+    /// P0-2: whether the selection overlay was active at the time of
+    /// the last paint. Selection extent isn't easily hashable, so we
+    /// use "was it active" as the coarse invalidation trigger — any
+    /// active-selection mouse drag also raises alacritty damage via
+    /// the cursor position update, so we rarely miss a real change.
+    last_selection_active: bool,
 }
 
 impl PtyPane {
@@ -165,6 +192,10 @@ impl PtyPane {
             scrollback_enabled: false,
             scrollbar_rect: None,
             scrollbar_drag: false,
+            last_render: None,
+            last_display_offset: 0,
+            last_focused: false,
+            last_selection_active: false,
         }
     }
 
@@ -473,6 +504,11 @@ impl PaneProvider for PtyPane {
         // Focus visuals: focused = bright cyan + bold + `▶ …` title marker
         // so it also reads in monochrome / low-contrast terminals; unfocused
         // = dim grey. `LightCyan` alone was hard to see on dark themes.
+        //
+        // Border painting stays unconditional — it's ~2×(w+h) cells,
+        // dwarfed by grid content, and the focus color / marker MUST
+        // reflect the current-frame state (P0-2 only skips the grid,
+        // not the frame).
         let marker = if ctx.focused { "▶ " } else { "  " };
         let title = format!(" {}🐚 {} ", marker, self.title);
         let border_style = if ctx.focused {
@@ -497,7 +533,8 @@ impl PaneProvider for PtyPane {
         // child sees the correct size before its splash frame — Ink apps
         // (oh-my-pi, opencode) render their layout once at spawn and don't
         // reflow well from an 80x24 start.
-        if inner != self.last_area {
+        let area_changed = inner != self.last_area;
+        if area_changed {
             if inner.width >= 2 && inner.height >= 1 {
                 let first_render = self.last_area == Rect::default();
                 self.resize
@@ -507,27 +544,70 @@ impl PaneProvider for PtyPane {
                 }
             }
             self.last_area = inner;
+            // Any stale snapshot points at the OLD abs coords + old
+            // dimensions; drop it so the slow path rebuilds.
+            self.last_render = None;
         }
         // Cheap poll — no-op when nothing is pending.
         self.tick_resize(Instant::now());
 
-        // Blit alacritty's grid cell-by-cell via `display_iter()`, which
-        // yields the visible viewport in row-major order (Indexed<&Cell>).
-        // While we hold the term lock, snapshot the cursor position +
-        // SHOW_CURSOR mode for the caret handoff to ratatui.
-        //
-        // Wide chars: alacritty stores a wide grapheme's leading cell
-        // with `Flags::WIDE_CHAR` and its trailing half with
-        // `Flags::WIDE_CHAR_SPACER`. Skipping the spacer avoids painting
-        // a phantom character in the second column while still letting
-        // the underlying `set_char` cover both cells visually (ratatui
-        // widens automatically for wide chars written via `set_char`).
-        let (vt_cursor_row, vt_cursor_col, vt_hide_cursor, history_size, display_offset) =
+        // P0-2 damage query. Runs under the term lock (short critical
+        // section — one `mem::replace` + a comparison + an iterator
+        // rewind). `reset_damage` clears the marker so the NEXT
+        // render's `damage()` reflects only changes made after this
+        // point.
+        let (
+            has_damage,
+            vt_cursor_row,
+            vt_cursor_col,
+            vt_hide_cursor,
+            history_size,
+            display_offset,
+        ) = self.session.with_term_mut(|term| {
+            let has_damage = match term.damage() {
+                alacritty_terminal::term::TermDamage::Full => true,
+                // Iterator is lazy — checking `next()` on it once
+                // is enough to decide "any damage vs none".
+                alacritty_terminal::term::TermDamage::Partial(mut it) => it.next().is_some(),
+            };
+            term.reset_damage();
+            let display_offset = term.grid().display_offset();
+            let history_size = term.total_lines().saturating_sub(term.screen_lines());
+            let point = term.grid().cursor.point;
+            let hide = !term.mode().contains(TermMode::SHOW_CURSOR) || display_offset > 0;
+            let r = point.line.0.max(0) as u16;
+            let c = point.column.0 as u16;
+            (has_damage, r, c, hide, history_size, display_offset)
+        });
+
+        // Cache invalidation. We take the slow path whenever anything
+        // we track has changed since the last frame — being coarse
+        // here is fine: the visible symptom of an over-invalidation is
+        // "we did the work anyway", not a rendering bug.
+        let selection_active_now = self.selection.is_active();
+        let scroll_changed = display_offset != self.last_display_offset;
+        let focus_changed = ctx.focused != self.last_focused;
+        let selection_changed = selection_active_now != self.last_selection_active;
+        let need_slow_path = has_damage
+            || area_changed
+            || focus_changed
+            || selection_changed
+            || scroll_changed
+            // If selection is still live, its extent may have moved
+            // without alacritty seeing anything (mouse drag inside our
+            // overlay never touches the grid). Repaint each frame while
+            // active; releasing the selection lands us back on the fast
+            // path within one frame.
+            || selection_active_now
+            || self.last_render.is_none();
+
+        if need_slow_path {
+            // Full grid blit. Same code as the pre-P0-2 renderer: walk
+            // alacritty's `display_iter()`, skip wide-char spacers, hand
+            // each cell to ratatui via `set_char` + `set_style`.
             self.session.with_term(|term| {
                 let inner_cols = inner.width as usize;
                 let inner_rows = inner.height as usize;
-                let display_offset = term.grid().display_offset();
-                let history_size = term.total_lines().saturating_sub(term.screen_lines());
                 for indexed in term.grid().display_iter() {
                     let Some(row_u) =
                         viewport_row(indexed.point.line.0, display_offset, inner_rows)
@@ -550,12 +630,14 @@ impl PaneProvider for PtyPane {
                     target.set_char(if ch == '\0' { ' ' } else { ch });
                     target.set_style(alac_cell_style(indexed.cell));
                 }
-                let point = term.grid().cursor.point;
-                let hide = !term.mode().contains(TermMode::SHOW_CURSOR) || display_offset > 0;
-                let r = point.line.0.max(0) as u16;
-                let c = point.column.0 as u16;
-                (r, c, hide, history_size, display_offset)
             });
+        } else if let Some(snap) = &self.last_render {
+            // Fast path: cell-clone from cache. No lock, no per-cell
+            // style translation. This is the wire-through that makes
+            // 4 idle panes cost ~4 memcpys per frame instead of 4
+            // full display_iter walks with a mutex acquisition each.
+            blit_buffer_at(snap, buf, (inner.x, inner.y));
+        }
 
         // Only the focused pane owns the caret. Unfocused shells still
         // update their alacritty cursor as output arrives, but the OS caret
@@ -573,7 +655,7 @@ impl PaneProvider for PtyPane {
         // reverse-video wins over the shell's own colours. Line/word
         // modes are handled inside `SelectionState::contains` which
         // knows how to flow past the raw cursor.
-        if self.selection.is_active() {
+        if selection_active_now {
             let cols = inner.width;
             for row in 0..inner.height {
                 for col in 0..inner.width {
@@ -610,6 +692,25 @@ impl PaneProvider for PtyPane {
         } else {
             self.scrollbar_drag = false;
         }
+
+        // Snapshot the inner region for the next frame's fast path.
+        // We only snapshot when we actually took the slow path — the
+        // fast path already re-established the cache-consistent state.
+        // Skipping the snapshot when selection is active spares us the
+        // memcpy: those frames will re-slow-path anyway (see
+        // `selection_active_now` in the guard above).
+        if need_slow_path && !selection_active_now && inner.width > 0 && inner.height > 0 {
+            self.last_render = Some(snapshot_inner(buf, inner));
+        } else if selection_active_now {
+            // Don't cache mid-selection frames — the overlay is baked
+            // into `buf` and would poison the cache once selection
+            // clears (we'd blit a highlighted region back with no
+            // active selection to overwrite it).
+            self.last_render = None;
+        }
+        self.last_display_offset = display_offset;
+        self.last_focused = ctx.focused;
+        self.last_selection_active = selection_active_now;
 
         RenderOutcome {
             request_redraw: false,
@@ -1138,6 +1239,41 @@ pub(crate) fn inner_rect(outer: Rect) -> Rect {
         y: outer.y.saturating_add(1),
         width: inset_w,
         height: inset_h,
+    }
+}
+
+/// P0-2: capture the current cell contents of `inner` inside `src`
+/// into a fresh `Buffer` sized to that rect. The snapshot uses
+/// coordinates relative to `inner` (a small `Buffer` at `x=0, y=0`)
+/// so it can be blitted back to any equal-sized rect later.
+///
+/// Cheap: one allocation + `w*h` cell clones. Cells are POD-ish
+/// (char + style + short symbol string), no heap allocations per
+/// cell for the ASCII / single-BMP case.
+pub(crate) fn snapshot_inner(src: &Buffer, inner: Rect) -> Buffer {
+    let snap_area = Rect {
+        x: 0,
+        y: 0,
+        width: inner.width,
+        height: inner.height,
+    };
+    let mut snap = Buffer::empty(snap_area);
+    for y in 0..inner.height {
+        for x in 0..inner.width {
+            let src_cell = src[(inner.x + x, inner.y + y)].clone();
+            snap[(x, y)] = src_cell;
+        }
+    }
+    snap
+}
+
+pub(crate) fn blit_buffer_at(snap: &Buffer, dst: &mut Buffer, dst_origin: (u16, u16)) {
+    let (dx, dy) = dst_origin;
+    let snap_area = snap.area();
+    for y in 0..snap_area.height {
+        for x in 0..snap_area.width {
+            dst[(dx + x, dy + y)] = snap[(x, y)].clone();
+        }
     }
 }
 
@@ -1803,5 +1939,88 @@ mod mouse_tests {
     #[test]
     fn ev_helper_still_compiles() {
         let _ = ev(down_left(0, 0), 0, 0, KeyModifiers::NONE);
+    }
+}
+
+#[cfg(test)]
+mod p0_2_tests {
+    //! P0-2 damage-driven repaint. The full `PtyPane::render` fast/slow
+    //! path needs a live `Session` (heavy — spawns a real PTY child),
+    //! so we test the pure buffer helpers here. They're the only
+    //! rendering-side surface with any nontrivial logic: fetching cells
+    //! from `snap` at (0,0)-anchored coords and painting them back at
+    //! an arbitrary `(dst_origin)` offset.
+    use super::*;
+
+    fn make_src() -> Buffer {
+        // A 10×5 buffer with recognisable content at a known origin.
+        // The pane's `inner` rect is offset (border eats 1 cell), so
+        // reads at `src[(inner.x + dx, inner.y + dy)]` must land on
+        // the right cells — this test catches an off-by-origin bug
+        // in `snapshot_inner`.
+        let mut b = Buffer::empty(Rect::new(0, 0, 10, 5));
+        for y in 0..5 {
+            for x in 0..10 {
+                let ch = ((x + y * 10) % 26 + ('a' as u16)) as u8 as char;
+                b[(x, y)].set_char(ch);
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn snapshot_inner_captures_only_the_inset_region() {
+        let src = make_src();
+        // Simulate a pane whose border makes its inner rect `(1,1)+8×3`.
+        let inner = Rect::new(1, 1, 8, 3);
+        let snap = snapshot_inner(&src, inner);
+
+        assert_eq!(snap.area().width, 8);
+        assert_eq!(snap.area().height, 3);
+        // Top-left of snap = the cell at src(1,1), NOT src(0,0). This
+        // guards the (0,0)-origin vs `inner.x/y`-origin invariant.
+        assert_eq!(snap[(0, 0)].symbol(), src[(1, 1)].symbol());
+        assert_eq!(snap[(7, 2)].symbol(), src[(8, 3)].symbol());
+    }
+
+    #[test]
+    fn blit_buffer_at_paints_at_requested_origin() {
+        // A 3×2 snap becomes visible at (5, 2) inside a larger dst.
+        let mut snap = Buffer::empty(Rect::new(0, 0, 3, 2));
+        snap[(0, 0)].set_char('X');
+        snap[(2, 1)].set_char('Y');
+
+        let mut dst = Buffer::empty(Rect::new(0, 0, 20, 10));
+        blit_buffer_at(&snap, &mut dst, (5, 2));
+
+        assert_eq!(dst[(5, 2)].symbol(), "X");
+        assert_eq!(dst[(7, 3)].symbol(), "Y");
+        // Untouched cells outside the target rect stay empty (space).
+        assert_eq!(dst[(0, 0)].symbol(), " ");
+        assert_eq!(dst[(8, 3)].symbol(), " ");
+    }
+
+    #[test]
+    fn snapshot_then_blit_roundtrips_content() {
+        // End-to-end: capture at one inner rect, paint back at another.
+        // This is what P0-2's fast path does when the pane rect stays
+        // stable (its typical case; a resize invalidates the cache
+        // upstream via `last_render = None`).
+        let src = make_src();
+        let inner = Rect::new(1, 1, 6, 3);
+        let snap = snapshot_inner(&src, inner);
+
+        let mut dst = Buffer::empty(Rect::new(0, 0, 10, 5));
+        blit_buffer_at(&snap, &mut dst, (inner.x, inner.y));
+
+        for y in 0..inner.height {
+            for x in 0..inner.width {
+                assert_eq!(
+                    dst[(inner.x + x, inner.y + y)].symbol(),
+                    src[(inner.x + x, inner.y + y)].symbol(),
+                    "mismatch at ({x},{y})",
+                );
+            }
+        }
     }
 }

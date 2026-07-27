@@ -37,3 +37,9 @@ image = { workspace = true }
 # C22 viewer code-highlighting (translation to ratatui styles lives in
 # `viewer::code_highlight`; no upstream adapter crate needed).
 syntect = { workspace = true }
+# BUG-1b (docs/rimeterm-upgrade-design.md): fs-watch `.git/HEAD`, `.git/index`,
+# `.git/refs/heads/` so gitui reflects external repo mutations (git commits
+# from a shell tab, agent rebases, external editor edits) without requiring
+# a manual F5. `macos_kqueue` feature is disabled — we don't need it; the
+# default FSEvents backend is fine and doesn't need extra native deps.
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }

@@ -313,6 +313,17 @@ impl Session {
         f(&t)
     }
 
+    /// Mutable access to the alacritty [`Term`], required by callers that
+    /// invoke `Term::damage()` / `Term::reset_damage()` (P0-2, damage-
+    /// driven pane redraw in `rimeterm-tui`). Same locking rules as
+    /// [`Self::with_term`]: hold the guard for the shortest time
+    /// possible; the read loop takes the same mutex to feed VTE bytes
+    /// through `Processor::advance`.
+    pub fn with_term_mut<R>(&self, f: impl FnOnce(&mut Term<Listener>) -> R) -> R {
+        let mut t = self.term.lock();
+        f(&mut t)
+    }
+
     /// Move the terminal viewport by `lines` relative to the live bottom.
     /// Positive values move into older history; negative values move toward live output.
     pub fn scroll_lines(&self, lines: i32) {

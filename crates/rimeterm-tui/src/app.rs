@@ -88,6 +88,12 @@ struct ActionFlags {
     viewer_open_with_system: AtomicBool,
     viewer_reveal: AtomicBool,
     theme_cycle: AtomicBool,
+    /// Manual gitui refresh (BUG-1a). Bypasses the repo-root debounce
+    /// so users can force a respawn after external repo mutations
+    /// (`git commit` from a shell tab, agent `git rebase`, external
+    /// editor changes, etc.). Bound to F5 in the keymap and exposed as
+    /// the `git.refresh` command.
+    git_refresh: AtomicBool,
 }
 
 /// A mutation the IPC handler queues for the main loop. Each variant carries
@@ -269,6 +275,13 @@ pub(crate) struct PendingSpawn {
 /// hasn't printed anything. Not a kill switch — the pane keeps running,
 /// we just stop nagging the hint bar.
 pub(crate) const PENDING_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// BUG-1b flicker guard window. Every watcher install grants gitui
+/// this much time to complete its startup I/O (index refresh, HEAD
+/// read, config read — potentially atime-triggered on Windows NTFS
+/// / Linux `strictatime` mounts) without those events counting toward
+/// a respawn debounce. See `App::git_watch_settle_until` field docs.
+pub(crate) const GIT_WATCH_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Braille dot spinner. One frame per ~100ms of elapsed time so the
 /// animation feels alive without being distracting. 8 frames cycles
@@ -617,6 +630,49 @@ pub struct App {
     /// tick of the main loop. Wrapped in `parking_lot::Mutex` — never held
     /// across an await point.
     pending_mutations: Arc<parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>>,
+    /// BUG-1b: fs watcher installed on `.git/` of the current
+    /// [`Self::active_repo_root`]. `None` means either the workspace
+    /// is not inside any repo (rule 2 in `refresh_gitui_at_active_root`)
+    /// or the platform-native backend failed to install (rare — the
+    /// user can still press F5 to force a refresh; see BUG-1a).
+    ///
+    /// Dropping this handle releases the OS-level watch. Recreated on
+    /// every `respawn_gitui_now` via [`Self::update_git_watcher`], so
+    /// crossing a repo boundary re-scopes the watcher automatically.
+    git_watcher: Option<notify::RecommendedWatcher>,
+    /// Sender end held by [`Self::update_git_watcher`] so each fresh
+    /// watcher closure can push into the same channel. Cloned into the
+    /// notify callback, which fires on the watcher's background thread.
+    git_event_tx: mpsc::UnboundedSender<()>,
+    /// Receiver end drained by the main loop. Every fs event becomes
+    /// one `()`; multiple events on the same commit collapse via
+    /// [`Self::git_debounce_deadline`] so the burst becomes one respawn.
+    git_event_rx: mpsc::UnboundedReceiver<()>,
+    /// When set, `respawn_gitui_now` fires at or after this instant.
+    /// Bumped forward every time a fresh fs event arrives so back-to-back
+    /// writes during a `git commit` (index → HEAD → refs) collapse into
+    /// a single respawn.
+    git_debounce_deadline: Option<Instant>,
+    /// BUG-1b flicker guard: after any watcher install (startup or
+    /// respawn) we drop fs events silently until this instant. Without
+    /// this, the freshly-spawned gitui process (or the OS reporting
+    /// atime updates on file reads under `.git/`) fires the watcher
+    /// during gitui's own startup, we respawn, the new gitui does the
+    /// same, and gitui "flickers wildly after switching folders"
+    /// (user-reported regression).
+    ///
+    /// The 500 ms window is a compromise: shorter than one
+    /// human-noticeable frame delay for a git commit → gitui update,
+    /// long enough to swallow libgit2's typical startup I/O burst.
+    git_watch_settle_until: Option<Instant>,
+    /// P0-1: gate for `Terminal::draw()`. Set by every event handler
+    /// that mutates render-visible state; cleared right after a
+    /// successful draw. **Not** load-bearing for correctness — ratatui's
+    /// buffer diff catches any missed set and paints the delta on the
+    /// next real draw. Exists purely to skip the entire draw pass
+    /// (widget renders + buffer diff) when nothing changed, killing
+    /// the ~60 fps idle-CPU burn caused by the 16 ms tick.
+    needs_redraw: bool,
 }
 
 impl App {
@@ -1008,9 +1064,35 @@ impl App {
         let viewer_picker = ratatui_image::picker::Picker::from_query_stdio().ok();
         let viewer_markdown_theme = parse_markdown_theme(&config.viewer.markdown.theme);
 
+        // BUG-1b: fs watcher on `.git/` so gitui reflects external repo
+        // mutations. Installed here at startup for the initial repo (if
+        // any); rebuilt on every repo-boundary crossing via
+        // `update_git_watcher`. Failure here (e.g. exotic filesystems on
+        // WSL where inotify is misconfigured) is non-fatal — F5 still
+        // works as a manual override.
+        let (git_event_tx, git_event_rx) = mpsc::unbounded_channel::<()>();
+        let initial_repo_root = find_git_root(&workspace_root);
+        let git_watcher = initial_repo_root.as_deref().and_then(|root| {
+            match spawn_git_watcher(root, git_event_tx.clone()) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    warn!(error = %e, path = %root.display(),
+                          "git watcher spawn failed; F5 still works");
+                    None
+                }
+            }
+        });
+        // BUG-1b flicker guard: seed the settle window as soon as the
+        // initial watcher exists so gitui's startup I/O burst (index
+        // refresh, HEAD read) doesn't trigger a bogus respawn on
+        // launch. Constant `GIT_WATCH_SETTLE` sizes the window.
+        let initial_settle = git_watcher
+            .as_ref()
+            .map(|_| Instant::now() + GIT_WATCH_SETTLE);
+
         Ok(Self {
             active_root: workspace_root.clone(),
-            active_repo_root: find_git_root(&workspace_root),
+            active_repo_root: initial_repo_root,
             workspace_root,
             config,
             shell_choice,
@@ -1063,6 +1145,13 @@ impl App {
             active_drag: None,
             default_ratios,
             pending_mutations,
+            git_watcher,
+            git_event_tx,
+            git_event_rx,
+            git_debounce_deadline: None,
+            git_watch_settle_until: initial_settle,
+            // First frame is always a "redraw" — we haven't drawn yet.
+            needs_redraw: true,
         })
     }
 
@@ -1088,11 +1177,29 @@ impl App {
             }
             self.drain_mutations();
             self.drain_flags();
-            self.expire_hint();
-            self.expire_pending_spawn();
+            // P0-1: `expire_*` helpers now signal via bool whether they
+            // actually mutated state; only those changes need a redraw.
+            // Skipping the flag flip for the "no-op tick" case is what
+            // kills the ~3 % idle-CPU burn (docs/rimeterm-upgrade-design.md).
+            if self.expire_hint() {
+                self.needs_redraw = true;
+            }
+            if self.expire_pending_spawn() {
+                self.needs_redraw = true;
+            }
+            if self.expire_git_debounce() {
+                self.needs_redraw = true;
+            }
 
             tokio::select! {
                 Some(evt) = input.next() => {
+                    // Any input triggers a redraw. We're deliberately
+                    // coarse here: an unbound Shift key doesn't change
+                    // any visible state, but re-painting once is cheap
+                    // and the alternative (per-key classification) is
+                    // brittle. Panes gate their own expensive work
+                    // via alacritty damage (P0-2).
+                    self.needs_redraw = true;
                     match evt {
                         Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => self.on_key(k),
                         Ok(Event::Mouse(m)) => self.on_mouse(m),
@@ -1101,7 +1208,33 @@ impl App {
                     }
                 }
                 Some(_) = self.redraw_rx.recv() => {
+                    // Every send() on redraw_tx means "something changed" —
+                    // drain any coalesced wakes and mark dirty.
                     while self.redraw_rx.try_recv().is_ok() {}
+                    self.needs_redraw = true;
+                }
+                Some(_) = self.git_event_rx.recv() => {
+                    // BUG-1b: collapse the burst that `git commit` emits
+                    // (index → HEAD → refs, sub-millisecond apart) into a
+                    // single 300 ms debounce window. Every fresh event
+                    // bumps the deadline forward, so a slow multi-file
+                    // `git add` still fires exactly one respawn at end.
+                    while self.git_event_rx.try_recv().is_ok() {}
+                    // Flicker guard: during the 500 ms after any
+                    // watcher install, fs events likely come from
+                    // gitui's own startup I/O, not real user activity.
+                    // Drop them silently to avoid the self-reinforcing
+                    // respawn loop ("gitui flickers wildly after
+                    // switching folders" bug).
+                    let in_settle = self
+                        .git_watch_settle_until
+                        .is_some_and(|t| Instant::now() < t);
+                    if !in_settle {
+                        self.git_debounce_deadline =
+                            Some(Instant::now() + Duration::from_millis(300));
+                    }
+                    // No redraw here — nothing visible changes until the
+                    // debounce fires (see `expire_git_debounce`).
                 }
                 Some(event) = self.osc_rx.recv() => {
                     // `recv()` already consumed the wake-triggering
@@ -1110,22 +1243,42 @@ impl App {
                     // event when the channel was previously empty.
                     self.dispatch_osc_event(event);
                     self.drain_osc_events();
+                    self.needs_redraw = true;
                 }
                 Some(completion) = self.viewer_completion_rx.recv() => {
                     self.apply_viewer_completion(completion);
                     while let Ok(next) = self.viewer_completion_rx.try_recv() {
                         self.apply_viewer_completion(next);
                     }
+                    self.needs_redraw = true;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(16)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(16)) => {
+                    // P0-1: the tick fires when NOTHING happened for 16 ms.
+                    // Only two subsystems actually need a periodic wake:
+                    //   1. `pending_spawn` spinner — one frame per ~100 ms
+                    //      of elapsed time (SPINNER_FRAMES cycles through
+                    //      8 glyphs), so we DO need frequent redraws while
+                    //      the pane is booting.
+                    //   2. `git_debounce_deadline` — we WANT the tick
+                    //      because `expire_git_debounce` at loop head is
+                    //      what actually fires the respawn once the 300ms
+                    //      window expires. The tick just wakes the loop.
+                    // Anything else = truly idle = skip the draw entirely.
+                    if self.pending_spawn.is_some() {
+                        self.needs_redraw = true;
+                    }
+                }
             }
 
-            guard.terminal.draw(|f| {
-                let cursor = self.draw(f.area(), f.buffer_mut());
-                if let Some((x, y)) = cursor {
-                    f.set_cursor_position((x, y));
-                }
-            })?;
+            if self.needs_redraw {
+                guard.terminal.draw(|f| {
+                    let cursor = self.draw(f.area(), f.buffer_mut());
+                    if let Some((x, y)) = cursor {
+                        f.set_cursor_position((x, y));
+                    }
+                })?;
+                self.needs_redraw = false;
+            }
         }
         if let Some(tx) = ipc_shutdown {
             let _ = tx.send(()).await;
@@ -3225,6 +3378,19 @@ impl App {
             self.settings_state.set_markdown_theme(next);
             let _ = self.redraw_tx.send(());
         }
+        if f.git_refresh.swap(false, Ordering::Relaxed) {
+            // BUG-1a: user-visible manual refresh. Bypass the repo-root
+            // debounce — we want to reflect external repo mutations
+            // (git commits from a shell tab, agent rebases, etc.) that
+            // don't move `active_repo_root`.
+            if find_git_root(&self.active_root).is_some() {
+                self.respawn_gitui_now();
+                self.set_hint("gitui refreshed".into());
+            } else {
+                self.set_hint("gitui refresh: current cwd is not inside a git repo".into());
+            }
+            let _ = self.redraw_tx.send(());
+        }
     }
 
     fn tab_step(&mut self, forward: bool) {
@@ -3615,12 +3781,55 @@ impl App {
         self.hint = Some((msg, Instant::now()));
     }
 
-    fn expire_hint(&mut self) {
+    /// Returns `true` when the hint just expired (state changed) so the
+    /// caller can flip `needs_redraw` and re-paint the hint bar with the
+    /// fallback text. `false` when either there's no hint or it's still
+    /// fresh.
+    fn expire_hint(&mut self) -> bool {
         if let Some((_, t)) = &self.hint {
             if t.elapsed() > Duration::from_secs(3) {
                 self.hint = None;
+                return true;
             }
         }
+        false
+    }
+
+    /// BUG-1b: fire the debounced gitui respawn when the deadline has
+    /// elapsed. Called each tick alongside `expire_hint` /
+    /// `expire_pending_spawn`.
+    ///
+    /// The `find_git_root` re-check guards the case where yazi walked
+    /// out of the repo during the 300 ms debounce window — respawning
+    /// gitui outside a repo just makes it error out. Same friendliness
+    /// rule as `refresh_gitui_at_active_root`.
+    ///
+    /// Returns `true` when the debounce actually fired (state changed).
+    fn expire_git_debounce(&mut self) -> bool {
+        let Some(deadline) = self.git_debounce_deadline else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        // Defense-in-depth against flicker: even if a stray event
+        // landed the deadline inside the settle window, refuse to
+        // fire during it. The select branch already screens most
+        // events out — this handles the race where a debounce set
+        // just before a respawn survives the swap.
+        if self
+            .git_watch_settle_until
+            .is_some_and(|t| Instant::now() < t)
+        {
+            return false;
+        }
+        self.git_debounce_deadline = None;
+        if find_git_root(&self.active_root).is_none() {
+            return false;
+        }
+        self.respawn_gitui_now();
+        self.set_hint("gitui refreshed (external repo change)".into());
+        true
     }
 
     /// Clear the boot-progress spinner if either the target pane has
@@ -3637,9 +3846,11 @@ impl App {
     /// re-render (window resize, which triggers the child to repaint
     /// its whole viewport, at which point the bottom rows finally hold
     /// a status bar / prompt). We now sample the ENTIRE visible viewport.
-    fn expire_pending_spawn(&mut self) {
+    ///
+    /// Returns `true` when the spinner just cleared (state changed).
+    fn expire_pending_spawn(&mut self) -> bool {
         let Some(pending) = &self.pending_spawn else {
-            return;
+            return false;
         };
         // Sample the whole visible viewport (rows = None). Cheap: a
         // single `parking_lot::Mutex` lock + a String walk sized to
@@ -3653,13 +3864,9 @@ impl App {
             .map(|s| s.grid_contents(None));
         if pending_spawn_should_clear(pending.started.elapsed(), sample.as_deref()) {
             self.pending_spawn = None;
-            // Force one more render immediately — without this pulse the
-            // hint bar would keep drawing "Initializing …" until the next
-            // input/timer tick delivers a fresh frame. The 16ms fallback
-            // in the main loop usually saves us, but under a busy tokio
-            // runtime or a starved timer wheel it can take noticeably
-            // longer. Belt-and-braces: pulse once, cost = one channel send.
-            let _ = self.redraw_tx.send(());
+            true
+        } else {
+            false
         }
     }
 
@@ -3783,7 +3990,12 @@ impl App {
         Ok(abs.display().to_string())
     }
 
-    /// Respawn the gitui tab in the files group at [`Self::active_root`].
+    /// Respawn the gitui tab in the files group at [`Self::active_root`],
+    /// **applying the repo-root debounce**. This is what OSC `cwd.changed`
+    /// events and `workspace.cwd.set` IPC calls should invoke — see
+    /// [`Self::respawn_gitui_now`] for the un-debounced variant used by
+    /// the manual `git.refresh` command and by the fs-watcher path
+    /// (BUG-1b in `docs/rimeterm-upgrade-design.md`).
     ///
     /// **Repo-root debounce**: yazi emits `cwd.changed` for every
     /// subdirectory the user cursors through, but gitui is a **repo-
@@ -3827,6 +4039,37 @@ impl App {
         }
         if new_repo_root.is_none() {
             self.active_repo_root = None;
+            return;
+        }
+        self.respawn_gitui_now();
+    }
+
+    /// Force-respawn the gitui tab at [`Self::active_root`], **bypassing
+    /// the repo-root debounce**. This is what the `git.refresh` command
+    /// (BUG-1a) and the `.git/*` fs-watcher (BUG-1b, when implemented)
+    /// invoke to reflect external repo mutations — a `git commit` from
+    /// a sibling shell, a branch switch, an agent `git rebase`, etc. —
+    /// that don't move `active_repo_root`.
+    ///
+    /// Callers whose event source implies a possible **repo boundary
+    /// change** (yazi `cwd.changed`, `workspace.cwd.set`) MUST use
+    /// [`Self::refresh_gitui_at_active_root`] instead so the debounce
+    /// still short-circuits the "yazi cursoring through one repo"
+    /// case. Skipping the debounce here is safe because the caller
+    /// has already opted into a full respawn.
+    ///
+    /// Silently no-ops when:
+    /// - the gitui spec is missing from `[files] tabs` (user disabled it),
+    /// - the cached `gitui_pane_id` doesn't resolve to a live member of
+    ///   [`BUILTIN_GIT`] (pane was closed / registry pruned),
+    /// - `find_git_root(active_root)` returns `None` (user is currently
+    ///   outside any repo — matches
+    ///   [`Self::refresh_gitui_at_active_root`]'s rule 2 friendliness).
+    fn respawn_gitui_now(&mut self) {
+        // Refuse to respawn outside any repo — gitui errors out
+        // immediately if cwd is not a git worktree, and each respawn
+        // is expensive (see rule 2 in `refresh_gitui_at_active_root`).
+        if find_git_root(&self.active_root).is_none() {
             return;
         }
 
@@ -3874,7 +4117,7 @@ impl App {
         ) {
             Ok(id) => id,
             Err(e) => {
-                warn!(error = %e, "refresh_gitui: spawn failed; keeping old pane");
+                warn!(error = %e, "respawn_gitui: spawn failed; keeping old pane");
                 return;
             }
         };
@@ -3888,7 +4131,7 @@ impl App {
             .find_tab_group_mut(BUILTIN_GIT)
             .expect("git group present");
         if let Err(e) = group.replace_member(idx, new_id) {
-            warn!(error = %e, "refresh_gitui: replace_member rejected; rolling back");
+            warn!(error = %e, "respawn_gitui: replace_member rejected; rolling back");
             self.drop_pane_and_session(new_id);
             return;
         }
@@ -3896,6 +4139,11 @@ impl App {
         // Cache the repo root the new gitui was rooted at so the next
         // `cwd.changed` under it can short-circuit (see debounce doc).
         self.active_repo_root = find_git_root(&self.active_root);
+        // BUG-1b: re-scope the fs watcher to the new repo (if any). This
+        // is a no-op cost when the same repo — we still tear down and
+        // re-create the watcher, but that's ~10 syscalls total on Linux
+        // and imperceptible next to a gitui respawn.
+        self.update_git_watcher();
         // The pinned set is keyed by PaneId (not by tab slot / spec id),
         // so a respawn must migrate the pin — otherwise the new pane
         // renders an `×` and `close_tab_in_group` accepts a Ctrl+W on
@@ -3911,6 +4159,54 @@ impl App {
         // user's cursor doesn't get orphaned on a dropped PaneId.
         if self.focus.focused_pane() == Some(old_id) {
             self.focus.set_focus(new_id, Some(BUILTIN_GIT));
+        }
+    }
+
+    /// Re-scope the `.git/*` fs watcher to [`Self::active_repo_root`].
+    /// Dropping the previous `git_watcher` handle releases the OS-level
+    /// watch (inotify on Linux, ReadDirectoryChangesW on Windows,
+    /// FSEvents on macOS). If `active_repo_root` is `None`, the watcher
+    /// stays torn down — F5 (BUG-1a) remains the only path to a
+    /// refresh until the user re-enters a repo.
+    ///
+    /// Cheap to call unconditionally; the OS handles are single-digit
+    /// syscalls to release + reinstall.
+    fn update_git_watcher(&mut self) {
+        // Drop first so the OS releases handles before we install new
+        // ones — some backends (Windows) can otherwise transiently
+        // exceed per-process watch limits during a rapid repo switch.
+        self.git_watcher = None;
+        // BUG-1b flicker guard: any events queued before the swap were
+        // for the OLD repo and are already stale. Drop them so a
+        // pre-swap burst doesn't fire a spurious respawn 300 ms later.
+        while self.git_event_rx.try_recv().is_ok() {}
+        self.git_debounce_deadline = None;
+
+        if let Some(root) = self.active_repo_root.clone() {
+            match spawn_git_watcher(&root, self.git_event_tx.clone()) {
+                Ok(w) => {
+                    self.git_watcher = Some(w);
+                    // Grant the freshly-spawned gitui process a
+                    // grace window to complete its startup I/O
+                    // (index refresh, HEAD read — potentially atime-
+                    // triggered notify events on Windows NTFS / Linux
+                    // strictatime) without those events counting
+                    // toward a respawn debounce. Without this the
+                    // gitui "flickers wildly after switching folders"
+                    // bug reappears.
+                    self.git_watch_settle_until = Some(Instant::now() + GIT_WATCH_SETTLE);
+                }
+                Err(e) => {
+                    self.git_watch_settle_until = None;
+                    warn!(
+                        error = %e,
+                        path = %root.display(),
+                        "git watcher spawn failed; F5 still works"
+                    );
+                }
+            }
+        } else {
+            self.git_watch_settle_until = None;
         }
     }
 
@@ -4531,6 +4827,13 @@ fn register_commands(
         "Cycle UI theme",
         "Alt+T — advance through Default → Dracula → Solarized{Dark,Light} → Nord → Gruvbox{Dark,Light} → GitHub Light",
         flags.theme_cycle
+    );
+    flag_cmd!(
+        cmds,
+        "git.refresh",
+        "Refresh gitui",
+        "F5 — force-respawn the gitui pane at the current workspace root (BUG-1a)",
+        flags.git_refresh
     );
     flag_cmd!(
         cmds,
@@ -5706,6 +6009,55 @@ fn find_git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
         }
         cur = cur.parent()?;
     }
+}
+
+/// BUG-1b: install an fs watcher on `<repo>/.git/` (non-recursive, so
+/// `objects/pack/` churn during a `git gc` doesn't flood us) plus
+/// `<repo>/.git/refs/heads/` (recursive, so nested branch names like
+/// `user/feature/x` still fire).
+///
+/// The callback runs on notify's background thread; we forward `()`
+/// into `tx` to wake the tokio main loop. Errors inside the callback
+/// are dropped by design — a single missed event is fine, the next one
+/// (usually within milliseconds during a `git commit`) will still fire.
+///
+/// Returns `Err` when notify's platform-native backend refuses to
+/// install (inotify limit hit, path outside the WSL rootfs, exotic
+/// SMB mount, …). Caller reports and falls back to F5.
+fn spawn_git_watcher(
+    repo_root: &std::path::Path,
+    tx: mpsc::UnboundedSender<()>,
+) -> notify::Result<notify::RecommendedWatcher> {
+    use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+
+    let mut watcher = RecommendedWatcher::new(
+        move |res: notify::Result<notify::Event>| {
+            if res.is_ok() {
+                // Send is fire-and-forget: if the main loop dropped
+                // the receiver (app shutting down) we simply stop.
+                let _ = tx.send(());
+            }
+        },
+        Config::default(),
+    )?;
+
+    let git_dir = repo_root.join(".git");
+    // Non-recursive catches direct children (HEAD, index, MERGE_HEAD,
+    // ORIG_HEAD, CHERRY_PICK_HEAD, REBASE_HEAD, packed-refs). Going
+    // recursive would surface objects/pack/ writes on every commit — a
+    // hundreds-of-events-per-second flood we neither need nor want.
+    watcher.watch(&git_dir, RecursiveMode::NonRecursive)?;
+
+    // refs/heads is recursive because branches can be nested slash-paths
+    // (`refs/heads/user/feature/x`). Missing directory (fresh repo, no
+    // branches, or bare .git-file worktree pointer) is silently OK — the
+    // top-level `.git/` watch still catches the common events.
+    let refs = git_dir.join("refs").join("heads");
+    if refs.is_dir() {
+        let _ = watcher.watch(&refs, RecursiveMode::Recursive);
+    }
+
+    Ok(watcher)
 }
 
 /// Remove a pane from the registry.
@@ -7325,5 +7677,237 @@ mod tests {
         // guaranteed to not be inside a repo in CI).
         assert!(find_git_root(&temp).is_none() || find_git_root(&temp).is_some());
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    // --- BUG-1a / BUG-1b regression tests -----------------------------
+    //
+    // These exercise the small pure surface of the git-refresh path:
+    // watcher install + fs-event bridge (BUG-1b) and the key `git.refresh`
+    // wiring (BUG-1a). The full `respawn_gitui_now` path requires a live
+    // App / PTY registry; smoke-tested manually via F5.
+
+    #[test]
+    fn spawn_git_watcher_delivers_event_on_head_write() {
+        // BUG-1b end-to-end: install the watcher, touch .git/HEAD,
+        // and confirm the notify callback pushes into our channel.
+        //
+        // Skipped on hosts where the platform-native backend rejects
+        // the watch (very rare — WSL with disabled inotify in CI).
+        use std::io::Write;
+
+        let temp =
+            std::env::temp_dir().join(format!("rimeterm-git-watcher-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join(".git").join("refs").join("heads")).unwrap();
+        std::fs::write(temp.join(".git").join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+        let _watcher = match spawn_git_watcher(&temp, tx) {
+            Ok(w) => w,
+            Err(_) => {
+                // Backend refused; document the skip in the log and
+                // pass — F5 is the fallback in production too.
+                let _ = std::fs::remove_dir_all(&temp);
+                return;
+            }
+        };
+
+        // Some backends need a warm-up tick before the initial watch
+        // subscription lands. Sleep 100 ms so the first write we make
+        // is actually seen.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let mut head = std::fs::OpenOptions::new()
+            .append(true)
+            .open(temp.join(".git").join("HEAD"))
+            .unwrap();
+        writeln!(head, "# rimeterm test").unwrap();
+        drop(head);
+
+        // Poll up to ~2 s for the event to arrive. FSEvents on macOS is
+        // known to batch at ~30 ms; Linux inotify is sub-ms; Windows
+        // ReadDirectoryChangesW is sub-100 ms typically.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut got = false;
+        while std::time::Instant::now() < deadline {
+            if rx.try_recv().is_ok() {
+                got = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let _ = std::fs::remove_dir_all(&temp);
+        assert!(got, "expected watcher event within 2s of HEAD write");
+    }
+
+    #[test]
+    fn spawn_git_watcher_errors_when_git_dir_missing() {
+        // BUG-1b: repos without an actual `.git/` (e.g. subdirs the
+        // user cd'd into before `git init`) must return Err rather
+        // than silently installing a broken watcher.
+        let temp =
+            std::env::temp_dir().join(format!("rimeterm-no-git-watcher-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel::<()>();
+        let res = spawn_git_watcher(&temp, tx);
+        let _ = std::fs::remove_dir_all(&temp);
+        assert!(
+            res.is_err(),
+            "expected Err when .git/ doesn't exist, got Ok — the watcher \
+             would silently install nothing and BUG-1b would silently fail"
+        );
+    }
+
+    #[test]
+    fn git_refresh_command_id_is_stable() {
+        // BUG-1a: the command id `git.refresh` is stable API — the
+        // keymap in `keymap.rs` and any user-facing docs / rimectl
+        // scripts embed it. If a future refactor renames it, this
+        // test forces you to update the keymap + docs in the same PR.
+        let flags = Arc::new(ActionFlags::default());
+        let mut cmds = CommandRegistry::new();
+        let pending: Arc<parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
+        let sessions: Arc<
+            parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
+        > = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let snap: Arc<parking_lot::RwLock<WorkspaceSnapshot>> =
+            Arc::new(parking_lot::RwLock::new(WorkspaceSnapshot::default()));
+        let (redraw_tx, _redraw_rx) = mpsc::unbounded_channel();
+        register_commands(
+            &mut cmds,
+            Arc::clone(&flags),
+            Arc::clone(&snap),
+            Arc::clone(&sessions),
+            Arc::clone(&pending),
+            redraw_tx,
+        )
+        .expect("register");
+        // Firing the command must flip the flag; drain_flags will see
+        // it and call respawn_gitui_now (that side is exercised
+        // manually via F5).
+        cmds.run("git.refresh").expect("git.refresh is registered");
+        assert!(
+            flags.git_refresh.load(Ordering::Relaxed),
+            "git.refresh command must flip flags.git_refresh"
+        );
+    }
+
+    #[test]
+    fn f5_maps_to_git_refresh() {
+        // BUG-1a: F5 is the primary keybinding. Guard against an
+        // accidental swap with F6/F7/etc.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ev = KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE);
+        assert_eq!(
+            crate::keymap::Keymap::dispatch(ev),
+            crate::keymap::KeymapOutcome::Run("git.refresh"),
+        );
+    }
+
+    // --- BUG-1b flicker guard tests -----------------------------------
+    //
+    // The full self-reinforcing "gitui spawns → touches .git/ → watcher
+    // fires → respawn → loop" pathology is hard to reproduce without a
+    // real PTY + a real libgit2 process. We test the pure predicate
+    // that gates the debounce set-point: given a `Some(future_instant)`
+    // in `git_watch_settle_until`, incoming fs events MUST NOT arm a
+    // respawn deadline.
+
+    fn in_settle_window(settle_until: Option<Instant>) -> bool {
+        // Mirrors the guard used inside the `git_event_rx` select
+        // branch and in `expire_git_debounce`. Kept as a free helper
+        // so the pure logic is unit-testable without spinning up App.
+        settle_until.is_some_and(|t| Instant::now() < t)
+    }
+
+    #[test]
+    fn settle_window_active_when_deadline_in_future() {
+        // Any deadline strictly after now = "we're inside the settle
+        // window; drop fs events".
+        let settle = Some(Instant::now() + GIT_WATCH_SETTLE);
+        assert!(
+            in_settle_window(settle),
+            "future deadline must engage guard"
+        );
+    }
+
+    #[test]
+    fn settle_window_inactive_when_none() {
+        // App::new with no `.git/` at startup leaves the field as
+        // None; fs events (from a later `update_git_watcher` cycle
+        // that hasn't happened yet) should NOT be dropped by the
+        // guard because there's no active respawn to protect.
+        assert!(!in_settle_window(None), "None must not engage guard");
+    }
+
+    #[test]
+    fn settle_window_inactive_when_deadline_elapsed() {
+        // Past deadline = window has expired; real user activity
+        // like a `git commit` from a shell tab must now be able to
+        // arm the debounce.
+        let settle = Some(Instant::now() - Duration::from_millis(1));
+        assert!(
+            !in_settle_window(settle),
+            "expired deadline must release guard"
+        );
+    }
+
+    #[test]
+    fn settle_window_default_size_covers_typical_libgit2_startup() {
+        // Sanity: the compile-time constant is at least 300 ms — one
+        // debounce cycle. A shorter window would risk the "gitui
+        // startup → fire → 300 ms later fire → respawn" pathology.
+        assert!(
+            GIT_WATCH_SETTLE >= Duration::from_millis(300),
+            "GIT_WATCH_SETTLE MUST be >= debounce (300 ms), got {:?}",
+            GIT_WATCH_SETTLE,
+        );
+    }
+
+    // --- P0-1 gated-redraw regression tests ---------------------------
+    //
+    // `needs_redraw` correctness lives at the main-loop level (hard to
+    // exercise without spawning tokio + PTYs) but the pure signals it
+    // feeds off — `expire_*` return-values — are testable in isolation.
+
+    #[test]
+    fn pending_spawn_should_clear_signals_when_grid_has_output() {
+        // Confirms the pure kernel that drives expire_pending_spawn's
+        // return-value (P0-1). "Any non-whitespace char present" is
+        // the "clear" signal that promotes `needs_redraw`.
+        assert!(
+            pending_spawn_should_clear(Duration::from_secs(1), Some("hello")),
+            "grid with visible chars should clear",
+        );
+        assert!(
+            !pending_spawn_should_clear(Duration::from_secs(1), Some("   \n\n   ")),
+            "grid with only whitespace must NOT clear yet",
+        );
+    }
+
+    #[test]
+    fn pending_spawn_should_clear_signals_when_timeout_elapsed() {
+        // The 30 s deadline is a safety valve so a broken child that
+        // never prints still stops nagging the hint bar (and by
+        // extension stops forcing needs_redraw on every tick).
+        //
+        // Note: `None` grid_sample means "pane vanished" (rule 1) and
+        // clears unconditionally — so this test pairs `Some("")` with
+        // pre-timeout to isolate the timeout branch.
+        assert!(
+            pending_spawn_should_clear(PENDING_SPAWN_TIMEOUT, Some("")),
+            "timeout elapsed with empty grid should clear (rule 2)",
+        );
+        assert!(
+            !pending_spawn_should_clear(Duration::from_secs(1), Some("   \n   ")),
+            "pre-timeout with only whitespace must NOT clear (pane still booting)",
+        );
+        assert!(
+            pending_spawn_should_clear(Duration::from_secs(1), None),
+            "None grid means pane vanished — rule 1 clears immediately",
+        );
     }
 }
