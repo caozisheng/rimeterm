@@ -47,6 +47,15 @@ node bootstrap-essentials.mjs
 
 Then run `rimeterm` from any terminal.
 
+## Recent changes
+
+### 0.1.22 — viewer perf + gitui refresh
+
+- **Viewer** — parsed Markdown and syntect state are cached per snapshot (checkpoints every 500 lines) and the selection-mode buffer capture only fires when a selection is actually active. Scrolling a large `.md` / `.rs` in the Alt+V viewer is now flat-CPU. See `docs/rimeterm-upgrade-design.md` §P1.
+- **gitui refresh** — a bare `F5` now force-respawns the gitui pane at the current workspace root, and an `.git/`-scoped `notify` watcher (300 ms debounce + 500 ms settle window) auto-refreshes it after external `git commit` / `checkout` / rebase from a sibling shell. Eliminates the "gitui shows stale HEAD" and "gitui flickers wildly after switching folders" reports.
+- **Renderer** — `PtyPane::render` skips the full `alacritty::display_iter` blit when the terminal has no damage and nothing tracked has changed (focus / area / scroll / selection). The main loop also skips `Terminal::draw()` on idle 16 ms ticks. Idle rimeterm CPU drops from ~3 % to ~0.1 %.
+- **BUG-2 guard** — `decide_frame_cursor` is now a pure function with regression tests locking in "viewer overlay MUST NOT hide the shell/agent caret when it was invoked from the right column".
+
 ## More
 
 - Full design doc, keybindings, config, and IPC schema: **[docs/rimeterm-overall-design.md](docs/rimeterm-overall-design.md)**

@@ -3125,17 +3125,22 @@ impl App {
         // only when `viewer_focused` is set — otherwise the user is
         // still typing into an agents/shells pane and its caret
         // must remain visible even with the overlay on screen.
-        let cursor = if self.menu_state.open
-            || self.palette_state.open
-            || self.picker_state.open
-            || self.settings_state.open
-            || self.ack_state.open
-            || (self.viewer.is_open() && self.viewer_focused)
-        {
-            None
-        } else {
-            focused_cursor
-        };
+        // BUG-2 guard: extract the cursor-visibility decision into a
+        // pure function so the invariant "viewer overlay MUST NOT hide
+        // the shell/agent caret when it was invoked from the right
+        // column (viewer_focused = false)" is unit-testable without a
+        // live App instance. All state flowing into the decision goes
+        // through arguments; no App field access happens inside.
+        let cursor = decide_frame_cursor(FrameCursorInputs {
+            menu_open: self.menu_state.open,
+            palette_open: self.palette_state.open,
+            picker_open: self.picker_state.open,
+            settings_open: self.settings_state.open,
+            ack_open: self.ack_state.open,
+            viewer_open: self.viewer.is_open(),
+            viewer_focused: self.viewer_focused,
+            focused_cursor,
+        });
 
         // Snapshot state for IPC consumers (§11). Cheap: reads &self + writes
         // a small owned struct; no PTY I/O.
@@ -6011,6 +6016,50 @@ fn find_git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
     }
 }
 
+/// BUG-2 fix: input bundle for [`decide_frame_cursor`]. Keeps the
+/// decision pure (no App field access) so it can be unit-tested
+/// without spinning up a live App / PTY.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FrameCursorInputs {
+    pub(crate) menu_open: bool,
+    pub(crate) palette_open: bool,
+    pub(crate) picker_open: bool,
+    pub(crate) settings_open: bool,
+    pub(crate) ack_open: bool,
+    pub(crate) viewer_open: bool,
+    pub(crate) viewer_focused: bool,
+    pub(crate) focused_cursor: Option<(u16, u16)>,
+}
+
+/// BUG-2 fix: decide the top-level frame cursor position from the
+/// overlay + focus snapshot. Split out of [`App::draw`] so the
+/// invariant "viewer opened from agents/shells MUST leave the pane
+/// caret visible" is enforced by tests, not by inspection.
+///
+/// Precedence (highest → lowest):
+/// 1. Any full-modal overlay (menu / palette / picker / settings /
+///    ack) hides the caret — those overlays own the input focus and
+///    the caret should follow them, not linger on a pane underneath.
+/// 2. Viewer overlay: hides the caret **only** when it also captured
+///    the input focus (`viewer_focused = true`). When invoked from
+///    an agent / shell pane, the viewer renders on top but keys still
+///    route to the underlying pane — its caret MUST stay visible so
+///    the user can see where they're typing.
+/// 3. Otherwise use whatever the focused pane painted.
+pub(crate) fn decide_frame_cursor(inputs: FrameCursorInputs) -> Option<(u16, u16)> {
+    let modal_owns_focus = inputs.menu_open
+        || inputs.palette_open
+        || inputs.picker_open
+        || inputs.settings_open
+        || inputs.ack_open
+        || (inputs.viewer_open && inputs.viewer_focused);
+    if modal_owns_focus {
+        None
+    } else {
+        inputs.focused_cursor
+    }
+}
+
 /// BUG-1b: install an fs watcher on `<repo>/.git/` (non-recursive, so
 /// `objects/pack/` churn during a `git gc` doesn't flood us) plus
 /// `<repo>/.git/refs/heads/` (recursive, so nested branch names like
@@ -7909,5 +7958,115 @@ mod tests {
             pending_spawn_should_clear(Duration::from_secs(1), None),
             "None grid means pane vanished — rule 1 clears immediately",
         );
+    }
+
+    // --- BUG-2 viewer/focus cursor guard tests -------------------------
+    //
+    // Invariant under test: when the viewer overlay is opened from a
+    // right-column pane (agent / shell), `viewer_focused` stays `false`,
+    // keystrokes still route to the underlying pane, and its caret
+    // MUST remain visible. Regression against the report
+    // "viewer 打开时 shell/agent pane 光标消失".
+
+    fn baseline_cursor_inputs() -> FrameCursorInputs {
+        FrameCursorInputs {
+            menu_open: false,
+            palette_open: false,
+            picker_open: false,
+            settings_open: false,
+            ack_open: false,
+            viewer_open: false,
+            viewer_focused: false,
+            focused_cursor: Some((10, 5)),
+        }
+    }
+
+    #[test]
+    fn bug2_viewer_open_from_right_column_preserves_pane_caret() {
+        // User is on a shell / agent (right column). Alt+V opens the
+        // viewer overlay. `viewer_focused = false` because the invoking
+        // group was NOT files/git. The pane's caret MUST stay visible.
+        let mut inputs = baseline_cursor_inputs();
+        inputs.viewer_open = true;
+        inputs.viewer_focused = false;
+        assert_eq!(
+            decide_frame_cursor(inputs),
+            Some((10, 5)),
+            "viewer over shell/agent must keep the pane caret visible — \
+             this is the exact BUG-2 regression"
+        );
+    }
+
+    #[test]
+    fn bug2_viewer_open_from_left_column_hides_pane_caret() {
+        // Complement: when viewer WAS invoked from yazi / gitui, it
+        // owns the input focus, so any residual pane caret must NOT
+        // leak through — otherwise two carets would blink at once.
+        let mut inputs = baseline_cursor_inputs();
+        inputs.viewer_open = true;
+        inputs.viewer_focused = true;
+        assert!(
+            decide_frame_cursor(inputs).is_none(),
+            "viewer with focus must suppress the pane caret"
+        );
+    }
+
+    #[test]
+    fn bug2_full_modal_overlays_still_suppress_caret() {
+        // Regression guard for the other four overlays: menu / palette
+        // / picker / settings / ack must always suppress, independent
+        // of the viewer flags.
+        for (name, mut inputs) in [
+            ("menu", {
+                let mut i = baseline_cursor_inputs();
+                i.menu_open = true;
+                i
+            }),
+            ("palette", {
+                let mut i = baseline_cursor_inputs();
+                i.palette_open = true;
+                i
+            }),
+            ("picker", {
+                let mut i = baseline_cursor_inputs();
+                i.picker_open = true;
+                i
+            }),
+            ("settings", {
+                let mut i = baseline_cursor_inputs();
+                i.settings_open = true;
+                i
+            }),
+            ("ack", {
+                let mut i = baseline_cursor_inputs();
+                i.ack_open = true;
+                i
+            }),
+        ] {
+            // Combine each overlay with viewer_focused=false to confirm
+            // it wins independently of the viewer path.
+            inputs.viewer_open = true;
+            inputs.viewer_focused = false;
+            assert!(
+                decide_frame_cursor(inputs).is_none(),
+                "{name} overlay must suppress the caret",
+            );
+        }
+    }
+
+    #[test]
+    fn bug2_no_overlays_uses_pane_caret() {
+        // Baseline: nothing is open, the pane's caret should surface.
+        assert_eq!(decide_frame_cursor(baseline_cursor_inputs()), Some((10, 5)),);
+    }
+
+    #[test]
+    fn bug2_focused_pane_without_caret_yields_none() {
+        // Unfocused / hidden-cursor pane returns None from
+        // `translate_cursor`. `decide_frame_cursor` must pass it
+        // through — hiding the caret is a valid pane-level decision.
+        let mut inputs = baseline_cursor_inputs();
+        inputs.focused_cursor = None;
+        assert_eq!(decide_frame_cursor(inputs), None);
     }
 }

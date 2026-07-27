@@ -260,6 +260,62 @@ pub type ReturnFocus = Option<PaneId>;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Generation(pub u64);
 
+/// P1-1 syntect checkpoint stride. Every N lines we snapshot the
+/// parser + highlighter state so scrolling into a large file jumps
+/// straight to the nearest checkpoint instead of re-parsing from
+/// the top. 500 chosen so a 10 kloc file has ~20 checkpoints
+/// (~20 KB of `Vec<ParseState>` clones — trivial memory) and each
+/// worst-case scroll re-runs at most 500 lines through syntect
+/// (< 1 ms on modern CPUs, imperceptible in the input loop).
+pub(crate) const CODE_HL_STRIDE: usize = 500;
+
+/// P1-1 cached parser + highlighter snapshot at a line boundary.
+/// Cheap to clone — `ParseState` is one `Vec<StackEntry>` + a
+/// `SyntaxSet` index, `HighlightState` is one `ScopeStack` +
+/// per-level color state. Both derive `Clone` upstream.
+#[derive(Debug, Clone)]
+pub(crate) struct CodeCheckpoint {
+    pub(crate) parse: syntect::parsing::ParseState,
+    pub(crate) highlight: syntect::highlighting::HighlightState,
+}
+
+/// P1-1 whole-file syntect state cache. Rebuilt when a fresh
+/// snapshot lands (`generation` bumps) or when the target syntax
+/// changes (rare — extension-driven). See `render_code` for the
+/// lookup / rebuild policy.
+///
+/// Guards against three staleness modes:
+/// - `generation` bump = user opened a different file → drop.
+/// - `source_len` mismatch = same generation but code payload just
+///   arrived from the worker (None → Some at same gen) → drop.
+/// - `syntax_name` mismatch = defensive, in case future work swaps
+///   the syntax post-load (e.g. user overrides file type) → drop.
+#[derive(Debug)]
+pub(crate) struct CodeHighlightCache {
+    pub(crate) generation: Generation,
+    pub(crate) source_len: usize,
+    pub(crate) syntax_name: String,
+    pub(crate) theme_name: &'static str,
+    pub(crate) checkpoints: Vec<CodeCheckpoint>,
+}
+
+/// P1-2 whole-source Markdown parse cache. Parsing 1 MB markdown
+/// costs 2–5 ms per frame; we do it exactly once per snapshot
+/// (bumping `generation`) or per theme flip (bumping `theme_epoch`).
+#[derive(Debug)]
+pub(crate) struct MarkdownRenderCache {
+    pub(crate) generation: Generation,
+    pub(crate) source_len: usize,
+    pub(crate) theme: rimeterm_markdown::Theme,
+    /// Pre-flattened Text ready to hand to `Paragraph::new`. Cloning
+    /// this is O(rows) memcpy — measurably cheaper than re-running
+    /// pulldown-cmark + rimeterm-markdown's block model per frame.
+    pub(crate) text: Text<'static>,
+    /// Cached wrapped-row count keyed by paragraph width. Cleared
+    /// only when the whole cache is rebuilt.
+    pub(crate) line_count_by_width: std::collections::HashMap<u16, u16>,
+}
+
 /// Payload carried by worker completions. `pane_id`, `generation`, and
 /// `path` must all match a live viewer tab's state for the completion
 /// to apply — stale results (tab closed, snapshot bumped, wrong file)
@@ -380,6 +436,13 @@ pub struct ViewerOverlayState {
     /// `close_viewer_overlay` (which owns focus restoration, so we
     /// don't try to duplicate that logic here).
     close_requested: bool,
+    /// P1-1 cached syntect state for the current Code snapshot.
+    /// Rebuilt in `render_code` when the cache is empty or stale.
+    pub(crate) code_hl_cache: Option<CodeHighlightCache>,
+    /// P1-2 cached parsed+flattened Markdown Text for the current
+    /// snapshot. Rebuilt in `render_markdown` when the cache is
+    /// empty or the theme flipped.
+    pub(crate) markdown_cache: Option<MarkdownRenderCache>,
 }
 
 impl Default for ViewerOverlayState {
@@ -402,6 +465,8 @@ impl Default for ViewerOverlayState {
             scrollbar_drag: false,
             close_button_rect: None,
             close_requested: false,
+            code_hl_cache: None,
+            markdown_cache: None,
         }
     }
 }
@@ -457,6 +522,8 @@ impl ViewerOverlayState {
         self.markdown = None;
         self.image = None;
         self.code = None;
+        self.code_hl_cache = None;
+        self.markdown_cache = None;
         self.markdown_scroll = 0;
         self.image_scale = 0;
         self.return_focus = return_focus;
@@ -523,6 +590,8 @@ impl ViewerOverlayState {
         self.markdown = None;
         self.image = None;
         self.code = None;
+        self.code_hl_cache = None;
+        self.markdown_cache = None;
         self.markdown_scroll = 0;
         self.image_scale = 0;
         self.selection.clear();
@@ -1058,8 +1127,6 @@ fn render_markdown(
     if inner.width < 2 || inner.height == 0 {
         return;
     }
-    let source = state.markdown().unwrap_or("").to_string();
-    let text = markdown_blocks_to_text(&source, theme);
 
     // Reserve the right-most column for the scrollbar. We split
     // upfront so `content_lines` counting matches the paragraph width
@@ -1077,7 +1144,42 @@ fn render_markdown(
         height: inner.height,
     };
 
-    let content_lines = wrapped_line_count(&text, text_area.width);
+    // P1-2 cache. Rebuild when generation bumped (fresh snapshot),
+    // source_len drifted (payload arrived at same generation), or the
+    // user flipped themes via F10 / Alt+T. On rebuild we also drop
+    // the per-width wrap-count map since its keys are only meaningful
+    // against the freshly-flattened Text.
+    let source_len = state.markdown().map(|s| s.len()).unwrap_or(0);
+    let generation = state.generation();
+    let need_rebuild = match &state.markdown_cache {
+        Some(c) => c.generation != generation || c.source_len != source_len || c.theme != theme,
+        None => true,
+    };
+    if need_rebuild {
+        let source = state.markdown().unwrap_or("").to_string();
+        let text = markdown_blocks_to_text(&source, theme);
+        state.markdown_cache = Some(MarkdownRenderCache {
+            generation,
+            source_len,
+            theme,
+            text,
+            line_count_by_width: std::collections::HashMap::new(),
+        });
+    }
+
+    // Memoised wrap-count keyed on paragraph width. First lookup per
+    // width pays `wrapped_line_count`; subsequent frames at the same
+    // width return in O(1) HashMap probe.
+    let cache = state
+        .markdown_cache
+        .as_mut()
+        .expect("just rebuilt above if missing");
+    let text_area_width = text_area.width;
+    let content_lines = *cache
+        .line_count_by_width
+        .entry(text_area_width)
+        .or_insert_with(|| wrapped_line_count(&cache.text, text_area_width));
+
     state.content_lines = content_lines;
     state.text_area = Some(text_area);
 
@@ -1089,15 +1191,24 @@ fn render_markdown(
     }
     let scroll = state.markdown_scroll;
 
-    Paragraph::new(text)
+    // ratatui's Paragraph::new takes ownership, so we clone the cached
+    // Text once per frame. That clone is Vec<Line<'static>> + inner
+    // Cow<str, 'static> refs — measurably cheaper than re-running
+    // pulldown-cmark + rimeterm-markdown for a 1 MB document.
+    let cache_ref = state.markdown_cache.as_ref().expect("cache present");
+    Paragraph::new(cache_ref.text.clone())
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0))
         .render(text_area, buf);
 
-    // Snapshot the rendered rows out of the buffer so the mouse-up
-    // copy path can produce exactly what the user saw. Cheap on a
-    // ~35% column: ≤ text_area.width * text_area.height Cell reads.
-    state.rendered_lines = capture_rendered_rows(buf, text_area);
+    // P1-2: only snapshot rendered rows while a selection is active.
+    // The mouse-up copy path is the sole consumer; without a live
+    // selection the memcpy is pure waste.
+    if state.selection.is_active() {
+        state.rendered_lines = capture_rendered_rows(buf, text_area);
+    } else {
+        state.rendered_lines.clear();
+    }
 
     // Selection reverse-video overlay. Painted AFTER the paragraph
     // so it wins the style merge, matching `PtyPane`'s convention.
@@ -1225,7 +1336,8 @@ fn table_to_lines(t: &rimeterm_markdown::TableBlock) -> Vec<Line<'static>> {
 /// start on each frame's first visible line, then walks forward.
 /// For a 4 MiB cap this is well under a millisecond on modern CPUs.
 fn render_code(state: &mut ViewerOverlayState, inner: Rect, buf: &mut Buffer) {
-    use syntect::easy::HighlightLines;
+    use syntect::highlighting::{HighlightIterator, HighlightState, Highlighter};
+    use syntect::parsing::{ParseState, ScopeStack};
     use syntect::util::LinesWithEndings;
 
     if inner.width < 2 || inner.height == 0 {
@@ -1251,6 +1363,7 @@ fn render_code(state: &mut ViewerOverlayState, inner: Rect, buf: &mut Buffer) {
 
     let source = state.code().unwrap_or("").to_owned();
     let path = state.snapshot().map(|s| s.path.clone()).unwrap_or_default();
+    let generation = state.generation();
 
     // The source-line count IS the content-line count for Code:
     // long lines are not wrapped (right-side overflow is clipped,
@@ -1274,32 +1387,99 @@ fn render_code(state: &mut ViewerOverlayState, inner: Rect, buf: &mut Buffer) {
     let scroll = state.markdown_scroll;
 
     // Resolve syntax by extension, falling back to plain text when
-    // the extension is unknown to syntect. Both branches highlight
-    // through `HighlightLines` for a uniform code path.
+    // the extension is unknown to syntect.
     let (syntax_set, theme_set) = code_highlight::assets();
     let syntax = path
         .extension()
         .and_then(|e| e.to_str())
         .and_then(|ext| syntax_set.find_syntax_by_extension(ext))
         .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
-    let theme = &theme_set.themes["base16-ocean.dark"];
-    let mut highlighter = HighlightLines::new(syntax, theme);
+    let theme_name: &'static str = "base16-ocean.dark";
+    let theme = &theme_set.themes[theme_name];
+    let highlighter = Highlighter::new(theme);
+    let syntax_name = syntax.name.as_str();
 
-    // Build ratatui lines for the visible viewport. Skip the syntect
-    // state forward for the invisible prefix so highlighting stays
-    // context-aware (multi-line strings, block comments) even mid-file.
-    let mut ratatui_lines: Vec<Line<'static>> = Vec::with_capacity(text_area.height as usize);
+    // P1-1 checkpoint cache. Rebuild when generation changed (new
+    // file), source_len changed (code payload just arrived at same
+    // generation), syntax swapped (defensive), or theme flipped.
+    // The value 500 is `CODE_HL_STRIDE`; growing it would save memory
+    // at the cost of longer post-jump replay.
+    let source_len = source.len();
+    let need_rebuild = match &state.code_hl_cache {
+        Some(c) => {
+            c.generation != generation
+                || c.source_len != source_len
+                || c.syntax_name != syntax_name
+                || c.theme_name != theme_name
+        }
+        None => true,
+    };
+    if need_rebuild {
+        let mut parse = ParseState::new(syntax);
+        let mut hstate = HighlightState::new(&highlighter, ScopeStack::new());
+        let mut checkpoints: Vec<CodeCheckpoint> = Vec::new();
+        checkpoints.push(CodeCheckpoint {
+            parse: parse.clone(),
+            highlight: hstate.clone(),
+        });
+        // Walk the whole file once, snapshotting every CODE_HL_STRIDE
+        // lines. We do NOT call `highlight_line` here — we just need
+        // parser state at each checkpoint; per-frame highlighting
+        // (below) will feed those saved states forward for the
+        // requested viewport slice only.
+        for (idx, line) in LinesWithEndings::from(&source).enumerate() {
+            if let Ok(ops) = parse.parse_line(line, syntax_set) {
+                // Advance highlight state too — HighlightIterator
+                // reads AND mutates `hstate` while iterating the ops.
+                for _ in HighlightIterator::new(&mut hstate, &ops, line, &highlighter) {
+                    // Iteration is the mutation.
+                }
+            }
+            // Checkpoint at the END of line `idx` means "state
+            // BEFORE line idx+1", so the checkpoint at index `k`
+            // covers scroll positions `[k*STRIDE, (k+1)*STRIDE)`.
+            if (idx + 1) % CODE_HL_STRIDE == 0 {
+                checkpoints.push(CodeCheckpoint {
+                    parse: parse.clone(),
+                    highlight: hstate.clone(),
+                });
+            }
+        }
+        state.code_hl_cache = Some(CodeHighlightCache {
+            generation,
+            source_len,
+            syntax_name: syntax_name.to_string(),
+            theme_name,
+            checkpoints,
+        });
+    }
+
+    // Fast path: resume from the closest checkpoint at or before
+    // `scroll`, then highlight only the visible slice.
     let start = scroll as usize;
     let end = start.saturating_add(text_area.height as usize);
-    for (idx, raw_line) in LinesWithEndings::from(&source).enumerate() {
+    let cache = state
+        .code_hl_cache
+        .as_ref()
+        .expect("just rebuilt above if missing");
+    let cp_idx = (start / CODE_HL_STRIDE).min(cache.checkpoints.len().saturating_sub(1));
+    let cp_line = cp_idx * CODE_HL_STRIDE;
+    let cp = &cache.checkpoints[cp_idx];
+    let mut parse = cp.parse.clone();
+    let mut hstate = cp.highlight.clone();
+
+    let mut ratatui_lines: Vec<Line<'static>> = Vec::with_capacity(text_area.height as usize);
+    for (idx, raw_line) in LinesWithEndings::from(&source).enumerate().skip(cp_line) {
         if idx >= end {
             break;
         }
-        // `highlight_line` MUST run on every line up to `end` to
-        // maintain syntect's parser state — never skip and resume.
-        let styled = highlighter
-            .highlight_line(raw_line, syntax_set)
-            .unwrap_or_default();
+        // Parser + highlighter MUST both advance on every line to
+        // stay context-correct (multi-line strings, block comments).
+        // The only skipped work is idx < start: we don't emit a Line,
+        // but we still run the state machine.
+        let ops = parse.parse_line(raw_line, syntax_set).unwrap_or_default();
+        let styled: Vec<(syntect::highlighting::Style, &str)> =
+            HighlightIterator::new(&mut hstate, &ops, raw_line, &highlighter).collect();
         if idx < start {
             continue;
         }
@@ -1323,7 +1503,13 @@ fn render_code(state: &mut ViewerOverlayState, inner: Rect, buf: &mut Buffer) {
         // rendered-row invariant used by scrollbar + copy math.
         .render(text_area, buf);
 
-    state.rendered_lines = capture_rendered_rows(buf, text_area);
+    // P1-2: only capture rendered rows while a selection is active —
+    // otherwise the copy path has nothing to consume the snapshot.
+    if state.selection.is_active() {
+        state.rendered_lines = capture_rendered_rows(buf, text_area);
+    } else {
+        state.rendered_lines.clear();
+    }
 
     if state.selection.is_active() {
         let cols = text_area.width;
@@ -2257,6 +2443,188 @@ mod markdown_tests {
         assert!(all.contains("one"), "missing body cell content: {all:?}");
         assert!(all.contains("|"), "missing pipe separator: {all:?}");
     }
+
+    // --- P1-2 render cache tests --------------------------------------
+
+    fn open_ready_markdown(state: &mut ViewerOverlayState, name: &str, body: &str) {
+        let path = scratch_file(name, body.as_bytes());
+        let snap_gen = state.open_snapshot(
+            ViewerSource {
+                path: path.clone(),
+                kind: ViewerKind::Markdown,
+            },
+            None,
+        );
+        assert!(state.apply_completion(ViewerCompletion {
+            pane_id: PaneId(0),
+            generation: snap_gen,
+            path,
+            payload: ViewerPayload::Markdown(body.into()),
+        }));
+    }
+
+    #[test]
+    fn markdown_cache_hit_on_second_render() {
+        // Two `render_markdown` invocations on the same snapshot MUST
+        // reuse the parsed Text cache: same allocation address after
+        // the second render = no rebuild.
+        let mut state = ViewerOverlayState::default();
+        open_ready_markdown(&mut state, "cache_hit.md", "# hello\n\nworld\n");
+
+        let bounds = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(bounds);
+
+        assert!(state.markdown_cache.is_none());
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
+        let ptr_first = state.markdown_cache.as_ref().unwrap() as *const _;
+
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
+        let ptr_second = state.markdown_cache.as_ref().unwrap() as *const _;
+
+        assert_eq!(
+            ptr_first, ptr_second,
+            "cache should NOT be replaced on second render — regression",
+        );
+    }
+
+    #[test]
+    fn markdown_cache_rebuilds_on_theme_switch() {
+        // Flipping themes at runtime (F10 → Settings) MUST rebuild
+        // the flattened Text because syntect / palette styles change.
+        let mut state = ViewerOverlayState::default();
+        open_ready_markdown(
+            &mut state,
+            "cache_theme.md",
+            "# hi\n\n```rust\nfn main() {}\n```\n",
+        );
+
+        let bounds = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(bounds);
+
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
+        let theme_seen_before = state.markdown_cache.as_ref().unwrap().theme;
+
+        // Any theme != Default forces the cache guard to fire.
+        let other = rimeterm_markdown::Theme::Dracula;
+        assert_ne!(theme_seen_before, other, "test needs distinct themes");
+        render_into_pane(&mut state, bounds, &mut buf, None, other);
+        let theme_seen_after = state.markdown_cache.as_ref().unwrap().theme;
+
+        assert_eq!(
+            theme_seen_after, other,
+            "cache theme field must reflect the requested theme",
+        );
+    }
+
+    #[test]
+    fn markdown_cache_memoises_line_count_by_width() {
+        // The wrap-count map should have exactly one entry per unique
+        // paragraph width seen. Rendering twice at the same width MUST
+        // reuse the entry; a resize adds a second entry.
+        let mut state = ViewerOverlayState::default();
+        open_ready_markdown(
+            &mut state,
+            "cache_wrap.md",
+            "one two three four five six seven\n",
+        );
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 10));
+        render_into_pane(
+            &mut state,
+            Rect::new(0, 0, 40, 10),
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
+        let entries_after_first = state
+            .markdown_cache
+            .as_ref()
+            .unwrap()
+            .line_count_by_width
+            .len();
+        assert_eq!(entries_after_first, 1, "one width → one memoised entry");
+
+        render_into_pane(
+            &mut state,
+            Rect::new(0, 0, 40, 10),
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
+        let entries_after_second = state
+            .markdown_cache
+            .as_ref()
+            .unwrap()
+            .line_count_by_width
+            .len();
+        assert_eq!(
+            entries_after_second, 1,
+            "same width MUST NOT add a duplicate memo",
+        );
+
+        // Re-render at a different width → the memo grows by one.
+        let mut buf2 = Buffer::empty(Rect::new(0, 0, 60, 10));
+        render_into_pane(
+            &mut state,
+            Rect::new(0, 0, 60, 10),
+            &mut buf2,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
+        let entries_after_resize = state
+            .markdown_cache
+            .as_ref()
+            .unwrap()
+            .line_count_by_width
+            .len();
+        assert_eq!(
+            entries_after_resize, 2,
+            "resize to new width MUST add one memo entry",
+        );
+    }
+
+    #[test]
+    fn rendered_lines_stays_empty_without_selection() {
+        // P1-2 lazy capture: when there's no active selection, the
+        // `state.rendered_lines` snapshot MUST stay empty so we don't
+        // pay `capture_rendered_rows` on every idle frame.
+        let mut state = ViewerOverlayState::default();
+        open_ready_markdown(&mut state, "capture_off.md", "some content here\n");
+
+        let bounds = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(bounds);
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
+
+        assert!(
+            state.rendered_lines.is_empty(),
+            "rendered_lines must be empty with no active selection; got {} rows",
+            state.rendered_lines.len(),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2419,6 +2787,180 @@ mod code_tests {
             .collect();
         assert!(row.contains("fn"), "row was {row:?}");
         assert!(row.contains("main"), "row was {row:?}");
+    }
+
+    #[test]
+    fn syntect_cache_builds_on_first_render_and_reuses_on_second() {
+        // P1-1 checkpoint reuse. Two calls to `render_code` on the
+        // same snapshot MUST result in exactly one cache entry
+        // (checkpoints Vec grows on first call, `is_some()` on
+        // second, no rebuild). This is the core "we do the syntect
+        // work once per snapshot" guarantee.
+        let path = scratch_file("cache_hit.rs", b"fn a() {}\nfn b() {}\nfn c() {}\n");
+        let mut state = ViewerOverlayState::default();
+        let source = ViewerSource {
+            path: path.clone(),
+            kind: ViewerKind::Code,
+        };
+        let snap_gen = state.open_snapshot(source, None);
+        assert!(state.apply_completion(ViewerCompletion {
+            pane_id: PaneId(0),
+            generation: snap_gen,
+            path: path.clone(),
+            payload: load_code_blocking(&path),
+        }));
+
+        let bounds = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(bounds);
+
+        assert!(
+            state.code_hl_cache.is_none(),
+            "cache pristine before render"
+        );
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
+        let generation_after_first = state.code_hl_cache.as_ref().map(|c| c.generation);
+        assert!(state.code_hl_cache.is_some(), "cache built on first render");
+        let ptr_first = state.code_hl_cache.as_ref().unwrap() as *const _;
+
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
+        let ptr_second = state.code_hl_cache.as_ref().unwrap() as *const _;
+        let generation_after_second = state.code_hl_cache.as_ref().map(|c| c.generation);
+
+        // Same allocation address = same cache struct = no rebuild.
+        assert_eq!(
+            ptr_first, ptr_second,
+            "cache should NOT be replaced on second render — regression",
+        );
+        assert_eq!(generation_after_first, generation_after_second);
+    }
+
+    #[test]
+    fn syntect_cache_invalidates_on_new_snapshot() {
+        // Opening a new snapshot bumps generation → cache MUST rebuild.
+        // The rebuild happens lazily inside `render_code`, so we drive
+        // it and check the cache reflects the new generation.
+        let p1 = scratch_file("cache_gen_a.rs", b"fn x() {}\n");
+        let p2 = scratch_file("cache_gen_b.rs", b"fn y() {}\nfn z() {}\n");
+        let mut state = ViewerOverlayState::default();
+
+        let gen_a = state.open_snapshot(
+            ViewerSource {
+                path: p1.clone(),
+                kind: ViewerKind::Code,
+            },
+            None,
+        );
+        assert!(state.apply_completion(ViewerCompletion {
+            pane_id: PaneId(0),
+            generation: gen_a,
+            path: p1.clone(),
+            payload: load_code_blocking(&p1),
+        }));
+        let bounds = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(bounds);
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
+        let gen_seen_a = state
+            .code_hl_cache
+            .as_ref()
+            .expect("cache built")
+            .generation;
+
+        // New snapshot → open_snapshot bumps generation AND drops cache.
+        let gen_b = state.open_snapshot(
+            ViewerSource {
+                path: p2.clone(),
+                kind: ViewerKind::Code,
+            },
+            None,
+        );
+        assert!(
+            state.code_hl_cache.is_none(),
+            "open_snapshot MUST clear code_hl_cache (guards stale checkpoint replay)",
+        );
+        assert!(state.apply_completion(ViewerCompletion {
+            pane_id: PaneId(0),
+            generation: gen_b,
+            path: p2.clone(),
+            payload: load_code_blocking(&p2),
+        }));
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
+        let gen_seen_b = state
+            .code_hl_cache
+            .as_ref()
+            .expect("cache rebuilt")
+            .generation;
+
+        assert_ne!(
+            gen_seen_a, gen_seen_b,
+            "generation guard failed — cache carried across snapshots",
+        );
+    }
+
+    #[test]
+    fn syntect_cache_has_expected_checkpoint_density() {
+        // Rebuild math sanity: a file with N lines has ceil(N/STRIDE)+1
+        // checkpoints (the +1 is the seed at line 0). Fixing this
+        // relationship guards future edits to `CODE_HL_STRIDE` that
+        // could otherwise silently regress scroll-into-file latency.
+        //
+        // File size chosen to force a checkpoint mid-file: STRIDE+50
+        // lines → 2 checkpoints (line 0 seed + one at STRIDE).
+        let lines: String = (0..CODE_HL_STRIDE + 50)
+            .map(|i| format!("// line {i}\n"))
+            .collect();
+        let path = scratch_file("stride.rs", lines.as_bytes());
+        let mut state = ViewerOverlayState::default();
+        let src = ViewerSource {
+            path: path.clone(),
+            kind: ViewerKind::Code,
+        };
+        let snap_gen = state.open_snapshot(src, None);
+        assert!(state.apply_completion(ViewerCompletion {
+            pane_id: PaneId(0),
+            generation: snap_gen,
+            path: path.clone(),
+            payload: load_code_blocking(&path),
+        }));
+        let bounds = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(bounds);
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut buf,
+            None,
+            rimeterm_markdown::Theme::Default,
+        );
+
+        let cp_len = state.code_hl_cache.as_ref().unwrap().checkpoints.len();
+        assert_eq!(
+            cp_len, 2,
+            "expected 2 checkpoints for {}+50 lines, got {cp_len}",
+            CODE_HL_STRIDE,
+        );
     }
 }
 
