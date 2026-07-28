@@ -10,7 +10,7 @@
 # Payload per archive (C21.5):
 #   * `rimeterm` (+ `.exe` on Windows; icon embedded via winresource)
 #   * `rimectl`
-#   * `essentials/`  ← pinned yazi + ya + gitui + btm + VERSIONS.toml
+#   * `essentials/`  ← pinned `btm` + VERSIONS.toml (native files/git handle the rest)
 #   * `LICENSE`, `README.md`, `ACKNOWLEDGEMENTS.md`
 #
 # Archive naming (matches Rust target triples so users can `curl` the right
@@ -135,10 +135,10 @@ jobs:
       - name: Cargo build --release (rimeterm + rimectl)
         run: cargo build --release --workspace --bins --target ${{ matrix.target }}
 
-      # C21.5: fetch prebuilt yazi/gitui/bottom for this matrix row.
-      # Pins live at essentials/VERSIONS.toml. The script hard-fails on
-      # 404/checksum mismatch — release will error out cleanly if an
-      # upstream tag or asset name changes.
+      # After the native-file-git refactor only `bottom` needs to be
+      # prefetched for this matrix row. Pins live at
+      # essentials/VERSIONS.toml; the script hard-fails on 404 /
+      # checksum mismatch so bad upstream releases surface here.
       - name: Fetch prebuilt essentials
         shell: bash
         # Fetches into `crates/rimeterm/essentials-staging/` because
@@ -346,7 +346,7 @@ jobs:
         # Layout inside the pkg (C21.5):
         #   /usr/local/lib/rimeterm/rimeterm
         #   /usr/local/lib/rimeterm/rimectl
-        #   /usr/local/lib/rimeterm/essentials/{yazi,ya,gitui,btm,VERSIONS.toml}
+        #   /usr/local/lib/rimeterm/essentials/{btm,VERSIONS.toml}
         #   /usr/local/share/doc/rimeterm/{README,LICENSE,ACKNOWLEDGEMENTS}
         #
         # postinstall symlinks /usr/local/bin/{rimeterm,rimectl} →

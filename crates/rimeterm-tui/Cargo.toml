@@ -34,12 +34,24 @@ tui-markdown = { workspace = true }
 rimeterm-markdown = { workspace = true }
 ratatui-image = { workspace = true }
 image = { workspace = true }
+tui-file-explorer = { workspace = true }
+gix = { workspace = true }
+gix-diff = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-highlight = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-json = { workspace = true }
+tree-sitter-toml-ng = { workspace = true }
+tree-sitter-yaml = { workspace = true }
+tree-sitter-bash = { workspace = true }
 # C22 viewer code-highlighting (translation to ratatui styles lives in
 # `viewer::code_highlight`; no upstream adapter crate needed).
 syntect = { workspace = true }
-# BUG-1b (docs/rimeterm-upgrade-design.md): fs-watch `.git/HEAD`, `.git/index`,
-# `.git/refs/heads/` so gitui reflects external repo mutations (git commits
-# from a shell tab, agent rebases, external editor edits) without requiring
-# a manual F5. `macos_kqueue` feature is disabled — we don't need it; the
-# default FSEvents backend is fine and doesn't need extra native deps.
-notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+
+[dev-dependencies]
+tempfile = "3"

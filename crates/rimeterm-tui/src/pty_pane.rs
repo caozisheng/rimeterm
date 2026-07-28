@@ -6,6 +6,7 @@
 //! bitmasks all come for free from the alacritty parser.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -24,79 +25,6 @@ use std::time::Instant;
 
 use crate::pty_selection::{self, Cell as SelCell, Granularity, SelectionState};
 
-/// yazi's three-column ratio `[parent, current, preview]`. §19.14.1
-/// mirrors what yazi puts under `[mgr] ratio` — default `[1, 4, 3]`
-/// matches yazi's own out-of-the-box layout.
-///
-/// Any zero entries are clamped to `1` in [`Self::from_ratio`] so a
-/// misconfigured `yazi.toml` (or a user pasting `[0,0,0]` into
-/// rimeterm's `[mouse]` section) cannot divide-by-zero the zone
-/// splitter.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct YaziLayout {
-    parent: u16,
-    current: u16,
-    preview: u16,
-}
-
-impl YaziLayout {
-    /// yazi's default `[1, 4, 3]` ratio.
-    pub const DEFAULT: Self = Self {
-        parent: 1,
-        current: 4,
-        preview: 3,
-    };
-
-    /// Build from a user-supplied `[u8; 3]`, clamping zeros to `1`.
-    /// The three values are promoted to `u16` before summing so
-    /// `preview_start_col` can't overflow on tiny (u8) products.
-    pub fn from_ratio(ratio: [u8; 3]) -> Self {
-        Self {
-            parent: ratio[0].max(1) as u16,
-            current: ratio[1].max(1) as u16,
-            preview: ratio[2].max(1) as u16,
-        }
-    }
-
-    /// Compute the (inner-relative) column at which the preview /
-    /// Quick Look zone starts, given the pane's inner width. Rounded
-    /// nearest-integer (half-up) so a 20-cell inner rect with `[1,4,3]`
-    /// puts the seam at column 13 (= round(20 * 5/8)).
-    ///
-    /// Returns `inner_width` when the ratio degenerates so callers can
-    /// safely detect "no preview visible" via `preview_start >= width`.
-    pub fn preview_start_col(self, inner_width: u16) -> u16 {
-        let non_preview = (self.parent + self.current) as u32;
-        let total = (self.parent + self.current + self.preview) as u32;
-        if total == 0 {
-            return inner_width;
-        }
-        let w = inner_width as u32;
-        (((w * non_preview) + (total / 2)) / total) as u16
-    }
-}
-
-/// Which of the three zones (§19.14.1) a mouse coordinate lands in.
-/// Determined **once** on `Down(Left)` for a drag session, then reused
-/// for every `Drag` / `Up` event until release — this is invariant 34
-/// ("origin decides"). Also computed on `Down(Right)` and each
-/// standalone Down/Up/Scroll.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum YaziZone {
-    /// Parent + current file lists — yazi owns the mouse; rimeterm
-    /// never starts a local selection here.
-    List,
-    /// yazi's internal column divider, detected live from the PTY grid
-    /// (a column whose cells are mostly box-drawing verticals). yazi
-    /// owns the mouse here too — it uses this column to drag-resize its
-    /// own column ratios. Detected from the grid (not a config ratio
-    /// estimate) so it stays correct after yazi resizes its columns.
-    Seam,
-    /// Read-only preview (Quick Look). rimeterm owns the mouse: local
-    /// text selection + right-click copy.
-    QuickLook,
-}
-
 pub struct PtyPane {
     id: PaneId,
     title: String,
@@ -111,22 +39,14 @@ pub struct PtyPane {
     /// When `true` the pane never owns the mouse for local text selection
     /// / middle-click paste — every mouse event either forwards to the
     /// child as SGR bytes (when the child asked for xterm mouse) or is
-    /// dropped. Set on the left column (files: yazi / gitui). This does
-    /// NOT affect rimeterm's own D1/D2 divider drag: App::on_mouse checks
-    /// dividers BEFORE pane-priority, so the seams stay draggable.
-    ///
-    /// When `yazi_layout` is also `Some`, this flag applies only to the
-    /// `List` zone; the `QuickLook` zone always owns the mouse locally
-    /// (§19.14.1).
+    /// dropped. Set on left-column (files) panes. This does NOT affect
+    /// rimeterm's own D1/D2 divider drag: App::on_mouse checks dividers
+    /// BEFORE pane-priority, so the seams stay draggable.
     mouse_passthrough: bool,
-    /// §19.14.4: `Down(Right)` semantics. `false` = legacy copy-only
-    /// (yazi / gitui / read-only children keep this); `true` = copy any
-    /// active selection then paste from clipboard (agents / shells).
+    /// §19.14.4: `Down(Right)` semantics. `false` = legacy copy-only;
+    /// `true` = copy any active selection then paste from clipboard
+    /// (agents / shells).
     right_click_paste: bool,
-    /// §19.14.1: if `Some`, the pane is yazi and mouse events split by
-    /// zone. `None` disables zoning and falls back to the plain
-    /// `mouse_passthrough` flag.
-    yazi_layout: Option<YaziLayout>,
     /// §19.14.6 invariant 34: origin of the current `Left` drag session.
     /// Set on `Down(Left)`, consulted by `Drag` / `Up`, cleared on
     /// `Up(Left)` (also cleared defensively when a new `Down` arrives
@@ -187,7 +107,6 @@ impl PtyPane {
             selection: SelectionState::default(),
             mouse_passthrough: false,
             right_click_paste: false,
-            yazi_layout: None,
             drag_forward_active: None,
             scrollback_enabled: false,
             scrollbar_rect: None,
@@ -217,21 +136,6 @@ impl PtyPane {
     /// [`MouseConfig`]: rimeterm_config::MouseConfig
     pub fn set_right_click_paste(&mut self, on: bool) {
         self.right_click_paste = on;
-    }
-
-    /// §19.14.1: install (or clear) the yazi three-column layout so
-    /// `on_mouse` can split events by zone. Only makes sense on the
-    /// yazi tab in the files group; every other pane keeps the default
-    /// `None`.
-    pub fn set_yazi_layout(&mut self, layout: Option<YaziLayout>) {
-        self.yazi_layout = layout;
-        if layout.is_none() {
-            // Clearing zoning during an active drag would leave the
-            // origin memoized against a geometry that no longer
-            // exists — safest to reset selection + drag state.
-            self.selection.clear();
-            self.drag_forward_active = None;
-        }
     }
 
     /// Kill the child process (used at shutdown).
@@ -351,127 +255,29 @@ impl PtyPane {
         let _ = self.session.write(&buf);
     }
 
-    /// §19.14.1: classify a mouse column into a [`YaziZone`].
-    ///
-    /// When `yazi_layout` is set (this pane is the yazi tab), the zone
-    /// boundaries come from a **live PTY-grid scan** — not from the
-    /// configured ratio estimate. yazi renders its column dividers as
-    /// box-drawing verticals (`│`, `┃`, …), and those columns are
-    /// detectable by walking the grid. This stays correct after yazi
-    /// resizes its internal columns, which a static ratio cannot.
-    ///
-    /// Returns `None` when zoning is disabled (non-yazi pane).
-    fn zone_at(&self, col: u16, inner: Rect) -> Option<YaziZone> {
-        // `yazi_layout` being `Some` is the "this is a yazi pane" signal.
-        // Its ratio value is no longer used for geometry (the grid scan
-        // replaced it) but the flag still gates zoning on/off.
-        if self.yazi_layout.is_none() || inner.width == 0 || inner.height == 0 {
-            return None;
-        }
-        let seams = self.detect_seam_cols(inner);
-        // Click on or adjacent to a detected seam column → forward to
-        // yazi (it drags its own divider). ±1 slop absorbs sub-cell
-        // jitter and the single-cell ambiguity of where the line sits.
-        for &seam_col in &seams {
-            if seam_col.saturating_sub(1) <= col && col <= seam_col.saturating_add(1) {
-                return Some(YaziZone::Seam);
-            }
-        }
-        // The rightmost seam separates `current` from `preview` (= Quick
-        // Look). Anything strictly right of it is the preview column.
-        if let Some(&last_seam) = seams.last() {
-            if col > last_seam {
-                return Some(YaziZone::QuickLook);
-            }
-        }
-        // No seam found, or left of the rightmost seam → file lists.
-        Some(YaziZone::List)
-    }
-
-    /// Scan the PTY grid for yazi's internal column dividers. A divider
-    /// is rendered as a near-full-height run of box-drawing verticals,
-    /// so we score each inner column by how many of its cells hold a
-    /// vertical-line char and keep columns above a ratio threshold.
-    ///
-    /// Returns inner-absolute column numbers (i.e. `inner.x + rel`),
-    /// in left-to-right order. Empty when no dividers are visible
-    /// (e.g. yazi still booting, or a non-yazi TUI that doesn't draw
-    /// verticals) — callers fall back to `List` for every column.
-    fn detect_seam_cols(&self, inner: Rect) -> Vec<u16> {
-        self.session
-            .with_term(|term| scan_seam_cols(term.grid(), inner))
-    }
-
-    /// §19.14.2: rect that a local selection (Down/Drag/Up) may span.
-    /// Non-yazi panes get the full inner rect. yazi panes get the
-    /// QuickLook column strip — everything right of the rightmost
-    /// detected seam — so a drag that overshoots left clamps to the
-    /// seam column instead of leaking the highlight across zones.
-    /// Geometry is read live from the PTY grid (matches `zone_at`).
-    fn local_selection_rect(&self, outer: Rect) -> Rect {
-        let inner = inner_rect(outer);
-        if self.yazi_layout.is_none() || inner.width == 0 {
-            return inner;
-        }
-        let seams = self.detect_seam_cols(inner);
-        // No seam detected yet (yazi still booting / rendering): fall
-        // back to the full inner rect so selection isn't dead — the
-        // zone_at path will also return List and forward everything,
-        // so local selection won't actually start until a seam exists.
-        let Some(&last) = seams.last() else {
-            return inner;
-        };
-        // QuickLook starts one column past the seam (the seam column
-        // itself belongs to yazi's divider).
-        let start = last.saturating_add(1);
-        let width = inner.right().saturating_sub(start);
-        Rect {
-            x: start,
-            y: inner.y,
-            width,
-            height: inner.height,
-        }
-    }
-
-    /// Adapter used from `on_mouse`: an inner-content [`SelCell`]
-    /// relative to `outer_rect.inner`, but only when the click lands
-    /// inside `sel_rect`. Cells stay indexed against the FULL inner
-    /// rect so the render overlay math (`inner.width` cols) keeps
-    /// working unchanged.
-    fn selection_cell_from_rect(
-        &self,
-        col: u16,
-        row: u16,
-        outer_rect: Rect,
-        sel_rect: Rect,
-    ) -> Option<SelCell> {
-        if !point_in_rect(col, row, sel_rect) {
-            return None;
-        }
+    /// Return the (inner-relative) [`SelCell`] for a mouse click at
+    /// absolute `(col, row)` when the click lands inside `outer_rect`'s
+    /// inner area. `None` when it hits the border cells.
+    fn selection_cell_at(&self, col: u16, row: u16, outer_rect: Rect) -> Option<SelCell> {
         let inner = inner_rect(outer_rect);
+        if !point_in_rect(col, row, inner) {
+            return None;
+        }
         Some(SelCell {
             row: row.saturating_sub(inner.y),
             col: col.saturating_sub(inner.x),
         })
     }
 
-    /// Adapter for Drag events: same as [`Self::selection_cell_from_rect`]
-    /// but clamps `(col, row)` into `sel_rect` first so overshoots
-    /// stay in the highlighted zone.
-    fn selection_cell_clamped_rect(
-        &self,
-        col: u16,
-        row: u16,
-        outer_rect: Rect,
-        sel_rect: Rect,
-    ) -> SelCell {
+    /// Adapter for Drag events: clamps `(col, row)` into `outer_rect`'s
+    /// inner area so overshoots stay bounded.
+    fn selection_cell_clamped(&self, col: u16, row: u16, outer_rect: Rect) -> SelCell {
         let inner = inner_rect(outer_rect);
-        // sel_rect may be a zero-width strip on very narrow panes;
-        // saturating_sub keeps the clamp legal.
-        let right = sel_rect.x.saturating_add(sel_rect.width.saturating_sub(1));
-        let bottom = sel_rect.y.saturating_add(sel_rect.height.saturating_sub(1));
-        let x = col.clamp(sel_rect.x, right.max(sel_rect.x));
-        let y = row.clamp(sel_rect.y, bottom.max(sel_rect.y));
+        // Guard against zero-width / zero-height inner rects.
+        let right = inner.x.saturating_add(inner.width.saturating_sub(1));
+        let bottom = inner.y.saturating_add(inner.height.saturating_sub(1));
+        let x = col.clamp(inner.x, right.max(inner.x));
+        let y = row.clamp(inner.y, bottom.max(inner.y));
         SelCell {
             row: y.saturating_sub(inner.y),
             col: x.saturating_sub(inner.x),
@@ -500,7 +306,8 @@ impl PaneProvider for PtyPane {
         }
     }
 
-    fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &PaneRenderCtx) -> RenderOutcome {
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>, ctx: &PaneRenderCtx) -> RenderOutcome {
+        let buf = frame.buffer_mut();
         // Focus visuals: focused = bright cyan + bold + `▶ …` title marker
         // so it also reads in monochrome / low-contrast terminals; unfocused
         // = dim grey. `LightCyan` alone was hard to see on dark themes.
@@ -824,9 +631,6 @@ impl PaneProvider for PtyPane {
         // default no-op fires and the flag never flips.
         PtyPane::set_right_click_paste(self, on);
     }
-    fn set_yazi_layout(&mut self, layout: Option<[u8; 3]>) {
-        PtyPane::set_yazi_layout(self, layout.map(YaziLayout::from_ratio));
-    }
     fn on_mouse(&mut self, ev: MouseEvent, outer_rect: Rect) -> bool {
         // Border occupies 1 cell on every side; clicks on the border are
         // not forwarded to the child (users are targeting the pane frame,
@@ -860,29 +664,21 @@ impl PaneProvider for PtyPane {
         }
 
         // Shift always forces local ownership so users can select text
-        // inside a full-screen TUI (yazi / vim / htop). Matches Alacritty
-        // / Wezterm convention.
+        // inside a full-screen TUI. Matches Alacritty / Wezterm convention.
         let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
-
-        // §19.14.1 zoning. Only meaningful when `yazi_layout` is set on
-        // this pane (i.e. it's the yazi tab in the files group). All
-        // other panes: `zone` stays `None` and the code falls back to
-        // the pre-§19.14 passthrough / child-wants logic.
-        let zone = self.zone_at(ev.column, inner);
 
         // §19.14.6 invariant 34 ("origin decides"): once a Left drag
         // session starts, every subsequent Drag / Up honours the mode
-        // (forward vs local) picked at Down time. This prevents the
-        // drag from flipping if the pointer crosses zones mid-drag.
+        // (forward vs local) picked at Down time.
         let forward = match ev.kind {
             MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(origin_forward) = self.drag_forward_active {
                     origin_forward
                 } else {
-                    self.decide_forward(&ev, zone, shift)
+                    self.decide_forward(&ev, shift)
                 }
             }
-            _ => self.decide_forward(&ev, zone, shift),
+            _ => self.decide_forward(&ev, shift),
         };
 
         // Track drag origin. Set on Down(Left); cleared on Up(Left).
@@ -911,12 +707,6 @@ impl PaneProvider for PtyPane {
         }
 
         // --- Local ownership: selection + paste ---
-        //
-        // `sel_rect` narrows Down/Drag targets when zoning is active
-        // (§19.14.2): a click that starts in QuickLook clamps its
-        // extension to the QuickLook column strip even if the pointer
-        // wanders left into the file lists.
-        let sel_rect = self.local_selection_rect(outer_rect);
         match ev.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.scrollback_enabled => {
                 if let Some(lines) = wheel_scroll_lines(ev.kind) {
@@ -927,9 +717,7 @@ impl PaneProvider for PtyPane {
                 false
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(cell) =
-                    self.selection_cell_from_rect(ev.column, ev.row, outer_rect, sel_rect)
-                {
+                if let Some(cell) = self.selection_cell_at(ev.column, ev.row, outer_rect) {
                     if shift {
                         // Shift+Left grows the existing selection.
                         self.selection.shift_extend(cell);
@@ -947,8 +735,7 @@ impl PaneProvider for PtyPane {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.selection.is_active() {
-                    let cell =
-                        self.selection_cell_clamped_rect(ev.column, ev.row, outer_rect, sel_rect);
+                    let cell = self.selection_cell_clamped(ev.column, ev.row, outer_rect);
                     self.selection.extend(cell);
                     return true;
                 }
@@ -967,27 +754,23 @@ impl PaneProvider for PtyPane {
                 true
             }
             MouseEventKind::Down(MouseButton::Right) => {
-                // §19.14.2 / §19.14.4 right-click semantics.
+                // §19.14.4 right-click semantics.
                 //
                 // 1. Any active selection is copied first (so users
                 //    who framed text with Left-drag can still "finish"
                 //    with a right-click, matching Windows Terminal's
                 //    "selection + right = copy" muscle memory).
-                // 2. Then, when `right_click_paste` is enabled AND the
-                //    zone allows writes (QuickLook is read-only), paste
-                //    the clipboard. QuickLook zone (§19.14.6 inv. 36)
-                //    forces copy-only regardless of the flag.
-                // 3. bottom / any read-only child transparently drops
-                //    the paste bytes because `paste_from_clipboard`
-                //    routes through `Session::write`, which is a no-op
-                //    when the child has no stdin.
+                // 2. Then, when `right_click_paste` is enabled, paste
+                //    the clipboard.
+                // 3. Read-only children transparently drop the paste
+                //    bytes because `paste_from_clipboard` routes through
+                //    `Session::write`, which is a no-op when the child
+                //    has no stdin.
                 if self.selection.is_active() {
                     self.copy_selection();
                     self.selection.clear();
                 }
-                let paste_allowed =
-                    self.right_click_paste && !matches!(zone, Some(YaziZone::QuickLook));
-                if paste_allowed {
+                if self.right_click_paste {
                     self.paste_from_clipboard();
                 }
                 true
@@ -998,25 +781,18 @@ impl PaneProvider for PtyPane {
 }
 
 impl PtyPane {
-    /// §19.14.1 forwarding decision for a **fresh** event (not a
-    /// continuation of an active drag — those are dispatched by the
-    /// caller against [`Self::drag_forward_active`]).
+    /// Forwarding decision for a **fresh** event (not a continuation of
+    /// an active drag — those are dispatched by the caller against
+    /// [`Self::drag_forward_active`]).
     ///
-    /// Splits into three regimes:
+    /// Splits into two regimes:
     /// - **Shift held** → always local (`false`), so Shift+Left can
     ///   select even inside a full-screen TUI.
-    /// - **yazi_layout set** → zone-based:
-    ///     - `List` (parent + current columns) → forward to yazi so
-    ///       its own selection / hover / seam-drag keeps working.
-    ///     - `QuickLook` (preview column) → local for Down/Drag/Up
-    ///       (text selection), but scroll wheel still forwards so
-    ///       yazi's previewer can page.
-    /// - **no yazi_layout** → legacy behaviour: forward iff the child
-    ///   wants xterm mouse OR the pane is marked `mouse_passthrough`.
-    fn decide_forward(&self, ev: &MouseEvent, zone: Option<YaziZone>, shift: bool) -> bool {
+    /// - **otherwise** → forward iff the child wants xterm mouse OR the
+    ///   pane is marked `mouse_passthrough`.
+    fn decide_forward(&self, ev: &MouseEvent, shift: bool) -> bool {
         decide_forward_pure(
             ev.kind,
-            zone,
             shift,
             self.mouse_passthrough,
             self.child_wants_mouse(),
@@ -1033,75 +809,11 @@ impl PtyPane {
     }
 }
 
-/// Session-free kernel of [`PtyPane::decide_forward`]. Extracted so
-/// unit tests can exercise the full decision matrix without spinning
-/// up an alacritty [`Session`].
-///
-/// Contract mirrors the doc-comment on `decide_forward`; kept as a
-/// free function (not a method) so tests don't need to construct a
-/// `PtyPane`.
-/// Scan the PTY grid for yazi's internal column dividers. yazi draws
-/// its three-column layout with box-drawing verticals, so each divider
-/// shows up as a column where most cells hold a vertical-line char.
-///
-/// We count vertical-char cells per inner column and keep columns whose
-/// density ≥ `SEAM_DENSITY_THRESHOLD`. Returns inner-absolute column
-/// numbers (`inner.x + rel`) in left→right order.
-///
-/// Extracted as a free function taking the grid by reference so the
-/// pure scoring logic (`seam_columns_from_counts`) stays unit-testable
-/// without a live alacritty `Term`.
-pub(crate) fn scan_seam_cols(grid: &alacritty_terminal::grid::Grid<Cell>, inner: Rect) -> Vec<u16> {
-    if inner.width == 0 || inner.height == 0 {
-        return Vec::new();
-    }
-    let mut counts = vec![0usize; inner.width as usize];
-    for rel_row in 0..inner.height as i32 {
-        for rel_col in 0..inner.width as usize {
-            let point = alacritty_terminal::index::Point::new(
-                alacritty_terminal::index::Line(rel_row),
-                alacritty_terminal::index::Column(rel_col),
-            );
-            if is_vertical_line_char(grid[point].c) {
-                counts[rel_col] += 1;
-            }
-        }
-    }
-    seam_columns_from_counts(&counts, inner.height as usize, inner.x)
-}
-
-/// Density threshold: a real divider spans nearly the full pane height.
-/// yazi sometimes shortens its borders on the active row, so we accept
-/// ≥ 75 % coverage rather than requiring every single cell.
-pub(crate) const SEAM_DENSITY_THRESHOLD: f32 = 0.75;
-
-/// Pure scoring kernel of [`scan_seam_cols`]. Given per-column vertical-
-/// char counts, the row count, and the inner rect's absolute x origin,
-/// return the columns that look like dividers, as absolute columns.
-pub(crate) fn seam_columns_from_counts(counts: &[usize], height: usize, inner_x: u16) -> Vec<u16> {
-    if height == 0 {
-        return Vec::new();
-    }
-    let threshold = (height as f32 * SEAM_DENSITY_THRESHOLD).ceil() as usize;
-    counts
-        .iter()
-        .enumerate()
-        .filter(|&(_, &c)| c >= threshold)
-        .map(|(rel, _)| inner_x.saturating_add(rel as u16))
-        .collect()
-}
-
-/// Is `c` a box-drawing vertical line? Covers the common variants yazi
-/// / ratatui borders use: thin `│`, heavy `┃`, dashed `╎╏┊┋`, and the
-/// double `║`. Excludes `|` (ASCII) on purpose — filenames legitimately
-/// contain it and it's not what yazi draws its frame with.
-pub(crate) fn is_vertical_line_char(c: char) -> bool {
-    matches!(c, '│' | '┃' | '┊' | '┋' | '╎' | '╏' | '║' | '╟')
-}
-
+/// Session-free kernel of [`PtyPane::decide_forward`]. Extracted so unit
+/// tests can exercise the full decision matrix without spinning up an
+/// alacritty [`Session`].
 pub(crate) fn decide_forward_pure(
-    kind: MouseEventKind,
-    zone: Option<YaziZone>,
+    _kind: MouseEventKind,
     shift: bool,
     mouse_passthrough: bool,
     child_wants_mouse: bool,
@@ -1109,28 +821,7 @@ pub(crate) fn decide_forward_pure(
     if shift {
         return false;
     }
-    let base_forward = mouse_passthrough || child_wants_mouse;
-
-    if let Some(YaziZone::QuickLook) = zone {
-        // Scroll wheel forwards regardless of zoning: yazi's previewer
-        // needs the SGR bytes to page its preview. Every other event
-        // owns the mouse locally.
-        if matches!(
-            kind,
-            MouseEventKind::ScrollUp
-                | MouseEventKind::ScrollDown
-                | MouseEventKind::ScrollLeft
-                | MouseEventKind::ScrollRight
-        ) {
-            return base_forward;
-        }
-        return false;
-    }
-
-    // List, Seam, or unzoned: legacy policy. Seam forwards to yazi so
-    // it can drag its own column divider; List forwards so yazi gets
-    // all file-list clicks. Both share `base_forward`.
-    base_forward
+    mouse_passthrough || child_wants_mouse
 }
 
 /// Translate an alacritty [`Cell`] into a ratatui [`Style`].
@@ -1767,278 +1458,31 @@ mod mouse_tests {
         assert_eq!(viewport_row(3, 7, 10), None);
     }
 
-    // --- §19.14 YaziLayout math ---
+    // --- decide_forward_pure — the routing decision matrix ---
 
-    #[test]
-    fn yazi_layout_default_matches_yazi_own_default() {
-        // yazi ships with [1, 4, 3] out of the box; make sure our
-        // hardcoded default matches so the seeded zone splitter agrees
-        // with what yazi actually renders.
-        let l = YaziLayout::DEFAULT;
-        assert_eq!(l.parent, 1);
-        assert_eq!(l.current, 4);
-        assert_eq!(l.preview, 3);
-    }
-
-    #[test]
-    fn yazi_layout_from_ratio_clamps_zeros_to_one() {
-        // A misconfigured `[mouse] yazi_layout = [0, 0, 0]` must not
-        // divide by zero downstream. All zero entries clamp to 1 →
-        // ratio 1:1:1 → preview starts at 2/3 * width.
-        let l = YaziLayout::from_ratio([0, 0, 0]);
-        assert_eq!(l.parent, 1);
-        assert_eq!(l.current, 1);
-        assert_eq!(l.preview, 1);
-    }
-
-    #[test]
-    fn preview_start_col_default_ratio_on_16_wide() {
-        // [1,4,3] over 16 cells → non-preview share = 5/8 = 62.5%.
-        // round(16 * 5/8) = round(10) = 10.
-        assert_eq!(YaziLayout::DEFAULT.preview_start_col(16), 10);
-    }
-
-    #[test]
-    fn preview_start_col_degenerate_widths() {
-        // Zero-width pane: seam == width so the "is in QuickLook" test
-        // (col >= preview_start) is always false — the callers all
-        // early-return before this matters.
-        assert_eq!(YaziLayout::DEFAULT.preview_start_col(0), 0);
-        // One-cell pane: preview effectively empty; rounds to 1 because
-        // 5/8 of 1 rounds to 1 half-up. Not a real scenario but must
-        // not panic.
-        let s = YaziLayout::DEFAULT.preview_start_col(1);
-        assert!(s <= 1);
-    }
-
-    #[test]
-    fn preview_start_col_matches_rounded_share_on_100_wide() {
-        // Documented in §19.14 that we round half-up. 100 * 5/8 = 62.5
-        // → 63.
-        assert_eq!(YaziLayout::DEFAULT.preview_start_col(100), 63);
-    }
-
-    #[test]
-    fn preview_start_col_custom_ratio() {
-        // [2, 3, 5] over 20 → non-preview = 5/10 = 50%. round(20*.5) = 10.
-        let l = YaziLayout::from_ratio([2, 3, 5]);
-        assert_eq!(l.preview_start_col(20), 10);
-    }
-
-    // --- §19.14 decide_forward_pure — the routing decision matrix ---
-
-    fn down_left(x: u16, y: u16) -> MouseEventKind {
-        // Only .kind is consulted by decide_forward_pure; ev helpers
-        // are unused here.
-        let _ = (x, y);
+    fn down_left() -> MouseEventKind {
         MouseEventKind::Down(MouseButton::Left)
     }
 
     #[test]
-    fn forward_matches_legacy_when_no_yazi_layout() {
-        // With zoning off, decisions collapse to the pre-§19.14 policy:
-        // passthrough OR child_wants → forward; shift always local.
-        assert!(decide_forward_pure(
-            down_left(0, 0),
-            None,
-            false,
-            true,
-            false
-        ));
-        assert!(decide_forward_pure(
-            down_left(0, 0),
-            None,
-            false,
-            false,
-            true
-        ));
-        assert!(!decide_forward_pure(
-            down_left(0, 0),
-            None,
-            false,
-            false,
-            false
-        ));
-        assert!(!decide_forward_pure(
-            down_left(0, 0),
-            None,
-            true,
-            true,
-            true
-        ));
+    fn forward_when_passthrough_or_child_wants() {
+        assert!(decide_forward_pure(down_left(), false, true, false));
+        assert!(decide_forward_pure(down_left(), false, false, true));
     }
 
     #[test]
-    fn quicklook_owns_down_left_locally_even_when_passthrough() {
-        // The whole point of §19.14: Quick Look must own text
-        // selection despite the pane being marked passthrough.
-        assert!(!decide_forward_pure(
-            down_left(0, 0),
-            Some(YaziZone::QuickLook),
-            false,
-            true, // passthrough
-            true, // child wants mouse
-        ));
+    fn no_forward_when_neither_passthrough_nor_child_wants() {
+        assert!(!decide_forward_pure(down_left(), false, false, false));
     }
 
     #[test]
-    fn quicklook_owns_right_click_locally() {
-        // Right-click in QuickLook is local (copy-only per §19.14.6
-        // invariant 36); the base_forward inputs don't matter.
-        assert!(!decide_forward_pure(
-            MouseEventKind::Down(MouseButton::Right),
-            Some(YaziZone::QuickLook),
-            false,
-            true,
-            true,
-        ));
+    fn shift_always_forces_local_ownership() {
+        assert!(!decide_forward_pure(down_left(), true, true, true));
     }
 
-    #[test]
-    fn quicklook_scroll_forwards_so_yazi_previewer_can_page() {
-        // §19.14.3: scroll wheel forwards even in the local-selection
-        // zone so yazi's previewer can page a long file.
-        for kind in [
-            MouseEventKind::ScrollUp,
-            MouseEventKind::ScrollDown,
-            MouseEventKind::ScrollLeft,
-            MouseEventKind::ScrollRight,
-        ] {
-            assert!(
-                decide_forward_pure(kind, Some(YaziZone::QuickLook), false, true, false),
-                "kind={kind:?} should forward when passthrough is set",
-            );
-            assert!(
-                !decide_forward_pure(kind, Some(YaziZone::QuickLook), false, false, false),
-                "kind={kind:?} should NOT forward without base_forward",
-            );
-        }
-    }
-
-    #[test]
-    fn list_zone_forwards_when_passthrough() {
-        // List zone (parent + current file lists) keeps the legacy
-        // passthrough behaviour: yazi owns the mouse.
-        assert!(decide_forward_pure(
-            down_left(0, 0),
-            Some(YaziZone::List),
-            false,
-            true,
-            false,
-        ));
-    }
-
-    #[test]
-    fn seam_zone_forwards_so_yazi_can_drag_its_divider() {
-        // §19.14.1 YaziSeam: yazi's internal column divider. MUST forward
-        // so yazi can drag-resize its own column ratios. If this regresses
-        // to local, the divider click starts a rimeterm text selection.
-        for kind in [
-            MouseEventKind::Down(MouseButton::Left),
-            MouseEventKind::Drag(MouseButton::Left),
-            MouseEventKind::Up(MouseButton::Left),
-        ] {
-            assert!(
-                decide_forward_pure(kind, Some(YaziZone::Seam), false, true, false),
-                "kind={kind:?} should forward in Seam zone"
-            );
-        }
-    }
-
-    #[test]
-    fn seam_zone_shift_forces_local() {
-        // Shift override is global: even on the seam, Shift+Left starts
-        // a local selection so power users can frame text there.
-        assert!(!decide_forward_pure(
-            down_left(0, 0),
-            Some(YaziZone::Seam),
-            true,
-            true,
-            true,
-        ));
-    }
-
-    // --- grid-based seam detection (scan_seam_cols / scoring kernel) ---
-
-    #[test]
-    fn seam_columns_from_counts_keeps_dense_columns() {
-        // 10-row pane; columns 3 and 8 are fully vertical (10/10 = 100%,
-        // ≥ 75% threshold). Columns 0 and 5 each have one stray `│`
-        // (a filename), below threshold → dropped.
-        let counts = [1usize, 0, 0, 10, 0, 1, 0, 0, 10, 0];
-        let seams = seam_columns_from_counts(&counts, 10, 100);
-        assert_eq!(seams, vec![103, 108]);
-    }
-
-    #[test]
-    fn seam_columns_from_counts_accepts_75_percent_density() {
-        // yazi shortens borders on the active row: 8/10 = 80% ≥ 75%.
-        let counts = [8usize, 0, 0, 0];
-        assert_eq!(seam_columns_from_counts(&counts, 10, 0), vec![0]);
-    }
-
-    #[test]
-    fn seam_columns_from_counts_rejects_below_threshold() {
-        // 7/10 = 70% < 75% → no seam.
-        let counts = [7usize, 0, 0, 0];
-        assert!(seam_columns_from_counts(&counts, 10, 0).is_empty());
-    }
-
-    #[test]
-    fn seam_columns_from_counts_empty_on_no_dividers() {
-        // Plain shell output — no verticals at all.
-        let counts = [0usize; 20];
-        assert!(seam_columns_from_counts(&counts, 10, 0).is_empty());
-    }
-
-    #[test]
-    fn seam_columns_from_counts_zero_height_returns_empty() {
-        // Degenerate: avoids divide-by-zero / spurious matches.
-        assert!(seam_columns_from_counts(&[5, 5, 5], 0, 0).is_empty());
-    }
-
-    #[test]
-    fn is_vertical_line_char_covers_box_drawing_set() {
-        // yazi default theme uses thin `│`; heavy / dashed / double
-        // are covered so users on other themes aren't left out.
-        for c in ['│', '┃', '┊', '┋', '╎', '╏', '║'] {
-            assert!(is_vertical_line_char(c), "should recognize {c:?}");
-        }
-        // ASCII `|` is deliberately excluded — filenames contain it.
-        assert!(!is_vertical_line_char('|'));
-        assert!(!is_vertical_line_char('l'));
-        assert!(!is_vertical_line_char(' '));
-    }
-
-    #[test]
-    fn shift_always_forces_local_even_in_list_zone() {
-        // Shift+Left in the file lists still starts a rimeterm-side
-        // selection so Alacritty / Wezterm muscle memory works.
-        assert!(!decide_forward_pure(
-            down_left(0, 0),
-            Some(YaziZone::List),
-            true, // shift
-            true,
-            true,
-        ));
-    }
-
-    // --- §19.14.1 zone geometry: `ev` param unused so we're really
-    // testing PtyPane's zone_at classifier via the pure math above. ---
-
-    // Note: PtyPane::zone_at now classifies via a live PTY-grid scan,
-    // not the ratio-based preview_start_col. The scoring kernel it
-    // calls (`seam_columns_from_counts`) is tested directly above.
-    // The full grid walk lives in `scan_seam_cols` and needs a live
-    // alacritty Term — covered by manual smoke (divider drag stays
-    // responsive after yazi resizes its columns).
-
-    // Suppress unused-helper warning on `ev()` when this module has
-    // no other consumer — kept because the earlier legacy tests use
-    // it and future §19.14 tests may want to as well.
     #[test]
     fn ev_helper_still_compiles() {
-        let _ = ev(down_left(0, 0), 0, 0, KeyModifiers::NONE);
+        let _ = ev(down_left(), 0, 0, KeyModifiers::NONE);
     }
 }
 

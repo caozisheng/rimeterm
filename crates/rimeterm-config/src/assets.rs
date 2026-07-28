@@ -1,200 +1,29 @@
-//! Bundled config assets — Yazi bridge plugin + first-launch seeds
-//! (C21.5).
+//! Bundled config assets — first-launch seeds (C21.5).
 //!
-//! Everything under `assets/` in the repo is `include_bytes!`-baked into
-//! the rimeterm binary. [`materialize_configs`] writes it out to the
-//! managed config dirs (`~/.rimeterm/{yazi,gitui,bottom}/`) with a strict
-//! ownership split:
+//! Historically this module `include_bytes!`-baked the Yazi bridge
+//! plugin plus curated Yazi/Gitui/Bottom seed configs into the
+//! rimeterm binary and dropped them into `~/.rimeterm/{yazi,gitui,bottom}/`
+//! on first launch. The native-file-git refactor retires the yazi and
+//! gitui external runtime paths — their bundled files are removed and
+//! [`materialize_configs`] shrinks to a no-op stub kept only so
+//! `rimeterm-tui` callers (still on the pre-refactor signature) keep
+//! compiling. Essentials extraction ([`extract_essentials`],
+//! [`copy_rimectl_alongside`]) is unaffected.
 //!
-//! - **plugin files** (`yazi/plugins/rimeterm-bridge.yazi/*`) —
-//!   rimeterm-owned. On every launch the version marker
-//!   `.rimeterm-version` is compared against `CARGO_PKG_VERSION`; if
-//!   different, the plugin files are force-rewritten.
-//! - **seed files** (`init.lua`, `yazi.toml`, `package.toml`,
-//!   `key_bindings.ron`, `theme.ron`, `bottom.toml`) — user-owned.
-//!   Written **only when absent**. Users may edit freely; rimeterm
-//!   never touches them again unless deleted.
-//!
-//! Failures are logged and swallowed — a broken filesystem must not
-//! prevent rimeterm from starting.
+//! Failures anywhere in this module are logged and swallowed by
+//! callers — a broken filesystem must not prevent rimeterm from
+//! starting.
 
-use std::io;
 use std::path::Path;
 
-/// Version marker file dropped into each rimeterm-owned dir. Bumped
-/// with `CARGO_PKG_VERSION` on every rimeterm release; a mismatch
-/// triggers a plugin rewrite.
+/// Version marker file dropped into each rimeterm-owned dir. Retained
+/// as a public constant because downstream doctor / cleanup code
+/// still keys off it to detect orphaned pre-refactor sandboxes.
 pub const VERSION_MARKER: &str = ".rimeterm-version";
 
-/// One asset entry — either a plugin file or a seed. Kept generic so
-/// the materialize logic doesn't fan out per file.
-struct Asset {
-    /// Path relative to the tool's config dir. E.g.
-    /// `"plugins/rimeterm-bridge.yazi/main.lua"` or `"init.lua"`.
-    rel_path: &'static str,
-    /// The file contents, baked in at compile time.
-    bytes: &'static [u8],
-    /// `Managed` → overwrite on version bump. `Seed` → write only if
-    /// absent.
-    ownership: Ownership,
-}
-
-#[derive(Copy, Clone, PartialEq)]
-enum Ownership {
-    Managed,
-    Seed,
-}
-
-/// Every asset bundled into rimeterm. Order matters only for
-/// determinism in tests; runtime doesn't care.
-const ASSETS: &[(ToolBucket, Asset)] = &[
-    // yazi — rimeterm-managed plugin (force-overwrite on version bump).
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "plugins/rimeterm-bridge.yazi/main.lua",
-            bytes: include_bytes!("../../../assets/yazi/plugins/rimeterm-bridge.yazi/main.lua"),
-            ownership: Ownership::Managed,
-        },
-    ),
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "plugins/rimeterm-bridge.yazi/README.md",
-            bytes: include_bytes!("../../../assets/yazi/plugins/rimeterm-bridge.yazi/README.md"),
-            ownership: Ownership::Managed,
-        },
-    ),
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "plugins/rimeterm-bridge.yazi/LICENSE",
-            bytes: include_bytes!("../../../assets/yazi/plugins/rimeterm-bridge.yazi/LICENSE"),
-            ownership: Ownership::Managed,
-        },
-    ),
-    // yazi — chafa image previewer plugin (managed).
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "plugins/chafa.yazi/main.lua",
-            bytes: include_bytes!("../../../assets/yazi/plugins/chafa.yazi/main.lua"),
-            ownership: Ownership::Managed,
-        },
-    ),
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "plugins/chafa.yazi/README.md",
-            bytes: include_bytes!("../../../assets/yazi/plugins/chafa.yazi/README.md"),
-            ownership: Ownership::Managed,
-        },
-    ),
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "plugins/chafa.yazi/LICENSE",
-            bytes: include_bytes!("../../../assets/yazi/plugins/chafa.yazi/LICENSE"),
-            ownership: Ownership::Managed,
-        },
-    ),
-    // yazi — glow markdown previewer plugin (managed).
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "plugins/glow.yazi/main.lua",
-            bytes: include_bytes!("../../../assets/yazi/plugins/glow.yazi/main.lua"),
-            ownership: Ownership::Managed,
-        },
-    ),
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "plugins/glow.yazi/README.md",
-            bytes: include_bytes!("../../../assets/yazi/plugins/glow.yazi/README.md"),
-            ownership: Ownership::Managed,
-        },
-    ),
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "plugins/glow.yazi/LICENSE",
-            bytes: include_bytes!("../../../assets/yazi/plugins/glow.yazi/LICENSE"),
-            ownership: Ownership::Managed,
-        },
-    ),
-    // yazi — user-owned seeds.
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "init.lua",
-            bytes: include_bytes!("../../../assets/yazi/seeds/init.lua"),
-            ownership: Ownership::Seed,
-        },
-    ),
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "yazi.toml",
-            bytes: include_bytes!("../../../assets/yazi/seeds/yazi.toml"),
-            ownership: Ownership::Seed,
-        },
-    ),
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "package.toml",
-            bytes: include_bytes!("../../../assets/yazi/seeds/package.toml"),
-            ownership: Ownership::Seed,
-        },
-    ),
-    (
-        ToolBucket::Yazi,
-        Asset {
-            rel_path: "theme.toml",
-            bytes: include_bytes!("../../../assets/yazi/seeds/theme.toml"),
-            ownership: Ownership::Seed,
-        },
-    ),
-    // gitui — user-owned seeds only (no bundled plugin).
-    (
-        ToolBucket::Gitui,
-        Asset {
-            rel_path: "key_bindings.ron",
-            bytes: include_bytes!("../../../assets/gitui/seeds/key_bindings.ron"),
-            ownership: Ownership::Seed,
-        },
-    ),
-    (
-        ToolBucket::Gitui,
-        Asset {
-            rel_path: "theme.ron",
-            bytes: include_bytes!("../../../assets/gitui/seeds/theme.ron"),
-            ownership: Ownership::Seed,
-        },
-    ),
-    // bottom — user-owned seed only.
-    (
-        ToolBucket::Bottom,
-        Asset {
-            rel_path: "bottom.toml",
-            bytes: include_bytes!("../../../assets/bottom/seeds/bottom.toml"),
-            ownership: Ownership::Seed,
-        },
-    ),
-];
-
-/// Which tool's config dir an asset targets.
-#[derive(Copy, Clone, PartialEq)]
-enum ToolBucket {
-    Yazi,
-    Gitui,
-    Bottom,
-}
-
-/// Result of a `materialize` call — what changed on disk. Kept structured
-/// so callers (startup logging, tests) can render or assert on it
-/// without re-scanning the filesystem.
+/// Result of a `materialize` call. Kept structured (rather than a bare
+/// `()`) so callers keep the "log this on startup" pattern intact even
+/// though the report is now always empty.
 #[derive(Debug, Default, PartialEq)]
 pub struct MaterializeReport {
     pub managed_rewritten: Vec<String>,
@@ -203,139 +32,16 @@ pub struct MaterializeReport {
     pub errors: Vec<String>,
 }
 
-/// Materialize all bundled assets under [`crate::paths::home`]. Safe to
-/// call on every startup; behavior:
+/// **No-op stub.** The native-file-git refactor removed every
+/// bundled asset (the yazi bridge plugin, chafa/glow previewers, and
+/// the yazi/gitui/bottom seed configs). Callers still invoke this on
+/// startup for parity with older builds; it returns an empty report
+/// so the "log the outcome" call sites stay untouched.
 ///
-/// - **Managed files**: rewritten whenever `.rimeterm-version` in the
-///   parent plugin dir doesn't match `current_version`.
-/// - **Seed files**: written only if absent — user's edits are never
-///   clobbered.
-///
-/// Individual write failures are captured in the report but never
-/// bubbled up — this must not prevent rimeterm from starting.
-pub fn materialize_configs(current_version: &str) -> MaterializeReport {
-    let mut report = MaterializeReport::default();
-    let Some(home) = crate::paths::home() else {
-        report
-            .errors
-            .push("$RIMETERM_HOME not resolvable; skipping config materialize".into());
-        return report;
-    };
-
-    // Precompute per-bucket parent dirs.
-    let dirs = [
-        (ToolBucket::Yazi, home.join("yazi")),
-        (ToolBucket::Gitui, home.join("gitui")),
-        (ToolBucket::Bottom, home.join("bottom")),
-    ];
-    let dir_for = |b: ToolBucket| -> &Path {
-        dirs.iter()
-            .find(|(kind, _)| *kind == b)
-            .map(|(_, p)| p.as_path())
-            .expect("all buckets have a dir")
-    };
-
-    // Managed files live in versioned subtrees. Read each subtree's
-    // `.rimeterm-version` marker once so we can decide overwrite vs
-    // skip cheaply.
-    for (bucket, asset) in ASSETS {
-        let parent_dir = dir_for(*bucket);
-        let dest = parent_dir.join(asset.rel_path);
-        let outcome = match asset.ownership {
-            Ownership::Seed => write_seed(&dest, asset.bytes),
-            Ownership::Managed => write_managed(
-                &dest,
-                asset.bytes,
-                current_version,
-                parent_dir,
-                asset.rel_path,
-            ),
-        };
-        match outcome {
-            Ok(Written::Wrote) => match asset.ownership {
-                Ownership::Managed => report.managed_rewritten.push(dest.display().to_string()),
-                Ownership::Seed => report.seeds_written.push(dest.display().to_string()),
-            },
-            Ok(Written::Kept) => match asset.ownership {
-                // Managed 'kept' just means "same version, no work" —
-                // silent success, no report entry.
-                Ownership::Managed => {}
-                Ownership::Seed => report.seeds_kept.push(dest.display().to_string()),
-            },
-            Err(e) => report.errors.push(format!("{}: {e}", dest.display(),)),
-        }
-    }
-
-    // Drop `.rimeterm-version` markers into every rimeterm-owned
-    // subdir we touched (currently just `yazi/plugins/rimeterm-bridge.yazi/`).
-    // Doing this once at the end avoids duplicate writes when multiple
-    // managed assets share a parent.
-    let mut version_dirs: Vec<std::path::PathBuf> = Vec::new();
-    for (bucket, asset) in ASSETS {
-        if asset.ownership != Ownership::Managed {
-            continue;
-        }
-        let dest = dir_for(*bucket).join(asset.rel_path);
-        if let Some(parent) = dest.parent() {
-            if !version_dirs.iter().any(|p| p == parent) {
-                version_dirs.push(parent.to_path_buf());
-            }
-        }
-    }
-    for dir in &version_dirs {
-        let marker = dir.join(VERSION_MARKER);
-        if let Err(e) = std::fs::write(&marker, current_version.as_bytes()) {
-            report.errors.push(format!("{}: {e}", marker.display()));
-        }
-    }
-
-    report
-}
-
-/// Outcome of a single asset write.
-enum Written {
-    Wrote,
-    Kept,
-}
-
-fn write_seed(dest: &Path, bytes: &[u8]) -> io::Result<Written> {
-    if dest.is_file() {
-        return Ok(Written::Kept);
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(dest, bytes)?;
-    Ok(Written::Wrote)
-}
-
-fn write_managed(
-    dest: &Path,
-    bytes: &[u8],
-    current_version: &str,
-    version_dir: &Path,
-    rel_path: &str,
-) -> io::Result<Written> {
-    // Version marker lives next to the managed asset — for the yazi
-    // bridge that's `plugins/rimeterm-bridge.yazi/.rimeterm-version`.
-    // We derive the marker dir from `rel_path`'s parent so multiple
-    // managed subtrees per bucket stay independent.
-    let marker_dir = match Path::new(rel_path).parent() {
-        Some(p) => version_dir.join(p),
-        None => version_dir.to_path_buf(),
-    };
-    let marker = marker_dir.join(VERSION_MARKER);
-    let existing_ok = std::fs::read_to_string(&marker)
-        .map(|s| s.trim() == current_version)
-        .unwrap_or(false);
-    if existing_ok && dest.is_file() {
-        return Ok(Written::Kept);
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(dest, bytes)?;
-    Ok(Written::Wrote)
+/// The `_current_version` argument is kept so re-adding a version-gated
+/// asset later doesn't require a signature change across the tree.
+pub fn materialize_configs(_current_version: &str) -> MaterializeReport {
+    MaterializeReport::default()
 }
 
 /// Report from an [`extract_essentials`] run.
@@ -460,9 +166,8 @@ pub fn extract_essentials(source_dir: &Path, current_version: &str) -> Essential
 }
 
 /// Copy the `rimectl` binary sitting alongside `rimeterm` in the
-/// release archive into `~/.rimeterm/bin/` so Yazi's bridge plugin
-/// (and any other child process using PATH lookup) can reliably find
-/// it — see design doc §5.
+/// release archive into `~/.rimeterm/bin/` so PATH-based lookups from
+/// child processes (agents, plugins) find it — see design doc §5.
 ///
 /// Idempotent: skips when the destination already exists with the
 /// same size + mtime as the source (cheap proxy for "unchanged").
@@ -550,107 +255,27 @@ mod tests {
     }
 
     #[test]
-    fn first_launch_writes_everything() {
+    fn materialize_configs_is_a_noop_stub() {
         with_home(|root| {
             let report = materialize_configs("1.0.0");
-            assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
-            assert!(report.seeds_kept.is_empty());
-            // 9 managed (3 plugins × main.lua/README.md/LICENSE) + 7 seeds.
-            assert_eq!(report.managed_rewritten.len(), 9);
-            assert_eq!(report.seeds_written.len(), 7);
-
-            // Every file must exist on disk.
-            assert!(
-                root.join("yazi/plugins/rimeterm-bridge.yazi/main.lua")
-                    .is_file()
-            );
-            assert!(root.join("yazi/init.lua").is_file());
-            assert!(root.join("gitui/key_bindings.ron").is_file());
-            assert!(root.join("bottom/bottom.toml").is_file());
-
-            // Version marker was written.
-            let marker = root.join("yazi/plugins/rimeterm-bridge.yazi/.rimeterm-version");
-            assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "1.0.0");
-        });
-    }
-
-    #[test]
-    fn second_call_same_version_is_idempotent() {
-        with_home(|root| {
-            let _ = materialize_configs("1.0.0");
-            // User edits a seed.
-            let seed = root.join("yazi/init.lua");
-            std::fs::write(&seed, b"-- user edit\n").unwrap();
-
-            let report = materialize_configs("1.0.0");
-            assert!(report.errors.is_empty());
-            assert!(report.managed_rewritten.is_empty(), "managed must stick");
-            assert!(report.seeds_written.is_empty(), "seeds must stick");
-            assert_eq!(report.seeds_kept.len(), 7);
-
-            // User's edit is preserved.
-            assert_eq!(std::fs::read_to_string(&seed).unwrap(), "-- user edit\n");
-        });
-    }
-
-    #[test]
-    fn version_bump_rewrites_managed_but_keeps_seeds() {
-        with_home(|root| {
-            let _ = materialize_configs("1.0.0");
-            let seed = root.join("yazi/init.lua");
-            std::fs::write(&seed, b"-- user edit\n").unwrap();
-            // User tampers with the managed plugin main.lua — this
-            // simulates a broken hand-edit. Version bump must clobber
-            // it, not preserve it.
-            let plugin = root.join("yazi/plugins/rimeterm-bridge.yazi/main.lua");
-            std::fs::write(&plugin, b"-- tampered\n").unwrap();
-
-            let report = materialize_configs("1.0.1");
-            assert!(report.errors.is_empty());
-            assert_eq!(report.managed_rewritten.len(), 9, "plugin dir rewritten");
-            assert_eq!(report.seeds_kept.len(), 7, "all seeds kept");
-
-            // Plugin was restored to bundled bytes.
-            let restored = std::fs::read(&plugin).unwrap();
-            assert!(
-                !restored.starts_with(b"-- tampered"),
-                "managed asset must be overwritten, not preserved"
-            );
-            // User edit still there.
-            assert_eq!(std::fs::read_to_string(&seed).unwrap(), "-- user edit\n");
-
-            // Marker updated.
-            let marker = root.join("yazi/plugins/rimeterm-bridge.yazi/.rimeterm-version");
-            assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "1.0.1");
-        });
-    }
-
-    #[test]
-    fn seed_deletion_re_creates_on_next_launch() {
-        with_home(|root| {
-            let _ = materialize_configs("1.0.0");
-            let seed = root.join("yazi/init.lua");
-            std::fs::remove_file(&seed).unwrap();
-
-            let report = materialize_configs("1.0.0");
-            assert!(report.errors.is_empty());
-            assert!(
-                report.seeds_written.iter().any(|p| p.contains("init.lua")),
-                "deleted seed must be re-seeded"
-            );
-            assert!(seed.is_file());
+            assert_eq!(report, MaterializeReport::default());
+            // No yazi/gitui/bottom sandbox files should be created —
+            // materialize is fully retired.
+            assert!(!root.join("yazi").exists());
+            assert!(!root.join("gitui").exists());
+            assert!(!root.join("bottom").exists());
         });
     }
 
     /// Fake `essentials/` folder for extractor tests. Creates the
-    /// three canonical binary names plus a `VERSIONS.toml` sibling that
+    /// canonical binary names plus a `VERSIONS.toml` sibling that
     /// the extractor must skip.
     fn seed_essentials_source(dir: &std::path::Path) -> Vec<String> {
         std::fs::create_dir_all(dir).unwrap();
         let names = if cfg!(windows) {
-            vec!["yazi.exe", "ya.exe", "gitui.exe", "btm.exe"]
+            vec!["btm.exe"]
         } else {
-            vec!["yazi", "ya", "gitui", "btm"]
+            vec!["btm"]
         };
         for n in &names {
             std::fs::write(dir.join(n), format!("#!fake {n}").as_bytes()).unwrap();
@@ -719,10 +344,10 @@ mod tests {
             let names = seed_essentials_source(&src);
             let _ = extract_essentials(&src, "1.0.0");
 
-            // Simulate a rimeterm release with a newer bundled yazi:
+            // Simulate a rimeterm release with a newer bundled btm:
             // rewrite the source and bump the version.
-            let bin_name = if cfg!(windows) { "yazi.exe" } else { "yazi" };
-            std::fs::write(src.join(bin_name), b"#!new bundled yazi").unwrap();
+            let bin_name = if cfg!(windows) { "btm.exe" } else { "btm" };
+            std::fs::write(src.join(bin_name), b"#!new bundled btm").unwrap();
 
             let report = extract_essentials(&src, "1.0.1");
             assert!(report.errors.is_empty());
@@ -731,7 +356,7 @@ mod tests {
             let dest = root.join("bin").join(bin_name);
             assert_eq!(
                 std::fs::read(&dest).unwrap(),
-                b"#!new bundled yazi",
+                b"#!new bundled btm",
                 "essentials binary must be overwritten"
             );
         });

@@ -29,30 +29,30 @@ will be added as new subsystems come online.
 - [anyhow](https://github.com/dtolnay/anyhow) — MIT / Apache-2.0
 - [thiserror](https://github.com/dtolnay/thiserror) — MIT / Apache-2.0
 
-## Bundled essentials (C21.5)
+## Bundled essentials
 
 rimeterm's release archive **bundles prebuilt binaries** for the
 following tools so first launch works with no extra installs. All
-are permissively licensed and redistribution-friendly. Pinned
-versions live at [`essentials/VERSIONS.toml`](essentials/VERSIONS.toml);
-bump per rimeterm release.
+are permissively licensed. Pinned versions live at
+[`essentials/VERSIONS.toml`](essentials/VERSIONS.toml).
 
-**Quadrant tools:**
-- [yazi](https://github.com/sxyazi/yazi) — MIT. File manager (files quadrant).
-- [gitui](https://github.com/gitui-org/gitui) — MIT. Git TUI.
-- [bottom](https://github.com/ClementTsang/bottom) — MIT. System monitor.
+- [bottom](https://github.com/ClementTsang/bottom) — MIT. System monitor
+  (pinned first tab in the shells column).
 
-**Yazi Quick Look previewers:**
-- [bat](https://github.com/sharkdp/bat) — MIT / Apache-2.0.
-  Syntax-highlighted text/code preview (Yazi's default text handler).
-- [glow](https://github.com/charmbracelet/glow) — MIT. Markdown preview.
-- [chafa](https://hpjansson.org/chafa/) — LGPL-3.0. Image preview
-  fallback (used when the terminal doesn't support Kitty / iTerm2 /
-  Sixel graphics protocols). Rehosted under the `essentials-mirror`
-  release tag because upstream doesn't publish to GitHub Releases;
-  `aarch64-apple-darwin` is skipped since upstream has no macOS
-  build (macOS terminals almost always support Kitty or iTerm2 image
-  protocols so chafa isn't needed there).
+## Native files / git stack
+
+Files and Git are Native panes compiled into rimeterm — no external
+processes. The stack:
+
+- [tui-file-explorer](https://github.com/sorinirimies/tui-file-explorer) — MIT.
+  Two-pane keyboard-driven explorer used by `FileManagerPane` (via the
+  `caozisheng/tui-file-explorer` fork adding `draw_in` + deferred
+  mutation APIs).
+- [gix](https://github.com/GitoxideLabs/gitoxide) / [gix-diff] — MIT /
+  Apache-2.0. Pure-Rust Git implementation powering `GitPane`.
+- [tree-sitter](https://tree-sitter.github.io/tree-sitter/) +
+  [tree-sitter-highlight] — MIT. Incremental parser used for diff syntax
+  highlighting. Grammars: `tree-sitter-{rust,c,cpp,python,javascript,typescript,json,toml-ng,yaml,bash}` (all MIT).
 
 **Extension slot (plugins, on-demand):**
 - [trippy](https://github.com/fujiapple852/trippy) — MIT / Apache-2.0.

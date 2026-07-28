@@ -21,7 +21,7 @@ pub mod tabs;
 
 pub use app_menu::{AppMenu, AppMenuItem};
 pub use command::{Command, CommandId, CommandRegistry};
-pub use event::{EventBus, KernelEvent};
+pub use event::{EventBus, FileSide, KernelEvent};
 pub use focus::FocusManager;
 pub use layout::{LayoutNode, LayoutTree};
 pub use pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};

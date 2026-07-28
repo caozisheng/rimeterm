@@ -12,15 +12,17 @@
 pub mod agents_state;
 pub mod assets;
 pub mod env;
+pub mod files_state;
 pub mod install_hint;
 pub mod layout_state;
+pub mod migrate;
 pub mod paths;
 
 #[doc(hidden)]
 pub mod test_util;
 pub mod tools;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +34,7 @@ pub struct Config {
     pub ui: UiConfig,
     pub agents: AgentsConfig,
     pub files: FilesConfig,
+    pub git: GitConfig,
     pub sysmon: SysmonConfig,
     pub mouse: MouseConfig,
     pub viewer: ViewerConfig,
@@ -209,52 +212,64 @@ pub struct ExternalToolSpec {
 /// Alias kept for M3 callers. Prefer `ExternalToolSpec`.
 pub type AgentSpec = ExternalToolSpec;
 
-/// Files quadrant (`yazi`, `gitui`, …). Fixed tab-group; user can reorder or
-/// swap in alternatives via config but rimeterm hardcodes the *group* itself.
+/// Files quadrant — the native two-pane file manager (post
+/// native-file-git refactor). No more `[[files.tabs]]` array; these
+/// are user-tweakable **defaults** consumed by the file-manager panes
+/// at startup and mirrored into per-workspace [`FilesState`] the
+/// first time a workspace is opened.
+///
+/// [`FilesState`]: crate::files_state::FilesState
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FilesConfig {
-    pub tabs: Vec<ExternalToolSpec>,
+    /// Default directory shown by the left pane on first open of a
+    /// workspace. Interpreted relative to the workspace root when
+    /// relative; absolute paths are honoured as-is.
+    pub left_dir: PathBuf,
+    /// Default directory shown by the right pane on first open.
+    pub right_dir: PathBuf,
+    /// Whether hidden entries are visible by default.
+    pub show_hidden: bool,
+    /// Stable sort-mode label (`"name"`, `"modified"`, …).
+    pub sort: String,
+    /// Whether both panes are visible by default.
+    pub dual_pane: bool,
 }
 
 impl Default for FilesConfig {
     fn default() -> Self {
-        use crate::install_hint::InstallHint;
         Self {
-            tabs: vec![
-                ExternalToolSpec {
-                    id: "yazi".into(),
-                    label: "yazi".into(),
-                    command: vec!["yazi".into()],
-                    install_hint: Some(
-                        InstallHint {
-                            winget: Some("winget install sxyazi.yazi"),
-                            scoop: Some("scoop install yazi"),
-                            brew: Some("brew install yazi"),
-                            linux: Some("see https://yazi-rs.github.io/docs/installation"),
-                            cargo: Some("cargo install --locked yazi-fm yazi-cli"),
-                            note: Some("optional image preview needs ImageMagick / ffmpeg"),
-                        }
-                        .to_string(),
-                    ),
-                },
-                ExternalToolSpec {
-                    id: "gitui".into(),
-                    label: "gitui".into(),
-                    command: vec!["gitui".into()],
-                    install_hint: Some(
-                        InstallHint {
-                            winget: Some("winget install StephanDilly.gitui"),
-                            scoop: Some("scoop install gitui"),
-                            brew: Some("brew install gitui"),
-                            linux: Some("sudo pacman -S gitui (Arch); see repo for other distros"),
-                            cargo: Some("cargo install --locked gitui"),
-                            note: None,
-                        }
-                        .to_string(),
-                    ),
-                },
-            ],
+            left_dir: PathBuf::from("."),
+            right_dir: PathBuf::from("."),
+            show_hidden: false,
+            sort: "name".into(),
+            dual_pane: true,
+        }
+    }
+}
+
+/// Git integration — the native diff / commit-log viewer that
+/// replaces the retired gitui external tool.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GitConfig {
+    /// Master switch for the native git panes. When `false` the git
+    /// column is hidden and no `gix` calls run.
+    pub enabled: bool,
+    /// Cap on the number of commits fetched for the log view. Bounded
+    /// so a monorepo with 100k+ commits doesn't stall startup.
+    pub commit_limit: u32,
+    /// Diff-view layout: `"auto"` (splits by terminal width),
+    /// `"unified"` (single column), or `"split"` (two columns).
+    pub diff_layout: String,
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            commit_limit: 200,
+            diff_layout: "auto".into(),
         }
     }
 }
@@ -367,13 +382,31 @@ mod tests {
     }
 
     #[test]
-    fn default_files_config_has_yazi_gitui() {
-        let ids: Vec<_> = FilesConfig::default()
-            .tabs
-            .iter()
-            .map(|s| s.id.clone())
-            .collect();
-        assert_eq!(ids, vec!["yazi".to_string(), "gitui".to_string()]);
+    fn default_files_config_matches_native_two_pane_schema() {
+        let f = FilesConfig::default();
+        assert_eq!(f.left_dir, PathBuf::from("."));
+        assert_eq!(f.right_dir, PathBuf::from("."));
+        assert!(!f.show_hidden);
+        assert_eq!(f.sort, "name");
+        assert!(f.dual_pane);
+    }
+
+    #[test]
+    fn default_git_config_matches_native_schema() {
+        let g = GitConfig::default();
+        assert!(g.enabled);
+        assert_eq!(g.commit_limit, 200);
+        assert_eq!(g.diff_layout, "auto");
+    }
+
+    #[test]
+    fn files_git_partial_toml_only_overrides_named_fields() {
+        let cfg: Config =
+            toml::from_str("[files]\nshow_hidden = true\n[git]\ncommit_limit = 42\n").unwrap();
+        assert!(cfg.files.show_hidden);
+        assert_eq!(cfg.files.sort, "name");
+        assert_eq!(cfg.git.commit_limit, 42);
+        assert!(cfg.git.enabled);
     }
 
     #[test]

@@ -57,12 +57,11 @@ impl Keymap {
         if matches!(key.code, KeyCode::F(1)) {
             return KeymapOutcome::Run("app.palette.open");
         }
-        // F5: force-refresh gitui (BUG-1a). Reflects external repo
-        // mutations (git commits from a shell tab, agent `git rebase`,
-        // external editor changes) that don't move `active_repo_root`
-        // and therefore wouldn't trip the yazi-cwd repo-boundary path.
+        // F5: reload the focused left-column pane. Files-focused reloads
+        // the native explorer; git-focused surfaces a "git pane pending"
+        // hint until the native git provider lands.
         if matches!(key.code, KeyCode::F(5)) {
-            return KeymapOutcome::Run("git.refresh");
+            return KeymapOutcome::Run("workspace.pane.reload");
         }
         // Ctrl+T / Ctrl+W: new / close shell tab (only meaningful when shells
         // group is focused; the command handler will validate policy).

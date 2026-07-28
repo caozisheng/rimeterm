@@ -1,68 +1,12 @@
 # Pinned upstream versions for the C21.5 essentials bundle.
 #
-# Per-tool block declares:
-#   version           — upstream release version (used verbatim in URLs
-#                       after the `tag_prefix`)
-#   repo              — owner/repo on GitHub for the release download URL
-#   tag_prefix        — usually "v", but bottom's tags omit the v so we
-#                       set it to "" there. Full tag = "{tag_prefix}{version}"
-#   assets_per_target — explicit map<Rust target triple → asset filename>.
-#                       Explicit beats template — some upstreams (gitui)
-#                       don't use Rust triples in their filenames at all.
-#   ext_per_target    — map<triple → archive extension>. Drives which
-#                       `tar` flag the fetch script picks.
-#   binaries.files    — list of binary basenames the archive contains;
-#                       fetch script adds `.exe` on Windows automatically.
-#   sha256            — map<asset filename → SHA-256>. Bootstrap-friendly:
-#                       empty hash accepts + records. Populate at release
-#                       time; subsequent runs verify against the pin.
-#
-# When bumping a tool: bump `version` + verify each `assets_per_target`
-# entry still resolves + verify the SHA-256 pins are still valid.
-
-[yazi]
-version = "26.5.6"
-repo = "sxyazi/yazi"
-tag_prefix = "v"
-[yazi.assets_per_target]
-x86_64-unknown-linux-gnu = "yazi-x86_64-unknown-linux-gnu.zip"
-aarch64-apple-darwin = "yazi-aarch64-apple-darwin.zip"
-x86_64-pc-windows-msvc = "yazi-x86_64-pc-windows-msvc.zip"
-[yazi.ext_per_target]
-x86_64-unknown-linux-gnu = "zip"
-aarch64-apple-darwin = "zip"
-x86_64-pc-windows-msvc = "zip"
-[yazi.binaries]
-files = ["yazi", "ya"]
-[yazi.sha256]
-"yazi-x86_64-unknown-linux-gnu.zip" = ""
-"yazi-aarch64-apple-darwin.zip" = ""
-"yazi-x86_64-pc-windows-msvc.zip" = ""
-
-[gitui]
-version = "0.28.1"
-repo = "gitui-org/gitui"
-tag_prefix = "v"
-[gitui.assets_per_target]
-# gitui doesn't use Rust triples — the assets are named per platform.
-x86_64-unknown-linux-gnu = "gitui-linux-x86_64.tar.gz"
-aarch64-apple-darwin = "gitui-mac.tar.gz"
-x86_64-pc-windows-msvc = "gitui-win.tar.gz"
-[gitui.ext_per_target]
-x86_64-unknown-linux-gnu = "tar.gz"
-aarch64-apple-darwin = "tar.gz"
-x86_64-pc-windows-msvc = "tar.gz"
-[gitui.binaries]
-files = ["gitui"]
-[gitui.sha256]
-"gitui-linux-x86_64.tar.gz" = ""
-"gitui-mac.tar.gz" = ""
-"gitui-win.tar.gz" = ""
+# After the native-file-git refactor the essentials set collapsed to
+# just `bottom` — files/git are now Native panes (see
+# docs/rimeterm-change-file-and-git-design.md).
 
 [bottom]
 version = "0.14.6"
 repo = "ClementTsang/bottom"
-# bottom's tags omit the `v` prefix. `URL = /releases/download/0.14.6/...`
 tag_prefix = ""
 [bottom.assets_per_target]
 x86_64-unknown-linux-gnu = "bottom_x86_64-unknown-linux-gnu.tar.gz"
@@ -78,66 +22,3 @@ files = ["btm"]
 "bottom_x86_64-unknown-linux-gnu.tar.gz" = ""
 "bottom_aarch64-apple-darwin.tar.gz" = ""
 "bottom_x86_64-pc-windows-msvc.zip" = ""
-
-[bat]
-version = "0.26.1"
-repo = "sharkdp/bat"
-tag_prefix = "v"
-[bat.assets_per_target]
-x86_64-unknown-linux-gnu = "bat-v0.26.1-x86_64-unknown-linux-gnu.tar.gz"
-aarch64-apple-darwin = "bat-v0.26.1-aarch64-apple-darwin.tar.gz"
-x86_64-pc-windows-msvc = "bat-v0.26.1-x86_64-pc-windows-msvc.zip"
-[bat.ext_per_target]
-x86_64-unknown-linux-gnu = "tar.gz"
-aarch64-apple-darwin = "tar.gz"
-x86_64-pc-windows-msvc = "zip"
-[bat.binaries]
-files = ["bat"]
-[bat.sha256]
-"bat-v0.26.1-x86_64-unknown-linux-gnu.tar.gz" = ""
-"bat-v0.26.1-aarch64-apple-darwin.tar.gz" = ""
-"bat-v0.26.1-x86_64-pc-windows-msvc.zip" = ""
-
-[glow]
-version = "2.1.2"
-repo = "charmbracelet/glow"
-tag_prefix = "v"
-[glow.assets_per_target]
-x86_64-unknown-linux-gnu = "glow_2.1.2_Linux_x86_64.tar.gz"
-aarch64-apple-darwin = "glow_2.1.2_Darwin_arm64.tar.gz"
-x86_64-pc-windows-msvc = "glow_2.1.2_Windows_x86_64.zip"
-[glow.ext_per_target]
-x86_64-unknown-linux-gnu = "tar.gz"
-aarch64-apple-darwin = "tar.gz"
-x86_64-pc-windows-msvc = "zip"
-[glow.binaries]
-files = ["glow"]
-[glow.sha256]
-"glow_2.1.2_Linux_x86_64.tar.gz" = ""
-"glow_2.1.2_Darwin_arm64.tar.gz" = ""
-"glow_2.1.2_Windows_x86_64.zip" = ""
-
-# chafa has no GitHub prebuilt from the upstream repo, so we re-host
-# the vendor's stand-alone binaries (from hpjansson.org/chafa/download)
-# under a dedicated `essentials-mirror` tag in caozisheng/rimeterm.
-# See docs/essentials-mirror.md for the upload procedure.
-#
-# macOS is skipped: upstream ships no aarch64-apple-darwin build,
-# and Yazi image preview on macOS uses Kitty/iTerm2 graphics
-# protocols first anyway. Users on other Macs can `brew install chafa`.
-[chafa]
-version = "1.18.2"
-repo = "caozisheng/rimeterm"
-mirror_release_tag = "essentials-mirror"
-skip_targets = ["aarch64-apple-darwin"]
-[chafa.assets_per_target]
-x86_64-unknown-linux-gnu = "chafa-1.18.2-1-x86_64-linux-gnu.tar.gz"
-x86_64-pc-windows-msvc = "chafa-1.18.2-1-x86_64-windows.zip"
-[chafa.ext_per_target]
-x86_64-unknown-linux-gnu = "tar.gz"
-x86_64-pc-windows-msvc = "zip"
-[chafa.binaries]
-files = ["chafa"]
-[chafa.sha256]
-"chafa-1.18.2-1-x86_64-linux-gnu.tar.gz" = "deb149bc8823589f635f24db3ecc83b7daa86e4c20d8a9f58e9ce53bd97bdda9"
-"chafa-1.18.2-1-x86_64-windows.zip" = "dcd3245c31851eef11eb077fefc12c6c76f3b0616754f0275fa8c3cb1e694165"

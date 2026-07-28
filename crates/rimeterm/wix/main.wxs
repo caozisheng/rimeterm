@@ -5,13 +5,11 @@
   Layout under `%ProgramFiles%\rimeterm\`:
     rimeterm.exe
     rimectl.exe
-    essentials\             <- prebuilt yazi/gitui/bottom (see release CI)
-        yazi.exe
-        ya.exe
-        gitui.exe
+    essentials\             <- prebuilt bottom (see release CI)
         btm.exe
         VERSIONS.toml
     LICENSE, ACKNOWLEDGEMENTS.md, README.md
+
   On install:
     - copies the whole tree under `%ProgramFiles%\rimeterm\`
     - appends `%ProgramFiles%\rimeterm` to the MACHINE `PATH` so both
@@ -101,46 +99,10 @@
 
                     <!-- Bundled essentials sibling -->
                     <Directory Id="EssentialsDir" Name="essentials">
-                        <Component Id="YaziExe" Guid="61F793B8-24E4-9371-05FC-C2C09F0F6F75" Win64="yes">
-                            <File Id="YaziExeFile"
-                                  Name="yazi.exe"
-                                  Source="$(var.EssentialsDir)\yazi.exe"
-                                  KeyPath="yes" />
-                        </Component>
-                        <Component Id="YaExe" Guid="7208A4C9-35F5-A482-1607-D3D1AF0F8086" Win64="yes">
-                            <File Id="YaExeFile"
-                                  Name="ya.exe"
-                                  Source="$(var.EssentialsDir)\ya.exe"
-                                  KeyPath="yes" />
-                        </Component>
-                        <Component Id="GituiExe" Guid="8319B5DA-4606-B593-2718-E4E2BF0F9197" Win64="yes">
-                            <File Id="GituiExeFile"
-                                  Name="gitui.exe"
-                                  Source="$(var.EssentialsDir)\gitui.exe"
-                                  KeyPath="yes" />
-                        </Component>
                         <Component Id="BtmExe" Guid="942AC6EB-5717-C6A4-3829-F5F3CF0FA2A8" Win64="yes">
                             <File Id="BtmExeFile"
                                   Name="btm.exe"
                                   Source="$(var.EssentialsDir)\btm.exe"
-                                  KeyPath="yes" />
-                        </Component>
-                        <Component Id="BatExe" Guid="B53CD7FD-6829-D7B6-593B-1715AEFF00CA" Win64="yes">
-                            <File Id="BatExeFile"
-                                  Name="bat.exe"
-                                  Source="$(var.EssentialsDir)\bat.exe"
-                                  KeyPath="yes" />
-                        </Component>
-                        <Component Id="GlowExe" Guid="C54EE80D-793B-E9C7-6A5C-2826BFFF00CB" Win64="yes">
-                            <File Id="GlowExeFile"
-                                  Name="glow.exe"
-                                  Source="$(var.EssentialsDir)\glow.exe"
-                                  KeyPath="yes" />
-                        </Component>
-                        <Component Id="ChafaExe" Guid="D65FF91E-8A4C-FAD8-7B6D-3937CFFF00DC" Win64="yes">
-                            <File Id="ChafaExeFile"
-                                  Name="chafa.exe"
-                                  Source="$(var.EssentialsDir)\chafa.exe"
                                   KeyPath="yes" />
                         </Component>
                         <Component Id="VersionsToml" Guid="A53BD7FC-6828-D7B5-493A-06040DFF00B9" Win64="yes">
@@ -217,13 +179,7 @@
         <Feature Id="Complete" Level="1" Title="rimeterm" Description="rimeterm + essentials">
             <ComponentRef Id="RimetermExe" />
             <ComponentRef Id="RimectlExe" />
-            <ComponentRef Id="YaziExe" />
-            <ComponentRef Id="YaExe" />
-            <ComponentRef Id="GituiExe" />
             <ComponentRef Id="BtmExe" />
-            <ComponentRef Id="BatExe" />
-            <ComponentRef Id="GlowExe" />
-            <ComponentRef Id="ChafaExe" />
             <ComponentRef Id="VersionsToml" />
             <ComponentRef Id="LicenseDoc" />
             <ComponentRef Id="ReadmeDoc" />

@@ -45,7 +45,7 @@ async function main() {
   }
   const pins = parseToml(await fs.readFile(versionsPath, "utf8"));
 
-  for (const tool of ["yazi", "gitui", "bottom", "bat", "glow", "chafa"]) {
+  for (const tool of ["bottom"]) {
     const pin = pins[tool];
     if (pin && pin.enabled === "false") {
       console.log(`== ${tool} disabled in VERSIONS.toml (enabled=false), skipping`);
