@@ -4,10 +4,11 @@
 //! implemented by PTY host / WASM host / native panes. This crate defines only
 //! the trait shape and the [`PaneId`] namespace; no rendering.
 
+use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossterm::event::{KeyEvent, MouseEvent};
-use ratatui::buffer::Buffer;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 
 use crate::event::KernelEvent;
@@ -85,6 +86,16 @@ pub struct RenderOutcome {
 /// - request focus via [`PaneRenderCtx`],
 /// - allocate scratch buffers, but reuse across frames.
 pub trait PaneProvider: Send + 'static {
+    /// Downcast hook for callers that need concrete provider access
+    /// (e.g. the app's file-manager → git-pane cwd bridge). Default
+    /// returns `None`; concrete panes override to expose themselves.
+    fn as_any(&self) -> Option<&dyn Any> {
+        None
+    }
+    fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
+        None
+    }
+
     /// Stable id assigned by the kernel at construction.
     fn id(&self) -> PaneId;
 
@@ -105,8 +116,8 @@ pub trait PaneProvider: Send + 'static {
         false
     }
 
-    /// Draw into `buf` clipped to `area`. Must be pure (no side-effecting I/O).
-    fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &PaneRenderCtx) -> RenderOutcome;
+    /// Draw into `area` of the current frame. Must be pure (no side-effecting I/O).
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>, ctx: &PaneRenderCtx) -> RenderOutcome;
 
     /// Handle a focused key event. Return `true` if consumed, else the kernel
     /// forwards to global keymap fallbacks.
@@ -141,6 +152,19 @@ pub trait PaneProvider: Send + 'static {
     fn set_scrollback_enabled(&mut self, on: bool) {
         let _ = on;
     }
+
+    /// Apply completed background work. Return `true` when visible state changed.
+    ///
+    /// The app calls this from its main loop, never from `render`.
+    fn poll_background(&mut self) -> bool {
+        false
+    }
+
+    /// Reload the pane's content in place. Providers that source data
+    /// from disk (native file manager, editor) reread it and drop any
+    /// caches; PTY / placeholder providers keep the default no-op. Bound
+    /// to F5 via `workspace.pane.reload`.
+    fn reload(&mut self) {}
 
     /// Deliver a kernel event this pane subscribed to.
     fn on_event(&mut self, ev: &KernelEvent) {
@@ -187,19 +211,6 @@ pub trait PaneProvider: Send + 'static {
     fn set_right_click_paste(&mut self, on: bool) {
         let _ = on;
     }
-
-    /// §19.14.1: hand the pane a `[parent, current, preview]` ratio so
-    /// it can split its inner rect into three zones and route `Down(Left)`
-    /// / `Down(Right)` differently in the read-only preview column
-    /// (Quick Look). `None` disables zoning and falls back to the plain
-    /// passthrough / local-selection dichotomy.
-    ///
-    /// Called on the yazi tab in the files group. gitui and every
-    /// non-files PTY pane keeps the default `None`.
-    fn set_yazi_layout(&mut self, layout: Option<[u8; 3]>) {
-        let _ = layout;
-    }
-
     /// Force any in-flight PTY resize (throttled by §19.12.6) to apply
     /// immediately. NativePane providers keep the default no-op; PtyPane
     /// overrides to flush the pending size to the underlying pseudo-console.

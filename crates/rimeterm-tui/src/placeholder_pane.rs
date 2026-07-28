@@ -5,7 +5,7 @@
 //! once the corresponding milestone lands.
 
 use crossterm::event::KeyEvent;
-use ratatui::buffer::Buffer;
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -82,7 +82,8 @@ impl PaneProvider for PlaceholderPane {
         }
     }
 
-    fn render(&mut self, area: Rect, buf: &mut Buffer, ctx: &PaneRenderCtx) -> RenderOutcome {
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>, ctx: &PaneRenderCtx) -> RenderOutcome {
+        let buf = frame.buffer_mut();
         // Focus visuals: match PtyPane — focused = bright + bold + `▶` marker,
         // unfocused = dim grey. Placeholder-specific `self.color` still tints
         // the border on focus so different tools stay visually distinct.

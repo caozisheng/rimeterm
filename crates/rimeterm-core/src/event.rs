@@ -11,13 +11,24 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::pane::PaneId;
 
+/// Which native file-manager column produced an event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileSide {
+    /// Left explorer column.
+    Left,
+    /// Right explorer column.
+    Right,
+}
+
 /// Everything the kernel broadcasts. Plugins subscribe or ignore per event.
 #[derive(Clone, Debug)]
 pub enum KernelEvent {
-    /// yazi (in files:yazi:active) reported a directory change. Contract A:
-    /// consumers MAY log / update status / feed agents, but MUST NOT auto-cd
-    /// any shell — see §19.3-A.
-    YaziCwdChanged { origin: PaneId, path: PathBuf },
+    /// The native file manager changed the focused column or its directory.
+    FileManagerCwdChanged {
+        origin: PaneId,
+        side: FileSide,
+        path: PathBuf,
+    },
 
     /// A shell tab reported its `$PWD` via OSC 7. Broadcast, no side effects.
     ShellCwdChanged {
@@ -26,8 +37,14 @@ pub enum KernelEvent {
         path: PathBuf,
     },
 
-    /// yazi cursor landed on a file (§19.3-B trigger source).
-    FileSelected { origin: PaneId, path: PathBuf },
+    /// The native file-manager highlight moved to a path.
+    FileSelected {
+        origin: PaneId,
+        side: FileSide,
+        path: PathBuf,
+    },
+    /// A native file mutation changed one or more paths.
+    FileSystemChanged { origin: PaneId, paths: Vec<PathBuf> },
 
     /// Configuration file was reloaded from disk; consumers reread their slice.
     ConfigReloaded,

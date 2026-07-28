@@ -70,8 +70,9 @@ pub struct ViewerSource {
     pub kind: ViewerKind,
 }
 
-/// The active-Yazi selection kernel state. `Alt+V` copies this into a
-/// snapshot iff `origin` is still the active files-group pane.
+/// The last file-manager selection captured for the Alt+V viewer.
+/// `Alt+V` copies this into a snapshot when the file-manager pane emits
+/// a `KernelEvent::FileSelected`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectionSnapshot {
     pub origin: PaneId,
@@ -608,8 +609,8 @@ impl ViewerOverlayState {
         focus
     }
 
-    /// Latest active-Yazi selection is NOT propagated into an open
-    /// snapshot (§19.7.20). Callers update their own `last_yazi_selection`
+    /// Latest file-manager selection is NOT propagated into an open
+    /// snapshot (§19.7.20). Callers update their own `last_file_selection`
     /// cache; the state is unaffected.
     pub fn ignore_background_selection(&self, _incoming: &Path) {
         // Intentionally empty. Documented no-op so integration code can

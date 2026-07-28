@@ -1,13 +1,15 @@
 //! **§9.4 Tools Registry** — canonical description of the TUI tools
 //! rimeterm boots into by default.
 //!
-//! C21.5 splits the registry into two tiers:
+//! C21.5 (revised by the native-file-git refactor) splits the registry
+//! into two tiers:
 //!
-//! - **essentials** (`yazi`, `gitui`, `bottom`) — bundled with the
-//!   rimeterm release archive; first-launch extraction drops them into
-//!   [`crate::paths::bin_dir`] and seeds `~/.rimeterm/{yazi,gitui,bottom}/`
-//!   with curated configs. `tools.install <essential>` is a no-op with
+//! - **essentials** (`bottom`) — bundled with the rimeterm release
+//!   archive; first-launch extraction drops the binary into
+//!   [`crate::paths::bin_dir`]. `tools.install bottom` is a no-op with
 //!   `already_bundled`; upgrades ship with new rimeterm releases.
+//!   (Yazi and gitui are retired — the native file / git panes replace
+//!   both external runtimes.)
 //! - **plugins** (`trippy` today, user-added tomorrow) — installed on
 //!   demand via `cargo install --locked --root ~/.rimeterm/plugins/<name>`;
 //!   binaries land in `~/.rimeterm/plugins/<name>/bin/`, configs (when
@@ -52,34 +54,22 @@ pub enum ToolKind {
     Plugin,
 }
 
-/// The three tools rimeterm's default four-quadrant layout requires
-/// (`yazi` for files, `gitui` for git, `bottom` for sysmon).
+/// The single essential the rimeterm shell requires (`bottom` for the
+/// sysmon quadrant). Yazi and gitui were removed in the native-file-git
+/// refactor — their functionality moved into the native file-manager
+/// + git panes.
 ///
-/// Every essential ships as a prebuilt binary alongside `rimeterm` in
-/// the release archive. The `crates` field is retained as a **build
+/// `bottom` ships as a prebuilt binary alongside `rimeterm` in the
+/// release archive. The `crates` field is retained as a **build
 /// recipe** for CI + the rare case a user opts out of the bundle via
 /// `[install.essentials] prefer_system` — it is NOT invoked by
 /// `tools.install` (essentials return `already_bundled`).
-pub const ESSENTIALS_REGISTRY: &[ToolSpec] = &[
-    ToolSpec {
-        name: "yazi",
-        binary: "yazi",
-        crates: &["yazi-fm", "yazi-cli"],
-        hint: "bundled with rimeterm; upgrade by installing a newer rimeterm release",
-    },
-    ToolSpec {
-        name: "gitui",
-        binary: "gitui",
-        crates: &["gitui"],
-        hint: "bundled with rimeterm; upgrade by installing a newer rimeterm release",
-    },
-    ToolSpec {
-        name: "bottom",
-        binary: "btm",
-        crates: &["bottom"],
-        hint: "bundled with rimeterm; upgrade by installing a newer rimeterm release",
-    },
-];
+pub const ESSENTIALS_REGISTRY: &[ToolSpec] = &[ToolSpec {
+    name: "bottom",
+    binary: "btm",
+    crates: &["bottom"],
+    hint: "bundled with rimeterm; upgrade by installing a newer rimeterm release",
+}];
 
 /// Non-essential tools rimeterm knows how to install on demand via
 /// `cargo install --locked --root ~/.rimeterm/plugins/<name>`. Users
@@ -313,11 +303,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn essentials_registry_holds_three_tools() {
-        // Hard-coded — if this fails someone shipped a registry change
-        // without updating the C21.5 design doc §9.4 table.
+    fn essentials_registry_holds_bottom_only() {
+        // Yazi and gitui dropped in the native-file-git refactor —
+        // if this fails someone shipped a registry change without
+        // updating §9.4.
         let names: Vec<&str> = ESSENTIALS_REGISTRY.iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["yazi", "gitui", "bottom"]);
+        assert_eq!(names, vec!["bottom"]);
     }
 
     #[test]
@@ -331,19 +322,21 @@ mod tests {
 
     #[test]
     fn kind_of_matches_registries() {
-        assert_eq!(kind_of("yazi"), Some(ToolKind::Essential));
-        assert_eq!(kind_of("gitui"), Some(ToolKind::Essential));
         assert_eq!(kind_of("bottom"), Some(ToolKind::Essential));
         assert_eq!(kind_of("trippy"), Some(ToolKind::Plugin));
+        // Yazi and gitui are no longer registered — retired.
+        assert_eq!(kind_of("yazi"), None);
+        assert_eq!(kind_of("gitui"), None);
         assert_eq!(kind_of("nope"), None);
         assert_eq!(kind_of(""), None);
     }
 
     #[test]
     fn find_hits_across_both_registries() {
-        assert!(find("yazi").is_some());
         assert!(find("bottom").is_some());
         assert!(find("trippy").is_some());
+        assert!(find("yazi").is_none(), "yazi retired");
+        assert!(find("gitui").is_none(), "gitui retired");
         assert!(find("nope").is_none());
         assert!(find("").is_none());
     }
@@ -397,16 +390,16 @@ mod tests {
         std::fs::create_dir_all(&plug_bin).unwrap();
         std::fs::create_dir_all(&cargo_bin).unwrap();
 
-        let yazi_spec = ESSENTIALS_REGISTRY
+        let bottom_spec = ESSENTIALS_REGISTRY
             .iter()
-            .find(|s| s.name == "yazi")
-            .expect("yazi essential exists");
+            .find(|s| s.name == "bottom")
+            .expect("bottom essential exists");
         let trippy_spec = PLUGIN_REGISTRY
             .iter()
             .find(|s| s.name == "trippy")
             .expect("trippy plugin exists");
 
-        let exe_yazi = platform_exe_name("yazi");
+        let exe_bottom = platform_exe_name(bottom_spec.binary);
         let exe_trip = platform_exe_name("trip");
 
         let ctx = DetectContext {
@@ -416,20 +409,20 @@ mod tests {
         };
 
         // 1. Both managed dirs empty → detector falls through to
-        //    `which::which`. When the host lacks yazi on `$PATH` we
+        //    `which::which`. When the host lacks btm on `$PATH` we
         //    can also assert `Missing`; otherwise skip (still get
         //    coverage from cases 2+3).
-        if which::which(yazi_spec.binary).is_err() {
-            let got = detect_with(yazi_spec, ToolKind::Essential, &ctx);
+        if which::which(bottom_spec.binary).is_err() {
+            let got = detect_with(bottom_spec, ToolKind::Essential, &ctx);
             assert_eq!(got.install_source, InstallSource::Missing);
             assert!(got.detected_path.is_none());
         }
 
-        // 2. Only `bin/yazi(.exe)` present → Essential.
-        std::fs::write(bin_dir.join(&exe_yazi), b"stub").unwrap();
-        let got = detect_with(yazi_spec, ToolKind::Essential, &ctx);
+        // 2. Only `bin/btm(.exe)` present → Essential.
+        std::fs::write(bin_dir.join(&exe_bottom), b"stub").unwrap();
+        let got = detect_with(bottom_spec, ToolKind::Essential, &ctx);
         assert_eq!(got.install_source, InstallSource::Essential);
-        assert_eq!(got.detected_path, Some(bin_dir.join(&exe_yazi)));
+        assert_eq!(got.detected_path, Some(bin_dir.join(&exe_bottom)));
 
         // 3. Only `plugins/trippy/bin/trip(.exe)` present → Plugin.
         std::fs::write(plug_bin.join(&exe_trip), b"stub").unwrap();

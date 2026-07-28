@@ -108,19 +108,25 @@ pub fn plugin_bin_dirs() -> Vec<PathBuf> {
     out.sort();
     out
 }
-/// may edit `init.lua` / `yazi.toml` freely; the `plugins/` subdir under
-/// this path is rewritten by rimeterm on version bumps.
-pub fn yazi_config_dir() -> Option<PathBuf> {
-    home().map(|d| d.join("yazi"))
+
+/// `~/.rimeterm/yazi/` if it exists on disk, otherwise `None`.
+///
+/// The yazi runtime path is retired in the native-file-git refactor.
+/// This helper is intentionally best-effort: it reports the LEGACY
+/// managed sandbox only when it still has state on disk, so the
+/// doctor / cleanup command can surface an "orphaned config" hint
+/// without materialising the directory on every launch.
+pub fn legacy_yazi_dir() -> Option<PathBuf> {
+    let dir = home()?.join("yazi");
+    dir.is_dir().then_some(dir)
 }
 
-/// `~/.rimeterm/gitui/` — rimeterm-owned gitui config sandbox (C21.5).
-///
-/// Gitui reads `$XDG_CONFIG_HOME/gitui/` (Unix) or `%APPDATA%\gitui\`
-/// (Windows). `spawn_external` sets `XDG_CONFIG_HOME=<home>` on Unix or
-/// `APPDATA=<home>` on Windows so both resolve to this directory.
-pub fn gitui_config_dir() -> Option<PathBuf> {
-    home().map(|d| d.join("gitui"))
+/// `~/.rimeterm/gitui/` if it exists on disk, otherwise `None`. Same
+/// contract as [`legacy_yazi_dir`] — the gitui external runtime is
+/// retired in favour of the native git panes.
+pub fn legacy_gitui_dir() -> Option<PathBuf> {
+    let dir = home()?.join("gitui");
+    dir.is_dir().then_some(dir)
 }
 
 /// `~/.rimeterm/bottom/` — rimeterm-owned bottom config sandbox (C21.5).
@@ -297,9 +303,26 @@ mod tests {
                 plugin_config_dir("trippy"),
                 Some(root.join("plugins").join("trippy").join("config"))
             );
-            assert_eq!(yazi_config_dir(), Some(root.join("yazi")));
-            assert_eq!(gitui_config_dir(), Some(root.join("gitui")));
             assert_eq!(bottom_config_dir(), Some(root.join("bottom")));
+        });
+    }
+
+    #[test]
+    fn legacy_dirs_only_reported_when_present_on_disk() {
+        with_rimeterm_home(|root| {
+            // Fresh home → neither legacy dir exists yet.
+            assert_eq!(legacy_yazi_dir(), None);
+            assert_eq!(legacy_gitui_dir(), None);
+
+            // Materialise leftover yazi state → helper reports it so
+            // doctor can flag the orphaned dir.
+            std::fs::create_dir_all(root.join("yazi")).expect("mkdir yazi");
+            assert_eq!(legacy_yazi_dir(), Some(root.join("yazi")));
+            // gitui still missing.
+            assert_eq!(legacy_gitui_dir(), None);
+
+            std::fs::create_dir_all(root.join("gitui")).expect("mkdir gitui");
+            assert_eq!(legacy_gitui_dir(), Some(root.join("gitui")));
         });
     }
 

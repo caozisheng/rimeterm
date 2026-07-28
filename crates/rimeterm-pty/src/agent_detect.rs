@@ -1,10 +1,11 @@
 //! Detect whether an external tool binary is installed on PATH.
 //!
-//! **Design decision (v0.2)**: rimeterm doesn't bundle third-party tools.
-//! Agents (`omp` / `codex` / `claude`) and the file/git/monitor group members
-//! (`yazi` / `gitui` / `bottom` / `bandwhich` / `trippy`) are all discovered
-//! via `which` at startup. Missing binaries surface a placeholder pane with
-//! the user-configured install hint; present binaries spawn a PTY.
+//! **Design decision (v0.2)**: rimeterm doesn't bundle third-party tools
+//! beyond the sysmon `bottom` binary shipped in `essentials/`. Agents
+//! (`omp` / `codex` / `claude` / `pi`) and the remaining sysmon plugins
+//! (`trippy`) are all discovered via `which` at startup. Missing
+//! binaries surface a placeholder pane with the user-configured install
+//! hint; present binaries spawn a PTY.
 //!
 //! This module intentionally does no version parsing / `--version` spawn:
 //! probing is on the hot startup path.

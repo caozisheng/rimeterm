@@ -12,11 +12,10 @@
 //!    §6.2 Windows guarantees.
 //! 2. **PATH prepend**: `~/.rimeterm/bin/` + `~/.rimeterm/plugins/*/bin/`
 //!    + inherited `$PATH`. See [`crate::paths::augmented_path_env`].
-//! 3. **Per-tool config sandbox**: `YAZI_CONFIG_HOME` for yazi,
-//!    `XDG_CONFIG_HOME` (Unix) or `APPDATA` (Windows) for gitui,
-//!    `BTM_CONFIG_LOCATION` for bottom. Injected only when `tool_id`
-//!    matches. Plugins get nothing — their crate-specific env (if any)
-//!    is documented in the plugin registry.
+//! 3. **Per-tool config sandbox**: `BTM_CONFIG_LOCATION` for `bottom`.
+//!    The yazi and gitui sandboxes are retired in the native-file-git
+//!    refactor; only `bottom` remains. Plugins get nothing — their
+//!    crate-specific env (if any) is documented in the plugin registry.
 
 /// Build the `env` vec passed to [`rimeterm_pty::SessionConfig`]. Kept
 /// static-string-free at the entry point so callers can pass a
@@ -24,10 +23,10 @@
 ///
 /// - `tool_id: None` → generic case (shells, unknown externals). Base
 ///   env + PATH prepend only.
-/// - `tool_id: Some("yazi" | "gitui" | "bottom")` → same as above plus
-///   the tool's config-sandbox env.
-/// - `tool_id: Some(<plugin>)` → same as `None` for now; plugin
-///   registry entries may declare custom env in a future revision.
+/// - `tool_id: Some("bottom")` → same as above plus bottom's config
+///   sandbox pointer.
+/// - `tool_id: Some(<other>)` → same as `None`; plugin registry entries
+///   may declare custom env in a future revision.
 pub fn default_env(tool_id: Option<&str>) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = vec![
         ("PYTHONIOENCODING".into(), "utf-8".into()),
@@ -36,29 +35,11 @@ pub fn default_env(tool_id: Option<&str>) -> Vec<(String, String)> {
     if let Some(pair) = crate::paths::augmented_path_env() {
         env.push(pair);
     }
-    match tool_id {
-        Some("yazi") => {
-            if let Some(dir) = crate::paths::yazi_config_dir() {
-                env.push(("YAZI_CONFIG_HOME".into(), dir.display().to_string()));
-            }
+    if let Some("bottom") = tool_id {
+        if let Some(dir) = crate::paths::bottom_config_dir() {
+            let cfg_file = dir.join("bottom.toml");
+            env.push(("BTM_CONFIG_LOCATION".into(), cfg_file.display().to_string()));
         }
-        Some("gitui") => {
-            if let Some(home) = crate::paths::home() {
-                let key = if cfg!(windows) {
-                    "APPDATA"
-                } else {
-                    "XDG_CONFIG_HOME"
-                };
-                env.push((key.into(), home.display().to_string()));
-            }
-        }
-        Some("bottom") => {
-            if let Some(dir) = crate::paths::bottom_config_dir() {
-                let cfg_file = dir.join("bottom.toml");
-                env.push(("BTM_CONFIG_LOCATION".into(), cfg_file.display().to_string()));
-            }
-        }
-        _ => {}
     }
     env
 }
@@ -115,36 +96,6 @@ mod tests {
     }
 
     #[test]
-    fn yazi_gets_config_home() {
-        with_home(|root| {
-            let env = default_env(Some("yazi"));
-            let expected = root.join("yazi").display().to_string();
-            let hit = env
-                .iter()
-                .find(|(k, _)| k == "YAZI_CONFIG_HOME")
-                .expect("YAZI_CONFIG_HOME injected");
-            assert_eq!(hit.1, expected);
-        });
-    }
-
-    #[test]
-    fn gitui_env_key_is_platform_specific() {
-        with_home(|root| {
-            let env = default_env(Some("gitui"));
-            let key = if cfg!(windows) {
-                "APPDATA"
-            } else {
-                "XDG_CONFIG_HOME"
-            };
-            let hit = env
-                .iter()
-                .find(|(k, _)| k == key)
-                .unwrap_or_else(|| panic!("{key} injected"));
-            assert_eq!(hit.1, root.display().to_string());
-        });
-    }
-
-    #[test]
     fn bottom_gets_config_file_path() {
         with_home(|root| {
             let env = default_env(Some("bottom"));
@@ -158,6 +109,22 @@ mod tests {
                 .find(|(k, _)| k == "BTM_CONFIG_LOCATION")
                 .expect("BTM_CONFIG_LOCATION injected");
             assert_eq!(hit.1, expected);
+        });
+    }
+
+    #[test]
+    fn yazi_and_gitui_no_longer_get_sandbox_env() {
+        with_home(|_| {
+            for tool in ["yazi", "gitui"] {
+                let env = default_env(Some(tool));
+                assert!(
+                    env.iter().all(|(k, _)| !matches!(
+                        k.as_str(),
+                        "YAZI_CONFIG_HOME" | "XDG_CONFIG_HOME" | "APPDATA"
+                    )),
+                    "retired {tool} env keys must not appear, got {env:?}",
+                );
+            }
         });
     }
 

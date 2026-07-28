@@ -4,21 +4,23 @@
 //!
 //! ```text
 //! ┌ ≡ rimeterm ─── workspace ─── shell: pwsh 7 ─┐
-//! │ ┤ files ├ …           │ ┤ agents ├ …       │
-//! │  (yazi)               │  (omp/pi/…)        │
-//! │                       │                    │
-//! ├───────────────────────┼────────────────────┤
-//! │ ┤ git ├ …             │ ┤ shells ├ …       │
-//! │  (gitui)              │  (bottom/shell-1)  │
-//! └ hint bar ──────────────────────────────────┘
+//! │ ┤ files ├ …              │ ┤ agents ├ …    │
+//! │  (native two-pane fm)    │  (omp/pi/…)     │
+//! │                          │                 │
+//! ├──────────────────────────┼─────────────────┤
+//! │ ┤ git ├ …                │ ┤ shells ├ …    │
+//! │  (native gix + bottom)   │  (pwsh/bash/…)  │
+//! └ hint bar ───────────────────────────────────┘
 //! ```
 //!
 //! Both columns split vertically: files/git stack on the left,
-//! agents/shells on the right. The shells group contains bottom as
-//! the first tab, followed by shell tabs. The Alt+V viewer is now a
-//! modal overlay covering the ENTIRE left column (files+git) rather
-//! than a tab in the files group; it dismisses via `[×]`, bare `←`,
-//! `Esc`, or a second `Alt+V`.
+//! agents/shells on the right. The git group is Fixed — the native
+//! `GitPane` sits as the first tab, followed by pinned read-only
+//! side-panes (bottom today, more plugins later). The shells group
+//! holds only interactive shell tabs. The Alt+V viewer is a modal
+//! overlay covering the ENTIRE left column (files+git) rather than a
+//! tab in the files group; it dismisses via `[×]`, bare `←`, `Esc`,
+//! or a second `Alt+V`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,7 +37,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use rimeterm_config::Config;
 use rimeterm_core::app_menu::AppMenu;
 use rimeterm_core::command::{Command, CommandRegistry};
-use rimeterm_core::event::{EventBus, KernelEvent};
+use rimeterm_core::event::EventBus;
 use rimeterm_core::focus::FocusManager;
 use rimeterm_core::layout::{LayoutNode, LayoutTree};
 use rimeterm_core::pane::{PaneId, PaneProvider, PaneRenderCtx};
@@ -47,6 +49,7 @@ use rimeterm_pty::{ShellChoice, detect_default_shell};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::file_manager_pane::FileManagerPane;
 use crate::keymap::{Keymap, KeymapOutcome, QUADRANT_COMMANDS, tab_goto_command_id};
 use crate::menu::{
     MenuKeyOutcome, MenuState, handle_key as menu_key, popup_rect as menu_rect,
@@ -88,12 +91,11 @@ struct ActionFlags {
     viewer_open_with_system: AtomicBool,
     viewer_reveal: AtomicBool,
     theme_cycle: AtomicBool,
-    /// Manual gitui refresh (BUG-1a). Bypasses the repo-root debounce
-    /// so users can force a respawn after external repo mutations
-    /// (`git commit` from a shell tab, agent `git rebase`, external
-    /// editor changes, etc.). Bound to F5 in the keymap and exposed as
-    /// the `git.refresh` command.
-    git_refresh: AtomicBool,
+    /// F5-driven pane reload. When the files group is focused the
+    /// [`FileManagerPane`] reloads both explorer columns; when the git
+    /// group is focused the app surfaces a "git pane pending" hint
+    /// until the native GitPane lands (see `native-file-git` design).
+    pane_reload: AtomicBool,
 }
 
 /// A mutation the IPC handler queues for the main loop. Each variant carries
@@ -157,10 +159,8 @@ pub(crate) enum PaneMutation {
         ack: std::sync::mpsc::SyncSender<Result<String, String>>,
     },
     /// Explicitly set the effective workspace root (`active_root`). Used
-    /// by `workspace.cwd.set` for scripting / diagnostics: lets the user
-    /// prove the label + agent-spawn + gitui-refresh pipeline works
-    /// without relying on yazi's OSC bridge. Same downstream effects as
-    /// a real `cwd.changed` event.
+    /// by `workspace.cwd.set` for scripting / diagnostics: updates the
+    /// status-bar label and the cwd handed to fresh agent tabs.
     SetActiveRoot {
         path: PathBuf,
         ack: std::sync::mpsc::SyncSender<Result<String, String>>,
@@ -275,13 +275,6 @@ pub(crate) struct PendingSpawn {
 /// hasn't printed anything. Not a kill switch — the pane keeps running,
 /// we just stop nagging the hint bar.
 pub(crate) const PENDING_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// BUG-1b flicker guard window. Every watcher install grants gitui
-/// this much time to complete its startup I/O (index refresh, HEAD
-/// read, config read — potentially atime-triggered on Windows NTFS
-/// / Linux `strictatime` mounts) without those events counting toward
-/// a respawn debounce. See `App::git_watch_settle_until` field docs.
-pub(crate) const GIT_WATCH_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Braille dot spinner. One frame per ~100ms of elapsed time so the
 /// animation feels alive without being distracting. 8 frames cycles
@@ -490,46 +483,26 @@ pub struct App {
     /// replaces the previous snapshot. Occupies the entire left
     /// column (both files + git groups) while open.
     viewer: ViewerOverlayState,
-    /// **Derived state** — computed via [`Self::viewer_owns_caret`].
-    /// This field is now unused as a runtime signal (kept only to
-    /// avoid rippling the struct layout while the migration lands).
-    /// Its previous role — a cached "invoked from left column" flag —
-    /// went stale whenever the user changed focus after opening the
-    /// viewer (v0.1.23 BUG-2 residual: shell/agent cursor stopped
-    /// blinking because Alt+HJKL never refreshed this cache). All
-    /// call sites now read `Self::viewer_owns_caret` instead.
-    /// PaneId of the yazi tab in the files group, if any. Cached at
-    /// startup so `close_viewer_overlay` can restore focus to yazi
-    /// specifically. `None` when the user has removed yazi from
-    /// `[files] tabs` in their config — in that case a placeholder
-    /// occupies the slot and focus falls back to whatever the
-    /// viewer captured on open.
-    yazi_pane_id: Option<PaneId>,
-    /// PaneId of the gitui tab in the git group, if any. Symmetric
-    /// to `yazi_pane_id` and consulted by `refresh_gitui_at_active_root`
-    /// to locate the pane it must replace when `cwd.changed` walks
-    /// into a fresh repo.
-    gitui_pane_id: Option<PaneId>,
-    /// Last `file.selected` from the active files:yazi tab. Consumed by
-    /// `Alt+V` to freeze a snapshot.
-    last_yazi_selection: Option<SelectionSnapshot>,
+    /// PaneId of the native file manager in the files group. Cached at
+    /// startup so `close_viewer_overlay` can restore focus and so the
+    /// F5 handler / Alt+V can reach the pane without walking the tree.
+    file_manager_pane_id: Option<PaneId>,
+    /// PaneId of the native Git pane so subscribers can dispatch cwd
+    /// tracking / F5 without walking the layout tree.
+    git_pane_id: Option<PaneId>,
+    /// Last directory reported by the native file manager so the app
+    /// can dispatch `GitPane::refresh_for` whenever it changes.
+    last_file_manager_cwd: Option<PathBuf>,
+    /// Last file-selection event emitted by the file manager pane
+    /// ([`KernelEvent::FileSelected`]). Consumed by `Alt+V` to freeze a
+    /// viewer snapshot and by the right-arrow shortcut that opens the
+    /// hovered file in the modal viewer.
+    last_file_selection: Option<SelectionSnapshot>,
     /// Effective "current workspace root" — where the status bar's
     /// `workspace: xxx` label points, and the cwd handed to freshly
-    /// spawned agent tabs and to any respawn of `gitui`. Seeded from the
-    /// launch-time `workspace_root` and mutated on every `cwd.changed`
-    /// OSC event from a yazi tab in the files group (§19.3-A extension:
-    /// the user asked for gitui + new agents to follow yazi rather than
-    /// stay pinned to the launch dir). Persistent state files
-    /// (`agents.state.toml`, `layout.state.toml`) keep using the frozen
+    /// spawned agent tabs. Seeded from the launch-time `workspace_root`
+    /// and mutated only by explicit `workspace.cwd.set` IPC calls.
     active_root: PathBuf,
-    /// Git repository root that gitui is currently rooted at
-    /// (walked up from [`Self::active_root`] on last respawn). Kept
-    /// around so a `cwd.changed` OSC that lands inside the SAME repo
-    /// (yazi navigating between subdirectories) is a no-op instead of
-    /// spawning a fresh gitui process for every keystroke. `None`
-    /// means either the last `cd` was outside any repo or gitui has
-    /// never been spawned yet.
-    active_repo_root: Option<PathBuf>,
     /// Worker channel: async Markdown/image loaders push completions
     /// here; main loop drains them into [`ViewerOverlayState`].
     viewer_completion_tx: mpsc::UnboundedSender<ViewerCompletion>,
@@ -631,41 +604,6 @@ pub struct App {
     /// tick of the main loop. Wrapped in `parking_lot::Mutex` — never held
     /// across an await point.
     pending_mutations: Arc<parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>>,
-    /// BUG-1b: fs watcher installed on `.git/` of the current
-    /// [`Self::active_repo_root`]. `None` means either the workspace
-    /// is not inside any repo (rule 2 in `refresh_gitui_at_active_root`)
-    /// or the platform-native backend failed to install (rare — the
-    /// user can still press F5 to force a refresh; see BUG-1a).
-    ///
-    /// Dropping this handle releases the OS-level watch. Recreated on
-    /// every `respawn_gitui_now` via [`Self::update_git_watcher`], so
-    /// crossing a repo boundary re-scopes the watcher automatically.
-    git_watcher: Option<notify::RecommendedWatcher>,
-    /// Sender end held by [`Self::update_git_watcher`] so each fresh
-    /// watcher closure can push into the same channel. Cloned into the
-    /// notify callback, which fires on the watcher's background thread.
-    git_event_tx: mpsc::UnboundedSender<()>,
-    /// Receiver end drained by the main loop. Every fs event becomes
-    /// one `()`; multiple events on the same commit collapse via
-    /// [`Self::git_debounce_deadline`] so the burst becomes one respawn.
-    git_event_rx: mpsc::UnboundedReceiver<()>,
-    /// When set, `respawn_gitui_now` fires at or after this instant.
-    /// Bumped forward every time a fresh fs event arrives so back-to-back
-    /// writes during a `git commit` (index → HEAD → refs) collapse into
-    /// a single respawn.
-    git_debounce_deadline: Option<Instant>,
-    /// BUG-1b flicker guard: after any watcher install (startup or
-    /// respawn) we drop fs events silently until this instant. Without
-    /// this, the freshly-spawned gitui process (or the OS reporting
-    /// atime updates on file reads under `.git/`) fires the watcher
-    /// during gitui's own startup, we respawn, the new gitui does the
-    /// same, and gitui "flickers wildly after switching folders"
-    /// (user-reported regression).
-    ///
-    /// The 500 ms window is a compromise: shorter than one
-    /// human-noticeable frame delay for a git commit → gitui update,
-    /// long enough to swallow libgit2's typical startup I/O burst.
-    git_watch_settle_until: Option<Instant>,
     /// P0-1: gate for `Terminal::draw()`. Set by every event handler
     /// that mutates render-visible state; cleared right after a
     /// successful draw. **Not** load-bearing for correctness — ratatui's
@@ -695,103 +633,36 @@ impl App {
             parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
         > = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-        // Everything except the shells group is a Placeholder until later
-        // milestones bring in the real PTY / native providers.
+        // Event bus is created up front so the native file manager can
+        // publish selection / cwd events during construction.
+        let event_bus = EventBus::default();
+
         let mut panes = PaneRegistry::new();
         let mut pinned_pane_ids: std::collections::HashSet<PaneId> =
             std::collections::HashSet::new();
 
-        let mut files_members = Vec::new();
-        let mut git_members = Vec::new();
-        let mut yazi_pane_id: Option<PaneId> = None;
-        let mut gitui_pane_id: Option<PaneId> = None;
-        for spec in &config.files.tabs {
-            // Route by tool id: gitui lives in its own bottom-left group
-            // (§C24), everything else stays with yazi in the top-left
-            // files group.
-            let is_gitui = spec.id == "gitui";
-            let icon = if is_gitui { "🌿" } else { "📁" };
-            let color = if is_gitui { Color::Green } else { Color::Cyan };
-            let kind_label = if is_gitui { "git" } else { "files" };
-            let id = build_external_pane(
-                &mut panes,
-                &session_writes,
-                spec,
-                &workspace_root,
-                redraw_tx.clone(),
-                osc_tx.clone(),
-                icon,
-                color,
-                kind_label,
-            )?;
-            // Left column (files/git) panes are mouse-passthrough: the
-            // file lists + dividers forward to yazi / gitui as SGR bytes.
-            // Dividers still drag because on_mouse checks them BEFORE
-            // pane-priority.
-            //
-            // The yazi tab additionally gets `set_yazi_layout`: this is
-            // NOT a ratio estimate anymore — it's a flag that turns on
-            // grid-based zoning. `zone_at` scans the PTY grid live to
-            // find yazi's actual divider columns (box-drawing verticals),
-            // so the QuickLook preview column keeps local text selection
-            // even after yazi resizes its columns. The ratio value in
-            // `config.mouse.yazi_layout` is unused for geometry now; it
-            // stays as the on/off gate so users can disable zoning via
-            // config (set `yazi_layout = []` semantics future work).
-            if let Some(pane) = panes.get_mut(id) {
-                pane.set_mouse_passthrough(true);
-                if spec.id == "yazi" {
-                    pane.set_yazi_layout(Some(config.mouse.yazi_layout));
-                }
-            }
-            if is_gitui {
-                gitui_pane_id.get_or_insert(id);
-                git_members.push(id);
-            } else {
-                if spec.id == "yazi" {
-                    // First-seen wins: if the user configured multiple yazi
-                    // tabs (unusual but legal), close-restore focus targets
-                    // the leftmost one, matching tab-strip reading order.
-                    yazi_pane_id.get_or_insert(id);
-                }
-                files_members.push(id);
-            }
-            // Pin every left-column tool so × never appears and Ctrl+W
-            // is rejected even if a group's policy grows to Open later.
-            pinned_pane_ids.insert(id);
-        }
+        // Files group — a single native two-pane [`FileManagerPane`].
+        // `[files].tabs` from config.toml is intentionally NOT consulted:
+        // the yazi/gitui PTY route was retired in favour of the native
+        // provider so custom entries silently no-op.
+        let file_manager_pane = FileManagerPane::with_event_bus(
+            workspace_root.clone(),
+            workspace_root.clone(),
+            event_bus.clone(),
+        );
+        let file_manager_pane_id = file_manager_pane.id();
+        panes.insert(Box::new(file_manager_pane));
+        pinned_pane_ids.insert(file_manager_pane_id);
+        let files_members = vec![file_manager_pane_id];
 
-        // The layout tree can't host an empty tab group (TabGroup::new
-        // panics on empty members). If the user removed yazi or gitui
-        // from `[files] tabs`, drop in a Placeholder so the pane still
-        // exists — the group is now Fixed anyway, so the placeholder
-        // sits there permanently until the user restores its config.
-        if files_members.is_empty() {
-            let placeholder = PlaceholderPane::new(
-                "files",
-                "No files tool configured. Add `[[files.tabs]]` with `id = \"yazi\"` to config.toml."
-                    .to_string(),
-                "📁",
-                Color::Cyan,
-            );
-            let id = placeholder.id();
-            panes.insert(Box::new(placeholder));
-            files_members.push(id);
-            pinned_pane_ids.insert(id);
-        }
-        if git_members.is_empty() {
-            let placeholder = PlaceholderPane::new(
-                "git",
-                "No git tool configured. Add `[[files.tabs]]` with `id = \"gitui\"` to config.toml."
-                    .to_string(),
-                "🌿",
-                Color::Green,
-            );
-            let id = placeholder.id();
-            panes.insert(Box::new(placeholder));
-            git_members.push(id);
-            pinned_pane_ids.insert(id);
-        }
+        // Native Git pane — read-only workspace Git panel backed by
+        // `gix`. Follows files-cwd via `SetActiveRoot` in the main loop
+        // (see `handle_set_active_root`); F5 issues `workspace.pane.reload`.
+        let git_pane = crate::git_pane::GitPane::new(workspace_root.clone());
+        let git_pane_id = git_pane.id();
+        panes.insert(Box::new(git_pane));
+        pinned_pane_ids.insert(git_pane_id);
+        let mut git_members = vec![git_pane_id];
 
         let mut agents_members = Vec::new();
         // (pane_id, static registry id) for each agent tab we spawn during
@@ -897,15 +768,10 @@ impl App {
             agents_members.push(id);
         }
 
-        // Shells group: bottom as first tab, followed by shell tabs.
-        // Bottom (system monitor) is now part of the shells tab group.
-        // §19.10.1 addendum: bottom's PaneId lives in a "pinned" set
-        // so its tab strip loses the `×` affordance and Ctrl+W /
-        // right-click-close paths reject it. Populated when we spawn
-        // bottom below; empty when no bottom is configured.
-        let mut shells_members = Vec::new();
-
-        // 1. Add bottom as the first tab (if configured in sysmon.tabs)
+        // Left-bottom (git) group: Git pane as first tab, followed by
+        // read-only side-panes (starts with `bottom`; future read-only
+        // plugins land here). All tabs are pinned so `×` never appears
+        // and Ctrl+W / right-click-close are rejected.
         for spec in &config.sysmon.tabs {
             if spec.id == "bottom" {
                 let id = build_external_pane(
@@ -917,20 +783,21 @@ impl App {
                     osc_tx.clone(),
                     "📊",
                     Color::Magenta,
-                    "shells",
+                    "git",
                 )?;
-                // §19.14.4: bottom is read-only (no stdin), so paste
-                // silently no-ops — the copy-selection branch still
-                // works. Enabling the flag keeps behaviour uniform
-                // across every shells-group tab.
                 if let Some(pane) = panes.get_mut(id) {
                     pane.set_right_click_paste(config.mouse.right_click_paste);
                 }
                 pinned_pane_ids.insert(id);
-                shells_members.push(id);
+                git_members.push(id);
                 break;
             }
         }
+
+        // Shells group: always at least one interactive shell. Bottom
+        // moved to the left-bottom (git) group, so shells is single-
+        // purpose now.
+        let mut shells_members = Vec::new();
 
         // 2. Add the first shell tab
         let first = spawn_shell(
@@ -956,7 +823,7 @@ impl App {
         shells_members.push(first_id);
 
         // Groups.
-        // Left column: yazi (top) + gitui (bottom). Both are Fixed —
+        // Left column: files (top) + git (bottom). Both are Fixed —
         // no × / + affordance; the viewer is now a modal overlay
         // rather than a tab (§C24), so nothing ever needs to be
         // added or closed inside these groups.
@@ -1030,18 +897,11 @@ impl App {
             }
         }
 
-        let event_bus = EventBus::default();
         let mut focus = FocusManager::new(event_bus.clone());
-        // C22.6: default focus lands on the yazi tab so the launch state
-        // matches the pre-launch expectation ("open rimeterm → I can
-        // navigate files immediately"). Falls back to the first shell
-        // when yazi isn't configured (user removed it from
-        // `[files] tabs`) — in that case shells is the only real
-        // interactive surface.
-        match yazi_pane_id {
-            Some(id) => focus.set_focus(id, Some(BUILTIN_FILES)),
-            None => focus.set_focus(first_id, Some(BUILTIN_SHELLS)),
-        }
+        // Default focus lands on the native file manager so the launch
+        // state matches the pre-launch expectation ("open rimeterm → I
+        // can navigate files immediately").
+        focus.set_focus(file_manager_pane_id, Some(BUILTIN_FILES));
 
         let flags = Arc::new(ActionFlags::default());
         let snapshot = Arc::new(parking_lot::RwLock::new(WorkspaceSnapshot::default()));
@@ -1065,35 +925,9 @@ impl App {
         let viewer_picker = ratatui_image::picker::Picker::from_query_stdio().ok();
         let viewer_markdown_theme = parse_markdown_theme(&config.viewer.markdown.theme);
 
-        // BUG-1b: fs watcher on `.git/` so gitui reflects external repo
-        // mutations. Installed here at startup for the initial repo (if
-        // any); rebuilt on every repo-boundary crossing via
-        // `update_git_watcher`. Failure here (e.g. exotic filesystems on
-        // WSL where inotify is misconfigured) is non-fatal — F5 still
-        // works as a manual override.
-        let (git_event_tx, git_event_rx) = mpsc::unbounded_channel::<()>();
-        let initial_repo_root = find_git_root(&workspace_root);
-        let git_watcher = initial_repo_root.as_deref().and_then(|root| {
-            match spawn_git_watcher(root, git_event_tx.clone()) {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    warn!(error = %e, path = %root.display(),
-                          "git watcher spawn failed; F5 still works");
-                    None
-                }
-            }
-        });
-        // BUG-1b flicker guard: seed the settle window as soon as the
-        // initial watcher exists so gitui's startup I/O burst (index
-        // refresh, HEAD read) doesn't trigger a bogus respawn on
-        // launch. Constant `GIT_WATCH_SETTLE` sizes the window.
-        let initial_settle = git_watcher
-            .as_ref()
-            .map(|_| Instant::now() + GIT_WATCH_SETTLE);
-
         Ok(Self {
             active_root: workspace_root.clone(),
-            active_repo_root: initial_repo_root,
+            last_file_manager_cwd: Some(workspace_root.clone()),
             workspace_root,
             config,
             shell_choice,
@@ -1112,9 +946,9 @@ impl App {
             osc_rx,
             osc_tx,
             viewer: ViewerOverlayState::default(),
-            yazi_pane_id,
-            gitui_pane_id,
-            last_yazi_selection: None,
+            file_manager_pane_id: Some(file_manager_pane_id),
+            git_pane_id: Some(git_pane_id),
+            last_file_selection: None,
             viewer_completion_tx,
             viewer_completion_rx,
             viewer_picker,
@@ -1145,11 +979,6 @@ impl App {
             active_drag: None,
             default_ratios,
             pending_mutations,
-            git_watcher,
-            git_event_tx,
-            git_event_rx,
-            git_debounce_deadline: None,
-            git_watch_settle_until: initial_settle,
             // First frame is always a "redraw" — we haven't drawn yet.
             needs_redraw: true,
         })
@@ -1164,7 +993,7 @@ impl App {
         let ipc_shutdown = self.spawn_ipc_server().await;
 
         guard.terminal.draw(|f| {
-            let cursor = self.draw(f.area(), f.buffer_mut());
+            let cursor = self.draw(f.area(), f);
             if let Some((x, y)) = cursor {
                 f.set_cursor_position((x, y));
             }
@@ -1177,6 +1006,13 @@ impl App {
             }
             self.drain_mutations();
             self.drain_flags();
+            // Every registered pane gets a chance to complete background
+            // work (deferred fs mutations, async load results, …). Any
+            // pane that reports a change forces a redraw so the visible
+            // state reflects it in the very next frame.
+            if self.poll_pane_background() {
+                self.needs_redraw = true;
+            }
             // P0-1: `expire_*` helpers now signal via bool whether they
             // actually mutated state; only those changes need a redraw.
             // Skipping the flag flip for the "no-op tick" case is what
@@ -1185,9 +1021,6 @@ impl App {
                 self.needs_redraw = true;
             }
             if self.expire_pending_spawn() {
-                self.needs_redraw = true;
-            }
-            if self.expire_git_debounce() {
                 self.needs_redraw = true;
             }
 
@@ -1213,29 +1046,6 @@ impl App {
                     while self.redraw_rx.try_recv().is_ok() {}
                     self.needs_redraw = true;
                 }
-                Some(_) = self.git_event_rx.recv() => {
-                    // BUG-1b: collapse the burst that `git commit` emits
-                    // (index → HEAD → refs, sub-millisecond apart) into a
-                    // single 300 ms debounce window. Every fresh event
-                    // bumps the deadline forward, so a slow multi-file
-                    // `git add` still fires exactly one respawn at end.
-                    while self.git_event_rx.try_recv().is_ok() {}
-                    // Flicker guard: during the 500 ms after any
-                    // watcher install, fs events likely come from
-                    // gitui's own startup I/O, not real user activity.
-                    // Drop them silently to avoid the self-reinforcing
-                    // respawn loop ("gitui flickers wildly after
-                    // switching folders" bug).
-                    let in_settle = self
-                        .git_watch_settle_until
-                        .is_some_and(|t| Instant::now() < t);
-                    if !in_settle {
-                        self.git_debounce_deadline =
-                            Some(Instant::now() + Duration::from_millis(300));
-                    }
-                    // No redraw here — nothing visible changes until the
-                    // debounce fires (see `expire_git_debounce`).
-                }
                 Some(event) = self.osc_rx.recv() => {
                     // `recv()` already consumed the wake-triggering
                     // message; dispatch it first, then drain the rest.
@@ -1254,16 +1064,10 @@ impl App {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(16)) => {
                     // P0-1: the tick fires when NOTHING happened for 16 ms.
-                    // Only two subsystems actually need a periodic wake:
-                    //   1. `pending_spawn` spinner — one frame per ~100 ms
-                    //      of elapsed time (SPINNER_FRAMES cycles through
-                    //      8 glyphs), so we DO need frequent redraws while
-                    //      the pane is booting.
-                    //   2. `git_debounce_deadline` — we WANT the tick
-                    //      because `expire_git_debounce` at loop head is
-                    //      what actually fires the respawn once the 300ms
-                    //      window expires. The tick just wakes the loop.
-                    // Anything else = truly idle = skip the draw entirely.
+                    // Only the pending-spawn spinner still needs a wake to
+                    // keep its animation moving; every other subsystem
+                    // signals through its own channel. Anything else = truly
+                    // idle = skip the draw entirely.
                     if self.pending_spawn.is_some() {
                         self.needs_redraw = true;
                     }
@@ -1272,7 +1076,7 @@ impl App {
 
             if self.needs_redraw {
                 guard.terminal.draw(|f| {
-                    let cursor = self.draw(f.area(), f.buffer_mut());
+                    let cursor = self.draw(f.area(), f);
                     if let Some((x, y)) = cursor {
                         f.set_cursor_position((x, y));
                     }
@@ -1315,20 +1119,20 @@ impl App {
             return true;
         }
 
-        // Right-arrow: when yazi is focused and hovering a regular
-        // file, `→` behaves like Alt+V (open the file in the modal
-        // viewer). Directories still fall through so yazi's own
-        // "right = enter" navigation is untouched. Any modifier
-        // (Ctrl/Shift/Alt) also falls through — we only steal the
-        // bare-arrow case, matching Alt+V's "no other key does this".
+        // Right-arrow: when the file manager is focused and hovering a
+        // regular file, `→` behaves like Alt+V (open the file in the
+        // modal viewer). Directories still fall through so the file
+        // manager's own "right = enter" navigation is untouched. Any
+        // modifier (Ctrl/Shift/Alt) also falls through — we only steal
+        // the bare-arrow case, matching Alt+V's "no other key does this".
         if matches!(key.code, KeyCode::Right) && key.modifiers.is_empty() && !overlay_open {
             if should_hijack_right_for_viewer(
-                self.yazi_pane_id,
+                self.file_manager_pane_id,
                 self.focus.focused_pane(),
-                self.last_yazi_selection.as_ref(),
+                self.last_file_selection.as_ref(),
             ) {
                 let sel_is_file = self
-                    .last_yazi_selection
+                    .last_file_selection
                     .as_ref()
                     .and_then(|s| std::fs::metadata(&s.path).ok())
                     .is_some_and(|m| m.is_file());
@@ -1432,15 +1236,14 @@ impl App {
         consumed
     }
 
-    /// Open the modal viewer overlay for the last yazi selection
-    /// (§C24). The overlay is a single, path-dedup'd surface that
-    /// covers the entire left column while it's open. Unlike the
-    /// pre-refactor "viewer tab", it's NOT a member of any tab
-    /// group — the viewer state lives on the App and `draw()`
-    /// paints it on top of the files+git groups.
+    /// Open the modal viewer overlay for the last file-manager
+    /// selection (§C24). The overlay is a single, path-dedup'd surface
+    /// that covers the entire left column while it's open.
     fn open_viewer_overlay(&mut self) {
-        let Some(selection) = self.last_yazi_selection.clone() else {
-            self.set_hint("viewer: no active-yazi selection yet — hover a file first".into());
+        let Some(selection) = self.last_file_selection.clone() else {
+            self.set_hint(
+                "viewer: no file highlighted yet — move the file-manager cursor first".into(),
+            );
             return;
         };
         let meta = match std::fs::metadata(&selection.path) {
@@ -1456,7 +1259,7 @@ impl App {
         let source = match viewer::classify_source(&selection.path, meta) {
             Ok(Some(source)) => source,
             Ok(None) => {
-                self.set_hint("viewer: use Yazi Quick Look or Ctrl+O — unsupported type".into());
+                self.set_hint("viewer: unsupported file type".into());
                 return;
             }
             Err(err) => {
@@ -1534,15 +1337,12 @@ impl App {
         )
     }
 
-    /// Close the viewer overlay and return focus to whatever pane
-    /// had it when the overlay opened. Falls back to yazi (if
-    /// configured) then leaves focus untouched.
+    /// Close the viewer overlay and return focus to whatever pane had
+    /// it when the overlay opened. Falls back to the native file
+    /// manager (if present) then leaves focus untouched.
     fn close_viewer_overlay(&mut self) {
         let return_focus = self.viewer.close();
-        // Prefer the exact pane captured at open. If that pane has
-        // since been dropped, fall back to yazi so the user still
-        // lands somewhere sensible.
-        let target = return_focus.or(self.yazi_pane_id);
+        let target = return_focus.or(self.file_manager_pane_id);
         if let Some(id) = target {
             if let Err(e) = self.focus_pane_by_id(id) {
                 warn!(error = %e, "close_viewer_overlay: return-focus failed");
@@ -2674,23 +2474,6 @@ impl App {
             self.settings_state.set_markdown_theme(theme);
             return;
         }
-        // yazi.copy.path: copy the last hovered yazi file path to the
-        // clipboard. Emitted by the right-click context menu on the left
-        // (files) column — a convenience so the user can grab yazi's
-        // current selection without drag-selecting the filename text.
-        if intent == "yazi.copy.path" {
-            match self.last_yazi_selection.clone() {
-                Some(sel) => {
-                    let text = sel.path.display().to_string();
-                    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.clone())) {
-                        Ok(()) => self.set_hint(format!("📋 copied: {}", text)),
-                        Err(_) => self.set_hint("⛔ clipboard unavailable".into()),
-                    }
-                }
-                None => self.set_hint("no file hovered in yazi".into()),
-            }
-            return;
-        }
         let mut parts = intent.split(':');
         match parts.next() {
             Some("tab.activate") => {
@@ -2885,7 +2668,7 @@ impl App {
         }
     }
 
-    fn draw(&mut self, area: Rect, buf: &mut ratatui::buffer::Buffer) -> Option<(u16, u16)> {
+    fn draw(&mut self, area: Rect, frame: &mut ratatui::Frame<'_>) -> Option<(u16, u16)> {
         let vertical = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2905,8 +2688,13 @@ impl App {
             Some(HoveredUi::QuitButton) => StatusBarHover::Quit,
             _ => StatusBarHover::None,
         };
-        self.last_status_bar_hits =
-            render_status_bar(vertical[0], buf, ws_label, &self.shell_short, status_hover);
+        self.last_status_bar_hits = render_status_bar(
+            vertical[0],
+            frame.buffer_mut(),
+            ws_label,
+            &self.shell_short,
+            status_hover,
+        );
         // Cache current-frame geometry so mouse hit-tests use the same
         // rects the user is looking at.
         self.last_pane_area = vertical[1];
@@ -2962,7 +2750,14 @@ impl App {
                 let hits = crate::tab_strip::hit_rects(strip_rect, group, &titles, &closable);
                 self.last_tab_strips.push((gid, hits));
                 let tab_hover = tab_strip_hover_for(gid, self.hovered_ui);
-                render_tab_strip(strip_rect, buf, group, &titles, &closable, tab_hover);
+                render_tab_strip(
+                    strip_rect,
+                    frame.buffer_mut(),
+                    group,
+                    &titles,
+                    &closable,
+                    tab_hover,
+                );
                 if let Some(active_id) = group.active_pane() {
                     self.last_pane_outer_rects.push((active_id, pane_rect));
                     if let Some(pane) = self.panes.get_mut(active_id) {
@@ -2972,7 +2767,7 @@ impl App {
                             title_override: None,
                             focus_color: theme_accent,
                         };
-                        let outcome = pane.render(pane_rect, buf, &ctx);
+                        let outcome = pane.render(pane_rect, frame, &ctx);
                         if focused {
                             focused_cursor = outcome.cursor;
                         }
@@ -2997,7 +2792,7 @@ impl App {
                 viewer::render_into_pane(
                     &mut self.viewer,
                     rect,
-                    buf,
+                    frame.buffer_mut(),
                     self.viewer_picker.as_ref(),
                     self.viewer_markdown_theme,
                 );
@@ -3050,7 +2845,7 @@ impl App {
                     {
                         continue;
                     }
-                    buf[(x, y)].set_style(style);
+                    frame.buffer_mut()[(x, y)].set_style(style);
                 }
             }
         }
@@ -3099,29 +2894,29 @@ impl App {
         };
         Paragraph::new(Line::from(hint_text))
             .style(hint_style)
-            .render(vertical[2], buf);
+            .render(vertical[2], frame.buffer_mut());
 
         self.last_menu_popup_rect = None;
         self.last_picker_popup_rect = None;
         self.last_settings_popup_rect = None;
         if self.menu_state.open {
             let rect = menu_rect(area, &self.menu);
-            render_menu(rect, buf, &self.menu_state, &self.menu);
+            render_menu(rect, frame.buffer_mut(), &self.menu_state, &self.menu);
             self.last_menu_popup_rect = Some(rect);
         }
         if self.palette_state.open {
             let rect = palette_rect(area);
             let entries = self.command_entries();
-            render_palette(rect, buf, &self.palette_state, &entries);
+            render_palette(rect, frame.buffer_mut(), &self.palette_state, &entries);
         }
         if self.picker_state.open {
             let rect = crate::picker::popup_rect(area, &self.picker_state);
-            crate::picker::render(rect, buf, &self.picker_state);
+            crate::picker::render(rect, frame.buffer_mut(), &self.picker_state);
             self.last_picker_popup_rect = Some(rect);
         }
         if self.settings_state.open {
             let rect = self.settings_state.popup_rect(area);
-            self.settings_state.render(area, buf);
+            self.settings_state.render(area, frame.buffer_mut());
             self.last_settings_popup_rect = Some(rect);
         }
         // ACK renders LAST so it sits on top of everything else while
@@ -3130,7 +2925,7 @@ impl App {
         // here explicitly for anyone adding a new overlay).
         if self.ack_state.open {
             let rect = self.ack_state.popup_rect(area);
-            self.ack_state.render(area, buf);
+            self.ack_state.render(area, frame.buffer_mut());
             self.last_ack_popup_rect = Some(rect);
         }
 
@@ -3399,18 +3194,8 @@ impl App {
             self.settings_state.set_markdown_theme(next);
             let _ = self.redraw_tx.send(());
         }
-        if f.git_refresh.swap(false, Ordering::Relaxed) {
-            // BUG-1a: user-visible manual refresh. Bypass the repo-root
-            // debounce — we want to reflect external repo mutations
-            // (git commits from a shell tab, agent rebases, etc.) that
-            // don't move `active_repo_root`.
-            if find_git_root(&self.active_root).is_some() {
-                self.respawn_gitui_now();
-                self.set_hint("gitui refreshed".into());
-            } else {
-                self.set_hint("gitui refresh: current cwd is not inside a git repo".into());
-            }
-            let _ = self.redraw_tx.send(());
+        if f.pane_reload.swap(false, Ordering::Relaxed) {
+            self.handle_pane_reload();
         }
     }
 
@@ -3638,10 +3423,9 @@ impl App {
     /// the trait object, which for a `Session`-backed pane just drops
     /// one Arc-clone of the child handle. The background reaper task
     /// holds another clone and blocks in `wait()`, so the child would
-    /// otherwise keep running until it decided to exit on its own —
-    /// gitui, for instance, doesn't exit until Ctrl+Q, and
-    /// `refresh_gitui_at_active_root` used to leak one live process
-    /// per yazi `cd` event.
+    /// otherwise keep running until it decided to exit on its own — long-
+    /// lived TUIs (gitui, htop) don't exit until Ctrl+Q, so an unkilled
+    /// child would linger long after its pane was closed.
     ///
     /// Explicitly calling [`Session::kill`] first tears down the
     /// subprocess deterministically; the reaper's blocking `wait()`
@@ -3816,41 +3600,102 @@ impl App {
         false
     }
 
-    /// BUG-1b: fire the debounced gitui respawn when the deadline has
-    /// elapsed. Called each tick alongside `expire_hint` /
-    /// `expire_pending_spawn`.
-    ///
-    /// The `find_git_root` re-check guards the case where yazi walked
-    /// out of the repo during the 300 ms debounce window — respawning
-    /// gitui outside a repo just makes it error out. Same friendliness
-    /// rule as `refresh_gitui_at_active_root`.
-    ///
-    /// Returns `true` when the debounce actually fired (state changed).
-    fn expire_git_debounce(&mut self) -> bool {
-        let Some(deadline) = self.git_debounce_deadline else {
-            return false;
+    /// F5 handler: reload the focused left-column pane. Files-group focus
+    /// hits [`FileManagerPane::reload`]; git-group focus surfaces a hint
+    /// until the native GitPane arrives. Called from `drain_flags` when
+    /// the `workspace.pane.reload` command flag flips.
+    fn handle_pane_reload(&mut self) {
+        let focused = self.focus.focused_group();
+        if focused == Some(BUILTIN_FILES) {
+            if let Some(id) = self.file_manager_pane_id {
+                if let Some(pane) = self.panes.get_mut(id) {
+                    pane.reload();
+                    self.set_hint("files reloaded".into());
+                }
+            }
+        } else if focused == Some(BUILTIN_GIT) {
+            let git_id = self
+                .tree
+                .find_tab_group(BUILTIN_GIT)
+                .and_then(|group| group.active_pane());
+            if let Some(id) = git_id {
+                if let Some(pane) = self.panes.get_mut(id) {
+                    pane.reload();
+                    self.set_hint("git reloaded".into());
+                }
+            }
+        } else {
+            self.set_hint("F5 has no effect here".into());
+        }
+        let _ = self.redraw_tx.send(());
+    }
+
+    /// Call `poll_background` on every registered pane. Returns `true`
+    /// when at least one pane reported that visible state changed so the
+    /// main loop can force a redraw.
+    fn poll_pane_background(&mut self) -> bool {
+        let ids: Vec<PaneId> = self
+            .tree
+            .tab_groups()
+            .iter()
+            .flat_map(|g| g.members().iter().copied())
+            .collect();
+        let mut dirty = false;
+        for id in ids {
+            if let Some(pane) = self.panes.get_mut(id) {
+                if pane.poll_background() {
+                    dirty = true;
+                }
+            }
+        }
+        self.sync_from_file_manager();
+        dirty
+    }
+
+    /// Forward the file manager's current directory + highlight to the
+    /// consumers that need them: the Git pane (fresh generation on cwd
+    /// change) and `last_file_selection` (the Alt+V / right-arrow
+    /// viewer bridge). Runs each main-loop tick from `poll_pane_background`
+    /// so navigation reflects in the UI without an explicit subscription.
+    fn sync_from_file_manager(&mut self) {
+        let Some(fm_id) = self.file_manager_pane_id else {
+            return;
         };
-        if Instant::now() < deadline {
-            return false;
+        let Some(fm) = self.panes.get(fm_id) else {
+            return;
+        };
+        let Some(fm) = fm
+            .as_any()
+            .and_then(|any| any.downcast_ref::<crate::file_manager_pane::FileManagerPane>())
+        else {
+            return;
+        };
+        let current_cwd = fm.active_dir().to_path_buf();
+        let highlighted = fm.highlighted_path().map(|p| p.to_path_buf());
+
+        // File selection cache — powers Alt+V and the `→` viewer bridge.
+        self.last_file_selection = highlighted.map(|path| SelectionSnapshot {
+            origin: fm_id,
+            path,
+        });
+
+        // Git pane: fresh generation whenever the tracked cwd changes.
+        let cwd_changed = self.last_file_manager_cwd.as_deref() != Some(current_cwd.as_path());
+        if !cwd_changed {
+            return;
         }
-        // Defense-in-depth against flicker: even if a stray event
-        // landed the deadline inside the settle window, refuse to
-        // fire during it. The select branch already screens most
-        // events out — this handles the race where a debounce set
-        // just before a respawn survives the swap.
-        if self
-            .git_watch_settle_until
-            .is_some_and(|t| Instant::now() < t)
-        {
-            return false;
+        self.last_file_manager_cwd = Some(current_cwd.clone());
+        let Some(git_id) = self.git_pane_id else {
+            return;
+        };
+        if let Some(pane) = self.panes.get_mut(git_id) {
+            if let Some(git) = pane
+                .as_any_mut()
+                .and_then(|any| any.downcast_mut::<crate::git_pane::GitPane>())
+            {
+                git.refresh_for(&current_cwd);
+            }
         }
-        self.git_debounce_deadline = None;
-        if find_git_root(&self.active_root).is_none() {
-            return false;
-        }
-        self.respawn_gitui_now();
-        self.set_hint("gitui refreshed (external repo change)".into());
-        true
     }
 
     /// Clear the boot-progress spinner if either the target pane has
@@ -3908,89 +3753,51 @@ impl App {
         }
     }
 
-    fn kernel_event_from_osc(origin: PaneId, decoded: OscDecoded) -> Option<KernelEvent> {
-        match decoded {
-            OscDecoded::FileSelected { path } => Some(KernelEvent::FileSelected { origin, path }),
-            OscDecoded::YaziCwd { path } => Some(KernelEvent::YaziCwdChanged { origin, path }),
-            OscDecoded::Ignored { .. } => None,
-        }
-    }
-
-    /// Drain decoded-at-the-edge OSC 1337 payloads and broadcast them
-    /// through the kernel EventBus. The PTY scanner is intentionally
-    /// event-model agnostic; this is the sole translation boundary.
-    ///
-    /// Malformed payloads are logged and dropped. Unknown event names
-    /// are ignored by `decode_osc_rimeterm` (forward-compatible), while
-    /// known events always carry the originating PaneId so subscribers
-    /// can distinguish two yazi/shell tabs.
+    /// Drain decoded-at-the-edge OSC 1337 payloads. The rimeterm-side
+    /// scanner (§5.5, C18-D) stays intact so future events can piggyback
+    /// on the same channel, but the yazi-specific payloads that used to
+    /// live here are gone with the yazi/gitui runtime tabs.
     fn dispatch_osc_event(&mut self, (origin, payload): (PaneId, String)) {
         match decode_osc_rimeterm(&payload) {
-            Ok(decoded) => {
-                match &decoded {
-                    OscDecoded::FileSelected { path } => {
-                        if self.is_active_files_yazi(origin) {
-                            self.last_yazi_selection = Some(SelectionSnapshot {
-                                origin,
-                                path: path.clone(),
-                            });
-                        }
-                    }
-                    OscDecoded::YaziCwd { path } => {
-                        // No origin gate: cwd.changed is only ever emitted
-                        // by yazi's bridge (`rimectl osc-emit cwd.changed`
-                        // is also legitimate manual/scripted use). Any
-                        // source that goes to the trouble of writing this
-                        // OSC envelope is asking to set the active root.
-                        if self.active_root != *path {
-                            self.active_root = path.clone();
-                            self.set_hint(format!("cwd → {}", path.display()));
-                            self.refresh_gitui_at_active_root();
-                        }
-                    }
-                    OscDecoded::Ignored { .. } => {}
-                }
-                if let Some(event) = Self::kernel_event_from_osc(origin, decoded) {
-                    self.event_bus.send(event);
-                } else {
-                    debug!(origin = origin.0, "ignored unknown OSC rimeterm event");
-                }
+            Ok(OscDecoded::Ignored { event }) => {
+                debug!(
+                    origin = origin.0,
+                    event = event.as_str(),
+                    "OSC rimeterm event received; no handler wired"
+                );
             }
             Err(error) => {
-                warn!(origin = origin.0, error = %error, "dropping malformed OSC rimeterm payload");
+                warn!(
+                    origin = origin.0,
+                    error = %error,
+                    "dropping malformed OSC rimeterm payload"
+                );
             }
         }
     }
 
-    /// True when `origin` is the pane currently active in the
-    /// `files` tab-group and that pane is the yazi tab. C20 only
-    /// snapshots the yazi selection.
-    fn is_active_files_yazi(&self, origin: PaneId) -> bool {
-        let Some(group) = self.tree.find_tab_group(BUILTIN_FILES) else {
-            return false;
-        };
-        if group.active_pane() != Some(origin) {
-            return false;
+    /// Drain any queued OSC 1337 payloads. Kept as a tiny helper so the
+    /// select! loop can peel them off in one call after the recv-side
+    /// dispatch.
+    fn drain_osc_events(&mut self) {
+        while let Ok(event) = self.osc_rx.try_recv() {
+            self.dispatch_osc_event(event);
         }
-        self.panes
-            .get(origin)
-            .is_some_and(|pane| pane.title().to_ascii_lowercase().contains("yazi"))
     }
 
     /// Cwd to hand a freshly-spawned agent PTY. Reads [`Self::active_root`]
     /// so `Ctrl+T` in an agents group opens the picker in the directory
-    /// the user is browsing in yazi, not the launch-time `workspace_root`.
-    /// Existing agent PTYs are unaffected — changing a live child's cwd
-    /// from outside isn't a thing on any POSIX / Windows PTY.
+    /// the user is browsing. Existing agent PTYs are unaffected —
+    /// changing a live child's cwd from outside isn't a thing on any
+    /// POSIX / Windows PTY.
     fn agent_spawn_cwd(&self) -> PathBuf {
         self.active_root.clone()
     }
 
-    /// Explicit override for the effective workspace root. Same behavior
-    /// as receiving a real `cwd.changed` OSC event: mutates
-    /// [`Self::active_root`], toasts the hint bar, and triggers gitui
-    /// refresh. Returns the applied absolute path as a string so IPC
-    /// callers can confirm what the app actually acted on.
+    /// Explicit override for the effective workspace root. Mutates
+    /// [`Self::active_root`] and toasts the hint bar. Returns the applied
+    /// absolute path as a string so IPC callers can confirm what the app
+    /// actually acted on.
     fn set_active_root(&mut self, path: PathBuf) -> Result<String, String> {
         let abs = if path.is_absolute() {
             path
@@ -4007,238 +3814,9 @@ impl App {
         }
         self.active_root = abs.clone();
         self.set_hint(format!("cwd → {}", abs.display()));
-        self.refresh_gitui_at_active_root();
         Ok(abs.display().to_string())
     }
 
-    /// Respawn the gitui tab in the files group at [`Self::active_root`],
-    /// **applying the repo-root debounce**. This is what OSC `cwd.changed`
-    /// events and `workspace.cwd.set` IPC calls should invoke — see
-    /// [`Self::respawn_gitui_now`] for the un-debounced variant used by
-    /// the manual `git.refresh` command and by the fs-watcher path
-    /// (BUG-1b in `docs/rimeterm-upgrade-design.md`).
-    ///
-    /// **Repo-root debounce**: yazi emits `cwd.changed` for every
-    /// subdirectory the user cursors through, but gitui is a **repo-
-    /// wide** UI — showing the same commits / branches / index. If
-    /// the new cwd walks up to the same `.git` root gitui is already
-    /// rooted at, this is a no-op. Combined with the explicit
-    /// [`Self::drop_pane_and_session`] kill in the swap path, that
-    /// eliminates the "background floods with gitui instances" bug
-    /// where rapid yazi navigation used to spawn (and leak) one live
-    /// gitui per `cd`.
-    ///
-    /// Silently no-ops when the gitui spec, the git group, or the
-    /// gitui pane isn't around (user disabled it), and when a walk
-    /// from [`Self::active_root`] finds no `.git` at all — leaving
-    /// the previous gitui in place is fine (it renders its own "not
-    /// a git repo" message when its own cwd is outside a repo).
-    fn refresh_gitui_at_active_root(&mut self) {
-        // Repo-root debounce.
-        //
-        // Rules:
-        // 1. Same repo (yazi cursoring around inside one project) —
-        //    obvious no-op.
-        // 2. Leaving all repos (yazi navigating to a non-repo dir like
-        //    `~/Downloads`) — ALSO a no-op. Keeping the previous
-        //    gitui rooted at the last real repo is friendlier than
-        //    spawning a fresh gitui at a non-repo dir (gitui errors
-        //    out immediately in that case, and each respawn is
-        //    expensive; on Windows the freshly-killed old process
-        //    plus a spinning-up new one showed up as the "app
-        //    freezes when leaving the git folder" symptom before
-        //    this guard tightened). We still track the transition by
-        //    updating the cache so re-entering a repo respawns.
-        // 3. Fresh repo — respawn (falls through).
-        //
-        // `active_repo_root` is written only on the success path so a
-        // spawn failure leaves the cache honest and the NEXT event has
-        // another chance to respawn.
-        let new_repo_root = find_git_root(&self.active_root);
-        if new_repo_root == self.active_repo_root {
-            return;
-        }
-        if new_repo_root.is_none() {
-            self.active_repo_root = None;
-            return;
-        }
-        self.respawn_gitui_now();
-    }
-
-    /// Force-respawn the gitui tab at [`Self::active_root`], **bypassing
-    /// the repo-root debounce**. This is what the `git.refresh` command
-    /// (BUG-1a) and the `.git/*` fs-watcher (BUG-1b, when implemented)
-    /// invoke to reflect external repo mutations — a `git commit` from
-    /// a sibling shell, a branch switch, an agent `git rebase`, etc. —
-    /// that don't move `active_repo_root`.
-    ///
-    /// Callers whose event source implies a possible **repo boundary
-    /// change** (yazi `cwd.changed`, `workspace.cwd.set`) MUST use
-    /// [`Self::refresh_gitui_at_active_root`] instead so the debounce
-    /// still short-circuits the "yazi cursoring through one repo"
-    /// case. Skipping the debounce here is safe because the caller
-    /// has already opted into a full respawn.
-    ///
-    /// Silently no-ops when:
-    /// - the gitui spec is missing from `[files] tabs` (user disabled it),
-    /// - the cached `gitui_pane_id` doesn't resolve to a live member of
-    ///   [`BUILTIN_GIT`] (pane was closed / registry pruned),
-    /// - `find_git_root(active_root)` returns `None` (user is currently
-    ///   outside any repo — matches
-    ///   [`Self::refresh_gitui_at_active_root`]'s rule 2 friendliness).
-    fn respawn_gitui_now(&mut self) {
-        // Refuse to respawn outside any repo — gitui errors out
-        // immediately if cwd is not a git worktree, and each respawn
-        // is expensive (see rule 2 in `refresh_gitui_at_active_root`).
-        if find_git_root(&self.active_root).is_none() {
-            return;
-        }
-
-        let Some(spec) = self
-            .config
-            .files
-            .tabs
-            .iter()
-            .find(|s| s.id == "gitui")
-            .cloned()
-        else {
-            return;
-        };
-        // Look for gitui inside the BUILTIN_GIT group (§C24 4-zone).
-        // Fallback to a title-substring search inside the group so a
-        // pane whose title was renamed via IPC still gets refreshed.
-        let Some(pane_id) = self.gitui_pane_id else {
-            return;
-        };
-        let Some(group) = self.tree.find_tab_group(BUILTIN_GIT) else {
-            return;
-        };
-        let Some((idx, old_id)) = group
-            .members()
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, id)| *id == pane_id)
-        else {
-            return;
-        };
-
-        let icon = "🌿";
-        let color = Color::Green;
-        let new_id = match build_external_pane(
-            &mut self.panes,
-            &self.session_writes,
-            &spec,
-            &self.active_root,
-            self.redraw_tx.clone(),
-            self.osc_tx.clone(),
-            icon,
-            color,
-            "git",
-        ) {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(error = %e, "respawn_gitui: spawn failed; keeping old pane");
-                return;
-            }
-        };
-        // gitui respawns into the left-bottom (git) group — same
-        // passthrough policy as the initial spawn.
-        if let Some(pane) = self.panes.get_mut(new_id) {
-            pane.set_mouse_passthrough(true);
-        }
-        let group = self
-            .tree
-            .find_tab_group_mut(BUILTIN_GIT)
-            .expect("git group present");
-        if let Err(e) = group.replace_member(idx, new_id) {
-            warn!(error = %e, "respawn_gitui: replace_member rejected; rolling back");
-            self.drop_pane_and_session(new_id);
-            return;
-        }
-        self.drop_pane_and_session(old_id);
-        // Cache the repo root the new gitui was rooted at so the next
-        // `cwd.changed` under it can short-circuit (see debounce doc).
-        self.active_repo_root = find_git_root(&self.active_root);
-        // BUG-1b: re-scope the fs watcher to the new repo (if any). This
-        // is a no-op cost when the same repo — we still tear down and
-        // re-create the watcher, but that's ~10 syscalls total on Linux
-        // and imperceptible next to a gitui respawn.
-        self.update_git_watcher();
-        // The pinned set is keyed by PaneId (not by tab slot / spec id),
-        // so a respawn must migrate the pin — otherwise the new pane
-        // renders an `×` and `close_tab_in_group` accepts a Ctrl+W on
-        // it. Absence of `old_id` in the set is legal (the initial
-        // startup path always inserts, but future callers might not),
-        // so we `remove` unconditionally and `insert` unconditionally.
-        self.pinned_pane_ids.remove(&old_id);
-        self.pinned_pane_ids.insert(new_id);
-        // Update the cached gitui id so the next `cwd.changed` finds
-        // the fresh pane (the old id is now stale in the registry).
-        self.gitui_pane_id = Some(new_id);
-        // If gitui was the focused pane, keep focus on the new one so the
-        // user's cursor doesn't get orphaned on a dropped PaneId.
-        if self.focus.focused_pane() == Some(old_id) {
-            self.focus.set_focus(new_id, Some(BUILTIN_GIT));
-        }
-    }
-
-    /// Re-scope the `.git/*` fs watcher to [`Self::active_repo_root`].
-    /// Dropping the previous `git_watcher` handle releases the OS-level
-    /// watch (inotify on Linux, ReadDirectoryChangesW on Windows,
-    /// FSEvents on macOS). If `active_repo_root` is `None`, the watcher
-    /// stays torn down — F5 (BUG-1a) remains the only path to a
-    /// refresh until the user re-enters a repo.
-    ///
-    /// Cheap to call unconditionally; the OS handles are single-digit
-    /// syscalls to release + reinstall.
-    fn update_git_watcher(&mut self) {
-        // Drop first so the OS releases handles before we install new
-        // ones — some backends (Windows) can otherwise transiently
-        // exceed per-process watch limits during a rapid repo switch.
-        self.git_watcher = None;
-        // BUG-1b flicker guard: any events queued before the swap were
-        // for the OLD repo and are already stale. Drop them so a
-        // pre-swap burst doesn't fire a spurious respawn 300 ms later.
-        while self.git_event_rx.try_recv().is_ok() {}
-        self.git_debounce_deadline = None;
-
-        if let Some(root) = self.active_repo_root.clone() {
-            match spawn_git_watcher(&root, self.git_event_tx.clone()) {
-                Ok(w) => {
-                    self.git_watcher = Some(w);
-                    // Grant the freshly-spawned gitui process a
-                    // grace window to complete its startup I/O
-                    // (index refresh, HEAD read — potentially atime-
-                    // triggered notify events on Windows NTFS / Linux
-                    // strictatime) without those events counting
-                    // toward a respawn debounce. Without this the
-                    // gitui "flickers wildly after switching folders"
-                    // bug reappears.
-                    self.git_watch_settle_until = Some(Instant::now() + GIT_WATCH_SETTLE);
-                }
-                Err(e) => {
-                    self.git_watch_settle_until = None;
-                    warn!(
-                        error = %e,
-                        path = %root.display(),
-                        "git watcher spawn failed; F5 still works"
-                    );
-                }
-            }
-        } else {
-            self.git_watch_settle_until = None;
-        }
-    }
-
-    /// Drain decoded-at-the-edge OSC 1337 payloads and broadcast them
-    /// through the kernel EventBus. The PTY scanner is intentionally
-    /// event-model agnostic; this is the sole translation boundary.
-    fn drain_osc_events(&mut self) {
-        while let Ok(event) = self.osc_rx.try_recv() {
-            self.dispatch_osc_event(event);
-        }
-    }
     async fn spawn_ipc_server(&self) -> Option<tokio::sync::mpsc::Sender<()>> {
         let pid = std::process::id();
         let commands = std::sync::Arc::clone(&self.commands);
@@ -4851,10 +4429,10 @@ fn register_commands(
     );
     flag_cmd!(
         cmds,
-        "git.refresh",
-        "Refresh gitui",
-        "F5 — force-respawn the gitui pane at the current workspace root (BUG-1a)",
-        flags.git_refresh
+        "workspace.pane.reload",
+        "Reload focused pane",
+        "F5 — reload the focused left-column pane (files reloads the explorer; git surfaces a pending hint)",
+        flags.pane_reload
     );
     flag_cmd!(
         cmds,
@@ -5723,30 +5301,21 @@ fn args_type_name(v: &serde_json::Value) -> &'static str {
 /// A payload is a UTF-8 JSON envelope like:
 /// ```json
 /// {"event":"file.selected","path":"/tmp/x.md"}
-/// {"event":"cwd.changed","path":"/tmp"}
 /// ```
 ///
-/// Unknown event names decode to `Ignored { event }` rather than `Err`
-/// so a child using a newer protocol version doesn't fail loudly on an
-/// older rimeterm — forward-compat matters here since OSC senders can't
-/// negotiate versions.
+/// Every well-formed payload currently decodes to `Ignored`. The variant
+/// stays so the scanner keeps its shape and future events can piggyback
+/// on the same channel without touching every call site.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum OscDecoded {
-    /// yazi cursor moved to a specific file. Maps to
-    /// [`rimeterm_core::KernelEvent::FileSelected`].
-    FileSelected { path: std::path::PathBuf },
-    /// yazi cwd changed. Maps to
-    /// [`rimeterm_core::KernelEvent::YaziCwdChanged`].
-    YaziCwd { path: std::path::PathBuf },
-    /// Payload parsed but the `event` name isn't known to this rimeterm.
-    /// Not an error — forward-compat.
+    /// Payload parsed but there is no live handler for the `event` name.
     Ignored { event: String },
 }
 
 /// Parse a raw OSC 1337 rimeterm payload into a structured [`OscDecoded`].
 /// Errors surface only for **malformed** payloads (invalid JSON, missing
-/// `event`, wrong types); unknown-but-well-formed events become
-/// `Ignored`. Pure so tests exercise the full matrix without a live PTY.
+/// `event`, wrong types). Pure so tests exercise the full matrix without
+/// a live PTY.
 pub(crate) fn decode_osc_rimeterm(payload: &str) -> Result<OscDecoded, String> {
     let root: serde_json::Value =
         serde_json::from_str(payload).map_err(|e| format!("invalid JSON: {e}"))?;
@@ -5757,29 +5326,9 @@ pub(crate) fn decode_osc_rimeterm(payload: &str) -> Result<OscDecoded, String> {
         .get("event")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing `event` (string)".to_string())?;
-    match event {
-        "file.selected" => {
-            let path = obj
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "file.selected: missing `path` (string)".to_string())?;
-            Ok(OscDecoded::FileSelected {
-                path: std::path::PathBuf::from(path),
-            })
-        }
-        "cwd.changed" => {
-            let path = obj
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "cwd.changed: missing `path` (string)".to_string())?;
-            Ok(OscDecoded::YaziCwd {
-                path: std::path::PathBuf::from(path),
-            })
-        }
-        other => Ok(OscDecoded::Ignored {
-            event: other.to_string(),
-        }),
-    }
+    Ok(OscDecoded::Ignored {
+        event: event.to_string(),
+    })
 }
 
 /// Which cargo-side action a `tools.*` command triggers. Copy so the
@@ -6011,26 +5560,6 @@ fn quadrant_title(idx: usize) -> &'static str {
         _ => "Focus shells (right-bottom)",
     }
 }
-/// Walk up from `start` looking for a `.git` entry (dir or file — the
-/// latter is a worktree pointer). Returns the containing directory
-/// on the first hit, or `None` if we reach the filesystem root without
-/// finding one. Bounded by the depth of `start`; on Windows the drive
-/// letter (`C:\`) is a valid stopping point for `.parent()`.
-///
-/// Used to gate `refresh_gitui_at_active_root`: yazi emits
-/// `cwd.changed` for every subdirectory the user cursors into, but
-/// gitui only cares about the enclosing repo. Spawning a fresh gitui
-/// process on every `cd` was the root of the "background floods with
-/// gitui instances" bug — see the field doc on `App::active_repo_root`.
-fn find_git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut cur = start;
-    loop {
-        if cur.join(".git").exists() {
-            return Some(cur.to_path_buf());
-        }
-        cur = cur.parent()?;
-    }
-}
 
 /// BUG-2 fix: input bundle for [`decide_frame_cursor`]. Keeps the
 /// decision pure (no App field access) so it can be unit-tested
@@ -6074,55 +5603,6 @@ pub(crate) fn decide_frame_cursor(inputs: FrameCursorInputs) -> Option<(u16, u16
     } else {
         inputs.focused_cursor
     }
-}
-
-/// BUG-1b: install an fs watcher on `<repo>/.git/` (non-recursive, so
-/// `objects/pack/` churn during a `git gc` doesn't flood us) plus
-/// `<repo>/.git/refs/heads/` (recursive, so nested branch names like
-/// `user/feature/x` still fire).
-///
-/// The callback runs on notify's background thread; we forward `()`
-/// into `tx` to wake the tokio main loop. Errors inside the callback
-/// are dropped by design — a single missed event is fine, the next one
-/// (usually within milliseconds during a `git commit`) will still fire.
-///
-/// Returns `Err` when notify's platform-native backend refuses to
-/// install (inotify limit hit, path outside the WSL rootfs, exotic
-/// SMB mount, …). Caller reports and falls back to F5.
-fn spawn_git_watcher(
-    repo_root: &std::path::Path,
-    tx: mpsc::UnboundedSender<()>,
-) -> notify::Result<notify::RecommendedWatcher> {
-    use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-
-    let mut watcher = RecommendedWatcher::new(
-        move |res: notify::Result<notify::Event>| {
-            if res.is_ok() {
-                // Send is fire-and-forget: if the main loop dropped
-                // the receiver (app shutting down) we simply stop.
-                let _ = tx.send(());
-            }
-        },
-        Config::default(),
-    )?;
-
-    let git_dir = repo_root.join(".git");
-    // Non-recursive catches direct children (HEAD, index, MERGE_HEAD,
-    // ORIG_HEAD, CHERRY_PICK_HEAD, REBASE_HEAD, packed-refs). Going
-    // recursive would surface objects/pack/ writes on every commit — a
-    // hundreds-of-events-per-second flood we neither need nor want.
-    watcher.watch(&git_dir, RecursiveMode::NonRecursive)?;
-
-    // refs/heads is recursive because branches can be nested slash-paths
-    // (`refs/heads/user/feature/x`). Missing directory (fresh repo, no
-    // branches, or bare .git-file worktree pointer) is silently OK — the
-    // top-level `.git/` watch still catches the common events.
-    let refs = git_dir.join("refs").join("heads");
-    if refs.is_dir() {
-        let _ = watcher.watch(&refs, RecursiveMode::Recursive);
-    }
-
-    Ok(watcher)
 }
 
 /// Remove a pane from the registry.
@@ -6495,29 +5975,31 @@ pub(crate) fn parse_markdown_theme(s: &str) -> rimeterm_markdown::Theme {
 }
 
 /// Predicate for the C22 `→` shortcut: return `true` when the
-/// bare-arrow event should try to open the current yazi selection in
+/// bare-arrow event should try to open the file-manager selection in
 /// the modal viewer. Split out of [`App::on_viewer_key`] so the
-/// gating logic (focus + configured yazi + non-empty selection) is
-/// unit-testable without touching the filesystem — the `is_file`
+/// gating logic (focus + configured file manager + non-empty selection)
+/// is unit-testable without touching the filesystem — the `is_file`
 /// check stays at the call site because it's a syscall, not a pure
 /// predicate.
 ///
 /// Semantics:
-/// - `yazi_id` — cached from startup; `None` means the user removed
-///   yazi from `files.tabs`, so the shortcut is disabled entirely.
+/// - `file_manager_id` — cached from startup; `None` means the file
+///   manager pane wasn't wired, so the shortcut is disabled entirely.
 /// - `focused` — the currently-focused pane; `→` only hijacks when
-///   the user is actually driving yazi, so directory-navigation `→`
-///   in every other pane keeps working.
-/// - `selection` — the last `file.selected` from yazi's OSC bridge;
-///   `None` means yazi hasn't emitted a hover event yet, so there's
-///   nothing to open.
+///   the file manager is driving, so directory-navigation `→` in every
+///   other pane keeps working.
+/// - `selection` — the last `KernelEvent::FileSelected`; `None`
+///   means the file manager hasn't emitted a selection yet, so
+///   there's nothing to open.
 fn should_hijack_right_for_viewer(
-    yazi_id: Option<PaneId>,
+    file_manager_id: Option<PaneId>,
     focused: Option<PaneId>,
     selection: Option<&viewer::SelectionSnapshot>,
 ) -> bool {
-    let Some(yazi_id) = yazi_id else { return false };
-    if focused != Some(yazi_id) {
+    let Some(id) = file_manager_id else {
+        return false;
+    };
+    if focused != Some(id) {
         return false;
     }
     selection.is_some()
@@ -7349,44 +6831,25 @@ mod tests {
         assert_eq!(pruned[1].0, sp(&[1]));
     }
 
-    // --- decode_osc_rimeterm (C18-D, OSC 1337 → KernelEvent) ---
+    // --- decode_osc_rimeterm (§5.5, C18-D) ---
 
     #[test]
-    fn osc_decode_file_selected() {
-        assert_eq!(
-            decode_osc_rimeterm(r#"{"event":"file.selected","path":"/tmp/a.md"}"#),
-            Ok(OscDecoded::FileSelected {
-                path: std::path::PathBuf::from("/tmp/a.md")
-            })
-        );
+    fn osc_decode_produces_ignored_for_any_event() {
+        for event in ["file.selected", "cwd.changed", "future.event"] {
+            let payload = format!(r#"{{"event":"{event}"}}"#);
+            assert_eq!(
+                decode_osc_rimeterm(&payload),
+                Ok(OscDecoded::Ignored {
+                    event: event.to_string(),
+                })
+            );
+        }
     }
 
     #[test]
-    fn osc_decode_cwd_changed() {
-        assert_eq!(
-            decode_osc_rimeterm(r#"{"event":"cwd.changed","path":"C:\\work"}"#),
-            Ok(OscDecoded::YaziCwd {
-                path: std::path::PathBuf::from("C:\\work")
-            })
-        );
-    }
-
-    #[test]
-    fn osc_decode_unknown_event_is_forward_compatible() {
-        assert_eq!(
-            decode_osc_rimeterm(r#"{"event":"git.commit","sha":"abc"}"#),
-            Ok(OscDecoded::Ignored {
-                event: "git.commit".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn osc_decode_rejects_invalid_json_and_missing_fields() {
+    fn osc_decode_rejects_invalid_json_and_missing_event() {
         let err = decode_osc_rimeterm("not json").unwrap_err();
         assert!(err.contains("invalid JSON"), "unexpected: {err}");
-        let err = decode_osc_rimeterm(r#"{"event":"file.selected"}"#).unwrap_err();
-        assert!(err.contains("missing `path`"), "unexpected: {err}");
         let err = decode_osc_rimeterm(r#"{"path":"/tmp"}"#).unwrap_err();
         assert!(err.contains("missing `event`"), "unexpected: {err}");
     }
@@ -7395,57 +6858,6 @@ mod tests {
     fn osc_decode_rejects_non_object_payload() {
         let err = decode_osc_rimeterm("[]").unwrap_err();
         assert!(err.contains("JSON object"), "unexpected: {err}");
-    }
-
-    #[tokio::test]
-    async fn osc_file_selected_reaches_event_bus_subscriber() {
-        let bus = EventBus::new(8);
-        let mut subscriber = bus.subscribe();
-        let origin = PaneId(77);
-        let decoded =
-            decode_osc_rimeterm(r#"{"event":"file.selected","path":"/tmp/from-yazi.md"}"#).unwrap();
-        let event = App::kernel_event_from_osc(origin, decoded).expect("known event maps");
-        assert_eq!(bus.send(event), 1);
-
-        let received = subscriber.next().await.expect("event arrives").unwrap();
-        match received {
-            KernelEvent::FileSelected {
-                origin: got_origin,
-                path,
-            } => {
-                assert_eq!(got_origin, origin);
-                assert_eq!(path, std::path::PathBuf::from("/tmp/from-yazi.md"));
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn osc_unknown_event_does_not_map_to_kernel_event() {
-        let decoded = decode_osc_rimeterm(r#"{"event":"future.event"}"#).unwrap();
-        assert!(App::kernel_event_from_osc(PaneId(1), decoded).is_none());
-    }
-
-    #[test]
-    fn osc_decode_matches_yazi_bridge_payload_shape() {
-        // Mirrors the exact payload string that
-        // `assets/yazi/plugins/rimeterm-bridge.yazi` writes for a hover.
-        // Regression guard: if the Lua plugin's JSON shape drifts, this
-        // test fails and points at the schema mismatch.
-        let hover = r#"{"event":"file.selected","path":"C:\\work\\notes.md"}"#;
-        assert_eq!(
-            decode_osc_rimeterm(hover),
-            Ok(OscDecoded::FileSelected {
-                path: std::path::PathBuf::from(r"C:\work\notes.md"),
-            })
-        );
-        let cwd = r#"{"event":"cwd.changed","path":"/tmp/proj"}"#;
-        assert_eq!(
-            decode_osc_rimeterm(cwd),
-            Ok(OscDecoded::YaziCwd {
-                path: std::path::PathBuf::from("/tmp/proj"),
-            })
-        );
     }
 
     #[test]
@@ -7510,15 +6922,14 @@ mod tests {
     #[test]
     fn tools_install_of_essential_returns_already_bundled() {
         // Essentials must never shell out to cargo — this locks in the
-        // §9.4 tools-install branch behavior for yazi/gitui/bottom.
-        let yazi_spec = rimeterm_config::tools::find("yazi").expect("yazi in registry");
-        let out = run_tool_action(ToolAction::Install, yazi_spec).expect("essentials never fail");
+        // §9.4 tools-install branch behavior for the remaining bundled
+        // essential (`bottom`) after the native-file-git refactor.
+        let bottom_spec = rimeterm_config::tools::find("bottom").expect("bottom in registry");
+        let out = run_tool_action(ToolAction::Install, bottom_spec).expect("essentials never fail");
         assert_eq!(out["result"], "already_bundled");
         assert_eq!(out["kind"], "essential");
 
-        // Same for uninstall — no matter what the user tries, we never
-        // touch a bundled essential.
-        let out = run_tool_action(ToolAction::Uninstall, yazi_spec).unwrap();
+        let out = run_tool_action(ToolAction::Uninstall, bottom_spec).unwrap();
         assert_eq!(out["result"], "already_bundled");
     }
 
@@ -7636,8 +7047,8 @@ mod tests {
     }
 
     #[test]
-    fn right_arrow_disabled_when_yazi_not_configured() {
-        // User removed `yazi` from files.tabs → shortcut is off. Any
+    fn right_arrow_disabled_when_file_manager_missing() {
+        // Native file-manager pane isn't wired → shortcut is off. Any
         // other guard state (focus, selection) is irrelevant.
         let sel = selection("/x/README.md");
         assert!(!should_hijack_right_for_viewer(
@@ -7648,42 +7059,38 @@ mod tests {
     }
 
     #[test]
-    fn right_arrow_disabled_when_yazi_not_focused() {
-        // yazi exists but a shells / agents pane is focused → `→`
-        // must fall through to that pane's own handler so cursor
+    fn right_arrow_disabled_when_file_manager_not_focused() {
+        // File manager exists but a shells / agents pane is focused →
+        // `→` must fall through to that pane's own handler so cursor
         // movement / directory navigation still works.
-        let yazi = PaneId::next();
+        let fm = PaneId::next();
         let elsewhere = PaneId::next();
         let sel = selection("/x/README.md");
         assert!(!should_hijack_right_for_viewer(
-            Some(yazi),
+            Some(fm),
             Some(elsewhere),
             Some(&sel),
         ));
     }
 
     #[test]
-    fn right_arrow_disabled_before_first_hover() {
-        // yazi is focused but never emitted `file.selected` yet →
-        // `selection == None`, nothing to open. `→` falls through so
-        // yazi's own key handler drives the cursor.
-        let yazi = PaneId::next();
-        assert!(!should_hijack_right_for_viewer(
-            Some(yazi),
-            Some(yazi),
-            None,
-        ));
+    fn right_arrow_disabled_before_first_selection() {
+        // File manager is focused but never emitted `FileSelected` yet
+        // → `selection == None`, nothing to open. `→` falls through so
+        // the file manager's own key handler drives the cursor.
+        let fm = PaneId::next();
+        assert!(!should_hijack_right_for_viewer(Some(fm), Some(fm), None,));
     }
 
     #[test]
-    fn right_arrow_hijacks_when_yazi_focused_with_selection() {
-        // Happy path: yazi focused + selection present → the caller
-        // will proceed to the `is_file` syscall check.
-        let yazi = PaneId::next();
+    fn right_arrow_hijacks_when_file_manager_focused_with_selection() {
+        // Happy path: file manager focused + selection present → the
+        // caller will proceed to the `is_file` syscall check.
+        let fm = PaneId::next();
         let sel = selection("/x/README.md");
         assert!(should_hijack_right_for_viewer(
-            Some(yazi),
-            Some(yazi),
+            Some(fm),
+            Some(fm),
             Some(&sel),
         ));
     }
@@ -7692,145 +7099,20 @@ mod tests {
     fn right_arrow_disabled_when_no_pane_focused() {
         // Bootstrap edge case: `focused_pane()` may return None
         // before the first draw. Guard must not treat `None` as
-        // "matches yazi".
-        let yazi = PaneId::next();
+        // "matches the file manager".
+        let fm = PaneId::next();
         let sel = selection("/x/README.md");
-        assert!(!should_hijack_right_for_viewer(
-            Some(yazi),
-            None,
-            Some(&sel),
-        ));
+        assert!(!should_hijack_right_for_viewer(Some(fm), None, Some(&sel),));
     }
 
-    // --- find_git_root debounce guard (fixes "background floods with
-    //     gitui instances" bug — see field doc on
-    //     App::active_repo_root and the debounce block in
-    //     refresh_gitui_at_active_root) ---
+    // --- pane reload command (F5) -------------------------------------
 
     #[test]
-    fn find_git_root_walks_up_from_a_subdir_inside_a_repo() {
-        let temp = std::env::temp_dir().join(format!(
-            "rimeterm-find-git-root-{}-{}",
-            std::process::id(),
-            "a"
-        ));
-        let repo = temp.join("repo");
-        let sub = repo.join("src").join("nested");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-
-        assert_eq!(find_git_root(&repo), Some(repo.clone()));
-        assert_eq!(find_git_root(&repo.join("src")), Some(repo.clone()));
-        assert_eq!(find_git_root(&sub), Some(repo.clone()));
-
-        let _ = std::fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn find_git_root_returns_none_outside_any_repo() {
-        // Point at a temp dir with no `.git` anywhere in its parents
-        // (temp_dir itself never has .git). Walking `.parent()` must
-        // terminate at the filesystem root without panicking or
-        // looping.
-        let temp = std::env::temp_dir().join(format!(
-            "rimeterm-find-git-root-{}-{}",
-            std::process::id(),
-            "b"
-        ));
-        std::fs::create_dir_all(&temp).unwrap();
-        // Sanity: no .git anywhere on the way up (temp_dir is
-        // guaranteed to not be inside a repo in CI).
-        assert!(find_git_root(&temp).is_none() || find_git_root(&temp).is_some());
-        let _ = std::fs::remove_dir_all(&temp);
-    }
-
-    // --- BUG-1a / BUG-1b regression tests -----------------------------
-    //
-    // These exercise the small pure surface of the git-refresh path:
-    // watcher install + fs-event bridge (BUG-1b) and the key `git.refresh`
-    // wiring (BUG-1a). The full `respawn_gitui_now` path requires a live
-    // App / PTY registry; smoke-tested manually via F5.
-
-    #[test]
-    fn spawn_git_watcher_delivers_event_on_head_write() {
-        // BUG-1b end-to-end: install the watcher, touch .git/HEAD,
-        // and confirm the notify callback pushes into our channel.
-        //
-        // Skipped on hosts where the platform-native backend rejects
-        // the watch (very rare — WSL with disabled inotify in CI).
-        use std::io::Write;
-
-        let temp =
-            std::env::temp_dir().join(format!("rimeterm-git-watcher-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(temp.join(".git").join("refs").join("heads")).unwrap();
-        std::fs::write(temp.join(".git").join("HEAD"), b"ref: refs/heads/main\n").unwrap();
-
-        let (tx, mut rx) = mpsc::unbounded_channel::<()>();
-        let _watcher = match spawn_git_watcher(&temp, tx) {
-            Ok(w) => w,
-            Err(_) => {
-                // Backend refused; document the skip in the log and
-                // pass — F5 is the fallback in production too.
-                let _ = std::fs::remove_dir_all(&temp);
-                return;
-            }
-        };
-
-        // Some backends need a warm-up tick before the initial watch
-        // subscription lands. Sleep 100 ms so the first write we make
-        // is actually seen.
-        std::thread::sleep(Duration::from_millis(100));
-
-        let mut head = std::fs::OpenOptions::new()
-            .append(true)
-            .open(temp.join(".git").join("HEAD"))
-            .unwrap();
-        writeln!(head, "# rimeterm test").unwrap();
-        drop(head);
-
-        // Poll up to ~2 s for the event to arrive. FSEvents on macOS is
-        // known to batch at ~30 ms; Linux inotify is sub-ms; Windows
-        // ReadDirectoryChangesW is sub-100 ms typically.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut got = false;
-        while std::time::Instant::now() < deadline {
-            if rx.try_recv().is_ok() {
-                got = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let _ = std::fs::remove_dir_all(&temp);
-        assert!(got, "expected watcher event within 2s of HEAD write");
-    }
-
-    #[test]
-    fn spawn_git_watcher_errors_when_git_dir_missing() {
-        // BUG-1b: repos without an actual `.git/` (e.g. subdirs the
-        // user cd'd into before `git init`) must return Err rather
-        // than silently installing a broken watcher.
-        let temp =
-            std::env::temp_dir().join(format!("rimeterm-no-git-watcher-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(&temp).unwrap();
-        let (tx, _rx) = mpsc::unbounded_channel::<()>();
-        let res = spawn_git_watcher(&temp, tx);
-        let _ = std::fs::remove_dir_all(&temp);
-        assert!(
-            res.is_err(),
-            "expected Err when .git/ doesn't exist, got Ok — the watcher \
-             would silently install nothing and BUG-1b would silently fail"
-        );
-    }
-
-    #[test]
-    fn git_refresh_command_id_is_stable() {
-        // BUG-1a: the command id `git.refresh` is stable API — the
-        // keymap in `keymap.rs` and any user-facing docs / rimectl
-        // scripts embed it. If a future refactor renames it, this
-        // test forces you to update the keymap + docs in the same PR.
+    fn pane_reload_command_id_is_registered() {
+        // `workspace.pane.reload` is stable API — the keymap in
+        // `keymap.rs` and any user-facing docs / rimectl scripts embed
+        // it. If a future refactor renames it, this test forces you to
+        // update the keymap + docs in the same PR.
         let flags = Arc::new(ActionFlags::default());
         let mut cmds = CommandRegistry::new();
         let pending: Arc<parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>> =
@@ -7850,85 +7132,21 @@ mod tests {
             redraw_tx,
         )
         .expect("register");
-        // Firing the command must flip the flag; drain_flags will see
-        // it and call respawn_gitui_now (that side is exercised
-        // manually via F5).
-        cmds.run("git.refresh").expect("git.refresh is registered");
+        cmds.run("workspace.pane.reload")
+            .expect("workspace.pane.reload is registered");
         assert!(
-            flags.git_refresh.load(Ordering::Relaxed),
-            "git.refresh command must flip flags.git_refresh"
+            flags.pane_reload.load(Ordering::Relaxed),
+            "workspace.pane.reload command must flip flags.pane_reload"
         );
     }
 
     #[test]
-    fn f5_maps_to_git_refresh() {
-        // BUG-1a: F5 is the primary keybinding. Guard against an
-        // accidental swap with F6/F7/etc.
+    fn f5_maps_to_workspace_pane_reload() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let ev = KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE);
         assert_eq!(
             crate::keymap::Keymap::dispatch(ev),
-            crate::keymap::KeymapOutcome::Run("git.refresh"),
-        );
-    }
-
-    // --- BUG-1b flicker guard tests -----------------------------------
-    //
-    // The full self-reinforcing "gitui spawns → touches .git/ → watcher
-    // fires → respawn → loop" pathology is hard to reproduce without a
-    // real PTY + a real libgit2 process. We test the pure predicate
-    // that gates the debounce set-point: given a `Some(future_instant)`
-    // in `git_watch_settle_until`, incoming fs events MUST NOT arm a
-    // respawn deadline.
-
-    fn in_settle_window(settle_until: Option<Instant>) -> bool {
-        // Mirrors the guard used inside the `git_event_rx` select
-        // branch and in `expire_git_debounce`. Kept as a free helper
-        // so the pure logic is unit-testable without spinning up App.
-        settle_until.is_some_and(|t| Instant::now() < t)
-    }
-
-    #[test]
-    fn settle_window_active_when_deadline_in_future() {
-        // Any deadline strictly after now = "we're inside the settle
-        // window; drop fs events".
-        let settle = Some(Instant::now() + GIT_WATCH_SETTLE);
-        assert!(
-            in_settle_window(settle),
-            "future deadline must engage guard"
-        );
-    }
-
-    #[test]
-    fn settle_window_inactive_when_none() {
-        // App::new with no `.git/` at startup leaves the field as
-        // None; fs events (from a later `update_git_watcher` cycle
-        // that hasn't happened yet) should NOT be dropped by the
-        // guard because there's no active respawn to protect.
-        assert!(!in_settle_window(None), "None must not engage guard");
-    }
-
-    #[test]
-    fn settle_window_inactive_when_deadline_elapsed() {
-        // Past deadline = window has expired; real user activity
-        // like a `git commit` from a shell tab must now be able to
-        // arm the debounce.
-        let settle = Some(Instant::now() - Duration::from_millis(1));
-        assert!(
-            !in_settle_window(settle),
-            "expired deadline must release guard"
-        );
-    }
-
-    #[test]
-    fn settle_window_default_size_covers_typical_libgit2_startup() {
-        // Sanity: the compile-time constant is at least 300 ms — one
-        // debounce cycle. A shorter window would risk the "gitui
-        // startup → fire → 300 ms later fire → respawn" pathology.
-        assert!(
-            GIT_WATCH_SETTLE >= Duration::from_millis(300),
-            "GIT_WATCH_SETTLE MUST be >= debounce (300 ms), got {:?}",
-            GIT_WATCH_SETTLE,
+            crate::keymap::KeymapOutcome::Run("workspace.pane.reload"),
         );
     }
 

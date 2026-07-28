@@ -12,15 +12,17 @@
 pub mod agents_state;
 pub mod assets;
 pub mod env;
+pub mod files_state;
 pub mod install_hint;
 pub mod layout_state;
+pub mod migrate;
 pub mod paths;
 
 #[doc(hidden)]
 pub mod test_util;
 pub mod tools;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +34,7 @@ pub struct Config {
     pub ui: UiConfig,
     pub agents: AgentsConfig,
     pub files: FilesConfig,
+    pub git: GitConfig,
     pub sysmon: SysmonConfig,
     pub mouse: MouseConfig,
     pub viewer: ViewerConfig,
@@ -110,8 +113,7 @@ impl Default for ViewerMarkdownConfig {
 }
 
 /// Mouse-input policy (§19.14). Governs right-click semantics on the
-/// interactive right-column panes (agents / shells) and the geometry of
-/// the left-column yazi zone router.
+/// interactive right-column panes (agents / shells).
 ///
 /// All fields are optional in TOML thanks to `#[serde(default)]`; defaults
 /// match the shipping behaviour described in §19.14.
@@ -127,35 +129,18 @@ pub struct MouseConfig {
     /// always uses copy semantics regardless of this flag —
     /// §19.14.2 invariant 36.
     pub right_click_paste: bool,
-
-    /// Render a `ratatui::Scrollbar` on the right edge of the Quick
-    /// Look zone. Only drawn when yazi actually reports scroll metrics
-    /// (§19.14.3); left `true` here just means "don't hide it even
-    /// when yazi reports". Toggle to `false` to suppress the widget
-    /// entirely.
-    pub quicklook_scrollbar: bool,
-
-    /// yazi's `[mgr] ratio` for the three visible columns
-    /// `[parent, current, preview]` — mirrors yazi's own config knob.
-    /// The Quick Look zone starts where the preview column would
-    /// start given this ratio and the pane's current inner width.
-    ///
-    /// Yazi's own default (as of yazi 0.4+) is `[1, 4, 3]`. If a user
-    /// customises `yazi.toml`, they should mirror the same three
-    /// integers here so rimeterm's zone splitter agrees with what
-    /// yazi actually draws.
-    ///
-    /// All three values must be > 0; the loader clamps zero / negative
-    /// entries to `1` before returning.
-    pub yazi_layout: [u8; 3],
+    // The pre-native-file-git schema also exposed `quicklook_scrollbar`
+    // and `yazi_layout` here; both drove the yazi PTY zone router
+    // which retired with the native file/git panes. Legacy configs
+    // that still carry those keys are stripped by
+    // [`crate::migrate::migrate_pre_native_file_git`] before load so
+    // `deny_unknown_fields` on this struct doesn't hard-fail them.
 }
 
 impl Default for MouseConfig {
     fn default() -> Self {
         Self {
             right_click_paste: true,
-            quicklook_scrollbar: true,
-            yazi_layout: [1, 4, 3],
         }
     }
 }
@@ -209,52 +194,64 @@ pub struct ExternalToolSpec {
 /// Alias kept for M3 callers. Prefer `ExternalToolSpec`.
 pub type AgentSpec = ExternalToolSpec;
 
-/// Files quadrant (`yazi`, `gitui`, …). Fixed tab-group; user can reorder or
-/// swap in alternatives via config but rimeterm hardcodes the *group* itself.
+/// Files quadrant — the native two-pane file manager (post
+/// native-file-git refactor). No more `[[files.tabs]]` array; these
+/// are user-tweakable **defaults** consumed by the file-manager panes
+/// at startup and mirrored into per-workspace [`FilesState`] the
+/// first time a workspace is opened.
+///
+/// [`FilesState`]: crate::files_state::FilesState
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FilesConfig {
-    pub tabs: Vec<ExternalToolSpec>,
+    /// Default directory shown by the left pane on first open of a
+    /// workspace. Interpreted relative to the workspace root when
+    /// relative; absolute paths are honoured as-is.
+    pub left_dir: PathBuf,
+    /// Default directory shown by the right pane on first open.
+    pub right_dir: PathBuf,
+    /// Whether hidden entries are visible by default.
+    pub show_hidden: bool,
+    /// Stable sort-mode label (`"name"`, `"modified"`, …).
+    pub sort: String,
+    /// Whether both panes are visible by default.
+    pub dual_pane: bool,
 }
 
 impl Default for FilesConfig {
     fn default() -> Self {
-        use crate::install_hint::InstallHint;
         Self {
-            tabs: vec![
-                ExternalToolSpec {
-                    id: "yazi".into(),
-                    label: "yazi".into(),
-                    command: vec!["yazi".into()],
-                    install_hint: Some(
-                        InstallHint {
-                            winget: Some("winget install sxyazi.yazi"),
-                            scoop: Some("scoop install yazi"),
-                            brew: Some("brew install yazi"),
-                            linux: Some("see https://yazi-rs.github.io/docs/installation"),
-                            cargo: Some("cargo install --locked yazi-fm yazi-cli"),
-                            note: Some("optional image preview needs ImageMagick / ffmpeg"),
-                        }
-                        .to_string(),
-                    ),
-                },
-                ExternalToolSpec {
-                    id: "gitui".into(),
-                    label: "gitui".into(),
-                    command: vec!["gitui".into()],
-                    install_hint: Some(
-                        InstallHint {
-                            winget: Some("winget install StephanDilly.gitui"),
-                            scoop: Some("scoop install gitui"),
-                            brew: Some("brew install gitui"),
-                            linux: Some("sudo pacman -S gitui (Arch); see repo for other distros"),
-                            cargo: Some("cargo install --locked gitui"),
-                            note: None,
-                        }
-                        .to_string(),
-                    ),
-                },
-            ],
+            left_dir: PathBuf::from("."),
+            right_dir: PathBuf::from("."),
+            show_hidden: false,
+            sort: "name".into(),
+            dual_pane: true,
+        }
+    }
+}
+
+/// Git integration — the native diff / commit-log viewer that
+/// replaces the retired gitui external tool.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GitConfig {
+    /// Master switch for the native git panes. When `false` the git
+    /// column is hidden and no `gix` calls run.
+    pub enabled: bool,
+    /// Cap on the number of commits fetched for the log view. Bounded
+    /// so a monorepo with 100k+ commits doesn't stall startup.
+    pub commit_limit: u32,
+    /// Diff-view layout: `"auto"` (splits by terminal width),
+    /// `"unified"` (single column), or `"split"` (two columns).
+    pub diff_layout: String,
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            commit_limit: 200,
+            diff_layout: "auto".into(),
         }
     }
 }
@@ -367,13 +364,31 @@ mod tests {
     }
 
     #[test]
-    fn default_files_config_has_yazi_gitui() {
-        let ids: Vec<_> = FilesConfig::default()
-            .tabs
-            .iter()
-            .map(|s| s.id.clone())
-            .collect();
-        assert_eq!(ids, vec!["yazi".to_string(), "gitui".to_string()]);
+    fn default_files_config_matches_native_two_pane_schema() {
+        let f = FilesConfig::default();
+        assert_eq!(f.left_dir, PathBuf::from("."));
+        assert_eq!(f.right_dir, PathBuf::from("."));
+        assert!(!f.show_hidden);
+        assert_eq!(f.sort, "name");
+        assert!(f.dual_pane);
+    }
+
+    #[test]
+    fn default_git_config_matches_native_schema() {
+        let g = GitConfig::default();
+        assert!(g.enabled);
+        assert_eq!(g.commit_limit, 200);
+        assert_eq!(g.diff_layout, "auto");
+    }
+
+    #[test]
+    fn files_git_partial_toml_only_overrides_named_fields() {
+        let cfg: Config =
+            toml::from_str("[files]\nshow_hidden = true\n[git]\ncommit_limit = 42\n").unwrap();
+        assert!(cfg.files.show_hidden);
+        assert_eq!(cfg.files.sort, "name");
+        assert_eq!(cfg.git.commit_limit, 42);
+        assert!(cfg.git.enabled);
     }
 
     #[test]
@@ -406,22 +421,25 @@ install_hint = "brew install yazi"
     fn default_mouse_config_matches_docs() {
         let m = MouseConfig::default();
         assert!(m.right_click_paste);
-        assert!(m.quicklook_scrollbar);
-        assert_eq!(m.yazi_layout, [1, 4, 3]);
     }
 
     #[test]
     fn mouse_config_partial_toml() {
         let cfg: Config = toml::from_str("[mouse]\nright_click_paste = false\n").unwrap();
         assert!(!cfg.mouse.right_click_paste);
-        // Other fields keep defaults.
-        assert!(cfg.mouse.quicklook_scrollbar);
-        assert_eq!(cfg.mouse.yazi_layout, [1, 4, 3]);
     }
 
     #[test]
-    fn mouse_config_user_layout_override() {
-        let cfg: Config = toml::from_str("[mouse]\nyazi_layout = [2, 3, 5]\n").unwrap();
-        assert_eq!(cfg.mouse.yazi_layout, [2, 3, 5]);
+    fn mouse_config_rejects_legacy_zone_keys() {
+        // The pre-native-file-git schema exposed `yazi_layout` /
+        // `quicklook_scrollbar` here. Configs that still carry them
+        // MUST be scrubbed by migrate::migrate_pre_native_file_git
+        // before load; a raw parse against MouseConfig hard-fails.
+        let err_layout =
+            toml::from_str::<Config>("[mouse]\nyazi_layout = [1, 4, 3]\n").unwrap_err();
+        assert!(err_layout.to_string().contains("unknown field"));
+        let err_scroll =
+            toml::from_str::<Config>("[mouse]\nquicklook_scrollbar = true\n").unwrap_err();
+        assert!(err_scroll.to_string().contains("unknown field"));
     }
 }

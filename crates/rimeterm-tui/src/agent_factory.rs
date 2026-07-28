@@ -1,10 +1,10 @@
-//! Spawn an external tool (`yazi`, `gitui`, `bottom`, `omp`, `claude`, or any
+//! Spawn an external tool (`bottom`, `omp`, `codex`, `claude`, `pi`, or any
 //! user-defined entry) into a fresh PTY, wrapped as a [`PtyPane`].
 //!
 //! Consolidates the "resolve program → build SessionConfig → spawn Session →
 //! wrap in PtyPane" flow so every quadrant that hosts an external command
-//! goes through one code path. See §19.10.9 (shells) and §19.10.7 (files /
-//! sysmon / agents grouping) of the design doc.
+//! goes through one code path. See §19.10.9 (shells) and §19.10.7 (sysmon /
+//! agents grouping) of the design doc.
 
 use std::path::PathBuf;
 
