@@ -86,7 +86,6 @@ struct ActionFlags {
     settings: AtomicBool,
     resize_toggle: AtomicBool,
     acknowledgement: AtomicBool,
-    #[cfg(windows)]
     upgrade: AtomicBool,
     viewer_open: AtomicBool,
     viewer_close: AtomicBool,
@@ -534,14 +533,9 @@ pub struct App {
     last_ack_popup_rect: Option<Rect>,
     settings_state: crate::settings::SettingsState,
     ack_state: crate::acknowledgement::AckOverlayState,
-    #[cfg(windows)]
     upgrade_state: crate::upgrade::UpgradeState,
-    #[cfg(windows)]
     upgrade_tx: mpsc::UnboundedSender<crate::upgrade::WorkerEvent>,
-    #[cfg(windows)]
     upgrade_rx: mpsc::UnboundedReceiver<crate::upgrade::WorkerEvent>,
-    #[cfg(not(windows))]
-    upgrade_rx: mpsc::UnboundedReceiver<()>,
     #[cfg(windows)]
     pending_installer: Option<PathBuf>,
     flags: Arc<ActionFlags>,
@@ -926,10 +920,7 @@ impl App {
         )?;
         let (viewer_completion_tx, viewer_completion_rx) =
             mpsc::unbounded_channel::<ViewerCompletion>();
-        #[cfg(windows)]
         let (upgrade_tx, upgrade_rx) = mpsc::unbounded_channel::<crate::upgrade::WorkerEvent>();
-        #[cfg(not(windows))]
-        let (_upgrade_tx, upgrade_rx) = mpsc::unbounded_channel::<()>();
         // Best-effort graphics protocol detection. Query at startup so
         // the terminal capabilities cache is warm before we ever try to
         // build an image protocol. Halfblocks fallback keeps the viewer
@@ -971,9 +962,7 @@ impl App {
             last_settings_popup_rect: None,
             last_ack_popup_rect: None,
             ack_state: crate::acknowledgement::AckOverlayState::default(),
-            #[cfg(windows)]
             upgrade_state: crate::upgrade::UpgradeState::default(),
-            #[cfg(windows)]
             upgrade_tx,
             upgrade_rx,
             #[cfg(windows)]
@@ -1357,7 +1346,14 @@ impl App {
         let _ = self.redraw_tx.send(());
     }
 
-    #[cfg(windows)]
+    fn upgrade_is_open(&self) -> bool {
+        self.upgrade_state.open
+    }
+
+    fn close_upgrade_overlay(&mut self) {
+        self.upgrade_state.open = false;
+    }
+
     fn spawn_upgrade_check(&self, generation: u64) {
         let tx = self.upgrade_tx.clone();
         tokio::spawn(async move {
@@ -1371,26 +1367,6 @@ impl App {
             let _ = tx.send(crate::upgrade::WorkerEvent::CheckFinished { generation, result });
         });
     }
-    #[cfg(windows)]
-    fn upgrade_is_open(&self) -> bool {
-        self.upgrade_state.open
-    }
-
-    #[cfg(not(windows))]
-    fn upgrade_is_open(&self) -> bool {
-        false
-    }
-
-    #[cfg(windows)]
-    fn close_upgrade_overlay(&mut self) {
-        self.upgrade_state.open = false;
-    }
-
-    #[cfg(not(windows))]
-    fn close_upgrade_overlay(&mut self) {}
-
-    #[cfg(not(windows))]
-    fn apply_upgrade_event(&mut self, _event: ()) {}
 
     #[cfg(windows)]
     fn spawn_upgrade_download(&self, generation: u64, release: crate::updater::AvailableRelease) {
@@ -1420,24 +1396,26 @@ impl App {
         });
     }
 
-    #[cfg(windows)]
     fn apply_upgrade_action(&mut self, action: crate::upgrade::UpgradeAction) {
         match action {
             crate::upgrade::UpgradeAction::Check { generation } => {
                 self.spawn_upgrade_check(generation);
             }
+            #[cfg(windows)]
             crate::upgrade::UpgradeAction::Download {
                 generation,
                 release,
             } => self.spawn_upgrade_download(generation, release),
+            #[cfg(not(windows))]
+            crate::upgrade::UpgradeAction::Download { .. } => {}
             crate::upgrade::UpgradeAction::Close => {}
         }
         let _ = self.redraw_tx.send(());
     }
 
-    #[cfg(windows)]
     fn apply_upgrade_event(&mut self, event: crate::upgrade::WorkerEvent) {
         self.upgrade_state.apply(event);
+        #[cfg(windows)]
         if let Some(path) = self.upgrade_state.ready_installer_path() {
             self.pending_installer = Some(path);
             self.should_quit = true;
@@ -1715,7 +1693,6 @@ impl App {
         // would produce a confusing z-order.
         // ACK overlay is checked FIRST because it's a purely-modal
         // credits popup — every other overlay can wait behind it.
-        #[cfg(windows)]
         if self.upgrade_state.open {
             if let Some(action) = self.upgrade_state.handle_key(key) {
                 self.apply_upgrade_action(action);
@@ -3047,7 +3024,6 @@ impl App {
             self.ack_state.render(area, frame.buffer_mut());
             self.last_ack_popup_rect = Some(rect);
         }
-        #[cfg(windows)]
         if self.upgrade_state.open {
             self.upgrade_state.render(area, frame.buffer_mut());
         }
@@ -3071,7 +3047,6 @@ impl App {
             picker_open: self.picker_state.open,
             settings_open: self.settings_state.open,
             ack_open: self.ack_state.open,
-            #[cfg(windows)]
             upgrade_open: self.upgrade_state.open,
             viewer_open: self.viewer.is_open(),
             viewer_focused: self.viewer_owns_caret(),
@@ -3289,7 +3264,6 @@ impl App {
             self.ack_state.open();
             let _ = self.redraw_tx.send(());
         }
-        #[cfg(windows)]
         if f.upgrade.swap(false, Ordering::Relaxed) {
             let generation = self.upgrade_state.open_and_check();
             if matches!(
@@ -4521,12 +4495,11 @@ fn register_commands(
         "Edit rimeterm config",
         flags.settings
     );
-    #[cfg(windows)]
     flag_cmd!(
         cmds,
         "app.upgrade",
         "Upgrade rimeterm",
-        "Check GitHub Releases and install a verified MSI",
+        "Check GitHub Releases for a newer version",
         flags.upgrade
     );
     flag_cmd!(
@@ -5686,7 +5659,6 @@ pub(crate) struct FrameCursorInputs {
     pub(crate) picker_open: bool,
     pub(crate) settings_open: bool,
     pub(crate) ack_open: bool,
-    #[cfg(windows)]
     pub(crate) upgrade_open: bool,
     pub(crate) viewer_open: bool,
     pub(crate) viewer_focused: bool,
@@ -5714,16 +5686,7 @@ pub(crate) fn decide_frame_cursor(inputs: FrameCursorInputs) -> Option<(u16, u16
         || inputs.picker_open
         || inputs.settings_open
         || inputs.ack_open
-        || {
-            #[cfg(windows)]
-            {
-                inputs.upgrade_open
-            }
-            #[cfg(not(windows))]
-            {
-                false
-            }
-        }
+        || inputs.upgrade_open
         || (inputs.viewer_open && inputs.viewer_focused);
     if modal_owns_focus {
         None
@@ -7306,7 +7269,6 @@ mod tests {
             picker_open: false,
             settings_open: false,
             ack_open: false,
-            #[cfg(windows)]
             upgrade_open: false,
             viewer_open: false,
             viewer_focused: false,

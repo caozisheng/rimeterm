@@ -1,4 +1,4 @@
-//! Windows online-upgrade modal state and rendering.
+//! Cross-platform online-upgrade modal state and rendering.
 
 use std::path::PathBuf;
 
@@ -164,12 +164,13 @@ impl UpgradeState {
         }
         match &self.phase {
             Phase::Available(release) => {
+                let total = release.windows_installer.as_ref()?.msi.size;
                 let release = release.clone();
                 self.generation = self.generation.wrapping_add(1);
                 self.phase = Phase::Downloading {
                     release: release.clone(),
                     downloaded: 0,
-                    total: release.msi.size,
+                    total,
                 };
                 Some(UpgradeAction::Download {
                     generation: self.generation,
@@ -251,20 +252,28 @@ impl UpgradeState {
                 if let Some(date) = &release.published_at {
                     lines.push(Line::raw(format!("Published: {date}")));
                 }
-                lines.push(Line::raw(format!("Installer: {} bytes", release.msi.size)));
+                if let Some(installer) = &release.windows_installer {
+                    lines.push(Line::raw(format!(
+                        "Installer: {} bytes",
+                        installer.msi.size
+                    )));
+                }
+                lines.push(Line::raw(format!("Release: {}", release.html_url)));
                 lines.push(Line::raw(""));
                 lines.extend(
                     release
                         .notes
                         .lines()
-                        .take(inner.height.saturating_sub(9) as usize)
+                        .take(inner.height.saturating_sub(10) as usize)
                         .map(Line::raw),
                 );
                 lines.push(Line::raw(""));
-                lines.push(Line::styled(
-                    "Enter: download and install · Esc: close",
-                    Style::default().fg(Color::Yellow),
-                ));
+                let action = if release.windows_installer.is_some() {
+                    "Enter: download and install · Esc: close"
+                } else {
+                    "Update information only · Esc: close"
+                };
+                lines.push(Line::styled(action, Style::default().fg(Color::Yellow)));
             }
             Phase::Downloading {
                 downloaded, total, ..
@@ -314,7 +323,7 @@ impl UpgradeState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::updater::{AvailableRelease, ReleaseAsset};
+    use crate::updater::{AvailableRelease, ReleaseAsset, WindowsInstaller};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use semver::Version;
 
@@ -324,16 +333,18 @@ mod tests {
             notes: "new feature".into(),
             html_url: "https://example.invalid/release".into(),
             published_at: Some("2026-07-29T00:00:00Z".into()),
-            msi: ReleaseAsset {
-                name: "rimeterm-0.3.0-x86_64.msi".into(),
-                browser_download_url: "https://example.invalid/rimeterm.msi".into(),
-                size: 100,
-            },
-            checksums: ReleaseAsset {
-                name: "SHA256SUMS".into(),
-                browser_download_url: "https://example.invalid/SHA256SUMS".into(),
-                size: 64,
-            },
+            windows_installer: Some(WindowsInstaller {
+                msi: ReleaseAsset {
+                    name: "rimeterm-0.3.0-x86_64.msi".into(),
+                    browser_download_url: "https://example.invalid/rimeterm.msi".into(),
+                    size: 100,
+                },
+                checksums: ReleaseAsset {
+                    name: "SHA256SUMS".into(),
+                    browser_download_url: "https://example.invalid/SHA256SUMS".into(),
+                    size: 64,
+                },
+            }),
         }
     }
 
@@ -368,6 +379,21 @@ mod tests {
             Some(UpgradeAction::Download { generation: 2, .. })
         ));
         assert!(matches!(state.phase(), UpgradePhase::Downloading));
+    }
+
+    #[test]
+    fn information_only_release_enter_does_not_start_download() {
+        let mut info = release();
+        info.windows_installer = None;
+        let mut state = UpgradeState::default();
+        let generation = state.open_and_check();
+        state.apply(WorkerEvent::CheckFinished {
+            generation,
+            result: Ok(Some(info)),
+        });
+
+        assert_eq!(state.handle_key(key(KeyCode::Enter)), None);
+        assert!(matches!(state.phase(), UpgradePhase::Available));
     }
 
     #[test]

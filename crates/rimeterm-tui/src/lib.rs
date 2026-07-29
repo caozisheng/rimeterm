@@ -32,9 +32,7 @@ pub mod sysmon_pane;
 pub mod sysmon_worker;
 pub mod tab_strip;
 pub mod terminal;
-#[cfg(windows)]
 pub mod updater;
-#[cfg(windows)]
 pub mod upgrade;
 pub mod viewer;
 

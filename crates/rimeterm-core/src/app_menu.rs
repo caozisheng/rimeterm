@@ -34,7 +34,6 @@ impl AppMenu {
                     command: "app.settings",
                     separator_before: false,
                 },
-                #[cfg(windows)]
                 AppMenuItem {
                     id: "app.upgrade",
                     title: "Upgrade",
@@ -80,7 +79,6 @@ mod tests {
     fn default_menu_has_platform_items_in_order() {
         let menu = AppMenu::v0_1_default();
 
-        #[cfg(windows)]
         assert_eq!(
             menu.items.iter().map(|item| item.id).collect::<Vec<_>>(),
             [
@@ -89,12 +87,6 @@ mod tests {
                 "app.acknowledgement",
                 "app.quit",
             ]
-        );
-
-        #[cfg(not(windows))]
-        assert_eq!(
-            menu.items.iter().map(|item| item.id).collect::<Vec<_>>(),
-            ["app.settings", "app.acknowledgement", "app.quit"]
         );
 
         assert!(

@@ -20,7 +20,7 @@ serde = { workspace = true }
 alacritty_terminal = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
 regex = "1.10"
@@ -29,6 +29,9 @@ which = { workspace = true }
 unicode-width = { workspace = true }
 arboard = { workspace = true }
 anyhow = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+semver = "1"
+sha2 = "0.10"
 # C20 viewer overlay
 tui-markdown = { workspace = true }
 rimeterm-markdown = { workspace = true }
@@ -69,11 +72,6 @@ bollard = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = { workspace = true }
 
-[target.'cfg(windows)'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-semver = "1"
-sha2 = "0.10"
-tokio = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

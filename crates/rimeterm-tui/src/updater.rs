@@ -1,4 +1,4 @@
-//! Windows GitHub Release checker and verified MSI downloader.
+//! Cross-platform GitHub Release checker with verified Windows MSI download.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -32,13 +32,18 @@ pub struct GitHubRelease {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowsInstaller {
+    pub msi: ReleaseAsset,
+    pub checksums: ReleaseAsset,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvailableRelease {
     pub version: Version,
     pub notes: String,
     pub html_url: String,
     pub published_at: Option<String>,
-    pub msi: ReleaseAsset,
-    pub checksums: ReleaseAsset,
+    pub windows_installer: Option<WindowsInstaller>,
 }
 
 pub fn client() -> Result<reqwest::Client> {
@@ -65,12 +70,20 @@ pub async fn check(client: &reqwest::Client, api_url: &str) -> Result<Option<Ava
         .json::<Vec<GitHubRelease>>()
         .await
         .context("decode GitHub Releases response")?;
-    select_release(env!("CARGO_PKG_VERSION"), &releases)
+    select_release_for(env!("CARGO_PKG_VERSION"), &releases, cfg!(windows))
 }
 
 pub fn select_release(
     current: &str,
     releases: &[GitHubRelease],
+) -> Result<Option<AvailableRelease>> {
+    select_release_for(current, releases, cfg!(windows))
+}
+
+pub fn select_release_for(
+    current: &str,
+    releases: &[GitHubRelease],
+    require_windows_installer: bool,
 ) -> Result<Option<AvailableRelease>> {
     let current = Version::parse(current).context("parse current rimeterm version")?;
     let accepts_prerelease = !current.pre.is_empty();
@@ -89,16 +102,21 @@ pub fn select_release(
         return Ok(None);
     };
 
-    let msi_name = format!("rimeterm-{version}-x86_64.msi");
-    let msi = exact_asset(release, &msi_name)?.clone();
-    let checksums = exact_asset(release, "SHA256SUMS")?.clone();
+    let windows_installer = if require_windows_installer {
+        let msi_name = format!("rimeterm-{version}-x86_64.msi");
+        Some(WindowsInstaller {
+            msi: exact_asset(release, &msi_name)?.clone(),
+            checksums: exact_asset(release, "SHA256SUMS")?.clone(),
+        })
+    } else {
+        None
+    };
     Ok(Some(AvailableRelease {
         version,
         notes: release.body.clone().unwrap_or_default(),
         html_url: release.html_url.clone(),
         published_at: release.published_at.clone(),
-        msi,
-        checksums,
+        windows_installer,
     }))
 }
 
@@ -148,11 +166,15 @@ pub async fn download_verified<F>(
 where
     F: FnMut(u64, u64),
 {
+    let installer = release
+        .windows_installer
+        .as_ref()
+        .ok_or_else(|| anyhow!("release {} has no Windows installer", release.version))?;
     tokio::fs::create_dir_all(dest_dir)
         .await
         .with_context(|| format!("create update directory {}", dest_dir.display()))?;
     let manifest = client
-        .get(&release.checksums.browser_download_url)
+        .get(&installer.checksums.browser_download_url)
         .send()
         .await
         .context("download SHA256SUMS")?
@@ -161,18 +183,18 @@ where
         .text()
         .await
         .context("read SHA256SUMS")?;
-    let expected = checksum_for(&manifest, &release.msi.name)?.to_owned();
+    let expected = checksum_for(&manifest, &installer.msi.name)?.to_owned();
 
-    let final_path = dest_dir.join(&release.msi.name);
+    let final_path = dest_dir.join(&installer.msi.name);
     let part_path = final_path.with_extension("msi.part");
     let response = client
-        .get(&release.msi.browser_download_url)
+        .get(&installer.msi.browser_download_url)
         .send()
         .await
         .context("download MSI")?
         .error_for_status()
         .context("MSI download returned an error")?;
-    let total = response.content_length().unwrap_or(release.msi.size);
+    let total = response.content_length().unwrap_or(installer.msi.size);
     let mut file = tokio::fs::File::create(&part_path)
         .await
         .with_context(|| format!("create {}", part_path.display()))?;
@@ -210,6 +232,7 @@ pub fn update_directory(version: &Version) -> PathBuf {
         .join(version.to_string())
 }
 
+#[cfg(windows)]
 pub fn installer_command(path: &Path) -> (&'static str, Vec<String>) {
     (
         "msiexec.exe",
@@ -217,6 +240,7 @@ pub fn installer_command(path: &Path) -> (&'static str, Vec<String>) {
     )
 }
 
+#[cfg(windows)]
 pub fn launch_installer(path: &Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
 
@@ -295,11 +319,24 @@ mod tests {
     }
 
     #[test]
+    fn generic_release_selection_does_not_require_windows_assets() {
+        let mut candidate = release("v0.2.3", false, false);
+        candidate.assets.clear();
+
+        let selected = select_release_for("0.2.2", &[candidate], false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.version.to_string(), "0.2.3");
+        assert!(selected.windows_installer.is_none());
+    }
+
+    #[test]
     fn requires_exact_msi_and_checksum_assets() {
         let mut candidate = release("v0.2.3", false, false);
         candidate.assets[0].name = "rimeterm-0.2.3-x86_64-pc-windows-msvc.zip".into();
 
-        let error = select_release("0.2.2", &[candidate]).unwrap_err();
+        let error = select_release_for("0.2.2", &[candidate], true).unwrap_err();
 
         assert!(error.to_string().contains("rimeterm-0.2.3-x86_64.msi"));
     }
@@ -362,16 +399,18 @@ mod tests {
             notes: String::new(),
             html_url: base.clone(),
             published_at: None,
-            msi: ReleaseAsset {
-                name: "rimeterm-9.9.9-x86_64.msi".into(),
-                browser_download_url: format!("{base}/installer.msi"),
-                size: msi.len() as u64,
-            },
-            checksums: ReleaseAsset {
-                name: "SHA256SUMS".into(),
-                browser_download_url: format!("{base}/SHA256SUMS"),
-                size: 0,
-            },
+            windows_installer: Some(WindowsInstaller {
+                msi: ReleaseAsset {
+                    name: "rimeterm-9.9.9-x86_64.msi".into(),
+                    browser_download_url: format!("{base}/installer.msi"),
+                    size: msi.len() as u64,
+                },
+                checksums: ReleaseAsset {
+                    name: "SHA256SUMS".into(),
+                    browser_download_url: format!("{base}/SHA256SUMS"),
+                    size: 0,
+                },
+            }),
         };
         let temp = tempfile::tempdir().unwrap();
         let mut progress = Vec::new();
@@ -390,6 +429,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn installer_command_uses_quiet_free_interactive_msi_arguments() {
         let path = std::path::Path::new(r"C:\Temp Folder\rimeterm.msi");
