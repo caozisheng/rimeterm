@@ -34,6 +34,15 @@ impl AppMenu {
                     command: "app.settings",
                     separator_before: false,
                 },
+                #[cfg(windows)]
+                AppMenuItem {
+                    id: "app.upgrade",
+                    title: "Upgrade",
+                    icon: Some("⇧"),
+                    key_hint: None,
+                    command: "app.upgrade",
+                    separator_before: false,
+                },
                 AppMenuItem {
                     id: "app.acknowledgement",
                     title: "Acknowledgement",
@@ -68,14 +77,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_menu_has_three_items_settings_ack_quit() {
+    fn default_menu_has_platform_items_in_order() {
         let menu = AppMenu::v0_1_default();
-        assert_eq!(menu.items.len(), 3);
-        assert_eq!(menu.items[0].id, "app.settings");
-        assert_eq!(menu.items[1].id, "app.acknowledgement");
-        assert_eq!(menu.items[2].id, "app.quit");
+
+        #[cfg(windows)]
+        assert_eq!(
+            menu.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [
+                "app.settings",
+                "app.upgrade",
+                "app.acknowledgement",
+                "app.quit",
+            ]
+        );
+
+        #[cfg(not(windows))]
+        assert_eq!(
+            menu.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            ["app.settings", "app.acknowledgement", "app.quit"]
+        );
+
         assert!(
-            menu.items[2].separator_before,
+            menu.items.last().is_some_and(|item| item.separator_before),
             "Quit sits under a separator"
         );
     }

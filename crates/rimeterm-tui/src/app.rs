@@ -86,6 +86,8 @@ struct ActionFlags {
     settings: AtomicBool,
     resize_toggle: AtomicBool,
     acknowledgement: AtomicBool,
+    #[cfg(windows)]
+    upgrade: AtomicBool,
     viewer_open: AtomicBool,
     viewer_close: AtomicBool,
     viewer_open_with_system: AtomicBool,
@@ -532,6 +534,16 @@ pub struct App {
     last_ack_popup_rect: Option<Rect>,
     settings_state: crate::settings::SettingsState,
     ack_state: crate::acknowledgement::AckOverlayState,
+    #[cfg(windows)]
+    upgrade_state: crate::upgrade::UpgradeState,
+    #[cfg(windows)]
+    upgrade_tx: mpsc::UnboundedSender<crate::upgrade::WorkerEvent>,
+    #[cfg(windows)]
+    upgrade_rx: mpsc::UnboundedReceiver<crate::upgrade::WorkerEvent>,
+    #[cfg(not(windows))]
+    upgrade_rx: mpsc::UnboundedReceiver<()>,
+    #[cfg(windows)]
+    pending_installer: Option<PathBuf>,
     flags: Arc<ActionFlags>,
     should_quit: bool,
     /// Transient status-bar hint (e.g. "Ctrl+T rejected: files is fixed").
@@ -914,6 +926,10 @@ impl App {
         )?;
         let (viewer_completion_tx, viewer_completion_rx) =
             mpsc::unbounded_channel::<ViewerCompletion>();
+        #[cfg(windows)]
+        let (upgrade_tx, upgrade_rx) = mpsc::unbounded_channel::<crate::upgrade::WorkerEvent>();
+        #[cfg(not(windows))]
+        let (_upgrade_tx, upgrade_rx) = mpsc::unbounded_channel::<()>();
         // Best-effort graphics protocol detection. Query at startup so
         // the terminal capabilities cache is warm before we ever try to
         // build an image protocol. Halfblocks fallback keeps the viewer
@@ -955,6 +971,13 @@ impl App {
             last_settings_popup_rect: None,
             last_ack_popup_rect: None,
             ack_state: crate::acknowledgement::AckOverlayState::default(),
+            #[cfg(windows)]
+            upgrade_state: crate::upgrade::UpgradeState::default(),
+            #[cfg(windows)]
+            upgrade_tx,
+            upgrade_rx,
+            #[cfg(windows)]
+            pending_installer: None,
             flags,
             should_quit: false,
             hint: None,
@@ -1002,17 +1025,9 @@ impl App {
             }
             self.drain_mutations();
             self.drain_flags();
-            // Every registered pane gets a chance to complete background
-            // work (deferred fs mutations, async load results, …). Any
-            // pane that reports a change forces a redraw so the visible
-            // state reflects it in the very next frame.
             if self.poll_pane_background() {
                 self.needs_redraw = true;
             }
-            // P0-1: `expire_*` helpers now signal via bool whether they
-            // actually mutated state; only those changes need a redraw.
-            // Skipping the flag flip for the "no-op tick" case is what
-            // kills the ~3 % idle-CPU burn (docs/rimeterm-upgrade-design.md).
             if self.expire_hint() {
                 self.needs_redraw = true;
             }
@@ -1022,12 +1037,6 @@ impl App {
 
             tokio::select! {
                 Some(evt) = input.next() => {
-                    // Any input triggers a redraw. We're deliberately
-                    // coarse here: an unbound Shift key doesn't change
-                    // any visible state, but re-painting once is cheap
-                    // and the alternative (per-key classification) is
-                    // brittle. Panes gate their own expensive work
-                    // via alacritty damage (P0-2).
                     self.needs_redraw = true;
                     match evt {
                         Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => self.on_key(k),
@@ -1037,16 +1046,10 @@ impl App {
                     }
                 }
                 Some(_) = self.redraw_rx.recv() => {
-                    // Every send() on redraw_tx means "something changed" —
-                    // drain any coalesced wakes and mark dirty.
                     while self.redraw_rx.try_recv().is_ok() {}
                     self.needs_redraw = true;
                 }
                 Some(event) = self.osc_rx.recv() => {
-                    // `recv()` already consumed the wake-triggering
-                    // message; dispatch it first, then drain the rest.
-                    // Dropping this first tuple would lose every OSC
-                    // event when the channel was previously empty.
                     self.dispatch_osc_event(event);
                     self.drain_osc_events();
                     self.needs_redraw = true;
@@ -1058,12 +1061,14 @@ impl App {
                     }
                     self.needs_redraw = true;
                 }
+                Some(event) = self.upgrade_rx.recv() => {
+                    self.apply_upgrade_event(event);
+                    while let Ok(next) = self.upgrade_rx.try_recv() {
+                        self.apply_upgrade_event(next);
+                    }
+                    self.needs_redraw = true;
+                }
                 _ = tokio::time::sleep(Duration::from_millis(16)) => {
-                    // P0-1: the tick fires when NOTHING happened for 16 ms.
-                    // Only the pending-spawn spinner still needs a wake to
-                    // keep its animation moving; every other subsystem
-                    // signals through its own channel. Anything else = truly
-                    // idle = skip the draw entirely.
                     if self.pending_spawn.is_some() {
                         self.needs_redraw = true;
                     }
@@ -1082,6 +1087,11 @@ impl App {
         }
         if let Some(tx) = ipc_shutdown {
             let _ = tx.send(()).await;
+        }
+        drop(guard);
+        #[cfg(windows)]
+        if let Some(installer) = self.pending_installer.take() {
+            crate::updater::launch_installer(&installer)?;
         }
         Ok(())
     }
@@ -1347,6 +1357,93 @@ impl App {
         let _ = self.redraw_tx.send(());
     }
 
+    #[cfg(windows)]
+    fn spawn_upgrade_check(&self, generation: u64) {
+        let tx = self.upgrade_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = crate::updater::client()?;
+                crate::updater::check(&client, crate::updater::RELEASES_API).await
+            }
+            .await
+            .map_err(|error: anyhow::Error| format!("{error:#}"));
+
+            let _ = tx.send(crate::upgrade::WorkerEvent::CheckFinished { generation, result });
+        });
+    }
+    #[cfg(windows)]
+    fn upgrade_is_open(&self) -> bool {
+        self.upgrade_state.open
+    }
+
+    #[cfg(not(windows))]
+    fn upgrade_is_open(&self) -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    fn close_upgrade_overlay(&mut self) {
+        self.upgrade_state.open = false;
+    }
+
+    #[cfg(not(windows))]
+    fn close_upgrade_overlay(&mut self) {}
+
+    #[cfg(not(windows))]
+    fn apply_upgrade_event(&mut self, _event: ()) {}
+
+    #[cfg(windows)]
+    fn spawn_upgrade_download(&self, generation: u64, release: crate::updater::AvailableRelease) {
+        let tx = self.upgrade_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = crate::updater::client()?;
+                let directory = crate::updater::update_directory(&release.version);
+                let progress_tx = tx.clone();
+                crate::updater::download_verified(
+                    &client,
+                    &release,
+                    &directory,
+                    move |downloaded, total| {
+                        let _ = progress_tx.send(crate::upgrade::WorkerEvent::Progress {
+                            generation,
+                            downloaded,
+                            total,
+                        });
+                    },
+                )
+                .await
+            }
+            .await
+            .map_err(|error: anyhow::Error| format!("{error:#}"));
+            let _ = tx.send(crate::upgrade::WorkerEvent::DownloadFinished { generation, result });
+        });
+    }
+
+    #[cfg(windows)]
+    fn apply_upgrade_action(&mut self, action: crate::upgrade::UpgradeAction) {
+        match action {
+            crate::upgrade::UpgradeAction::Check { generation } => {
+                self.spawn_upgrade_check(generation);
+            }
+            crate::upgrade::UpgradeAction::Download {
+                generation,
+                release,
+            } => self.spawn_upgrade_download(generation, release),
+            crate::upgrade::UpgradeAction::Close => {}
+        }
+        let _ = self.redraw_tx.send(());
+    }
+
+    #[cfg(windows)]
+    fn apply_upgrade_event(&mut self, event: crate::upgrade::WorkerEvent) {
+        self.upgrade_state.apply(event);
+        if let Some(path) = self.upgrade_state.ready_installer_path() {
+            self.pending_installer = Some(path);
+            self.should_quit = true;
+        }
+    }
+
     /// Open the Settings overlay (F10 → Settings, or the `,` key from
     /// the app menu). Refreshes tool/agent detection and seeds the
     /// Viewer tab's cursor with the currently-applied markdown theme.
@@ -1450,6 +1547,7 @@ impl App {
         if self.menu_state.open
             || self.palette_state.open
             || self.picker_state.open
+            || self.upgrade_is_open()
             || self.settings_state.open
             || self.ack_state.open
         {
@@ -1617,6 +1715,13 @@ impl App {
         // would produce a confusing z-order.
         // ACK overlay is checked FIRST because it's a purely-modal
         // credits popup — every other overlay can wait behind it.
+        #[cfg(windows)]
+        if self.upgrade_state.open {
+            if let Some(action) = self.upgrade_state.handle_key(key) {
+                self.apply_upgrade_action(action);
+            }
+            return;
+        }
         if self.ack_state.open {
             let page_rows = self
                 .last_ack_popup_rect
@@ -1853,6 +1958,11 @@ impl App {
                 self.handle_picker_mouse(m.column, m.row);
                 return;
             }
+            if self.upgrade_is_open() {
+                self.close_upgrade_overlay();
+                let _ = self.redraw_tx.send(());
+                return;
+            }
             if self.ack_state.open {
                 // Click-outside closes; click-inside is swallowed.
                 if let Some(popup) = self.last_ack_popup_rect {
@@ -1869,7 +1979,8 @@ impl App {
         if (self.menu_state.open
             || self.settings_state.open
             || self.picker_state.open
-            || self.ack_state.open)
+            || self.ack_state.open
+            || self.upgrade_is_open())
             && !matches!(m.kind, MouseEventKind::Moved)
         {
             return;
@@ -2936,6 +3047,10 @@ impl App {
             self.ack_state.render(area, frame.buffer_mut());
             self.last_ack_popup_rect = Some(rect);
         }
+        #[cfg(windows)]
+        if self.upgrade_state.open {
+            self.upgrade_state.render(area, frame.buffer_mut());
+        }
 
         // Suppress the caret when any overlay owns the input focus.
         // Menu / palette / picker / settings / ack all own their own
@@ -2956,6 +3071,8 @@ impl App {
             picker_open: self.picker_state.open,
             settings_open: self.settings_state.open,
             ack_open: self.ack_state.open,
+            #[cfg(windows)]
+            upgrade_open: self.upgrade_state.open,
             viewer_open: self.viewer.is_open(),
             viewer_focused: self.viewer_owns_caret(),
             focused_cursor,
@@ -3170,6 +3287,17 @@ impl App {
         }
         if f.acknowledgement.swap(false, Ordering::Relaxed) {
             self.ack_state.open();
+            let _ = self.redraw_tx.send(());
+        }
+        #[cfg(windows)]
+        if f.upgrade.swap(false, Ordering::Relaxed) {
+            let generation = self.upgrade_state.open_and_check();
+            if matches!(
+                self.upgrade_state.phase(),
+                crate::upgrade::UpgradePhase::Checking
+            ) {
+                self.spawn_upgrade_check(generation);
+            }
             let _ = self.redraw_tx.send(());
         }
         if f.viewer_open.swap(false, Ordering::Relaxed) {
@@ -4393,6 +4521,14 @@ fn register_commands(
         "Edit rimeterm config",
         flags.settings
     );
+    #[cfg(windows)]
+    flag_cmd!(
+        cmds,
+        "app.upgrade",
+        "Upgrade rimeterm",
+        "Check GitHub Releases and install a verified MSI",
+        flags.upgrade
+    );
     flag_cmd!(
         cmds,
         "app.acknowledgement",
@@ -5550,6 +5686,8 @@ pub(crate) struct FrameCursorInputs {
     pub(crate) picker_open: bool,
     pub(crate) settings_open: bool,
     pub(crate) ack_open: bool,
+    #[cfg(windows)]
+    pub(crate) upgrade_open: bool,
     pub(crate) viewer_open: bool,
     pub(crate) viewer_focused: bool,
     pub(crate) focused_cursor: Option<(u16, u16)>,
@@ -5576,6 +5714,16 @@ pub(crate) fn decide_frame_cursor(inputs: FrameCursorInputs) -> Option<(u16, u16
         || inputs.picker_open
         || inputs.settings_open
         || inputs.ack_open
+        || {
+            #[cfg(windows)]
+            {
+                inputs.upgrade_open
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
         || (inputs.viewer_open && inputs.viewer_focused);
     if modal_owns_focus {
         None
@@ -7158,6 +7306,8 @@ mod tests {
             picker_open: false,
             settings_open: false,
             ack_open: false,
+            #[cfg(windows)]
+            upgrade_open: false,
             viewer_open: false,
             viewer_focused: false,
             focused_cursor: Some((10, 5)),

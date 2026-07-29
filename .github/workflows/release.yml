@@ -407,11 +407,22 @@ jobs:
         run: |
           find dist -type f | sort
 
+      - name: Generate release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > dist/SHA256SUMS
+          while IFS= read -r -d '' file; do
+            hash="$(sha256sum "$file" | cut -d' ' -f1)"
+            printf '%s  %s\n' "$hash" "$(basename "$file")" >> dist/SHA256SUMS
+          done < <(find dist -type f ! -name SHA256SUMS -print0 | sort -z)
+          cat dist/SHA256SUMS
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          # download-artifact restores each build's zip/tarball inside its
-          # own subdir under `dist/`; softprops accepts glob.
+          # The recursive glob includes nested build artifacts and the
+          # root-level SHA256SUMS manifest consumed by Menu → Upgrade.
           files: dist/**/*
           generate_release_notes: true
           draft: false

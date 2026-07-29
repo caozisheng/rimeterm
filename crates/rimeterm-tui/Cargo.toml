@@ -69,5 +69,11 @@ bollard = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+semver = "1"
+sha2 = "0.10"
+tokio = { workspace = true, features = ["fs"] }
+
 [dev-dependencies]
 tempfile = "3"
