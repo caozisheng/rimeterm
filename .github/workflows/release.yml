@@ -135,23 +135,8 @@ jobs:
       - name: Cargo build --release (rimeterm + rimectl)
         run: cargo build --release --workspace --bins --target ${{ matrix.target }}
 
-      # After the native-file-git refactor only `bottom` needs to be
-      # prefetched for this matrix row. Pins live at
-      # essentials/VERSIONS.toml; the script hard-fails on 404 /
-      # checksum mismatch so bad upstream releases surface here.
-      - name: Fetch prebuilt essentials
-        shell: bash
-        # Fetches into `crates/rimeterm/essentials-staging/` because
-        # both cargo-deb (asset paths in [package.metadata.deb]) and
-        # cargo-wix (Source= paths in wix/main.wxs) resolve relative
-        # to the crate directory, not the workspace root. Sinking here
-        # means the same on-disk layout satisfies all three consumers:
-        # deb (assets), wix (File Source), and archive-stage below.
-        run: |
-          set -euo pipefail
-          node .github/scripts/fetch-essentials.mjs \
-            "${{ matrix.target }}" \
-            "crates/rimeterm/essentials-staging"
+      # C25: essentials fetch retired. Files, git, and sysmon are all
+      # Native panes now — zero external binaries ship with rimeterm.
 
       - name: Stage payload
         id: stage
@@ -166,11 +151,6 @@ jobs:
           cp "target/${{ matrix.target }}/release/rimeterm${EXT}" "${STAGE}/"
           cp "target/${{ matrix.target }}/release/rimectl${EXT}"  "${STAGE}/"
           cp LICENSE README.md ACKNOWLEDGEMENTS.md "${STAGE}/"
-          # C21.5: bundle prebuilt essentials next to the rimeterm
-          # binary so first launch can extract them into
-          # ~/.rimeterm/bin/ (see rimeterm-config::assets::extract_essentials).
-          mkdir -p "${STAGE}/essentials"
-          cp -r crates/rimeterm/essentials-staging/. "${STAGE}/essentials/"
           echo "dir=${STAGE}"   >> "$GITHUB_OUTPUT"
           echo "name=${NAME}"   >> "$GITHUB_OUTPUT"
           echo "Payload:"
@@ -273,9 +253,6 @@ jobs:
           echo "=== crates/rimeterm/wix ==="
           ls -la crates/rimeterm/wix
           echo
-          echo "=== crates/rimeterm/essentials-staging (if any) ==="
-          ls -la crates/rimeterm/essentials-staging || echo "MISSING"
-          echo
           echo "=== target/${{ matrix.target }}/release (bins) ==="
           ls -la "target/${{ matrix.target }}/release" | head -20 || echo "MISSING"
 
@@ -283,22 +260,17 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         id: msi
         shell: bash
-        # Ships crates/rimeterm/wix/main.wxs in-tree (C21.5). Uses
-        # candle preprocessor variables `$(var.EssentialsDir)` and
-        # `$(var.WorkspaceRoot)` to reach outside the wxs directory,
-        # because light.exe's own path resolution (relative to wxs or
-        # bindir, depending on version) has burned us twice — being
-        # explicit with absolute paths kills that class of bug.
+        # Ships crates/rimeterm/wix/main.wxs in-tree. C25 dropped the
+        # `$(var.EssentialsDir)` preprocessor variable — no bundled
+        # binaries remain — but keeps the `WorkspaceRoot` handle for
+        # LICENSE / README / ACKNOWLEDGEMENTS Source paths.
         run: |
           set -euo pipefail
           WSROOT="$(pwd -W 2>/dev/null || pwd)"
-          ESSENTIALS="${WSROOT}/crates/rimeterm/essentials-staging"
           echo "WSROOT=${WSROOT}"
-          echo "ESSENTIALS=${ESSENTIALS}"
           cargo wix --no-build \
             --package rimeterm \
             --target-bin-dir "target/${{ matrix.target }}/release" \
-            -C "-dEssentialsDir=${ESSENTIALS}" \
             -C "-dWorkspaceRoot=${WSROOT}" \
             --install-version "${{ steps.version.outputs.value }}" \
             --nocapture \
@@ -317,13 +289,10 @@ jobs:
         shell: bash
         # `--no-build` reuses the already-compiled release binary;
         # metadata sourced from [package.metadata.deb] in
-        # crates/rimeterm/Cargo.toml (assets, description, etc).
-        #
-        # cargo-deb resolves every asset path relative to the crate
-        # dir. The essentials-staging tree already sits there (Fetch
-        # step above), but the workspace-root docs (README/LICENSE/
-        # ACKNOWLEDGEMENTS) need a symlink stub — cheaper and less
-        # intrusive than copying, and unwound at the end of the step.
+        # crates/rimeterm/Cargo.toml (assets, description, etc). The
+        # workspace-root docs (README/LICENSE/ACKNOWLEDGEMENTS) need a
+        # symlink stub because cargo-deb resolves asset paths relative
+        # to the crate dir; unwound at the end of the step.
         run: |
           set -euo pipefail
           ln -sf ../../README.md            crates/rimeterm/README.md
@@ -343,27 +312,24 @@ jobs:
         # launch. Codesign / notarize would need an Apple Developer
         # account; deferred to a later checkpoint.
         #
-        # Layout inside the pkg (C21.5):
+        # Layout inside the pkg (C25):
         #   /usr/local/lib/rimeterm/rimeterm
         #   /usr/local/lib/rimeterm/rimectl
-        #   /usr/local/lib/rimeterm/essentials/{btm,VERSIONS.toml}
         #   /usr/local/share/doc/rimeterm/{README,LICENSE,ACKNOWLEDGEMENTS}
         #
         # postinstall symlinks /usr/local/bin/{rimeterm,rimectl} →
-        # /usr/local/lib/rimeterm/. `env::current_exe()` on macOS
-        # follows symlinks so `parent()?.join("essentials")` still
-        # finds the bundled tools next to the real binary.
+        # /usr/local/lib/rimeterm/. No essentials/ sibling ships now
+        # — files / git / sysmon are all Native panes.
         run: |
           set -euo pipefail
           ROOT="pkgroot"
           SCRIPTS="pkgscripts"
-          mkdir -p "$ROOT/usr/local/lib/rimeterm/essentials"
+          mkdir -p "$ROOT/usr/local/lib/rimeterm"
           mkdir -p "$ROOT/usr/local/share/doc/rimeterm"
           mkdir -p "$SCRIPTS"
 
           cp target/${{ matrix.target }}/release/rimeterm "$ROOT/usr/local/lib/rimeterm/"
           cp target/${{ matrix.target }}/release/rimectl  "$ROOT/usr/local/lib/rimeterm/"
-          cp -R crates/rimeterm/essentials-staging/. "$ROOT/usr/local/lib/rimeterm/essentials/"
           cp README.md            "$ROOT/usr/local/share/doc/rimeterm/README"
           cp LICENSE              "$ROOT/usr/local/share/doc/rimeterm/LICENSE"
           cp ACKNOWLEDGEMENTS.md  "$ROOT/usr/local/share/doc/rimeterm/ACKNOWLEDGEMENTS"

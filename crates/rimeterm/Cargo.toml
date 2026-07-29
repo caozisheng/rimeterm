@@ -31,9 +31,8 @@ tracing-subscriber = { workspace = true }
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
-# Linux .deb metadata used by `cargo-deb`. After the native-file-git
-# refactor only `bottom` ships as an essential; files/git are Native
-# panes that need no external binaries.
+# Linux .deb metadata used by `cargo-deb`. After C25 no external
+# binaries ship — files/git/sysmon are all Native panes.
 [package.metadata.deb]
 maintainer = "cjzzz <zisheng.cao@protonmail.com>"
 section = "utils"
@@ -42,17 +41,15 @@ maintainer-scripts = "debian/"
 assets = [
     ["target/release/rimeterm", "usr/lib/rimeterm/rimeterm", "755"],
     ["target/release/rimectl",  "usr/lib/rimeterm/rimectl",  "755"],
-    ["essentials-staging/btm",   "usr/lib/rimeterm/essentials/btm",   "755"],
-    ["essentials-staging/VERSIONS.toml", "usr/lib/rimeterm/essentials/VERSIONS.toml", "644"],
     ["README.md",               "usr/share/doc/rimeterm/README",         "644"],
     ["LICENSE",                 "usr/share/doc/rimeterm/copyright",      "644"],
     ["ACKNOWLEDGEMENTS.md",     "usr/share/doc/rimeterm/ACKNOWLEDGEMENTS","644"],
 ]
 extended-description = """\
 A TUI terminal built for coding agents (Claude Code, Codex, Cursor,
-Gemini CLI, and others). Native two-pane file manager + Git snapshot
-backed by `gix`; PTY sub-panes for agents, shells, and the bundled
-`bottom` system monitor.
+Gemini CLI, and others). Native two-pane file manager, Git snapshot
+backed by `gix`, and system-monitor pane backed by `sysinfo`; PTY
+sub-panes for agents and shells. Zero bundled binaries.
 """
 
 # Windows .msi metadata used by `cargo-wix`. The default main.wxs

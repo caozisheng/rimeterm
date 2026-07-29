@@ -768,31 +768,14 @@ impl App {
             agents_members.push(id);
         }
 
-        // Left-bottom (git) group: Git pane as first tab, followed by
-        // read-only side-panes (starts with `bottom`; future read-only
-        // plugins land here). All tabs are pinned so `×` never appears
-        // and Ctrl+W / right-click-close are rejected.
-        for spec in &config.sysmon.tabs {
-            if spec.id == "bottom" {
-                let id = build_external_pane(
-                    &mut panes,
-                    &session_writes,
-                    spec,
-                    &workspace_root,
-                    redraw_tx.clone(),
-                    osc_tx.clone(),
-                    "📊",
-                    Color::Magenta,
-                    "git",
-                )?;
-                if let Some(pane) = panes.get_mut(id) {
-                    pane.set_right_click_paste(config.mouse.right_click_paste);
-                }
-                pinned_pane_ids.insert(id);
-                git_members.push(id);
-                break;
-            }
-        }
+        // Left-bottom (git) group second tab: Native SysmonPane (C25).
+        // Replaces the previous `bottom` PTY. Pinned so `×` never
+        // appears; future read-only plugins land here alongside it.
+        let sysmon = crate::sysmon_pane::SysmonPane::new();
+        let sysmon_id = sysmon.id();
+        panes.insert(Box::new(sysmon));
+        pinned_pane_ids.insert(sysmon_id);
+        git_members.push(sysmon_id);
 
         // Shells group: always at least one interactive shell. Bottom
         // moved to the left-bottom (git) group, so shells is single-
@@ -6919,19 +6902,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tools_install_of_essential_returns_already_bundled() {
-        // Essentials must never shell out to cargo — this locks in the
-        // §9.4 tools-install branch behavior for the remaining bundled
-        // essential (`bottom`) after the native-file-git refactor.
-        let bottom_spec = rimeterm_config::tools::find("bottom").expect("bottom in registry");
-        let out = run_tool_action(ToolAction::Install, bottom_spec).expect("essentials never fail");
-        assert_eq!(out["result"], "already_bundled");
-        assert_eq!(out["kind"], "essential");
-
-        let out = run_tool_action(ToolAction::Uninstall, bottom_spec).unwrap();
-        assert_eq!(out["result"], "already_bundled");
-    }
+    // `tools_install_of_essential_returns_already_bundled` retired in
+    // C25 alongside the last bundled essential (`bottom`). If a future
+    // essential returns, restore a coverage test that seeds it in the
+    // registry and asserts `already_bundled`.
 
     #[test]
     fn resolve_managed_program_prefers_bin_dir_then_plugin_then_none() {

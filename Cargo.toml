@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
@@ -53,7 +53,7 @@ arboard       = { version = "3", default-features = false }
 # C20 viewer overlay (§19.11)
 tui-markdown  = { version = "0.3.8", default-features = false }
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
-tui-file-explorer = { git = "https://github.com/caozisheng/tui-file-explorer.git", rev = "7faaa4a", default-features = false }
+tui-file-explorer = { git = "https://github.com/caozisheng/tui-file-explorer.git", rev = "fc463b5", default-features = false }
 gix           = { version = "=0.86.0", default-features = false, features = ["status", "revision", "blob-diff", "sha1"] }
 gix-diff      = { version = "=0.66.0", default-features = false, features = ["blob", "index", "sha1"] }
 tree-sitter   = "=0.25.10"
@@ -79,6 +79,20 @@ image         = { version = "0.25", default-features = false, features = ["png",
 # translate `syntect::Style` → `ratatui::Style`. The translation is ~40
 # lines and lives inline in `viewer::code_highlight`.
 syntect       = { version = "5.2", default-features = false, features = ["default-fancy"] }
+# C25 Native SysmonPane. `sysinfo` sampled on a std::thread worker
+# (same pattern as git_worker); `humansize` formats byte/rate values.
+# `sysinfo 0.38.x` pins the last line supporting our workspace rustc
+# 1.90 (0.39+ bumped MSRV to 1.95).
+sysinfo   = { version = "0.38", default-features = false, features = ["system", "network", "disk", "component"] }
+humansize = "2.1"
+# Optional feature deps — declared here without `optional = true`
+# (workspace inheritance doesn't allow it); each consuming crate opts
+# in with `optional = true` at its own `[dependencies]` entry. Real
+# runtime requirements (Linux cgroup FS / NVIDIA driver / Docker
+# socket) mean the default build keeps them out entirely.
+procfs        = { version = "0.18", default-features = false }
+nvml-wrapper  = { version = "0.12" }
+bollard       = { version = "0.21", default-features = false, features = ["ssl_providerless"] }
 
 [workspace.lints.rust]
 unreachable_pub = "warn"

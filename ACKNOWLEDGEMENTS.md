@@ -29,15 +29,15 @@ will be added as new subsystems come online.
 - [anyhow](https://github.com/dtolnay/anyhow) — MIT / Apache-2.0
 - [thiserror](https://github.com/dtolnay/thiserror) — MIT / Apache-2.0
 
-## Bundled essentials
+## Native system monitor
 
-rimeterm's release archive **bundles prebuilt binaries** for the
-following tools so first launch works with no extra installs. All
-are permissively licensed. Pinned versions live at
-[`essentials/VERSIONS.toml`](essentials/VERSIONS.toml).
+`SysmonPane` samples system metrics in-process; no external binary
+ships. The stack:
 
-- [bottom](https://github.com/ClementTsang/bottom) — MIT. System monitor
-  (pinned first tab in the shells column).
+- [sysinfo](https://github.com/GuillaumeGomez/sysinfo) — MIT. Cross-platform
+  system/CPU/memory/process/network/disk sampler.
+- [humansize](https://github.com/LeopoldArkham/humansize) — MIT / Apache-2.0.
+  Byte / rate formatter.
 
 ## Native files / git stack
 

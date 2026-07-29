@@ -54,21 +54,60 @@ impl GitWorker {
 
 fn run(rx: Receiver<GitRequest>, tx: Sender<GitResponse>) {
     while let Ok(request) = rx.recv() {
-        match request {
-            GitRequest::Snapshot { generation, cwd } => {
-                let snapshot = build_snapshot(generation, &cwd);
-                if tx.send(GitResponse::Snapshot(snapshot)).is_err() {
-                    break;
+        // Coalesce a burst of navigation requests. When the user
+        // descends N directories rapidly the App enqueues N Snapshot
+        // requests; without draining we'd compute all N serially and
+        // the user would watch stale-then-stale-then-current land in
+        // sequence. Drain the queue, keep only the freshest Snapshot
+        // (identified by max generation), and preserve every Diff
+        // request in arrival order — diffs correspond to distinct
+        // files the user asked about and can't be coalesced.
+        let mut latest_snapshot: Option<GitRequest> = None;
+        let mut diffs: Vec<GitRequest> = Vec::new();
+        let mut classify = |req: GitRequest| match req {
+            GitRequest::Snapshot { generation, .. } => {
+                let keep_new = match &latest_snapshot {
+                    Some(GitRequest::Snapshot {
+                        generation: prev, ..
+                    }) => generation > *prev,
+                    _ => true,
+                };
+                if keep_new {
+                    latest_snapshot = Some(req);
                 }
             }
-            GitRequest::WorktreeDiff {
+            GitRequest::WorktreeDiff { .. } => diffs.push(req),
+        };
+        classify(request);
+        while let Ok(more) = rx.try_recv() {
+            classify(more);
+        }
+
+        if let Some(GitRequest::Snapshot { generation, cwd }) = latest_snapshot {
+            let started = std::time::Instant::now();
+            let snapshot = build_snapshot(generation, &cwd);
+            debug!(
+                generation,
+                cwd = %cwd.display(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                changes = snapshot.changes.len(),
+                commits = snapshot.commits.len(),
+                "git snapshot built"
+            );
+            if tx.send(GitResponse::Snapshot(snapshot)).is_err() {
+                break;
+            }
+        }
+        for diff_req in diffs {
+            if let GitRequest::WorktreeDiff {
                 generation,
                 repo_root,
                 change,
-            } => {
+            } = diff_req
+            {
                 let diff = build_worktree_diff(generation, &repo_root, &change);
                 if tx.send(GitResponse::Diff(diff)).is_err() {
-                    break;
+                    return;
                 }
             }
         }
@@ -87,7 +126,13 @@ fn build_snapshot(generation: u64, cwd: &Path) -> GitSnapshot {
     let head = summarise_head(&repo);
     let upstream = summarise_upstream(&repo);
     let changes = collect_changes(&repo);
-    let commits = collect_commits(&repo, 200);
+    // Cap the initial history walk at 50. Empirically each commit
+    // read (find_commit + decode author/message/time) runs ~1-2 ms;
+    // 200 rows meant 200-400 ms of unresponsive UI on every cwd
+    // change. 50 covers the visible page for typical GitPane heights
+    // (~30 rows) and a screen or two of scroll headroom; the user
+    // can hit "load more" (future) to extend if needed.
+    let commits = collect_commits(&repo, 50);
 
     GitSnapshot {
         generation,

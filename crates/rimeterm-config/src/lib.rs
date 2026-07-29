@@ -265,45 +265,13 @@ pub struct SysmonConfig {
 
 impl Default for SysmonConfig {
     fn default() -> Self {
-        use crate::install_hint::InstallHint;
-        Self {
-            tabs: vec![
-                ExternalToolSpec {
-                    id: "bottom".into(),
-                    label: "bottom".into(),
-                    // `bottom` ships as `btm` on all platforms.
-                    command: vec!["btm".into()],
-                    install_hint: Some(
-                        InstallHint {
-                            winget: Some("winget install Clement.bottom"),
-                            scoop:  Some("scoop install bottom"),
-                            brew:   Some("brew install bottom"),
-                            linux:  Some("sudo apt install bottom (Debian); sudo dnf install bottom (Fedora)"),
-                            cargo:  Some("cargo install --locked bottom"),
-                            note:   None,
-                        }
-                        .to_string(),
-                    ),
-                },
-                ExternalToolSpec {
-                    id: "trippy".into(),
-                    label: "trippy".into(),
-                    // `trippy` ships as `trip` on all platforms.
-                    command: vec!["trip".into()],
-                    install_hint: Some(
-                        InstallHint {
-                            winget: Some("winget install FujiApple.Trippy"),
-                            scoop:  None,
-                            brew:   Some("brew install trippy"),
-                            linux:  Some("sudo pacman -S trippy (Arch); see repo for other distros"),
-                            cargo:  Some("cargo install --locked trippy"),
-                            note:   Some("Windows needs Npcap; Linux needs CAP_NET_RAW or sudo"),
-                        }
-                        .to_string(),
-                    ),
-                },
-            ],
-        }
+        // The `bottom` PTY entry retired in C25 — the Native SysmonPane
+        // owns the left-bottom quadrant now, no external process. The
+        // `tabs` field survives as an extension slot so a user can wire
+        // a bespoke sysmon plugin (e.g. `bandwhich`, `trippy`) via
+        // `[[sysmon.tabs]]` in `config.toml`; nothing is seeded by
+        // default.
+        Self { tabs: Vec::new() }
     }
 }
 
@@ -392,15 +360,11 @@ mod tests {
     }
 
     #[test]
-    fn default_sysmon_config_has_bottom_and_trippy() {
-        let cmds: Vec<_> = SysmonConfig::default()
-            .tabs
-            .iter()
-            .map(|s| s.command[0].clone())
-            .collect();
-        // bandwhich dropped in C13 — winget has no bandwhich package
-        // and needing Npcap on Windows makes it hostile to install.
-        assert_eq!(cmds, vec!["btm".to_string(), "trip".to_string()]);
+    fn default_sysmon_config_has_no_seeded_tabs() {
+        // C25: bottom is now the Native SysmonPane; nothing is seeded.
+        // The `tabs` array survives as an extension slot for user-added
+        // PTY plugins configured via `[[sysmon.tabs]]`.
+        assert!(SysmonConfig::default().tabs.is_empty());
     }
 
     #[test]

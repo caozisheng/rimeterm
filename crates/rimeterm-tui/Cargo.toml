@@ -52,6 +52,22 @@ tree-sitter-bash = { workspace = true }
 # C22 viewer code-highlighting (translation to ratatui styles lives in
 # `viewer::code_highlight`; no upstream adapter crate needed).
 syntect = { workspace = true }
+# C25 Native SysmonPane
+sysinfo = { workspace = true }
+humansize = { workspace = true }
+# nvml-wrapper dynamic-loads `libnvidia-ml.so` / `nvml.dll` at first
+# use, so it's safe to compile everywhere; missing driver silently
+# degrades to "no GPU section" at runtime.
+nvml-wrapper = { workspace = true }
+# bollard connects to the local Docker socket / named pipe on demand;
+# missing daemon silently degrades to "no Docker section" at runtime.
+bollard = { workspace = true }
+
+# procfs has a Linux-only build.rs; conditional-target keeps
+# Windows/macOS builds compiling. Its worker code lives behind
+# `#[cfg(target_os = "linux")]` for the same reason.
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

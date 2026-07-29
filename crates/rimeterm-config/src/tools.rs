@@ -1,19 +1,18 @@
 //! **§9.4 Tools Registry** — canonical description of the TUI tools
 //! rimeterm boots into by default.
 //!
-//! C21.5 (revised by the native-file-git refactor) splits the registry
-//! into two tiers:
+//! C25 collapses the registry to one tier:
 //!
-//! - **essentials** (`bottom`) — bundled with the rimeterm release
-//!   archive; first-launch extraction drops the binary into
-//!   [`crate::paths::bin_dir`]. `tools.install bottom` is a no-op with
-//!   `already_bundled`; upgrades ship with new rimeterm releases.
-//!   (Yazi and gitui are retired — the native file / git panes replace
-//!   both external runtimes.)
 //! - **plugins** (`trippy` today, user-added tomorrow) — installed on
 //!   demand via `cargo install --locked --root ~/.rimeterm/plugins/<name>`;
 //!   binaries land in `~/.rimeterm/plugins/<name>/bin/`, configs (when
 //!   the entry ships a seed) in `~/.rimeterm/plugins/<name>/config/`.
+//!
+//! The prior essentials tier (`bottom`) retired with the Native
+//! SysmonPane; `ESSENTIALS_REGISTRY` stays declared but empty so the
+//! detector's tiered probe surface (`bin/` → `plugins/*/bin/` →
+//! `$CARGO_HOME/bin` → `$PATH`) keeps its shape and callers that
+//! iterate `all_tools()` stay uniform.
 //!
 //! Detection order (§9.4 layered rule 1): `bin/` (`Essential`) →
 //! `plugins/*/bin/` (`Plugin`) → `$CARGO_HOME/bin` (`Cargo`, v0.1.x
@@ -54,22 +53,11 @@ pub enum ToolKind {
     Plugin,
 }
 
-/// The single essential the rimeterm shell requires (`bottom` for the
-/// sysmon quadrant). Yazi and gitui were removed in the native-file-git
-/// refactor — their functionality moved into the native file-manager
-/// + git panes.
-///
-/// `bottom` ships as a prebuilt binary alongside `rimeterm` in the
-/// release archive. The `crates` field is retained as a **build
-/// recipe** for CI + the rare case a user opts out of the bundle via
-/// `[install.essentials] prefer_system` — it is NOT invoked by
-/// `tools.install` (essentials return `already_bundled`).
-pub const ESSENTIALS_REGISTRY: &[ToolSpec] = &[ToolSpec {
-    name: "bottom",
-    binary: "btm",
-    crates: &["bottom"],
-    hint: "bundled with rimeterm; upgrade by installing a newer rimeterm release",
-}];
+/// After C25 the essentials tier is empty — the Native SysmonPane
+/// replaced `bottom`, the last bundled binary. The constant is
+/// deliberately retained so the detector's four-tier probe order stays
+/// intact and any future bundled binary just extends this slice.
+pub const ESSENTIALS_REGISTRY: &[ToolSpec] = &[];
 
 /// Non-essential tools rimeterm knows how to install on demand via
 /// `cargo install --locked --root ~/.rimeterm/plugins/<name>`. Users
@@ -303,17 +291,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn essentials_registry_holds_bottom_only() {
-        // Yazi and gitui dropped in the native-file-git refactor —
-        // if this fails someone shipped a registry change without
-        // updating §9.4.
-        let names: Vec<&str> = ESSENTIALS_REGISTRY.iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["bottom"]);
+    fn essentials_registry_is_empty_after_c25() {
+        // Bottom retired with the Native SysmonPane in C25; no bundled
+        // binary remains. Registry stays declared for future re-use.
+        assert!(ESSENTIALS_REGISTRY.is_empty());
     }
 
     #[test]
     fn plugin_registry_holds_trippy() {
-        // v0.2 keeps this hardcoded; future revisions may make it
+        // v0.3 keeps this hardcoded; future revisions may make it
         // extensible via config.toml (see design open q #6 resolved:
         // additive schema).
         let names: Vec<&str> = PLUGIN_REGISTRY.iter().map(|s| s.name).collect();
@@ -322,9 +308,10 @@ mod tests {
 
     #[test]
     fn kind_of_matches_registries() {
-        assert_eq!(kind_of("bottom"), Some(ToolKind::Essential));
         assert_eq!(kind_of("trippy"), Some(ToolKind::Plugin));
-        // Yazi and gitui are no longer registered — retired.
+        // Retired names — bottom (C25), yazi + gitui (C24) — must not
+        // resolve to any tier.
+        assert_eq!(kind_of("bottom"), None);
         assert_eq!(kind_of("yazi"), None);
         assert_eq!(kind_of("gitui"), None);
         assert_eq!(kind_of("nope"), None);
@@ -332,9 +319,9 @@ mod tests {
     }
 
     #[test]
-    fn find_hits_across_both_registries() {
-        assert!(find("bottom").is_some());
+    fn find_hits_plugin_registry_only() {
         assert!(find("trippy").is_some());
+        assert!(find("bottom").is_none(), "bottom retired in C25");
         assert!(find("yazi").is_none(), "yazi retired");
         assert!(find("gitui").is_none(), "gitui retired");
         assert!(find("nope").is_none());
@@ -382,6 +369,10 @@ mod tests {
     /// hermetic across dev machines and CI.
     #[test]
     fn detect_with_prefers_managed_dirs_over_path() {
+        // C25: `bottom` retired from the essentials tier, so this test
+        // covers plugin detection only. The `Essential` install-source
+        // branch of the detector stays functional for any future
+        // bundled binary that reuses the tier.
         let root = mktemp("rimeterm-detect");
         let bin_dir = root.join("bin");
         let plug_bin = root.join("plugins").join("trippy").join("bin");
@@ -390,16 +381,11 @@ mod tests {
         std::fs::create_dir_all(&plug_bin).unwrap();
         std::fs::create_dir_all(&cargo_bin).unwrap();
 
-        let bottom_spec = ESSENTIALS_REGISTRY
-            .iter()
-            .find(|s| s.name == "bottom")
-            .expect("bottom essential exists");
         let trippy_spec = PLUGIN_REGISTRY
             .iter()
             .find(|s| s.name == "trippy")
             .expect("trippy plugin exists");
 
-        let exe_bottom = platform_exe_name(bottom_spec.binary);
         let exe_trip = platform_exe_name("trip");
 
         let ctx = DetectContext {
@@ -408,29 +394,22 @@ mod tests {
             cargo_bin: Some(cargo_bin.clone()),
         };
 
-        // 1. Both managed dirs empty → detector falls through to
-        //    `which::which`. When the host lacks btm on `$PATH` we
-        //    can also assert `Missing`; otherwise skip (still get
-        //    coverage from cases 2+3).
-        if which::which(bottom_spec.binary).is_err() {
-            let got = detect_with(bottom_spec, ToolKind::Essential, &ctx);
+        // 1. Managed dirs empty → detector falls through to
+        //    `which::which`. When the host lacks `trip` on `$PATH` we
+        //    can also assert `Missing`; otherwise skip.
+        if which::which(trippy_spec.binary).is_err() {
+            let got = detect_with(trippy_spec, ToolKind::Plugin, &ctx);
             assert_eq!(got.install_source, InstallSource::Missing);
             assert!(got.detected_path.is_none());
         }
 
-        // 2. Only `bin/btm(.exe)` present → Essential.
-        std::fs::write(bin_dir.join(&exe_bottom), b"stub").unwrap();
-        let got = detect_with(bottom_spec, ToolKind::Essential, &ctx);
-        assert_eq!(got.install_source, InstallSource::Essential);
-        assert_eq!(got.detected_path, Some(bin_dir.join(&exe_bottom)));
-
-        // 3. Only `plugins/trippy/bin/trip(.exe)` present → Plugin.
+        // 2. `plugins/trippy/bin/trip(.exe)` present → Plugin.
         std::fs::write(plug_bin.join(&exe_trip), b"stub").unwrap();
         let got = detect_with(trippy_spec, ToolKind::Plugin, &ctx);
         assert_eq!(got.install_source, InstallSource::Plugin);
         assert_eq!(got.detected_path, Some(plug_bin.join(&exe_trip)));
 
-        // 4. Cleanup.
+        // 3. Cleanup.
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use tui_file_explorer::{
     App, AppOptions, AppOutcome, Editor, FileMutation, FileMutationFailure, FileMutationResult,
-    Pane, copy_dir_all, draw_in,
+    HintLayout, Pane, copy_dir_all, draw_in,
 };
 
 /// Which explorer column currently receives keyboard input.
@@ -55,6 +55,11 @@ impl FileManagerPane {
             left_dir,
             right_dir,
             editor: Editor::None,
+            // Native FileManagerPane lives in the top-left quadrant
+            // (~35 % of a typical terminal). Horizontal hint pairs
+            // truncate at that width; stack them vertically so every
+            // key hint stays legible.
+            hint_layout: HintLayout::Vertical,
             ..AppOptions::default()
         });
         Self {

@@ -5,9 +5,6 @@
   Layout under `%ProgramFiles%\rimeterm\`:
     rimeterm.exe
     rimectl.exe
-    essentials\             <- prebuilt bottom (see release CI)
-        btm.exe
-        VERSIONS.toml
     LICENSE, ACKNOWLEDGEMENTS.md, README.md
 
   On install:
@@ -24,6 +21,9 @@
 
   The upgrade-guid / path-guid stay stable across versions so newer
   MSIs cleanly replace older ones (major upgrade).
+
+  C25: `essentials/` sibling retired. Files/git/sysmon are Native
+  panes; nothing else needs to ship next to the executable.
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
      xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
@@ -97,21 +97,7 @@
                               KeyPath="yes" />
                     </Component>
 
-                    <!-- Bundled essentials sibling -->
-                    <Directory Id="EssentialsDir" Name="essentials">
-                        <Component Id="BtmExe" Guid="942AC6EB-5717-C6A4-3829-F5F3CF0FA2A8" Win64="yes">
-                            <File Id="BtmExeFile"
-                                  Name="btm.exe"
-                                  Source="$(var.EssentialsDir)\btm.exe"
-                                  KeyPath="yes" />
-                        </Component>
-                        <Component Id="VersionsToml" Guid="A53BD7FC-6828-D7B5-493A-06040DFF00B9" Win64="yes">
-                            <File Id="VersionsFile"
-                                  Name="VERSIONS.toml"
-                                  Source="$(var.EssentialsDir)\VERSIONS.toml"
-                                  KeyPath="yes" />
-                        </Component>
-                    </Directory>
+                    <!-- C25: essentials/ subtree retired. -->
 
                     <!-- Add APPLICATIONFOLDER to MACHINE PATH. The
                          `System=yes` writes to HKLM\...\Environment,
@@ -179,8 +165,6 @@
         <Feature Id="Complete" Level="1" Title="rimeterm" Description="rimeterm + essentials">
             <ComponentRef Id="RimetermExe" />
             <ComponentRef Id="RimectlExe" />
-            <ComponentRef Id="BtmExe" />
-            <ComponentRef Id="VersionsToml" />
             <ComponentRef Id="LicenseDoc" />
             <ComponentRef Id="ReadmeDoc" />
             <ComponentRef Id="AckDoc" />
