@@ -162,7 +162,7 @@
             </Directory>
         </Directory>
 
-        <Feature Id="Complete" Level="1" Title="rimeterm" Description="rimeterm + essentials">
+        <Feature Id="Complete" Level="1" Title="rimeterm" Description="rimeterm">
             <ComponentRef Id="RimetermExe" />
             <ComponentRef Id="RimectlExe" />
             <ComponentRef Id="LicenseDoc" />

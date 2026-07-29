@@ -10,7 +10,7 @@
 One screen, four zones in a 2×2 grid:
 
 - **Top-left · files** — native dual-pane file manager (`tui-file-explorer` fork). Alt+V opens a modal viewer over the whole left column for the file under the cursor (markdown / code / image).
-- **Bottom-left · git** — native Git snapshot powered by `gix` / `gix-diff` with tree-sitter diff highlighting; auto-refreshes when the files column changes directory. `bottom` shares this group as a pinned read-only tab.
+- **Bottom-left · git** — native Git snapshot powered by `gix` / `gix-diff` with tree-sitter diff highlighting; auto-refreshes when the files column changes directory. Shares the group with the native **Sysmon** and **agtop** (AI-coding-agent monitor) tabs — both in-process, no external binaries.
 - **Top-right · agents** — coding agent picked at runtime from whatever's on `$PATH` (`omp` / `codex` / `claude` / `pi` …).
 - **Bottom-right · shells** — interactive shells (pwsh / bash / fish); add more with `Ctrl+Shift+T`.
 
@@ -19,7 +19,7 @@ Every zone is tabbed and hot-swappable; layout ratios and agent choice persist p
 ## What's inside
 
 - **Agent-first** — auto-detects coding-agent CLIs on `$PATH`, picker in the app menu and command palette (`Ctrl+P`).
-- **Native files + git** — zero external processes for the left column; `bottom` is the only bundled essential (self-installs into `~/.rimeterm/` on first launch).
+- **Native files + git + sysmon** — zero external processes for the left column; no bundled binaries ship at all after C25 (files/git are native pure-Rust panes, sysmon and agtop are in-process monitors).
 - **`rimectl` IPC** — line-delimited JSON over a named pipe (Windows) or Unix socket. Every UI command is scriptable from tests, git hooks, or *other* agents.
 - **Native mouse** — click / drag / scroll on tabs, dividers, selections, and shell prompts. Right-click is context-aware.
 - **Themes** — 8 curated palettes (`Alt+T` cycles), applied uniformly across chrome and the markdown viewer.
@@ -27,15 +27,13 @@ Every zone is tabbed and hot-swappable; layout ratios and agent choice persist p
 
 ## Install
 
-Grab the archive for your platform from the [latest release] — MSI on Windows, `.deb` on Debian/Ubuntu, `.pkg` on macOS, or a plain `.tar.gz`/`.zip` extractable anywhere. Keep the `essentials/` sibling next to the launcher.
+Grab the archive for your platform from the [latest release] — MSI on Windows, `.deb` on Debian/Ubuntu, `.pkg` on macOS, or a plain `.tar.gz`/`.zip` extractable anywhere. Nothing else ships alongside — a single `rimeterm` + `rimectl` binary is the entire payload.
 
 From source:
 
 ```bash
 cargo install --path crates/rimeterm --bin rimeterm
 cargo install --path crates/rimectl  --bin rimectl
-# dev builds only — drop essentials next to target/
-node bootstrap-essentials.mjs
 ```
 
 Then run `rimeterm` from any terminal.

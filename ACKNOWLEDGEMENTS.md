@@ -1,8 +1,9 @@
 # Acknowledgements
 
-rimeterm stands on the shoulders of a lot of open-source work. This file lists
-the direct upstreams that make the M0 skeleton possible; deeper attributions
-will be added as new subsystems come online.
+rimeterm stands on the shoulders of a lot of open-source work. This file
+lists the direct upstreams that ship in the binary; transitive deps
+pulled in through `cargo` are covered by `Cargo.lock` + each dep's own
+license header.
 
 ## Rust runtime / language
 
@@ -17,17 +18,28 @@ will be added as new subsystems come online.
 
 ## PTY / terminal parsing
 
-- [portable-pty](https://github.com/wezterm/wezterm/tree/main/pty) — MIT
-- [vt100](https://github.com/doy/vt100-rust) — MIT
+- [portable-pty](https://github.com/wezterm/wezterm/tree/main/pty) — MIT.
+  Cross-platform PTY spawner (ConPTY on Windows, forkpty elsewhere).
+- [alacritty_terminal](https://github.com/alacritty/alacritty) — Apache-2.0.
+  VT-500 grid + parser powering every PTY pane (replaced `vt100` in C17
+  for full alt-screen / SGR / mouse support).
 
 ## Config / paths
 
 - [serde](https://github.com/serde-rs/serde) — MIT / Apache-2.0
+- [serde_json](https://github.com/serde-rs/json) — MIT / Apache-2.0
 - [toml](https://github.com/toml-rs/toml) — MIT / Apache-2.0
 - [directories](https://github.com/dirs-dev/directories-rs) — MIT / Apache-2.0
 - [which](https://github.com/harryfei/which-rs) — MIT
 - [anyhow](https://github.com/dtolnay/anyhow) — MIT / Apache-2.0
 - [thiserror](https://github.com/dtolnay/thiserror) — MIT / Apache-2.0
+- [parking_lot](https://github.com/Amanieu/parking_lot) — MIT / Apache-2.0.
+  Non-poisoning mutexes used across the App main loop and PTY session
+  writers.
+- [regex](https://github.com/rust-lang/regex) — MIT / Apache-2.0. Used
+  by the `AgtopPane` matcher table and by IPC arg validation.
+- [tokio-stream](https://github.com/tokio-rs/tokio) — MIT. Async stream
+  glue for the redraw / OSC bridges.
 
 ## Native system monitor
 
@@ -38,6 +50,20 @@ ships. The stack:
   system/CPU/memory/process/network/disk sampler.
 - [humansize](https://github.com/LeopoldArkham/humansize) — MIT / Apache-2.0.
   Byte / rate formatter.
+
+## Native AI-agent monitor
+
+`AgtopPane` classifies AI-coding-agent processes (Claude Code, Codex,
+Aider, Cursor, Gemini, Goose, …) in-process; no external binary ships.
+
+- [agtop](https://github.com/mbrassey/agtop) — MIT. Upstream `agtop`
+  is a standalone binary; we ported the matcher table
+  (`src/matchers.rs` @ v2.4.24) into `rimeterm-tui::agtop_matchers`
+  so detection works without a separate `cargo install agtop`. The
+  rest of the pane (sysinfo-based worker, ratatui table view, filter
+  / sort / cursor UX) is rimeterm-native.
+- Also uses [sysinfo] and [humansize] from the system-monitor stack
+  above.
 
 ## Native files / git stack
 
@@ -58,6 +84,52 @@ processes. The stack:
 - [trippy](https://github.com/fujiapple852/trippy) — MIT / Apache-2.0.
   Not bundled; installed on demand into `~/.rimeterm/plugins/trippy/`
   via `cargo install --root` when the user runs `tools.install trippy`.
+
+## Modal viewer (Alt+V)
+
+`Viewer` overlays markdown / code / image previews on top of the left
+column when the user Alt+V's a file-manager selection.
+
+- [`rimeterm-markdown`](crates/rimeterm-markdown/) — MIT. In-tree fork of
+  [leboiko/markdown-reader](https://github.com/leboiko/markdown-reader)
+  v1.34.75; carries the pure-Rust Markdown + Mermaid + LaTeX renderer.
+  Attribution + fork history in `crates/rimeterm-markdown/NOTICE.md`.
+- [tui-markdown](https://github.com/joshka/tui-markdown) — MIT. Ratatui
+  block/span translation used inside `rimeterm-markdown`.
+- [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark) — MIT.
+  Zero-copy Markdown tokenizer.
+- [ratatui-image](https://github.com/benjajaja/ratatui-image) — MIT.
+  Kitty / Sixel / iTerm2 / half-block image renderer for the image
+  branch of the viewer.
+- [image](https://github.com/image-rs/image) — MIT / Apache-2.0.
+  Decoder backend for PNG / JPG / GIF / BMP / WebP.
+- [syntect](https://github.com/trishume/syntect) — MIT. Sublime Text
+  grammar engine powering the viewer's code-highlight branch.
+- [unicode-width](https://github.com/unicode-rs/unicode-width) —
+  MIT / Apache-2.0. Grapheme-cluster width tables shared across every
+  layout / truncation call site.
+
+## Clipboard / OS integration
+
+- [arboard](https://github.com/1Password/arboard) — MIT / Apache-2.0.
+  System clipboard reader / writer used by the mouse-selection copy
+  path and the "Copy path" context menu.
+
+## Optional runtime deps
+
+These are compiled in unconditionally so the same binary supports every
+host, but activate at runtime only when their host feature is present.
+A missing library / daemon silently degrades to "no data" rather than
+failing startup.
+
+- [nvml-wrapper](https://github.com/rust-nvml/nvml-wrapper) — MIT.
+  NVIDIA NVML dynamic-loader used by `SysmonPane`'s GPU section.
+  Missing driver → GPU rows hidden.
+- [bollard](https://github.com/fussybeaver/bollard) — Apache-2.0.
+  Docker Engine API client used by `SysmonPane`'s Docker container
+  count. Missing daemon → Docker row hidden.
+- [procfs](https://github.com/eminence/procfs) — MIT / Apache-2.0 (Linux
+  only). `/proc/self/cgroup` decoder for the cgroup badge on Linux.
 
 ## Terminal / TUI design lineage
 

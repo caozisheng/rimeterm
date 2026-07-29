@@ -777,6 +777,19 @@ impl App {
         pinned_pane_ids.insert(sysmon_id);
         git_members.push(sysmon_id);
 
+        // Left-bottom (git) group third tab: Native AgtopPane — a
+        // top-like status view for AI coding agents (Claude Code,
+        // Codex, Aider, Cursor, Gemini, Goose, …). In-process, no
+        // PTY: we spun off from the upstream `agtop` binary (see
+        // `agtop_matchers` for attribution) so users don't need a
+        // separate `cargo install agtop`. Pinned so `×` never
+        // appears — this is a permanent left-column tab.
+        let agtop = crate::agtop_pane::AgtopPane::new();
+        let agtop_id = agtop.id();
+        panes.insert(Box::new(agtop));
+        pinned_pane_ids.insert(agtop_id);
+        git_members.push(agtop_id);
+
         // Shells group: always at least one interactive shell. Bottom
         // moved to the left-bottom (git) group, so shells is single-
         // purpose now.
@@ -2671,12 +2684,24 @@ impl App {
             Some(HoveredUi::QuitButton) => StatusBarHover::Quit,
             _ => StatusBarHover::None,
         };
+        // C22.6: while the viewer overlay is up, surface `F9 menu`
+        // as a status-bar chip. F9 is the only keyboard path to the
+        // pane menu (markdown-theme picker on markdown snapshots, "no
+        // actions here" toast otherwise) and users have no other
+        // visible affordance for it — the viewer's own chrome only
+        // advertises `Esc / ←` (close) and the `[×]` mouse button.
+        let key_hint = if self.viewer.is_open() {
+            Some("F9 menu")
+        } else {
+            None
+        };
         self.last_status_bar_hits = render_status_bar(
             vertical[0],
             frame.buffer_mut(),
             ws_label,
             &self.shell_short,
             status_hover,
+            key_hint,
         );
         // Cache current-frame geometry so mouse hit-tests use the same
         // rects the user is looking at.
@@ -4379,7 +4404,7 @@ fn register_commands(
         cmds,
         "viewer.open",
         "Open viewer overlay",
-        "Freeze the last active-yazi selection into the Modal Snapshot viewer",
+        "Freeze the highlighted file-manager selection into the Modal Snapshot viewer",
         flags.viewer_open
     );
     flag_cmd!(
@@ -4458,7 +4483,7 @@ fn register_commands(
     // other groups' overrides in the state file survive.
     //
     //   args: {} | null                 → reset everything (all groups)
-    //   args: {group: "files"|"sysmon"|"agents"|"shells"}
+    //   args: {group: "files"|"git"|"agents"|"shells"}
     //                                   → reset only that group
     //   → {scope: "all"|"<gid>"}
     {
@@ -4467,7 +4492,7 @@ fn register_commands(
         let cmd = Command {
             id: "workspace.layout.reset",
             title: "Reset layout ratios",
-            description: Some("args: {group?: \"files\"|\"sysmon\"|\"agents\"|\"shells\"}"),
+            description: Some("args: {group?: \"files\"|\"git\"|\"agents\"|\"shells\"}"),
             run: Arc::new(move |args: &serde_json::Value| {
                 let group = parse_layout_reset_args(args)?;
                 let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
@@ -4937,42 +4962,13 @@ fn register_commands(
         register(cmds, cmd)?;
     }
 
-    // `essentials.reinstall` — force re-extraction of the prebuilt
-    // essentials from the release archive's sibling `essentials/`
-    // folder. Users invoke this when they've corrupted their
-    // `~/.rimeterm/bin/` and want a clean copy without re-installing
-    // rimeterm. Idempotent otherwise.
-    {
-        let cmd = Command {
-            id: "essentials.reinstall",
-            title: "Re-extract bundled essentials into ~/.rimeterm/bin/",
-            description: Some("no args; returns per-binary extract report"),
-            run: Arc::new(move |_args: &serde_json::Value| {
-                let Ok(exe) = std::env::current_exe() else {
-                    return Err("cannot resolve rimeterm binary path".to_string());
-                };
-                let Some(parent) = exe.parent() else {
-                    return Err("rimeterm binary has no parent dir".to_string());
-                };
-                let src = parent.join("essentials");
-                // Force a re-copy by deleting the fingerprint marker
-                // first. `extract_essentials` is idempotent otherwise;
-                // this is the one place we want it to actually work.
-                if let Some(bin) = rimeterm_config::paths::bin_dir() {
-                    let _ = std::fs::remove_file(bin.join(".rimeterm-essentials-version"));
-                }
-                let report =
-                    rimeterm_config::assets::extract_essentials(&src, env!("CARGO_PKG_VERSION"));
-                Ok(serde_json::json!({
-                    "source_absent": report.source_absent,
-                    "extracted": report.extracted,
-                    "skipped_up_to_date": report.skipped_up_to_date,
-                    "errors": report.errors,
-                }))
-            }),
-        };
-        register(cmds, cmd)?;
-    }
+    // `essentials.reinstall` retired in C25: no bundled binaries ship
+    // any more (files/git/sysmon/agtop are all Native panes). The
+    // command used to force-re-copy `<exe>/../essentials/*` into
+    // `~/.rimeterm/bin/`, but that sibling dir hasn't been produced by
+    // release.yml since the C25 payload trim, so the command was a
+    // guaranteed `source_absent = true` no-op. If a future bundle
+    // reintroduces essentials, restore `essentials.reinstall` here.
 
     // ── §14 C14 Agents Picker ──
     //
@@ -6876,31 +6872,10 @@ mod tests {
         assert!(flags.viewer_open.load(Ordering::Relaxed));
     }
 
-    #[test]
-    fn essentials_reinstall_command_is_registered() {
-        let flags = Arc::new(ActionFlags::default());
-        let snapshot = Arc::new(parking_lot::RwLock::new(WorkspaceSnapshot::default()));
-        let session_writes: Arc<
-            parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
-        > = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-        let pending: Arc<parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>> =
-            Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
-        let (redraw_tx, _redraw_rx) = mpsc::unbounded_channel();
-        let mut cmds = CommandRegistry::new();
-        register_commands(
-            &mut cmds,
-            Arc::clone(&flags),
-            Arc::clone(&snapshot),
-            Arc::clone(&session_writes),
-            Arc::clone(&pending),
-            redraw_tx,
-        )
-        .expect("register");
-        assert!(
-            cmds.get("essentials.reinstall").is_some(),
-            "essentials.reinstall must be registered (C21.5 §6)"
-        );
-    }
+    // `essentials_reinstall_command_is_registered` retired in C25
+    // alongside the last bundled binary. See the note above the
+    // command registration site — if a future bundle reintroduces
+    // essentials, restore both the command and this test.
 
     // `tools_install_of_essential_returns_already_bundled` retired in
     // C25 alongside the last bundled essential (`bottom`). If a future

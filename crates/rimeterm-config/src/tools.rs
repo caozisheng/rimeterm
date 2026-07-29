@@ -310,7 +310,11 @@ mod tests {
     fn kind_of_matches_registries() {
         assert_eq!(kind_of("trippy"), Some(ToolKind::Plugin));
         // Retired names — bottom (C25), yazi + gitui (C24) — must not
-        // resolve to any tier.
+        // resolve to any tier.  `agtop` is intentionally NOT a plugin
+        // binary: rimeterm hosts an in-process native pane instead
+        // (see `rimeterm-tui::agtop_pane`), so its detection ID must
+        // stay unregistered here.
+        assert_eq!(kind_of("agtop"), None);
         assert_eq!(kind_of("bottom"), None);
         assert_eq!(kind_of("yazi"), None);
         assert_eq!(kind_of("gitui"), None);
@@ -321,6 +325,7 @@ mod tests {
     #[test]
     fn find_hits_plugin_registry_only() {
         assert!(find("trippy").is_some());
+        assert!(find("agtop").is_none(), "agtop lives as a native pane");
         assert!(find("bottom").is_none(), "bottom retired in C25");
         assert!(find("yazi").is_none(), "yazi retired");
         assert!(find("gitui").is_none(), "gitui retired");

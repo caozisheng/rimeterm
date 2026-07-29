@@ -5,6 +5,10 @@
 
 pub mod acknowledgement;
 pub mod agent_factory;
+pub mod agtop_matchers;
+pub mod agtop_model;
+pub mod agtop_pane;
+pub mod agtop_worker;
 pub mod app;
 pub mod diff_highlight;
 pub mod file_manager_pane;

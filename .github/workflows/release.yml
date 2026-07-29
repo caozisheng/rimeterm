@@ -7,11 +7,13 @@
 #     Release (uploaded as run artefacts only), useful for testing the
 #     packaging pipeline itself.
 #
-# Payload per archive (C21.5):
+# Payload per archive (C25):
 #   * `rimeterm` (+ `.exe` on Windows; icon embedded via winresource)
 #   * `rimectl`
-#   * `essentials/`  ← pinned `btm` + VERSIONS.toml (native files/git handle the rest)
 #   * `LICENSE`, `README.md`, `ACKNOWLEDGEMENTS.md`
+#
+# No `essentials/` sibling ships — files, git, sysmon, and the AI-agent
+# monitor are all Native panes; zero external binaries are bundled.
 #
 # Archive naming (matches Rust target triples so users can `curl` the right
 # one from CI env vars):
@@ -19,7 +21,7 @@
 #   * macOS   → `rimeterm-<version>-aarch64-apple-darwin.tar.gz` (Apple Silicon only)
 #   * Windows → `rimeterm-<version>-x86_64-pc-windows-msvc.zip`
 #
-# Installers (v0.1.3+, alongside the archives, all bundling essentials):
+# Installers (v0.1.3+, alongside the archives):
 #   * Windows → `rimeterm-<version>-x86_64.msi`
 #                 cargo-wix with in-tree wix/main.wxs, %ProgramFiles%\rimeterm
 #                 auto-appended to MACHINE PATH, Start-menu shortcut.

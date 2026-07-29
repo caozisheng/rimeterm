@@ -2,11 +2,10 @@
 # postinst — cargo-deb copies this into DEBIAN/postinst inside the .deb.
 # Debian policy fires it as `postinst configure` on install/upgrade.
 #
-# We host the real binaries + essentials sibling under /usr/lib/rimeterm/
-# so `env::current_exe()?.parent()?.join("essentials")` at first
-# launch resolves next to the actual executable. /usr/bin/{rimeterm,
-# rimectl} are symlinks — Rust's env::current_exe() follows them back
-# to /usr/lib/rimeterm/ so the sibling stays reachable.
+# We host the real binaries under /usr/lib/rimeterm/ so
+# /usr/bin/{rimeterm,rimectl} can be symlinks — Rust's env::current_exe()
+# follows them back to /usr/lib/rimeterm/ so any sibling asset (none
+# ship today after C25) would stay reachable if we ever re-introduce one.
 
 set -e
 
