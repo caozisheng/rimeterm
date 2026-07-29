@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use crossterm::event::{Event, EventStream, KeyEvent, KeyEventKind, MouseEventKind};
+use fast_resume::embed::ResumeTarget;
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -50,6 +51,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::file_manager_pane::FileManagerPane;
+use crate::fr_pane::{FrAction, FrPane};
 use crate::keymap::{Keymap, KeymapOutcome, QUADRANT_COMMANDS, tab_goto_command_id};
 use crate::menu::{
     MenuKeyOutcome, MenuState, handle_key as menu_key, popup_rect as menu_rect,
@@ -479,6 +481,8 @@ pub struct App {
     /// mid-runtime factory calls (new_shell_tab_in / new_agent_tab_in)
     /// can hand a fresh clone to newly-spawned children.
     osc_tx: mpsc::UnboundedSender<(PaneId, String)>,
+    /// Native FR pane actions are resolved by App because only App owns tab/PTY state.
+    fr_action_rx: mpsc::UnboundedReceiver<FrAction>,
     /// §C24: The viewer is a single modal overlay (not a tab). Only
     /// one file can be previewed at a time; opening a new one
     /// replaces the previous snapshot. Occupies the entire left
@@ -647,10 +651,7 @@ impl App {
         let mut pinned_pane_ids: std::collections::HashSet<PaneId> =
             std::collections::HashSet::new();
 
-        // Files group — a single native two-pane [`FileManagerPane`].
-        // `[files].tabs` from config.toml is intentionally NOT consulted:
-        // the yazi/gitui PTY route was retired in favour of the native
-        // provider so custom entries silently no-op.
+        // Files group — native two-pane explorer followed by embedded Fast Resume.
         let file_manager_pane = FileManagerPane::with_event_bus(
             workspace_root.clone(),
             workspace_root.clone(),
@@ -659,7 +660,12 @@ impl App {
         let file_manager_pane_id = file_manager_pane.id();
         panes.insert(Box::new(file_manager_pane));
         pinned_pane_ids.insert(file_manager_pane_id);
-        let files_members = vec![file_manager_pane_id];
+
+        let (fr_action_tx, fr_action_rx) = mpsc::unbounded_channel();
+        let fr_pane = FrPane::new(fr_action_tx);
+        let fr_pane_id = fr_pane.id();
+        panes.insert(Box::new(fr_pane));
+        pinned_pane_ids.insert(fr_pane_id);
 
         // Native Git pane — read-only workspace Git panel backed by
         // `gix`. Follows files-cwd via `SetActiveRoot` in the main loop
@@ -822,6 +828,7 @@ impl App {
             pane.set_right_click_paste(config.mouse.right_click_paste);
             pane.set_scrollback_enabled(true);
         }
+        let files = build_files_group(file_manager_pane_id, fr_pane_id);
         shells_members.push(first_id);
 
         // Groups.
@@ -829,12 +836,6 @@ impl App {
         // no × / + affordance; the viewer is now a modal overlay
         // rather than a tab (§C24), so nothing ever needs to be
         // added or closed inside these groups.
-        let files = TabGroup::new(
-            BUILTIN_FILES,
-            files_members,
-            MembersPolicy::Fixed,
-            PaneKind::Files,
-        );
         let git = TabGroup::new(
             BUILTIN_GIT,
             git_members,
@@ -948,6 +949,7 @@ impl App {
             redraw_rx,
             osc_rx,
             osc_tx,
+            fr_action_rx,
             viewer: ViewerOverlayState::default(),
             file_manager_pane_id: Some(file_manager_pane_id),
             git_pane_id: Some(git_pane_id),
@@ -1014,6 +1016,7 @@ impl App {
             }
             self.drain_mutations();
             self.drain_flags();
+            self.drain_fr_actions();
             if self.poll_pane_background() {
                 self.needs_redraw = true;
             }
@@ -3380,6 +3383,95 @@ impl App {
         self.new_shell_tab_in(gid)
     }
 
+    fn drain_fr_actions(&mut self) {
+        while let Ok(action) = self.fr_action_rx.try_recv() {
+            match action {
+                FrAction::Resume(target) => {
+                    let label = target.agent.clone();
+                    match self.new_resumed_agent_tab(target) {
+                        Ok(pane_id) => {
+                            self.pending_spawn = Some(PendingSpawn {
+                                label,
+                                pane_id,
+                                started: Instant::now(),
+                            });
+                            self.set_hint("resuming session in agents pane".to_string());
+                        }
+                        Err(error) => self.set_hint(format!("resume failed: {error}")),
+                    }
+                    self.needs_redraw = true;
+                }
+            }
+        }
+    }
+
+    fn new_resumed_agent_tab(&mut self, target: ResumeTarget) -> Result<PaneId> {
+        let group = self
+            .tree
+            .find_tab_group(BUILTIN_AGENTS)
+            .ok_or_else(|| anyhow!("agents group missing"))?;
+        let MembersPolicy::Open { max } = group.policy() else {
+            return Err(anyhow!("agents group does not accept resumed sessions"));
+        };
+        if group.kind() != PaneKind::AgentChat {
+            return Err(anyhow!("agents group does not accept resumed sessions"));
+        }
+        if group.len() >= max {
+            return Err(anyhow!("agents group is full (max = {max})"));
+        }
+
+        let mut spec = resume_spawn_spec(target)?;
+        if spec.cwd.as_os_str().is_empty() {
+            spec.cwd = self.active_root.clone();
+        }
+        let argv = std::iter::once(spec.program.clone())
+            .chain(spec.args.iter().cloned())
+            .collect::<Vec<_>>();
+        let program = match rimeterm_pty::detect_tool(&argv) {
+            rimeterm_pty::ToolAvailability::Available(program) => program,
+            rimeterm_pty::ToolAvailability::Missing { probed } => {
+                return Err(anyhow!("`{probed}` is not installed"));
+            }
+        };
+        let spawn = crate::agent_factory::spawn_external(
+            program,
+            spec.args,
+            spec.cwd,
+            format!("{} resume", spec.agent),
+            80,
+            24,
+            self.redraw_tx.clone(),
+            self.osc_tx.clone(),
+            None,
+        )?;
+        let new_id = spawn.pane.id();
+        self.session_writes
+            .lock()
+            .insert(new_id, spawn.pane.session().clone());
+        self.panes.insert(Box::new(spawn.pane));
+        if let Some(pane) = self.panes.get_mut(new_id) {
+            pane.set_right_click_paste(self.config.mouse.right_click_paste);
+            pane.set_scrollback_enabled(true);
+        }
+
+        let add_result = self
+            .tree
+            .find_tab_group_mut(BUILTIN_AGENTS)
+            .expect("agents group checked above")
+            .try_add(new_id, PaneKind::AgentChat);
+        if let Err(error) = add_result {
+            self.drop_pane_and_session(new_id);
+            return Err(anyhow!("policy rejected resumed session: {error}"));
+        }
+        let group = self
+            .tree
+            .find_tab_group_mut(BUILTIN_AGENTS)
+            .expect("agents group checked above");
+        remove_agent_picker_placeholder(group, &mut self.panes);
+        self.focus.set_focus(new_id, Some(BUILTIN_AGENTS));
+        Ok(new_id)
+    }
+
     /// Spawn a fresh shell tab in `gid` regardless of focus. Returns the new
     /// `PaneId` so IPC callers can address it. Used by both `Ctrl+T`
     /// (focused group) and `workspace.pane.open` (currently only shells;
@@ -3631,18 +3723,16 @@ impl App {
             .tree
             .tab_groups()
             .iter()
-            .find_map(|g| {
-                g.members()
+            .find_map(|group| {
+                group
+                    .members()
                     .iter()
-                    .position(|m| *m == pane_id)
-                    .map(|i| (g.id(), i))
+                    .position(|member| *member == pane_id)
+                    .map(|index| (group.id(), index))
             })
-            .ok_or_else(|| anyhow!("pane {} not in any tab group", pane_id.0))?;
-        // Update the tab group's active index. `goto` is fallible for
-        // out-of-range but we just computed the index from members, so it
-        // won't fail — still bubble to be defensive.
+            .ok_or_else(|| anyhow!("pane {} not found in layout", pane_id.0))?;
         if let Some(group) = self.tree.find_tab_group_mut(gid) {
-            group.goto(idx).map_err(|e| anyhow!("{e}"))?;
+            group.goto(idx).map_err(|error| anyhow!("{error}"))?;
         }
         self.focus.set_focus(pane_id, Some(gid));
         Ok(())
@@ -3710,29 +3800,23 @@ impl App {
         false
     }
 
-    /// F5 handler: reload the focused left-column pane. Files-group focus
-    /// hits [`FileManagerPane::reload`]; git-group focus surfaces a hint
-    /// until the native GitPane arrives. Called from `drain_flags` when
-    /// the `workspace.pane.reload` command flag flips.
+    /// F5 handler: reload the active pane in either fixed left-column group.
     fn handle_pane_reload(&mut self) {
         let focused = self.focus.focused_group();
-        if focused == Some(BUILTIN_FILES) {
-            if let Some(id) = self.file_manager_pane_id {
-                if let Some(pane) = self.panes.get_mut(id) {
-                    pane.reload();
-                    self.set_hint("files reloaded".into());
-                }
-            }
-        } else if focused == Some(BUILTIN_GIT) {
-            let git_id = self
-                .tree
-                .find_tab_group(BUILTIN_GIT)
-                .and_then(|group| group.active_pane());
-            if let Some(id) = git_id {
-                if let Some(pane) = self.panes.get_mut(id) {
-                    pane.reload();
-                    self.set_hint("git reloaded".into());
-                }
+        let active_id = focused.and_then(|group_id| {
+            matches!(group_id, BUILTIN_FILES | BUILTIN_GIT)
+                .then(|| {
+                    self.tree
+                        .find_tab_group(group_id)
+                        .and_then(TabGroup::active_pane)
+                })
+                .flatten()
+        });
+        if let Some(id) = active_id {
+            if let Some(pane) = self.panes.get_mut(id) {
+                let title = pane.title().to_string();
+                pane.reload();
+                self.set_hint(format!("{title} reloaded"));
             }
         } else {
             self.set_hint("F5 has no effect here".into());
@@ -4190,6 +4274,60 @@ fn classify_hint(err: viewer::ClassifyError) -> String {
             format!("file is {} bytes (cap {} bytes)", size, cap)
         }
         viewer::ClassifyError::Unreadable(msg) => msg,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResumeSpawnSpec {
+    agent: String,
+    program: String,
+    args: Vec<String>,
+    cwd: PathBuf,
+}
+
+fn resume_spawn_spec(target: ResumeTarget) -> Result<ResumeSpawnSpec> {
+    let mut argv = target.argv.into_iter();
+    let program = argv
+        .next()
+        .filter(|program| !program.trim().is_empty())
+        .ok_or_else(|| anyhow!("resume command is empty"))?;
+    Ok(ResumeSpawnSpec {
+        agent: target.agent,
+        program,
+        args: argv.collect(),
+        cwd: target.cwd,
+    })
+}
+
+fn build_files_group(file_manager_pane_id: PaneId, fr_pane_id: PaneId) -> TabGroup {
+    TabGroup::new(
+        BUILTIN_FILES,
+        vec![file_manager_pane_id, fr_pane_id],
+        MembersPolicy::Fixed,
+        PaneKind::Files,
+    )
+}
+
+fn remove_agent_picker_placeholder(group: &mut TabGroup, panes: &mut PaneRegistry) {
+    let placeholders: Vec<PaneId> = group
+        .members()
+        .iter()
+        .copied()
+        .filter(|id| {
+            panes
+                .get(*id)
+                .is_some_and(|pane| pane.title() == AGENT_PICKER_TITLE)
+        })
+        .collect();
+    for placeholder_id in placeholders {
+        if let Some(index) = group
+            .members()
+            .iter()
+            .position(|member| *member == placeholder_id)
+        {
+            let _ = group.try_close(index, true);
+            drop_pane(panes, placeholder_id);
+        }
     }
 }
 
@@ -6109,6 +6247,46 @@ fn should_route_pane_mouse(kind: MouseEventKind, hit: PaneId, focused: Option<Pa
 mod tests {
     use super::*;
     use crossterm::event::MouseButton;
+
+    #[test]
+    fn files_group_contains_files_then_fr_and_is_fixed() {
+        let files_id = PaneId(41);
+        let fr_id = PaneId(42);
+
+        let group = build_files_group(files_id, fr_id);
+
+        assert_eq!(group.members(), &[files_id, fr_id]);
+        assert_eq!(group.policy(), MembersPolicy::Fixed);
+    }
+
+    #[test]
+    fn resume_spawn_spec_preserves_program_args_and_cwd() {
+        let target = fast_resume::embed::ResumeTarget {
+            agent: "codex".to_string(),
+            argv: vec![
+                "codex".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "resume".to_string(),
+                "session-42".to_string(),
+            ],
+            cwd: PathBuf::from("C:/work/api"),
+        };
+
+        let spec = resume_spawn_spec(target).expect("valid resume target");
+
+        assert_eq!(
+            (spec.program, spec.args, spec.cwd),
+            (
+                "codex".to_string(),
+                vec![
+                    "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                    "resume".to_string(),
+                    "session-42".to_string(),
+                ],
+                PathBuf::from("C:/work/api"),
+            )
+        );
+    }
 
     #[test]
     fn classify_hint_maps_all_error_variants_to_non_empty_string() {

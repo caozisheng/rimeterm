@@ -14,6 +14,7 @@ rimeterm-core = { workspace = true }
 rimeterm-config = { workspace = true }
 rimeterm-pty = { workspace = true }
 rimeterm-ipc = { workspace = true }
+fast-resume = { workspace = true }
 serde_json = "1"
 parking_lot = "0.12"
 serde = { workspace = true }
@@ -74,4 +75,5 @@ procfs = { workspace = true }
 
 
 [dev-dependencies]
+chrono = "0.4"
 tempfile = "3"

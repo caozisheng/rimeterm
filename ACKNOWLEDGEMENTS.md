@@ -65,6 +65,15 @@ Aider, Cursor, Gemini, Goose, …) in-process; no external binary ships.
 - Also uses [sysinfo] and [humansize] from the system-monitor stack
   above.
 
+## Native session search
+
+`FR` is an in-process search and conversation-preview pane backed by:
+
+- [fast-resume](https://github.com/angristan/fast-resume) — MIT. The complete
+  source at commit `66e42cfd34bca4800161098d3b302a35a52ce69b` is vendored in
+  `crates/fast-resume`; rimeterm adds an embedding API and native pane while
+  retaining the upstream adapters, Tantivy index, query parser, and `fr` CLI.
+
 ## Native files / git stack
 
 Files and Git are Native panes compiled into rimeterm — no external
