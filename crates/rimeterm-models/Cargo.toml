@@ -1,0 +1,32 @@
+[package]
+name = "rimeterm-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Data types + models.dev fetcher for the ModelsPane. Ported from reyamira/models (MIT)."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = "1"
+# reqwest is already in the workspace dep tree via `rimeterm-tui`. We
+# opt in to the `blocking` feature here so the ModelsPane worker can
+# call `reqwest::blocking::get()` from a std::thread — matching the
+# AgtopWorker / SysmonWorker pattern (blocking recv on a channel, no
+# async runtime crossing).
+#
+# `system-proxy` is REQUIRED for the pane's escape-hatch story:
+# `models.dev` sits on Cloudflare Pages and is unreachable from a
+# handful of regions (mainland China, some corporate egress). Without
+# this feature, reqwest ignores `HTTPS_PROXY` / `HTTP_PROXY` env vars
+# — silently — and the pane looks broken. With it, users just export
+# a working proxy and the fetch tunnels through.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "system-proxy"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"

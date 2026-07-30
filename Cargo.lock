@@ -728,6 +728,16 @@ dependencies = [
 
 [[package]]
 name = "core-foundation"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e195e091a93c46f7102ec7818a2aa394e1e1771c3ab4825963fa03e45afb8f"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
+name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
@@ -2558,9 +2568,11 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "socket2",
+ "system-configuration",
  "tokio",
  "tower-service",
  "tracing",
+ "windows-registry",
 ]
 
 [[package]]
@@ -4486,6 +4498,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
@@ -4527,7 +4540,7 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
 name = "rimectl"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "rimeterm-ipc",
@@ -4537,7 +4550,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "rimeterm-config",
@@ -4552,7 +4565,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-config"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "directories",
@@ -4567,7 +4580,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-core"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -4581,7 +4594,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-ipc"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "libc",
@@ -4597,7 +4610,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-markdown"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "pulldown-cmark",
  "ratatui",
@@ -4607,8 +4620,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rimeterm-models"
+version = "0.2.10"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "rimeterm-pty"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4625,7 +4649,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-tui"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4650,6 +4674,7 @@ dependencies = [
  "rimeterm-core",
  "rimeterm-ipc",
  "rimeterm-markdown",
+ "rimeterm-models",
  "rimeterm-pty",
  "semver",
  "serde",
@@ -4908,7 +4933,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
 dependencies = [
  "bitflags 2.13.1",
- "core-foundation",
+ "core-foundation 0.10.1",
  "core-foundation-sys",
  "libc",
  "security-framework-sys",
@@ -5328,6 +5353,27 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "windows 0.62.2",
+]
+
+[[package]]
+name = "system-configuration"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a13f3d0daba03132c0aa9767f98351b3488edc2c100cda2d2ec2b04f3d8d3c8b"
+dependencies = [
+ "bitflags 2.13.1",
+ "core-foundation 0.9.4",
+ "system-configuration-sys",
+]
+
+[[package]]
+name = "system-configuration-sys"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
 ]
 
 [[package]]
@@ -6697,6 +6743,17 @@ checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
 dependencies = [
  "windows-core 0.62.2",
  "windows-link",
+]
+
+[[package]]
+name = "windows-registry"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02752bf7fbdcce7f2a27a742f798510f3e5ad88dbe84871e5168e2120c3d5720"
+dependencies = [
+ "windows-link",
+ "windows-result 0.4.1",
+ "windows-strings 0.5.1",
 ]
 
 [[package]]

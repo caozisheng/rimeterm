@@ -806,6 +806,19 @@ impl App {
         pinned_pane_ids.insert(agtop_id);
         git_members.push(agtop_id);
 
+        // Left-bottom (git) group fourth tab: Native ModelsPane — a
+        // catalog browser for models.dev showing every provider's
+        // model list with context window and $/1M-tokens pricing.
+        // In-process, no PTY: data types + fetch layer live in the
+        // `rimeterm-models` crate (ported from MIT `reyamira/models`
+        // v0.14.0) so users don't need a separate `cargo install
+        // modelsdev`. Pinned so `×` never appears.
+        let models = crate::models_pane::ModelsPane::new();
+        let models_id = models.id();
+        panes.insert(Box::new(models));
+        pinned_pane_ids.insert(models_id);
+        git_members.push(models_id);
+
         // Shells group: always at least one interactive shell. Bottom
         // moved to the left-bottom (git) group, so shells is single-
         // purpose now.

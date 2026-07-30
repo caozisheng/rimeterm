@@ -66,6 +66,10 @@ nvml-wrapper = { workspace = true }
 # bollard connects to the local Docker socket / named pipe on demand;
 # missing daemon silently degrades to "no Docker section" at runtime.
 bollard = { workspace = true }
+# C26 Native ModelsPane — fetches https://models.dev/api.json in a
+# blocking worker thread. Data types + fetch layer ported from
+# reyamira/models (MIT) into `rimeterm-models`.
+rimeterm-models = { workspace = true }
 
 # procfs has a Linux-only build.rs; conditional-target keeps
 # Windows/macOS builds compiling. Its worker code lives behind

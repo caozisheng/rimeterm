@@ -65,6 +65,24 @@ Aider, Cursor, Gemini, Goose, …) in-process; no external binary ships.
 - Also uses [sysinfo] and [humansize] from the system-monitor stack
   above.
 
+## Native AI-model catalog
+
+`ModelsPane` browses the [models.dev](https://models.dev) catalog
+(~4,000 models across ~85 providers) in-process; no external binary
+ships.
+
+- [modelsdev](https://github.com/reyamira/models) — MIT. Upstream
+  `modelsdev` is a standalone TUI + CLI binary; we ported the data
+  types (`src/data.rs`) + fetch layer (`src/api.rs`) from v0.14.0
+  into the `rimeterm-models` crate so browsing works without a
+  separate `cargo install modelsdev`. The rest of the pane (blocking
+  worker thread, ratatui table view, filter / sort / cursor UX) is
+  rimeterm-native and covers only the Models tab — Agents /
+  Benchmarks / Status stay in upstream `modelsdev` for users who
+  want the full experience.
+- [reqwest](https://github.com/seanmonstar/reqwest) — MIT / Apache-2.0.
+  Blocking HTTP client used by the fetcher.
+
 ## Native session search
 
 `FR` is an in-process search and conversation-preview pane backed by:

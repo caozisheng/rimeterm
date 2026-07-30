@@ -10,10 +10,11 @@ members = [
     "crates/rimeterm-tui",
     "crates/rimeterm-markdown",
     "crates/fast-resume",
+    "crates/rimeterm-models",
 ]
 
 [workspace.package]
-version = "0.2.9"
+version = "0.2.10"
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
@@ -28,6 +29,7 @@ rimeterm-config = { path = "crates/rimeterm-config", version = "0.2" }
 rimeterm-pty    = { path = "crates/rimeterm-pty",    version = "0.2" }
 rimeterm-tui    = { path = "crates/rimeterm-tui",    version = "0.2" }
 rimeterm-markdown = { path = "crates/rimeterm-markdown", version = "0.2" }
+rimeterm-models = { path = "crates/rimeterm-models", version = "0.2" }
 fast-resume      = { path = "crates/fast-resume" }
 
 rimeterm-ipc    = { path = "crates/rimeterm-ipc",    version = "0.2" }
