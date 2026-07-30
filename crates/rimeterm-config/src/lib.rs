@@ -17,6 +17,7 @@ pub mod install_hint;
 pub mod layout_state;
 pub mod migrate;
 pub mod paths;
+pub mod session_state;
 
 #[doc(hidden)]
 pub mod test_util;

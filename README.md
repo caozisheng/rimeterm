@@ -8,10 +8,9 @@
 
 One screen, four zones in a 2×2 grid:
 
-- **Top-left · files / FR** — native dual-pane file manager plus embedded Fast Resume session search. `FR` searches local coding-agent history with a live conversation preview; `Ctrl+R` resumes the selected session in a new top-right agent tab. Alt+V opens a modal viewer over the whole left column for the file under the cursor (markdown / code / image).
-- **Bottom-left · git** — native Git snapshot powered by `gix` / `gix-diff` with tree-sitter diff highlighting; auto-refreshes when the files column changes directory. Shares the group with the native **Sysmon** and **agtop** (AI-coding-agent monitor) tabs — both in-process, no external binaries.
-- **Top-right · agents** — coding agent picked at runtime from whatever's on `$PATH` (`omp` / `codex` / `claude` / `pi` …).
-- **Bottom-right · shells** — interactive shells (pwsh / bash / fish); add more with `Ctrl+Shift+T`.
+| **Top-left · files / FR**<br/>· Native dual-pane file explorer<br/>· Fast Resume session-history fuzzy search + live preview<br/>· `Ctrl+R` resumes the selected session as a new agent tab<br/>· `Alt+V` modal viewer for the cursor'd file (markdown / code / image) | **Top-right · agents**<br/>· Coding-agent PTY (`omp` / `codex` / `claude` / `pi` / …)<br/>· `Ctrl+Shift+P` picker (`agents.pick.*`)<br/>· Scrollback + inline scrollbar<br/>· Mouse text selection · `Ctrl+Shift+C/V` clipboard |
+|---|---|
+| **Bottom-left · git / sysmon / agtop**<br/>· Native `gix` snapshot: working-tree changes + commit graph<br/>· Tree-sitter diff highlighting<br/>· In-process **Sysmon** (CPU / memory / disks / network, optional GPU + Docker)<br/>· In-process **agtop** monitors detected agent processes (Claude / Codex / Aider / Cursor / Gemini / Goose / …) | **Bottom-right · shells**<br/>· Interactive PTY (pwsh / bash / fish / cmd / …)<br/>· `Ctrl+Shift+T` new shell tab · shell picker in Settings<br/>· Scrollback + inline scrollbar<br/>· Mouse text selection · `Ctrl+Shift+C/V` clipboard |
 
 Every zone is tabbed and hot-swappable; layout ratios and agent choice persist per workspace.
 

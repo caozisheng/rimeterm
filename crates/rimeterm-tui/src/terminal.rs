@@ -30,9 +30,12 @@ impl TerminalGuard {
         let mut stdout = io::stdout();
         // BlinkingBlock: DEC "\x1b[1 q". Alt-screen entry can reset the
         // caret to steady on some terminals (Windows Terminal in
-        // particular), so we request the blink explicitly. Restored to
-        // DefaultUserShape on Drop so the user's shell keeps whatever
-        // caret they had before rimeterm started.
+        // particular), so we request the blink explicitly. Only the
+        // focused pane gets the OS caret placed on its cursor — every
+        // other pane paints a reverse-video block overlay in-buffer
+        // (see `pty_pane::render`). Restored to DefaultUserShape on
+        // Drop so the user's shell keeps whatever caret they had
+        // before rimeterm started.
         execute!(
             stdout,
             EnterAlternateScreen,

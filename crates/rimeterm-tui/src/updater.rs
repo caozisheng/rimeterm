@@ -13,11 +13,30 @@ use tokio::io::AsyncWriteExt;
 pub const RELEASES_API: &str =
     "https://api.github.com/repos/caozisheng/rimeterm/releases?per_page=30";
 
+/// GitHub release download mirrors tried in order after a direct request fails
+/// with a connection-level error. Each entry is a prefix that gets prepended
+/// to the original `https://github.com/...` URL — well-known Chinese-friendly
+/// proxies that pass GitHub bytes through unchanged. SHA-256 verification
+/// gates the final file, so a hostile mirror cannot swap in a tampered MSI.
+pub const DOWNLOAD_MIRRORS: &[&str] = &[
+    "https://gh-proxy.com/",
+    "https://ghproxy.net/",
+    "https://ghfast.top/",
+    "https://mirror.ghproxy.com/",
+];
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct ReleaseAsset {
     pub name: String,
     pub browser_download_url: String,
     pub size: u64,
+    /// GitHub API `digest` field, populated on modern releases as
+    /// `"sha256:<hex>"`. Preferred over the separately hosted SHA256SUMS
+    /// asset because it ships with the same JSON response we already fetched
+    /// from `api.github.com`, so the checksum is available even when the
+    /// release CDN is unreachable (e.g. TCP resets from mainland China).
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -173,35 +192,14 @@ where
     tokio::fs::create_dir_all(dest_dir)
         .await
         .with_context(|| format!("create update directory {}", dest_dir.display()))?;
-    let checksum_url = installer.checksums.browser_download_url.as_str();
-    let response = client
-        .get(checksum_url)
-        .header("Accept", "text/plain, */*")
-        .send()
-        .await
-        .with_context(|| format!("download SHA256SUMS from {checksum_url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        bail!("SHA256SUMS download from {checksum_url} returned HTTP {status}");
-    }
-    let manifest = response
-        .text()
-        .await
-        .with_context(|| format!("read SHA256SUMS body from {checksum_url}"))?;
-    let expected = checksum_for(&manifest, &installer.msi.name)?.to_owned();
+    let expected = resolve_expected_digest(client, installer).await?;
 
     let final_path = dest_dir.join(&installer.msi.name);
     let part_path = final_path.with_extension("msi.part");
     let msi_url = installer.msi.browser_download_url.as_str();
-    let response = client
-        .get(msi_url)
-        .send()
+    let response = fetch_asset_response(client, msi_url, None)
         .await
         .with_context(|| format!("download MSI from {msi_url}"))?;
-    let msi_status = response.status();
-    if !msi_status.is_success() {
-        bail!("MSI download from {msi_url} returned HTTP {msi_status}");
-    }
     let total = response.content_length().unwrap_or(installer.msi.size);
     let mut file = tokio::fs::File::create(&part_path)
         .await
@@ -232,6 +230,76 @@ where
         .await
         .with_context(|| format!("finalize {}", final_path.display()))?;
     Ok(final_path)
+}
+
+/// Prefer the `sha256:<hex>` digest carried in the release JSON — it reaches
+/// us via `api.github.com`, which stays reachable in networks where the
+/// release CDN (`objects.githubusercontent.com`) TCP-resets. Fall back to
+/// SHA256SUMS for older releases that predate GitHub's asset digest field.
+async fn resolve_expected_digest(
+    client: &reqwest::Client,
+    installer: &WindowsInstaller,
+) -> Result<String> {
+    if let Some(digest) = installer.msi.digest.as_deref() {
+        if let Some(hex) = digest.strip_prefix("sha256:") {
+            if hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Ok(hex.to_ascii_lowercase());
+            }
+        }
+    }
+    let checksum_url = installer.checksums.browser_download_url.as_str();
+    let response = fetch_asset_response(client, checksum_url, Some("text/plain, */*"))
+        .await
+        .with_context(|| format!("download SHA256SUMS from {checksum_url}"))?;
+    let manifest = response
+        .text()
+        .await
+        .with_context(|| format!("read SHA256SUMS body from {checksum_url}"))?;
+    Ok(checksum_for(&manifest, &installer.msi.name)?.to_owned())
+}
+
+/// GET `direct_url` first, then each configured mirror if the direct hop
+/// fails with a transport error or non-success status. Only GitHub release
+/// asset URLs are eligible for mirroring; every other host is used as-is.
+/// Callers still SHA-256 the response, so a mirror cannot forge content.
+async fn fetch_asset_response(
+    client: &reqwest::Client,
+    direct_url: &str,
+    accept: Option<&str>,
+) -> Result<reqwest::Response> {
+    let candidates = candidate_urls(direct_url);
+    let mut errors: Vec<String> = Vec::with_capacity(candidates.len());
+    for url in &candidates {
+        let mut request = client.get(url);
+        if let Some(accept) = accept {
+            request = request.header("Accept", accept);
+        }
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(response);
+                }
+                errors.push(format!("{url} -> HTTP {status}"));
+            }
+            Err(error) => errors.push(format!("{url} -> {error}")),
+        }
+    }
+    bail!(
+        "all download endpoints failed:\n  - {}",
+        errors.join("\n  - ")
+    )
+}
+
+fn candidate_urls(direct_url: &str) -> Vec<String> {
+    let mut urls = Vec::with_capacity(1 + DOWNLOAD_MIRRORS.len());
+    urls.push(direct_url.to_owned());
+    if direct_url.starts_with("https://github.com/") {
+        for prefix in DOWNLOAD_MIRRORS {
+            urls.push(format!("{prefix}{direct_url}"));
+        }
+    }
+    urls
 }
 
 pub fn update_directory(version: &Version) -> PathBuf {
@@ -271,6 +339,7 @@ mod tests {
             name: name.to_string(),
             browser_download_url: format!("https://example.invalid/{name}"),
             size: 42,
+            digest: None,
         }
     }
 
@@ -412,11 +481,13 @@ mod tests {
                     name: "rimeterm-9.9.9-x86_64.msi".into(),
                     browser_download_url: format!("{base}/installer.msi"),
                     size: msi.len() as u64,
+                    digest: None,
                 },
                 checksums: ReleaseAsset {
                     name: "SHA256SUMS".into(),
                     browser_download_url: format!("{base}/SHA256SUMS"),
                     size: 0,
+                    digest: None,
                 },
             }),
         };
@@ -435,6 +506,80 @@ mod tests {
             Some((msi.len() as u64, msi.len() as u64))
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn digest_from_release_metadata_skips_sha256sums_fetch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let msi = b"digest-verified installer".to_vec();
+        let digest = format!("{:x}", Sha256::digest(&msi));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}");
+        let server_msi = msi.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 2048];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.starts_with("GET /installer.msi "),
+                "digest path must skip SHA256SUMS request (got: {})",
+                request.lines().next().unwrap_or("")
+            );
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_msi.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&server_msi).await.unwrap();
+        });
+        let release = AvailableRelease {
+            version: Version::parse("9.9.9").unwrap(),
+            notes: String::new(),
+            html_url: base.clone(),
+            published_at: None,
+            windows_installer: Some(WindowsInstaller {
+                msi: ReleaseAsset {
+                    name: "rimeterm-9.9.9-x86_64.msi".into(),
+                    browser_download_url: format!("{base}/installer.msi"),
+                    size: msi.len() as u64,
+                    digest: Some(format!("sha256:{digest}")),
+                },
+                checksums: ReleaseAsset {
+                    name: "SHA256SUMS".into(),
+                    browser_download_url: "http://127.0.0.1:1/SHA256SUMS".into(),
+                    size: 0,
+                    digest: None,
+                },
+            }),
+        };
+        let temp = tempfile::tempdir().unwrap();
+
+        let path = download_verified(&client().unwrap(), &release, temp.path(), |_, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(path).await.unwrap(), msi);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn candidate_urls_prepends_mirrors_only_for_github_hosts() {
+        let github = candidate_urls("https://github.com/o/r/releases/download/v1/asset");
+        assert!(github.len() > 1);
+        assert_eq!(
+            github[0],
+            "https://github.com/o/r/releases/download/v1/asset"
+        );
+        for mirror in &github[1..] {
+            assert!(mirror.ends_with("https://github.com/o/r/releases/download/v1/asset"));
+        }
+
+        let other = candidate_urls("http://127.0.0.1:1234/thing");
+        assert_eq!(other, vec!["http://127.0.0.1:1234/thing".to_string()]);
     }
 
     #[cfg(windows)]

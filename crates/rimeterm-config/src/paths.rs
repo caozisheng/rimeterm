@@ -39,6 +39,19 @@ pub fn home() -> Option<PathBuf> {
     directories::UserDirs::new().map(|u| u.home_dir().join(".rimeterm"))
 }
 
+/// Resolve the real user home directory — e.g. `C:\Users\alice` on
+/// Windows or `/home/alice` on Linux — NOT the rimeterm dot-dir.
+///
+/// Used as the default workspace root when no CLI arg is passed and
+/// no persisted last workspace exists. Prefer this over
+/// [`std::env::current_dir`] for installed-binary launches (Start
+/// Menu, Spotlight, Dock) where CWD points at the install directory.
+///
+/// Returns `None` on headless CI without a resolvable home.
+pub fn user_home_dir() -> Option<PathBuf> {
+    directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
+}
+
 pub fn config_dir() -> Option<PathBuf> {
     home()
 }

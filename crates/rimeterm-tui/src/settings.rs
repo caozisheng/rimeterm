@@ -1,8 +1,8 @@
-//! Native Settings overlay for the Tools and Agents registries (C19).
+//! Native Settings overlay for the Agents registry, viewer knobs, shell
+//! picker, and Explorer-integration toggle.
 //!
-//! The overlay owns only presentation state. Tool actions are returned to App,
-//! which schedules them away from the render loop; agent selection is likewise
-//! handled by App so this module never owns pane or command handles.
+//! The overlay owns only presentation state. Agent selection is handed
+//! back to App so this module never owns pane or command handles.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::buffer::Buffer;
@@ -10,13 +10,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
-use rimeterm_config::tools::DetectedTool;
 use rimeterm_pty::ShellChoice;
 use rimeterm_pty::agent_registry::DetectedAgent;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SettingsTab {
-    Tools,
     Agents,
     /// C22.6: Alt+V viewer knobs. Currently only the markdown theme
     /// picker lives here.
@@ -36,23 +34,12 @@ pub enum SettingsTab {
 
 impl Default for SettingsTab {
     fn default() -> Self {
-        Self::Tools
+        Self::Agents
     }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ToolAction {
-    Install,
-    Upgrade,
-    Uninstall,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SettingsAction {
-    Tool {
-        name: String,
-        action: ToolAction,
-    },
     Agent {
         id: String,
     },
@@ -78,7 +65,6 @@ pub struct SettingsState {
     pub open: bool,
     pub tab: SettingsTab,
     pub cursor: usize,
-    pub tools: Vec<DetectedTool>,
     pub agents: Vec<DetectedAgent>,
     /// Populated by [`Self::refresh`] on open. Empty if the host has
     /// no shells at all (extremely unusual).
@@ -108,7 +94,6 @@ impl Default for SettingsState {
             open: false,
             tab: SettingsTab::default(),
             cursor: 0,
-            tools: Vec::new(),
             agents: Vec::new(),
             shells: Vec::new(),
             busy: None,
@@ -122,7 +107,7 @@ impl Default for SettingsState {
 impl SettingsState {
     pub fn open(&mut self) {
         self.open = true;
-        self.tab = SettingsTab::Tools;
+        self.tab = SettingsTab::default();
         self.cursor = 0;
         self.refresh();
     }
@@ -147,7 +132,6 @@ impl SettingsState {
     }
 
     pub fn refresh(&mut self) {
-        self.tools = rimeterm_config::tools::detect_all();
         self.agents = rimeterm_pty::agent_registry::detect_all();
         // Same hint list App uses to build its own initial choice, so
         // the picker rows always contain the currently-active shell.
@@ -170,7 +154,6 @@ impl SettingsState {
 
     fn row_count(&self) -> usize {
         match self.tab {
-            SettingsTab::Tools => self.tools.len(),
             SettingsTab::Agents => self.agents.len(),
             SettingsTab::Viewer => rimeterm_markdown::Theme::ALL.len(),
             SettingsTab::Shell => self.shells.len(),
@@ -203,21 +186,19 @@ impl SettingsState {
         match key.code {
             KeyCode::Esc => Some(SettingsAction::Close),
             KeyCode::Tab => {
-                // Cycle Tools → Agents → Viewer → Shell → Integration → Tools.
+                // Cycle Agents → Viewer → Shell → Integration → Agents.
                 self.tab = match self.tab {
-                    SettingsTab::Tools => SettingsTab::Agents,
                     SettingsTab::Agents => SettingsTab::Viewer,
                     SettingsTab::Viewer => SettingsTab::Shell,
                     SettingsTab::Shell => SettingsTab::Integration,
-                    SettingsTab::Integration => SettingsTab::Tools,
+                    SettingsTab::Integration => SettingsTab::Agents,
                 };
                 self.reset_cursor_for_tab();
                 None
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.tab = match self.tab {
-                    SettingsTab::Tools => SettingsTab::Integration,
-                    SettingsTab::Agents => SettingsTab::Tools,
+                    SettingsTab::Agents => SettingsTab::Integration,
                     SettingsTab::Viewer => SettingsTab::Agents,
                     SettingsTab::Shell => SettingsTab::Viewer,
                     SettingsTab::Integration => SettingsTab::Shell,
@@ -227,11 +208,10 @@ impl SettingsState {
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 self.tab = match self.tab {
-                    SettingsTab::Tools => SettingsTab::Agents,
                     SettingsTab::Agents => SettingsTab::Viewer,
                     SettingsTab::Viewer => SettingsTab::Shell,
                     SettingsTab::Shell => SettingsTab::Integration,
-                    SettingsTab::Integration => SettingsTab::Tools,
+                    SettingsTab::Integration => SettingsTab::Agents,
                 };
                 self.reset_cursor_for_tab();
                 None
@@ -246,16 +226,12 @@ impl SettingsState {
             }
             KeyCode::Char('r') | KeyCode::Char('R') => Some(SettingsAction::Refresh),
             KeyCode::Enter => self.selected_action(),
-            KeyCode::Char('i') | KeyCode::Char('I') => self.tool_action(ToolAction::Install),
-            KeyCode::Char('u') | KeyCode::Char('U') => self.tool_action(ToolAction::Upgrade),
-            KeyCode::Char('x') | KeyCode::Char('X') => self.tool_action(ToolAction::Uninstall),
             _ => None,
         }
     }
 
     fn selected_action(&self) -> Option<SettingsAction> {
         match self.tab {
-            SettingsTab::Tools => self.tool_action(ToolAction::Install),
             SettingsTab::Agents => self.agents.get(self.cursor).and_then(|agent| {
                 agent.is_available().then(|| SettingsAction::Agent {
                     id: agent.id.to_string(),
@@ -285,13 +261,13 @@ impl SettingsState {
         }
     }
 
-    /// Snap the cursor to the "current" row on tab switch. For Tools
-    /// / Agents that's row 0; for Viewer that's the row matching
+    /// Snap the cursor to the "current" row on tab switch. For Agents
+    /// that's row 0; for Viewer that's the row matching
     /// `self.markdown_theme` so opening the tab lands on the active
     /// theme (visual confirmation of what's applied).
     fn reset_cursor_for_tab(&mut self) {
         self.cursor = match self.tab {
-            SettingsTab::Tools | SettingsTab::Agents => 0,
+            SettingsTab::Agents => 0,
             SettingsTab::Viewer => rimeterm_markdown::Theme::ALL
                 .iter()
                 .position(|t| *t == self.markdown_theme)
@@ -312,15 +288,6 @@ impl SettingsState {
                 }
             }
         };
-    }
-
-    fn tool_action(&self, action: ToolAction) -> Option<SettingsAction> {
-        self.tools
-            .get(self.cursor)
-            .map(|tool| SettingsAction::Tool {
-                name: tool.name.to_string(),
-                action,
-            })
     }
 
     /// Compute the popup rect for the current draw area. Extracted
@@ -355,15 +322,13 @@ impl SettingsState {
         };
         Clear.render(popup, buf);
         let block = Block::default()
-            .title(" Settings · Tools / Agents / Viewer / Shell / Integration ")
+            .title(" Settings · Agents / Viewer / Shell / Integration ")
             .borders(Borders::ALL);
         let inner = block.inner(popup);
         block.render(popup, buf);
 
         let accent = rimeterm_markdown::Palette::from_theme(self.markdown_theme).border_focused;
         let tab_line = Line::from(vec![
-            Span::styled(" Tools ", tab_style(self.tab == SettingsTab::Tools, accent)),
-            Span::raw("  "),
             Span::styled(
                 " Agents ",
                 tab_style(self.tab == SettingsTab::Agents, accent),
@@ -394,22 +359,6 @@ impl SettingsState {
         };
         let mut lines = Vec::new();
         match self.tab {
-            SettingsTab::Tools => {
-                lines.push(Line::styled(
-                    " ↑/↓ select   [I]nstall [U]pgrade [X] Uninstall",
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
-                for (idx, tool) in self.tools.iter().enumerate() {
-                    let source = format!("{:?}", tool.install_source).to_ascii_lowercase();
-                    let status = tool
-                        .detected_path
-                        .as_ref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "missing".to_string());
-                    let text = format!(" {:<10} {:<9} {}", tool.name, source, status);
-                    lines.push(Line::styled(text, row_style(idx == self.cursor)));
-                }
-            }
             SettingsTab::Agents => {
                 lines.push(Line::styled(
                     " ↑/↓ select   [Enter] open detected agent",
@@ -570,10 +519,9 @@ mod tests {
     fn tabs_and_cursor_navigation_are_local() {
         let mut state = SettingsState::default();
         state.open = true;
-        state.tools = Vec::new();
         state.agents = Vec::new();
         state.handle_key(key(KeyCode::Tab));
-        assert_eq!(state.tab, SettingsTab::Agents);
+        assert_eq!(state.tab, SettingsTab::Viewer);
         assert_eq!(state.cursor, 0);
     }
 
@@ -591,10 +539,9 @@ mod tests {
 
     #[test]
     fn tab_cycle_visits_every_tab() {
-        // Tools → Agents → Viewer → Shell → Integration → Tools
+        // Agents → Viewer → Shell → Integration → Agents
         let mut state = SettingsState::default();
         state.open = true;
-        state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Agents);
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Viewer);
@@ -603,13 +550,14 @@ mod tests {
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Integration);
         state.handle_key(key(KeyCode::Tab));
-        assert_eq!(state.tab, SettingsTab::Tools);
+        assert_eq!(state.tab, SettingsTab::Agents);
     }
 
     #[test]
-    fn left_arrow_wraps_from_tools_to_integration() {
+    fn left_arrow_wraps_from_agents_to_integration() {
         let mut state = SettingsState::default();
         state.open = true;
+        assert_eq!(state.tab, SettingsTab::Agents);
         state.handle_key(key(KeyCode::Char('h')));
         assert_eq!(state.tab, SettingsTab::Integration);
     }

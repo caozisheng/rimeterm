@@ -338,11 +338,13 @@ mod tests {
                     name: "rimeterm-0.3.0-x86_64.msi".into(),
                     browser_download_url: "https://example.invalid/rimeterm.msi".into(),
                     size: 100,
+                    digest: None,
                 },
                 checksums: ReleaseAsset {
                     name: "SHA256SUMS".into(),
                     browser_download_url: "https://example.invalid/SHA256SUMS".into(),
                     size: 64,
+                    digest: None,
                 },
             }),
         }

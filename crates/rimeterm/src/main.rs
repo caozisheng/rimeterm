@@ -91,15 +91,25 @@ fn main() -> Result<()> {
     })
 }
 
-/// Pick the workspace root: first positional argument that resolves
-/// to an existing directory, otherwise the process CWD.
+/// Pick the workspace root, in priority order:
+/// 1. First positional argument that resolves to an existing
+///    directory. The Windows "Open with rimeterm here" Explorer
+///    context-menu entry — `rimeterm.exe "<folder>"` — depends on
+///    this taking precedence so it lands in the clicked folder even
+///    when Explorer spawns the process with a CWD elsewhere (the
+///    `Directory` verb runs from `%SystemRoot%\System32`). Kept
+///    explicit and first so right-click launches always win.
+/// 2. `last_workspace` persisted in `~/.rimeterm/data/session.state.toml`
+///    from the previous shutdown, when the directory still exists.
+/// 3. The user home directory (`~`). Installed-binary launches
+///    (Start Menu / Spotlight / Dock) inherit the install directory
+///    as CWD, which is useless — home is a saner "first launch"
+///    landing pad.
+/// 4. `std::env::current_dir()` as a last-ditch fallback for headless
+///    CI without a resolvable home.
 ///
-/// The argv path takes precedence so the Windows "Open with rimeterm
-/// here" Explorer context-menu entry — which invokes
-/// `rimeterm.exe "<folder>"` — lands in the clicked folder even when
-/// Explorer's spawn CWD points elsewhere (e.g. the `Directory` verb
-/// running from `%SystemRoot%\System32`). Non-existent paths and
-/// non-directory paths fall through to CWD so a fat-fingered arg
+/// Non-existent / non-directory candidates fall through to the next
+/// step, so a fat-fingered CLI arg or a since-deleted persisted path
 /// still boots cleanly.
 fn resolve_workspace_root() -> Result<PathBuf> {
     if let Some(arg) = std::env::args_os().nth(1) {
@@ -109,6 +119,23 @@ fn resolve_workspace_root() -> Result<PathBuf> {
             // status-bar `workspace:` label see an absolute path.
             return Ok(canonicalize_workspace_root(candidate));
         }
+    }
+    if let Some(path) = rimeterm_config::session_state::session_state_file() {
+        match rimeterm_config::session_state::SessionState::load_or_default(&path) {
+            Ok(state) => {
+                if let Some(last) = state.last_workspace
+                    && last.is_dir()
+                {
+                    return Ok(canonicalize_workspace_root(last));
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "failed to load session state"),
+        }
+    }
+    if let Some(home) = rimeterm_config::paths::user_home_dir()
+        && home.is_dir()
+    {
+        return Ok(canonicalize_workspace_root(home));
     }
     Ok(std::env::current_dir()?)
 }

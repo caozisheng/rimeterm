@@ -446,18 +446,6 @@ impl PaneProvider for PtyPane {
             blit_buffer_at(snap, buf, (inner.x, inner.y));
         }
 
-        // Only the focused pane owns the caret. Unfocused shells still
-        // update their alacritty cursor as output arrives, but the OS caret
-        // should stay with whichever pane the user is typing into.
-        // DECTCEM (ESC[?25l) hides the caret regardless of focus.
-        let cursor = translate_cursor(
-            ctx.focused,
-            vt_hide_cursor,
-            inner,
-            vt_cursor_row,
-            vt_cursor_col,
-        );
-
         // C22.6 selection overlay. Painted AFTER the grid blit so
         // reverse-video wins over the shell's own colours. Line/word
         // modes are handled inside `SelectionState::contains` which
@@ -516,23 +504,21 @@ impl PaneProvider for PtyPane {
             self.last_render = None;
         }
 
-        // BUG-2 fix: paint a cell-level cursor overlay so each PTY
-        // pane keeps a visible cursor block regardless of focus. The
-        // focused pane also gets the OS caret via `RenderOutcome.cursor`
-        // above; the unfocused panes (or every pane while the viewer
-        // overlay owns the OS caret) get JUST this reverse-video cell.
+        // C25.1 cursor: focused pane hands the alacritty cursor
+        // position back to App as `RenderOutcome.cursor` so ratatui
+        // places the OS caret there (BlinkingBlock — see
+        // `TerminalGuard::enter`). Every unfocused pane paints a
+        // reverse-video block overlay in-buffer so users still see
+        // where each background shell / agent is sitting.
         //
         // Painted AFTER `snapshot_inner` on purpose: the cache holds
         // the raw grid, so when the cursor moves next frame the fast
         // path blits a clean background and we re-apply the overlay
         // at the fresh coordinates. No ghost cursor left behind.
-        //
-        // Painted BEFORE we return the OutcomeCursor so the OS caret
-        // and the cell overlay agree on the same coordinate — the OS
-        // caret sits on top and blinks; underneath it, the reverse
-        // cell keeps the unfocused-pane cursor visible.
-        if let Some((cx, cy)) =
-            overlay_cursor_cell(vt_hide_cursor, inner, vt_cursor_row, vt_cursor_col)
+        let cursor_cell = cursor_cell_pos(vt_hide_cursor, inner, vt_cursor_row, vt_cursor_col);
+        let cursor = if ctx.focused { cursor_cell } else { None };
+        if !ctx.focused
+            && let Some((cx, cy)) = cursor_cell
         {
             let target = &mut buf[(cx, cy)];
             let style = target.style().add_modifier(Modifier::REVERSED);
@@ -991,58 +977,27 @@ pub(crate) fn blit_buffer_at(snap: &Buffer, dst: &mut Buffer, dst_origin: (u16, 
     }
 }
 
-/// Translate a alacritty grid cursor position into an absolute frame position
-/// suitable for `ratatui::terminal::Frame::set_cursor_position`.
+/// C25.1: absolute frame coordinates of the cursor cell inside `inner`,
+/// or `None` when the cursor should NOT be painted at all.
 ///
-/// Returns `None` when the caret should NOT be visible:
-/// - the pane is unfocused (only the focused pane owns the OS caret), or
-/// - alacritty says the child hid the caret via DECTCEM (`ESC[?25l`), or
+/// The PTY pane paints its cursor entirely in the ratatui buffer — a
+/// hollow `▯` glyph in the focused pane, a reverse-video block in
+/// every other pane. Callers hand the result to `buf[(x, y)]` and
+/// choose the style based on focus.
+///
+/// Returns `None` when:
+/// - the child hid the caret via DECTCEM (`ESC[?25l`), or
 /// - the cursor position (from a stale grid) landed outside `inner`
-///   after a shrink resize (safety clamp — otherwise ratatui would try
-///   to place the caret past the terminal edge).
+///   after a shrink resize (safety clamp — otherwise we'd write past
+///   the pane border).
 ///
-/// `inner` is the pane's rendered rect AFTER the border/title inset. The
-/// alacritty `(row, col)` values are already inner-relative (0-based from
-/// the top-left of the child's viewport).
+/// `inner` is the pane's rendered rect AFTER the border/title inset.
+/// The alacritty `(row, col)` values are already inner-relative
+/// (0-based from the top-left of the child's viewport).
 ///
-/// Pure so we can unit-test focus / hide-cursor / clamp behavior without
+/// Pure so we can unit-test hide-cursor / clamp behavior without
 /// spinning up a real PTY.
-pub(crate) fn translate_cursor(
-    focused: bool,
-    hide_cursor: bool,
-    inner: Rect,
-    row: u16,
-    col: u16,
-) -> Option<(u16, u16)> {
-    if !focused || hide_cursor {
-        return None;
-    }
-    if inner.width == 0 || inner.height == 0 {
-        return None;
-    }
-    if row >= inner.height || col >= inner.width {
-        return None;
-    }
-    Some((inner.x + col, inner.y + row))
-}
-
-/// BUG-2 fix: decide whether the PTY pane should paint a cell-level
-/// cursor overlay (reverse-video block at `(row, col)` inside `inner`).
-///
-/// This mirrors tmux / wezterm / foot behaviour: every pane shows a
-/// visible cursor cell regardless of focus, so users can still see
-/// where each shell / agent is sitting when another pane (or the
-/// viewer overlay) owns the OS caret.
-///
-/// Returns `Some((abs_x, abs_y))` when the overlay should paint;
-/// `None` when the child hid the caret (DECTCEM `ESC[?25l`) or the
-/// cursor lives outside the rendered viewport (scrollback / mid-resize).
-///
-/// Notably, `focused` is NOT a gate here — that's the whole point.
-/// The focused pane already has the OS caret painted on top of this
-/// cell; the unfocused panes get JUST the reverse-video block, which
-/// is the visible "cursor still here" affordance.
-pub(crate) fn overlay_cursor_cell(
+pub(crate) fn cursor_cell_pos(
     hide_cursor: bool,
     inner: Rect,
     row: u16,
@@ -1307,7 +1262,7 @@ mod mouse_tests {
         assert!(point_in_rect(1, 1, inner)); // first content cell
     }
 
-    // --- translate_cursor (focus / hide / clamp) ---
+    // --- cursor_cell_pos (C25.1: focus-agnostic cursor cell locator) ---
 
     fn inner_10x5() -> Rect {
         Rect {
@@ -1319,108 +1274,53 @@ mod mouse_tests {
     }
 
     #[test]
-    fn cursor_none_when_pane_unfocused() {
-        // Even a normal, visible alacritty cursor should not steal the OS
-        // caret from whichever pane is actually focused.
-        assert_eq!(translate_cursor(false, false, inner_10x5(), 2, 3), None);
-    }
-
-    #[test]
-    fn cursor_none_when_child_hid_it_via_dectcem() {
-        // A curses / TUI child that emits ESC[?25l expects no visible
-        // caret; we honor that even if we're focused.
-        assert_eq!(translate_cursor(true, true, inner_10x5(), 2, 3), None);
-    }
-
-    #[test]
-    fn cursor_maps_grid_pos_to_absolute_frame_pos_when_focused() {
+    fn cursor_cell_maps_grid_pos_to_absolute_frame_pos() {
         // alacritty grid (row=2, col=3) inside an inner rect at (3, 4)
         // must translate to absolute (x=6, y=6).
-        assert_eq!(
-            translate_cursor(true, false, inner_10x5(), 2, 3),
-            Some((6, 6))
-        );
+        assert_eq!(cursor_cell_pos(false, inner_10x5(), 2, 3), Some((6, 6)));
     }
 
     #[test]
-    fn cursor_at_grid_origin_maps_to_inner_origin() {
-        assert_eq!(
-            translate_cursor(true, false, inner_10x5(), 0, 0),
-            Some((3, 4))
-        );
+    fn cursor_cell_at_grid_origin_maps_to_inner_origin() {
+        assert_eq!(cursor_cell_pos(false, inner_10x5(), 0, 0), Some((3, 4)));
     }
 
     #[test]
-    fn cursor_none_when_grid_pos_outside_inner_after_resize() {
-        // Shrunk pane: alacritty's grid may still say row=8 for a tick after
-        // resize; clamping to None avoids painting the caret past the
-        // pane's rendered area (which ratatui would translate into the
-        // hint bar / another pane).
-        assert_eq!(translate_cursor(true, false, inner_10x5(), 8, 0), None);
-        assert_eq!(translate_cursor(true, false, inner_10x5(), 0, 20), None);
+    fn cursor_cell_none_when_child_hid_it_via_dectcem() {
+        // DECTCEM ESC[?25l suppresses the cursor entirely; otherwise a
+        // curses TUI (vim, less) would sprout a ghost block on its own
+        // hidden-cursor line.
+        assert_eq!(cursor_cell_pos(true, inner_10x5(), 2, 3), None);
     }
 
     #[test]
-    fn cursor_none_when_inner_rect_collapsed() {
+    fn cursor_cell_none_when_grid_pos_outside_inner_after_resize() {
+        // Shrunk pane: alacritty's grid may still say row=8 for a tick
+        // after resize; clamping to None avoids painting past the pane
+        // border (which ratatui would translate into the hint bar /
+        // another pane).
+        assert_eq!(cursor_cell_pos(false, inner_10x5(), 8, 0), None);
+        assert_eq!(cursor_cell_pos(false, inner_10x5(), 0, 20), None);
+    }
+
+    #[test]
+    fn cursor_cell_none_when_inner_rect_collapsed() {
         // 0-width or 0-height inner rect (mid-teardown / extreme resize)
-        // must not produce a caret position.
+        // must not produce a paint position.
         let collapsed = Rect {
             x: 0,
             y: 0,
             width: 0,
             height: 5,
         };
-        assert_eq!(translate_cursor(true, false, collapsed, 0, 0), None);
+        assert_eq!(cursor_cell_pos(false, collapsed, 0, 0), None);
         let collapsed = Rect {
             x: 0,
             y: 0,
             width: 5,
             height: 0,
         };
-        assert_eq!(translate_cursor(true, false, collapsed, 0, 0), None);
-    }
-
-    // --- overlay_cursor_cell (BUG-2 fix: cell-level cursor overlay) ---
-
-    #[test]
-    fn overlay_paints_regardless_of_focus() {
-        // The whole point of BUG-2: unfocused panes still get a visible
-        // cursor block. `overlay_cursor_cell` has no `focused` argument.
-        assert_eq!(overlay_cursor_cell(false, inner_10x5(), 2, 3), Some((6, 6)));
-    }
-
-    #[test]
-    fn overlay_none_when_child_hid_cursor() {
-        // DECTCEM ESC[?25l suppresses BOTH the OS caret and the cell
-        // overlay — otherwise a full-screen curses TUI (vim, less) would
-        // sprout a ghost reverse-cell block on its own hidden-cursor line.
-        assert_eq!(overlay_cursor_cell(true, inner_10x5(), 2, 3), None);
-    }
-
-    #[test]
-    fn overlay_none_when_grid_pos_outside_inner_after_resize() {
-        // Same clamp rule as translate_cursor — a stale cursor from a
-        // pre-shrink frame must never paint past the pane border.
-        assert_eq!(overlay_cursor_cell(false, inner_10x5(), 8, 0), None);
-        assert_eq!(overlay_cursor_cell(false, inner_10x5(), 0, 20), None);
-    }
-
-    #[test]
-    fn overlay_none_when_inner_rect_collapsed() {
-        let collapsed = Rect {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 5,
-        };
-        assert_eq!(overlay_cursor_cell(false, collapsed, 0, 0), None);
-        let collapsed = Rect {
-            x: 0,
-            y: 0,
-            width: 5,
-            height: 0,
-        };
-        assert_eq!(overlay_cursor_cell(false, collapsed, 0, 0), None);
+        assert_eq!(cursor_cell_pos(false, collapsed, 0, 0), None);
     }
 
     #[test]

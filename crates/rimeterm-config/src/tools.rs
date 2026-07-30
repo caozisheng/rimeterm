@@ -1,18 +1,16 @@
 //! **§9.4 Tools Registry** — canonical description of the TUI tools
 //! rimeterm boots into by default.
 //!
-//! C25 collapses the registry to one tier:
+//! C25.1 leaves both tiers empty as user-facing tools:
 //!
-//! - **plugins** (`trippy` today, user-added tomorrow) — installed on
-//!   demand via `cargo install --locked --root ~/.rimeterm/plugins/<name>`;
-//!   binaries land in `~/.rimeterm/plugins/<name>/bin/`, configs (when
-//!   the entry ships a seed) in `~/.rimeterm/plugins/<name>/config/`.
+//! - **essentials** — `bottom` retired with the Native SysmonPane.
+//! - **plugins** — `trippy` retired with the Settings > Tools tab.
 //!
-//! The prior essentials tier (`bottom`) retired with the Native
-//! SysmonPane; `ESSENTIALS_REGISTRY` stays declared but empty so the
-//! detector's tiered probe surface (`bin/` → `plugins/*/bin/` →
-//! `$CARGO_HOME/bin` → `$PATH`) keeps its shape and callers that
-//! iterate `all_tools()` stay uniform.
+//! Both constants stay declared so the detector's tiered probe
+//! surface (`bin/` → `plugins/*/bin/` → `$CARGO_HOME/bin` → `$PATH`)
+//! keeps its shape and callers that iterate `all_tools()` stay
+//! uniform. Any future bundled binary or user-added plugin just
+//! extends the matching slice.
 //!
 //! Detection order (§9.4 layered rule 1): `bin/` (`Essential`) →
 //! `plugins/*/bin/` (`Plugin`) → `$CARGO_HOME/bin` (`Cargo`, v0.1.x
@@ -60,20 +58,19 @@ pub enum ToolKind {
 pub const ESSENTIALS_REGISTRY: &[ToolSpec] = &[];
 
 /// Non-essential tools rimeterm knows how to install on demand via
-/// `cargo install --locked --root ~/.rimeterm/plugins/<name>`. Users
-/// can extend this registry via `config.toml` in a future revision;
-/// v0.2 keeps it hardcoded to `trippy`.
+/// `cargo install --locked --root ~/.rimeterm/plugins/<name>`. Empty
+/// after C25.1: `trippy` retired with the Settings > Tools tab (users
+/// who want it install via `brew install trippy` / `cargo install
+/// trippy` themselves). The constant is deliberately retained so the
+/// detector's tiered probe order (`bin/` → `plugins/*/bin/` →
+/// `$CARGO_HOME/bin` → `$PATH`) stays intact and any future user-added
+/// plugin just extends this slice.
 ///
 /// **`bandwhich` dropped in C13**: winget has no package, Windows
 /// requires Npcap, and the tool needs admin/cap_net_raw to run.
 /// Users who want bandwhich install it through their system package
 /// manager.
-pub const PLUGIN_REGISTRY: &[ToolSpec] = &[ToolSpec {
-    name: "trippy",
-    binary: "trip",
-    crates: &["trippy"],
-    hint: "brew/scoop install trippy, or install via rimeterm `tools.install trippy`",
-}];
+pub const PLUGIN_REGISTRY: &[ToolSpec] = &[];
 
 /// Deprecated alias — merged view of essentials + plugins, kept so
 /// v0.1.2 IPC callers that iterate `TOOL_REGISTRY` don't break. New
@@ -298,33 +295,33 @@ mod tests {
     }
 
     #[test]
-    fn plugin_registry_holds_trippy() {
-        // v0.3 keeps this hardcoded; future revisions may make it
-        // extensible via config.toml (see design open q #6 resolved:
-        // additive schema).
-        let names: Vec<&str> = PLUGIN_REGISTRY.iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["trippy"]);
+    fn plugin_registry_is_empty_after_c25_1() {
+        // `trippy` retired with the Settings > Tools tab in C25.1.
+        // Registry stays declared as an extension slot for future
+        // user-added plugins.
+        assert!(PLUGIN_REGISTRY.is_empty());
     }
 
     #[test]
     fn kind_of_matches_registries() {
-        assert_eq!(kind_of("trippy"), Some(ToolKind::Plugin));
-        // Retired names — bottom (C25), yazi + gitui (C24) — must not
-        // resolve to any tier.  `agtop` is intentionally NOT a plugin
-        // binary: rimeterm hosts an in-process native pane instead
-        // (see `rimeterm-tui::agtop_pane`), so its detection ID must
-        // stay unregistered here.
+        // Retired names — bottom (C25), yazi + gitui (C24), trippy
+        // (C25.1) — must not resolve to any tier. `agtop` is
+        // intentionally NOT a plugin binary: rimeterm hosts an
+        // in-process native pane instead (see
+        // `rimeterm-tui::agtop_pane`), so its detection ID must stay
+        // unregistered here.
         assert_eq!(kind_of("agtop"), None);
         assert_eq!(kind_of("bottom"), None);
         assert_eq!(kind_of("yazi"), None);
         assert_eq!(kind_of("gitui"), None);
+        assert_eq!(kind_of("trippy"), None);
         assert_eq!(kind_of("nope"), None);
         assert_eq!(kind_of(""), None);
     }
 
     #[test]
-    fn find_hits_plugin_registry_only() {
-        assert!(find("trippy").is_some());
+    fn find_returns_none_for_all_retired_names() {
+        assert!(find("trippy").is_none(), "trippy retired in C25.1");
         assert!(find("agtop").is_none(), "agtop lives as a native pane");
         assert!(find("bottom").is_none(), "bottom retired in C25");
         assert!(find("yazi").is_none(), "yazi retired");
@@ -369,29 +366,30 @@ mod tests {
         }
     }
 
-    /// Drive [`detect_with`] through the full classification matrix
-    /// using tempdirs — no `which::which` invocation, so the test is
-    /// hermetic across dev machines and CI.
+    /// Drive [`detect_with`] through the plugin-tier classification
+    /// matrix using a synthetic `ToolSpec` fixture and tempdirs — no
+    /// `which::which` invocation, so the test is hermetic across dev
+    /// machines and CI. Uses a synthetic spec because `PLUGIN_REGISTRY`
+    /// is empty post-C25.1; the branch under test is still the exact
+    /// path a future user-added plugin would take.
     #[test]
     fn detect_with_prefers_managed_dirs_over_path() {
-        // C25: `bottom` retired from the essentials tier, so this test
-        // covers plugin detection only. The `Essential` install-source
-        // branch of the detector stays functional for any future
-        // bundled binary that reuses the tier.
+        static FIXTURE: ToolSpec = ToolSpec {
+            name: "fixture",
+            binary: "fixture-bin",
+            crates: &["fixture"],
+            hint: "test-only",
+        };
+
         let root = mktemp("rimeterm-detect");
         let bin_dir = root.join("bin");
-        let plug_bin = root.join("plugins").join("trippy").join("bin");
+        let plug_bin = root.join("plugins").join(FIXTURE.name).join("bin");
         let cargo_bin = root.join("cargo").join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         std::fs::create_dir_all(&plug_bin).unwrap();
         std::fs::create_dir_all(&cargo_bin).unwrap();
 
-        let trippy_spec = PLUGIN_REGISTRY
-            .iter()
-            .find(|s| s.name == "trippy")
-            .expect("trippy plugin exists");
-
-        let exe_trip = platform_exe_name("trip");
+        let exe = platform_exe_name(FIXTURE.binary);
 
         let ctx = DetectContext {
             bin_dir: Some(bin_dir.clone()),
@@ -400,19 +398,17 @@ mod tests {
         };
 
         // 1. Managed dirs empty → detector falls through to
-        //    `which::which`. When the host lacks `trip` on `$PATH` we
-        //    can also assert `Missing`; otherwise skip.
-        if which::which(trippy_spec.binary).is_err() {
-            let got = detect_with(trippy_spec, ToolKind::Plugin, &ctx);
-            assert_eq!(got.install_source, InstallSource::Missing);
-            assert!(got.detected_path.is_none());
-        }
+        //    `which::which`. `fixture-bin` cannot exist on any
+        //    developer's PATH, so the assertion holds unconditionally.
+        let got = detect_with(&FIXTURE, ToolKind::Plugin, &ctx);
+        assert_eq!(got.install_source, InstallSource::Missing);
+        assert!(got.detected_path.is_none());
 
-        // 2. `plugins/trippy/bin/trip(.exe)` present → Plugin.
-        std::fs::write(plug_bin.join(&exe_trip), b"stub").unwrap();
-        let got = detect_with(trippy_spec, ToolKind::Plugin, &ctx);
+        // 2. `plugins/fixture/bin/fixture-bin(.exe)` present → Plugin.
+        std::fs::write(plug_bin.join(&exe), b"stub").unwrap();
+        let got = detect_with(&FIXTURE, ToolKind::Plugin, &ctx);
         assert_eq!(got.install_source, InstallSource::Plugin);
-        assert_eq!(got.detected_path, Some(plug_bin.join(&exe_trip)));
+        assert_eq!(got.detected_path, Some(plug_bin.join(&exe)));
 
         // 3. Cleanup.
         let _ = std::fs::remove_dir_all(&root);

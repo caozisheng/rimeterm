@@ -1505,12 +1505,11 @@ impl App {
                 }
                 let _ = self.redraw_tx.send(());
             }
-            SettingsAction::Tool { .. } | SettingsAction::Agent { .. } => {
-                // Tool install/upgrade/uninstall + agent picker are
-                // pre-existing paths from C19 that aren't wired to a
-                // command yet — surface a hint so the row click isn't
-                // silently dropped.
-                self.set_hint("Tool/Agent actions not wired yet (C22.6 scope)".into());
+            SettingsAction::Agent { .. } => {
+                // Agent picker rows are a pre-existing path from C19
+                // that isn't wired to a command yet — surface a hint so
+                // the row click isn't silently dropped.
+                self.set_hint("Agent actions not wired yet (C22.6 scope)".into());
             }
         }
     }
@@ -3898,12 +3897,21 @@ impl App {
             path,
         });
 
-        // Git pane: fresh generation whenever the tracked cwd changes.
+        // Git pane + active_root: fresh whenever the tracked cwd changes.
         let cwd_changed = self.last_file_manager_cwd.as_deref() != Some(current_cwd.as_path());
         if !cwd_changed {
             return;
         }
         self.last_file_manager_cwd = Some(current_cwd.clone());
+        // Keep the effective workspace root in step with the file
+        // manager: the status-bar `workspace:` label, the cwd handed
+        // to freshly-spawned agent tabs, and the `session.state.toml`
+        // that resumes the next launch all read `active_root`. This
+        // is the silent sibling of `set_active_root` — no toast,
+        // because file manager navigation is the user's own action.
+        if self.active_root != current_cwd {
+            self.active_root = current_cwd.clone();
+        }
         let Some(git_id) = self.git_pane_id else {
             return;
         };
@@ -4080,6 +4088,10 @@ impl App {
         // Persist current ratios (§19.12.9). Silent on error — persistence
         // is a nice-to-have; we should never block shutdown on it.
         self.persist_layout();
+        // Remember the last active workspace root so the next launch
+        // (without an explicit CLI arg) resumes here instead of the
+        // install directory / process CWD. Also silent on error.
+        self.persist_session_state();
         for id in all {
             self.drop_pane_and_session(id);
         }
@@ -4116,6 +4128,29 @@ impl App {
                 path = %path.display(),
                 diffs = state.splits.len(),
                 "persisted layout state (diff)"
+            );
+        }
+    }
+
+    /// Write the active workspace root to `${data_dir}/session.state.toml`
+    /// so the next launch — when invoked without a positional CLI arg —
+    /// resumes in the directory the user was last browsing rather than
+    /// the install directory / process CWD. Silent on error; the next
+    /// launch just falls back to the user home.
+    fn persist_session_state(&self) {
+        let Some(path) = rimeterm_config::session_state::session_state_file() else {
+            return;
+        };
+        let state = rimeterm_config::session_state::SessionState {
+            last_workspace: Some(self.active_root.clone()),
+        };
+        if let Err(e) = state.save_to(&path) {
+            warn!(error = %e, "failed to persist session state");
+        } else {
+            info!(
+                path = %path.display(),
+                last_workspace = %self.active_root.display(),
+                "persisted session state"
             );
         }
     }
