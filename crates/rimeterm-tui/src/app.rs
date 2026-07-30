@@ -1124,10 +1124,17 @@ impl App {
         // modifier (Ctrl/Shift/Alt) also falls through — we only steal
         // the bare-arrow case, matching Alt+V's "no other key does this".
         if matches!(key.code, KeyCode::Right) && key.modifiers.is_empty() && !overlay_open {
-            if should_hijack_right_for_viewer(
+            let fm_editing = self
+                .file_manager_pane_id
+                .and_then(|id| self.panes.get(id))
+                .and_then(|pane| pane.as_any())
+                .and_then(|any| any.downcast_ref::<FileManagerPane>())
+                .is_some_and(FileManagerPane::is_editing);
+            if should_hijack_right_for_viewer_with_editing(
                 self.file_manager_pane_id,
                 self.focus.focused_pane(),
                 self.last_file_selection.as_ref(),
+                fm_editing,
             ) {
                 let sel_is_file = self
                     .last_file_selection
@@ -6219,15 +6226,31 @@ pub(crate) fn parse_markdown_theme(s: &str) -> rimeterm_markdown::Theme {
 /// - `selection` — the last `KernelEvent::FileSelected`; `None`
 ///   means the file manager hasn't emitted a selection yet, so
 ///   there's nothing to open.
+#[cfg(test)]
 fn should_hijack_right_for_viewer(
     file_manager_id: Option<PaneId>,
     focused: Option<PaneId>,
     selection: Option<&viewer::SelectionSnapshot>,
 ) -> bool {
+    should_hijack_right_for_viewer_with_editing(file_manager_id, focused, selection, false)
+}
+
+/// Editing-aware variant of [`should_hijack_right_for_viewer`]. When the
+/// file manager's inline editor (`i`) is open the shortcut is disabled
+/// so `→` reaches the editor as a bare cursor-move.
+fn should_hijack_right_for_viewer_with_editing(
+    file_manager_id: Option<PaneId>,
+    focused: Option<PaneId>,
+    selection: Option<&viewer::SelectionSnapshot>,
+    file_manager_editing: bool,
+) -> bool {
     let Some(id) = file_manager_id else {
         return false;
     };
     if focused != Some(id) {
+        return false;
+    }
+    if file_manager_editing {
         return false;
     }
     selection.is_some()
@@ -6286,6 +6309,24 @@ mod tests {
                 PathBuf::from("C:/work/api"),
             )
         );
+    }
+
+    #[test]
+    fn right_arrow_falls_through_when_file_manager_is_editing() {
+        // File manager is focused and has a selection, but the user is
+        // typing into its inline editor (`i` opened it). `→` must go
+        // to the editor as a cursor move, not open the viewer.
+        let fm = PaneId::next();
+        let sel = viewer::SelectionSnapshot {
+            origin: fm,
+            path: std::path::PathBuf::from("/x/README.md"),
+        };
+        assert!(!should_hijack_right_for_viewer_with_editing(
+            Some(fm),
+            Some(fm),
+            Some(&sel),
+            true,
+        ));
     }
 
     #[test]

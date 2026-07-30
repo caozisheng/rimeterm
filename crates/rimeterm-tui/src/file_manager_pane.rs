@@ -1,6 +1,6 @@
 //! Native dual-pane file manager backed by `tui-file-explorer`.
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{Frame, layout::Rect};
 use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
 use rimeterm_core::{EventBus, FileSide as KernelFileSide, KernelEvent};
@@ -39,6 +39,9 @@ pub struct FileManagerPane {
     mutation_rx: Option<Receiver<FileMutationResult>>,
     event_bus: Option<EventBus>,
     last_snapshot: Option<Snapshot>,
+    /// Rect of the embedded preview pane captured on the last render.
+    /// Zero-sized when the upstream App is not showing a preview.
+    preview_rect: Rect,
 }
 
 #[derive(Clone)]
@@ -70,6 +73,7 @@ impl FileManagerPane {
             mutation_rx: None,
             event_bus: None,
             last_snapshot: None,
+            preview_rect: Rect::default(),
         }
     }
     /// Construct a file manager that broadcasts structured navigation events.
@@ -88,6 +92,40 @@ impl FileManagerPane {
     /// Return the focused column's current directory.
     pub fn active_dir(&self) -> &Path {
         &self.app.active_pane().current_dir
+    }
+
+    /// Returns `true` when the upstream App has an inline editor active
+    /// (opened with `i`). Callers use this to suppress global shortcuts
+    /// like the viewer overlay right-arrow so the editor gets raw input.
+    pub fn is_editing(&self) -> bool {
+        self.app.inline_editor.is_some()
+    }
+
+    /// Refresh the cached preview rect from the current `App` state.
+    /// Mirrors the layout in upstream `draw_in`: the preview panel is
+    /// the last horizontal chunk when `show_preview` is set.
+    fn recompute_preview_rect(&mut self, area: Rect) {
+        if !self.app.show_preview {
+            self.preview_rect = Rect::default();
+            return;
+        }
+        let action_bar_height = self.app.hint_layout.action_bar_rows();
+        let main_height = area.height.saturating_sub(action_bar_height);
+        if main_height == 0 || area.width == 0 {
+            self.preview_rect = Rect::default();
+            return;
+        }
+        // Preview takes the trailing 50% (single-pane) or 50% remainder
+        // (dual pane 25%/25%/50%). Rimeterm never enables theme/options/
+        // editor side panels, so the preview rect is the last chunk.
+        let (preview_x, preview_width) = if self.app.single_pane {
+            let list_w = area.width * 40 / 100;
+            (area.x + list_w, area.width - list_w)
+        } else {
+            let list_w = area.width * 25 / 100;
+            (area.x + list_w * 2, area.width - list_w * 2)
+        };
+        self.preview_rect = Rect::new(preview_x, area.y, preview_width, main_height);
     }
 
     /// Return the focused column's highlighted path, if any.
@@ -263,6 +301,7 @@ impl PaneProvider for FileManagerPane {
         _ctx: &PaneRenderCtx<'_>,
     ) -> RenderOutcome {
         draw_in(&mut self.app, frame, area);
+        self.recompute_preview_rect(area);
         RenderOutcome::default()
     }
 
@@ -281,6 +320,35 @@ impl PaneProvider for FileManagerPane {
                 self.app.status_msg = format!("Input failed: {error}");
                 true
             }
+        }
+    }
+
+    fn on_mouse(&mut self, event: MouseEvent, outer: Rect) -> bool {
+        // Prefer the rect captured by the most recent render — it
+        // reflects the exact upstream layout. Fall back to a fresh
+        // computation against the host's outer rect when we haven't
+        // rendered yet (unit tests, first frame after resize).
+        if self.preview_rect.width == 0 || self.preview_rect.height == 0 {
+            self.recompute_preview_rect(outer);
+        }
+        let point_in = |rect: Rect| {
+            rect.width > 0
+                && rect.height > 0
+                && event.column >= rect.x
+                && event.column < rect.right()
+                && event.row >= rect.y
+                && event.row < rect.bottom()
+        };
+        match event.kind {
+            MouseEventKind::ScrollDown if point_in(self.preview_rect) => {
+                self.app.preview_state.scroll_down(3);
+                true
+            }
+            MouseEventKind::ScrollUp if point_in(self.preview_rect) => {
+                self.app.preview_state.scroll_up(3);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -306,5 +374,70 @@ impl PaneProvider for FileManagerPane {
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    use tempfile::tempdir;
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn scroll_over_preview_area_scrolls_preview_state() {
+        let dir = tempdir().unwrap();
+        let mut pane = FileManagerPane::new(dir.path().into(), dir.path().into());
+        pane.app.show_preview = true;
+        pane.preview_rect = Rect::new(20, 0, 30, 20);
+        let before = pane.app.preview_state.scroll;
+        let consumed = pane.on_mouse(
+            mouse(MouseEventKind::ScrollDown, 25, 5),
+            Rect::new(0, 0, 60, 20),
+        );
+        assert!(consumed);
+        assert!(pane.app.preview_state.scroll > before);
+    }
+
+    #[test]
+    fn scroll_up_over_preview_area_decreases_preview_scroll() {
+        let dir = tempdir().unwrap();
+        let mut pane = FileManagerPane::new(dir.path().into(), dir.path().into());
+        pane.app.show_preview = true;
+        pane.app.preview_state.scroll = 10;
+        pane.preview_rect = Rect::new(20, 0, 30, 20);
+        let _ = pane.on_mouse(
+            mouse(MouseEventKind::ScrollUp, 25, 5),
+            Rect::new(0, 0, 60, 20),
+        );
+        assert!(pane.app.preview_state.scroll < 10);
+    }
+
+    #[test]
+    fn scroll_outside_preview_area_does_not_consume() {
+        let dir = tempdir().unwrap();
+        let mut pane = FileManagerPane::new(dir.path().into(), dir.path().into());
+        pane.app.show_preview = true;
+        pane.preview_rect = Rect::new(20, 0, 30, 20);
+        let consumed = pane.on_mouse(
+            mouse(MouseEventKind::ScrollDown, 5, 5),
+            Rect::new(0, 0, 60, 20),
+        );
+        assert!(!consumed);
+    }
+
+    #[test]
+    fn is_editing_matches_inline_editor_state() {
+        let dir = tempdir().unwrap();
+        let pane = FileManagerPane::new(dir.path().into(), dir.path().into());
+        assert!(!pane.is_editing());
     }
 }

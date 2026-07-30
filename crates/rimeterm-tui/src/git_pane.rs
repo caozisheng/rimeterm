@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -45,6 +45,12 @@ pub struct GitPane {
     changes_cursor: usize,
     commits_cursor: usize,
     highlighter: DiffHighlighter,
+    /// Rect of the Changes list captured on the last render. Used by
+    /// `on_mouse` to route scroll wheel events without depending on the
+    /// caller's outer rect.
+    changes_rect: Rect,
+    /// Rect of the Commits list captured on the last render.
+    commits_rect: Rect,
 }
 
 impl GitPane {
@@ -64,6 +70,8 @@ impl GitPane {
             changes_cursor: 0,
             commits_cursor: 0,
             highlighter: DiffHighlighter::new(),
+            changes_rect: Rect::default(),
+            commits_rect: Rect::default(),
         };
         pane.request_refresh_at(&workspace_root);
         pane
@@ -158,6 +166,8 @@ impl PaneProvider for GitPane {
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(inner);
+        self.changes_rect = layout[0];
+        self.commits_rect = layout[1];
         render_changes(
             frame,
             layout[0],
@@ -233,6 +243,46 @@ impl PaneProvider for GitPane {
                     self.diff = None;
                     self.focus = Focus::Changes;
                 }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn on_mouse(&mut self, event: MouseEvent, _outer: Rect) -> bool {
+        let point_in = |rect: Rect| {
+            rect.width > 0
+                && rect.height > 0
+                && event.column >= rect.x
+                && event.column < rect.right()
+                && event.row >= rect.y
+                && event.row < rect.bottom()
+        };
+        match event.kind {
+            MouseEventKind::ScrollDown if point_in(self.changes_rect) => {
+                if !self.snapshot.changes.is_empty() {
+                    self.focus = Focus::Changes;
+                    self.changes_cursor = (self.changes_cursor + 3)
+                        .min(self.snapshot.changes.len().saturating_sub(1));
+                }
+                true
+            }
+            MouseEventKind::ScrollUp if point_in(self.changes_rect) => {
+                self.focus = Focus::Changes;
+                self.changes_cursor = self.changes_cursor.saturating_sub(3);
+                true
+            }
+            MouseEventKind::ScrollDown if point_in(self.commits_rect) => {
+                if !self.snapshot.commits.is_empty() {
+                    self.focus = Focus::Commits;
+                    self.commits_cursor = (self.commits_cursor + 3)
+                        .min(self.snapshot.commits.len().saturating_sub(1));
+                }
+                true
+            }
+            MouseEventKind::ScrollUp if point_in(self.commits_rect) => {
+                self.focus = Focus::Commits;
+                self.commits_cursor = self.commits_cursor.saturating_sub(3);
                 true
             }
             _ => false,
@@ -476,5 +526,91 @@ fn color_for(label: &str) -> Color {
         "comment" => Color::DarkGray,
         "attribute" | "property" => Color::LightCyan,
         _ => Color::White,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn seeded_pane() -> GitPane {
+        let mut pane = GitPane::new(std::env::temp_dir());
+        pane.snapshot = GitSnapshot {
+            generation: 1,
+            repo_root: None,
+            head: None,
+            upstream: None,
+            changes: (0..40)
+                .map(|i| GitChange {
+                    side: ChangeSide::Worktree,
+                    kind: ChangeKind::Modified,
+                    path: format!("f{i}.txt").into(),
+                    previous_path: None,
+                    is_binary: false,
+                })
+                .collect(),
+            commits: (0..40)
+                .map(|i| crate::git_model::CommitSummary {
+                    id: format!("{i:040}"),
+                    short_id: format!("{i:07}"),
+                    summary: format!("commit {i}"),
+                    author: "cjzzz".into(),
+                    seconds_since_epoch: 0,
+                })
+                .collect(),
+            scanned_at: std::time::Instant::now(),
+        };
+        pane.changes_rect = Rect::new(0, 0, 40, 10);
+        pane.commits_rect = Rect::new(0, 10, 40, 10);
+        pane
+    }
+
+    #[test]
+    fn scroll_over_changes_advances_changes_cursor() {
+        let mut pane = seeded_pane();
+        pane.focus = Focus::Commits;
+        let start = pane.changes_cursor;
+        let consumed = pane.on_mouse(
+            mouse(MouseEventKind::ScrollDown, 5, 3),
+            Rect::new(0, 0, 40, 20),
+        );
+        assert!(consumed);
+        assert_eq!(pane.focus, Focus::Changes);
+        assert!(pane.changes_cursor > start);
+    }
+
+    #[test]
+    fn scroll_over_commits_advances_commits_cursor() {
+        let mut pane = seeded_pane();
+        pane.focus = Focus::Changes;
+        let start = pane.commits_cursor;
+        let consumed = pane.on_mouse(
+            mouse(MouseEventKind::ScrollDown, 5, 13),
+            Rect::new(0, 0, 40, 20),
+        );
+        assert!(consumed);
+        assert_eq!(pane.focus, Focus::Commits);
+        assert!(pane.commits_cursor > start);
+    }
+
+    #[test]
+    fn scroll_up_over_commits_moves_cursor_up_toward_top() {
+        let mut pane = seeded_pane();
+        pane.commits_cursor = 10;
+        let _ = pane.on_mouse(
+            mouse(MouseEventKind::ScrollUp, 5, 13),
+            Rect::new(0, 0, 40, 20),
+        );
+        assert!(pane.commits_cursor < 10);
     }
 }

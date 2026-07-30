@@ -7,16 +7,25 @@ use fast_resume::embed::{
     EmbeddedEngine, ResumeTarget, SearchRequest, SearchResult, resume_target,
 };
 use fast_resume::model::Session;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget, Wrap};
 use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
 use tokio::sync::mpsc::UnboundedSender;
 use unicode_width::UnicodeWidthStr;
 
 const RESULT_LIMIT: usize = 100;
 const HORIZONTAL_SPLIT_MIN_WIDTH: u16 = 80;
+/// Upper bound on `Session.content` bytes we keep in `state.results`.
+/// Larger content is silently truncated at a UTF-8 boundary before the
+/// preview / cache path sees it. Coding-agent transcripts routinely
+/// spill into hundreds of KB; feeding them to `Paragraph::wrap` on
+/// every frame is the dominant cost of a busy FR pane on Windows.
+/// 64 KiB is enough for tens of screens of scrollable preview without
+/// blocking sysmon's 200 ms redraw cadence.
+const PREVIEW_CONTENT_MAX: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrAction {
@@ -51,8 +60,15 @@ impl FrWorker {
         let (refresh_tx, refresh_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let search_events = event_tx.clone();
-        let initial_engine = EmbeddedEngine::open_default().map_err(|error| format!("{error:#}"));
-        thread::spawn(move || search_worker_loop(search_rx, search_events, initial_engine));
+        thread::spawn(move || {
+            // Deferred to the worker thread so a slow initial index
+            // open (Windows OneDrive-synced HOME, cold NTFS cache)
+            // never blocks the tokio runtime worker that runs
+            // `FrPane::new`.
+            let initial_engine =
+                EmbeddedEngine::open_default().map_err(|error| format!("{error:#}"));
+            search_worker_loop(search_rx, search_events, initial_engine);
+        });
         thread::spawn(move || refresh_worker_loop(refresh_rx, event_tx));
         Self {
             search_tx,
@@ -237,7 +253,18 @@ impl FrState {
             self.status = format!("search failed: {error}");
             return true;
         }
-        self.results = result.sessions;
+        // Bound each session's `content` before it enters `results` so
+        // the preview / cache paths never wrap megabytes of transcript
+        // per redraw. Truncation keeps the leading portion (users read
+        // top-to-bottom and can Alt+↑↓ scroll within it).
+        self.results = result
+            .sessions
+            .into_iter()
+            .map(|mut session| {
+                session.content = truncate_utf8_bytes(session.content, PREVIEW_CONTENT_MAX);
+                session
+            })
+            .collect();
         self.selected = 0;
         self.preview_scroll = 0;
         self.status = format!("{} sessions", self.results.len());
@@ -294,6 +321,33 @@ pub struct FrPane {
     results_rect: Rect,
     preview_rect: Rect,
     results_offset: usize,
+    /// Cached preview buffer keyed on the state that changes what the
+    /// preview paints. When the key matches the caller's rect + state,
+    /// `render` blits `buf` into the frame instead of re-running
+    /// `Paragraph::wrap` over the (potentially 64 KiB) session content.
+    /// See `PREVIEW_CONTENT_MAX` for the sizing rationale.
+    preview_cache: Option<PreviewCache>,
+}
+
+/// Snapshot of the FR preview area. `key` covers every input that
+/// changes the painted cells; `buf` is sized to the cached rect
+/// (`x=0, y=0, w=key.width, h=key.height`) so it can be blitted at any
+/// origin later.
+struct PreviewCache {
+    key: PreviewCacheKey,
+    buf: Buffer,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct PreviewCacheKey {
+    /// Generation of the search result the preview reflects. Bumps when
+    /// `apply_result` swaps in a new `results` vec.
+    result_generation: u64,
+    selected: usize,
+    preview_scroll: u16,
+    /// Rect dimensions only — the origin doesn't affect wrap layout.
+    width: u16,
+    height: u16,
 }
 
 impl FrPane {
@@ -314,11 +368,45 @@ impl FrPane {
             results_rect: Rect::default(),
             preview_rect: Rect::default(),
             results_offset: 0,
+            preview_cache: None,
         }
     }
 
     fn send_search(&self) {
         self.worker.search(self.state.search_request());
+    }
+
+    /// Paint the preview panel, reusing a cached `Buffer` whenever the
+    /// inputs that affect the wrap layout haven't changed.
+    ///
+    /// Why: `Paragraph::new(session.content).wrap(...)` re-wraps the
+    /// entire content on every frame. sysmon drives a global redraw
+    /// every 200 ms; letting FR redo an O(content) wrap on top of that
+    /// is the leading cause of Windows-side slowdown as the user
+    /// browses long transcripts. The cache reduces the steady-state
+    /// cost to `w*h` cell clones (one memcpy-ish blit).
+    fn render_preview_cached(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            self.preview_cache = None;
+            return;
+        }
+        let key = PreviewCacheKey {
+            result_generation: self.state.applied_generation,
+            selected: self.state.selected,
+            preview_scroll: self.state.preview_scroll,
+            width: area.width,
+            height: area.height,
+        };
+        let hit = matches!(&self.preview_cache, Some(cache) if cache.key == key);
+        if !hit {
+            let cache_area = Rect::new(0, 0, area.width, area.height);
+            let mut scratch = Buffer::empty(cache_area);
+            render_preview_into(&mut scratch, cache_area, &self.state);
+            self.preview_cache = Some(PreviewCache { key, buf: scratch });
+        }
+        if let Some(cache) = &self.preview_cache {
+            blit_buffer(&cache.buf, frame.buffer_mut(), (area.x, area.y));
+        }
     }
 }
 
@@ -379,7 +467,7 @@ impl PaneProvider for FrPane {
         self.results_rect = body[0];
         self.preview_rect = body[1];
         self.results_offset = render_results(frame, body[0], &self.state);
-        render_preview(frame, body[1], &self.state);
+        self.render_preview_cached(frame, body[1]);
         render_footer(frame, rows[2], &self.state);
 
         let search_inner = Block::default().borders(Borders::ALL).inner(rows[0]);
@@ -485,6 +573,26 @@ fn char_to_byte_idx(value: &str, char_idx: usize) -> usize {
         .unwrap_or(value.len())
 }
 
+/// Truncate `value` to at most `max_bytes` bytes at a valid UTF-8
+/// boundary. Cheap when the input is already short. `String` (not
+/// `&str`) so the common "no truncation" path returns without an
+/// alloc / copy.
+fn truncate_utf8_bytes(value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    // Walk backwards from `max_bytes` to the previous char boundary
+    // (str::is_char_boundary is O(1)). `max_bytes` may land inside a
+    // multi-byte sequence; the loop backs off at most 3 bytes.
+    let mut cut = max_bytes;
+    while cut > 0 && !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut truncated = value;
+    truncated.truncate(cut);
+    truncated
+}
+
 fn fr_key_consumed(key: KeyEvent) -> bool {
     matches!(
         key.code,
@@ -550,23 +658,33 @@ fn render_results(frame: &mut ratatui::Frame<'_>, area: Rect, state: &FrState) -
     offset
 }
 
-fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, state: &FrState) {
+fn render_preview_into(buf: &mut Buffer, area: Rect, state: &FrState) {
     let Some(session) = state.results.get(state.selected) else {
-        frame.render_widget(
-            Paragraph::new("No matching sessions")
-                .block(Block::default().borders(Borders::ALL).title(" Preview ")),
-            area,
-        );
+        Paragraph::new("No matching sessions")
+            .block(Block::default().borders(Borders::ALL).title(" Preview "))
+            .render(area, buf);
         return;
     };
     let title = format!(" {} · {} ", session.agent, session.title);
-    frame.render_widget(
-        Paragraph::new(session.content.as_str())
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .wrap(Wrap { trim: false })
-            .scroll((state.preview_scroll, 0)),
-        area,
-    );
+    Paragraph::new(session.content.as_str())
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false })
+        .scroll((state.preview_scroll, 0))
+        .render(area, buf);
+}
+
+/// Copy every cell of `src` into `dst` starting at `dst_origin`.
+/// Mirrors `pty_pane::blit_buffer_at` — kept local because the two
+/// modules live in the same crate but neither exports a helper the
+/// other can depend on without introducing a cycle in the pub API.
+fn blit_buffer(src: &Buffer, dst: &mut Buffer, dst_origin: (u16, u16)) {
+    let (dx, dy) = dst_origin;
+    let src_area = src.area();
+    for y in 0..src_area.height {
+        for x in 0..src_area.width {
+            dst[(dx + x, dy + y)] = src[(x, y)].clone();
+        }
+    }
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &FrState) {
