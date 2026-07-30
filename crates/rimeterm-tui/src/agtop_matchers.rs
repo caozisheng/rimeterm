@@ -71,6 +71,12 @@ pub fn builtin() -> Vec<Matcher> {
         m("mods", &p(&format!(r"mods{E}"))),
         m("sgpt", &p(&format!(r"sgpt{E}"))),
         m("llm", &p(&format!(r"llm{E}"))),
+        // oh-my-pi ships the bare `omp` binary as well as the scoped
+        // npm package `@oh-my-pi/pi-coding-agent`; match both so the
+        // pane shows omp sessions whether the user runs the CLI shim
+        // directly or invokes it through `node <path>/cli.js`.
+        m("omp", &p(&format!(r"omp{E}"))),
+        m("oh-my-pi", r"@oh-my-pi[/\\]"),
         m("ollama", &p(r"ollama(\s+(run|chat|serve)|$)")),
         m("fabric", &p(&format!(r"fabric{E}"))),
         m("block-goose", &p(&format!(r"goose-server{E}"))),
@@ -163,6 +169,38 @@ mod tests {
             Some("cursor-agent")
         );
         assert_eq!(classify("/usr/bin/bash", &b, &u), None);
+    }
+
+    /// oh-my-pi is a Pi fork that ships as the bare `omp` binary plus the
+    /// scoped npm package `@oh-my-pi/pi-coding-agent`; both surfaces MUST
+    /// classify so agtop pane picks the process up on every platform.
+    #[test]
+    fn oh_my_pi_variants() {
+        let b = builtin();
+        let u: Vec<UserMatcher> = vec![];
+        assert_eq!(classify("/usr/local/bin/omp", &b, &u), Some("omp"));
+        assert_eq!(classify("omp --resume", &b, &u), Some("omp"));
+        assert_eq!(
+            classify(r"C:\Users\jake\AppData\Roaming\npm\omp.cmd chat", &b, &u),
+            Some("omp")
+        );
+        assert_eq!(classify(r"C:\bin\omp.exe", &b, &u), Some("omp"));
+        assert_eq!(
+            classify(
+                r"node C:\Users\jake\AppData\Roaming\npm\node_modules\@oh-my-pi\pi-coding-agent\dist\cli.js",
+                &b,
+                &u
+            ),
+            Some("oh-my-pi")
+        );
+        assert_eq!(
+            classify(
+                "/usr/bin/node /opt/nvm/lib/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
+                &b,
+                &u
+            ),
+            Some("oh-my-pi")
+        );
     }
 
     #[test]

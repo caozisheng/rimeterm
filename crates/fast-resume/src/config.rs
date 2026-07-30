@@ -10,7 +10,7 @@ use once_cell::sync::Lazy;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const INDEX_SCHEMA_VERSION: u32 = 23;
 
-pub const AGENT_ORDER: [&str; 12] = [
+pub const AGENT_ORDER: [&str; 13] = [
     "antigravity",
     "claude",
     "codex",
@@ -19,6 +19,7 @@ pub const AGENT_ORDER: [&str; 12] = [
     "cursor",
     "grok",
     "kimi",
+    "omp",
     "opencode",
     "pi",
     "vibe",
@@ -80,6 +81,14 @@ pub static AGENTS: Lazy<HashMap<&'static str, AgentConfig>> = Lazy::new(|| {
                 name: "kimi",
                 badge: "kimi",
                 color: ratatui::style::Color::Rgb(56, 189, 248),
+            },
+        ),
+        (
+            "omp",
+            AgentConfig {
+                name: "omp",
+                badge: "omp",
+                color: ratatui::style::Color::Rgb(151, 118, 255),
             },
         ),
         (
@@ -190,11 +199,33 @@ pub fn opencode_dir() -> PathBuf {
 }
 
 pub fn pi_sessions_dir() -> PathBuf {
-    if let Some(path) = env_path("PI_CODING_AGENT_SESSION_DIR") {
+    coding_agent_sessions_dir("PI_CODING_AGENT_SESSION_DIR", "PI_CODING_AGENT_DIR", ".pi")
+}
+
+/// Session directory for the [oh-my-pi](https://github.com/can1357/oh-my-pi)
+/// `omp` binary. Oh-My-Pi is a fork of Pi that keeps the JSONL session
+/// format identical but relocates every agent-scoped path from `~/.pi/`
+/// to `~/.omp/`. Env overrides mirror the same rename (`OMP_*` → `PI_*`
+/// as documented in oh-my-pi's `docs/environment-variables.md`).
+pub fn omp_sessions_dir() -> PathBuf {
+    coding_agent_sessions_dir(
+        "OMP_CODING_AGENT_SESSION_DIR",
+        "OMP_CODING_AGENT_DIR",
+        ".omp",
+    )
+}
+
+fn coding_agent_sessions_dir(
+    session_env: &str,
+    agent_env: &str,
+    default_home_subdir: &str,
+) -> PathBuf {
+    if let Some(path) = env_path(session_env) {
         return path;
     }
 
-    let agent_dir = pi_agent_dir();
+    let agent_dir =
+        env_path(agent_env).unwrap_or_else(|| home_dir().join(default_home_subdir).join("agent"));
     let settings_path = agent_dir.join("settings.json");
     if let Ok(settings_bytes) = fs::read(settings_path)
         && let Ok(settings) = serde_json::from_slice::<Value>(&settings_bytes)
@@ -207,10 +238,6 @@ pub fn pi_sessions_dir() -> PathBuf {
     }
 
     agent_dir.join("sessions")
-}
-
-fn pi_agent_dir() -> PathBuf {
-    env_path("PI_CODING_AGENT_DIR").unwrap_or_else(|| home_dir().join(".pi").join("agent"))
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {

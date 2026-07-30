@@ -19,14 +19,24 @@ use super::{Adapter, IncrementalScan, KnownSessions, SessionCallback};
 
 type SessionFiles = HashMap<String, (PathBuf, f64)>;
 
+/// Shared session adapter for the [Pi](https://pi.dev) coding agent and
+/// its [oh-my-pi](https://github.com/can1357/oh-my-pi) fork (`omp`). The
+/// on-disk layout, JSONL entry taxonomy, and `--session <id>` resume
+/// contract are identical across both — the only differences are the
+/// default sessions directory (`~/.pi/agent/sessions/` vs
+/// `~/.omp/agent/sessions/`) and the resume-command binary name.
 #[derive(Debug, Clone)]
 pub struct PiAdapter {
+    agent: &'static str,
+    resume_binary: &'static str,
     sessions_dir: PathBuf,
 }
 
 impl Default for PiAdapter {
     fn default() -> Self {
         Self {
+            agent: "pi",
+            resume_binary: "pi",
             sessions_dir: config::pi_sessions_dir(),
         }
     }
@@ -35,7 +45,31 @@ impl Default for PiAdapter {
 impl PiAdapter {
     #[allow(dead_code)]
     pub fn new(sessions_dir: PathBuf) -> Self {
-        Self { sessions_dir }
+        Self {
+            agent: "pi",
+            resume_binary: "pi",
+            sessions_dir,
+        }
+    }
+
+    /// Configure the adapter for the oh-my-pi fork. Storage layout and
+    /// JSONL schema are inherited from Pi; only the on-disk root and the
+    /// resume binary change.
+    pub fn omp() -> Self {
+        Self {
+            agent: "omp",
+            resume_binary: "omp",
+            sessions_dir: config::omp_sessions_dir(),
+        }
+    }
+
+    #[cfg(test)]
+    fn omp_with_dir(sessions_dir: PathBuf) -> Self {
+        Self {
+            agent: "omp",
+            resume_binary: "omp",
+            sessions_dir,
+        }
     }
 
     fn scan_session_files(&self) -> Option<(SessionFiles, bool)> {
@@ -199,7 +233,7 @@ impl PiAdapter {
 
 impl Adapter for PiAdapter {
     fn name(&self) -> &'static str {
-        "pi"
+        self.agent
     }
 
     fn find_sessions(&self) -> Vec<Session> {
@@ -251,11 +285,12 @@ impl Adapter for PiAdapter {
     fn resume_command(&self, session: &Session, _yolo: bool) -> Vec<String> {
         // Pi's `--session <path|id>` accepts the session ID directly (even a
         // partial UUID), and `Session.id` always holds the full UUID from the
-        // `session` row. `fr` only indexes sessions under the global
-        // `pi_sessions_dir()` — the same store `pi --session <id>` resolves
-        // against — so no path resolution is needed here.
+        // `session` row. `fr` only indexes sessions under the configured
+        // sessions directory — the same store `<binary> --session <id>`
+        // resolves against — so no path resolution is needed here. The
+        // oh-my-pi `omp` binary honours the same `--session` flag.
         vec![
-            "pi".to_string(),
+            self.resume_binary.to_string(),
             "--session".to_string(),
             session.id.clone(),
         ]
@@ -427,5 +462,39 @@ mod tests {
         let scan = adapter.find_sessions_incremental(&known);
         assert!(scan.new_or_modified.is_empty());
         assert_eq!(scan.deleted_ids, vec!["test123"]);
+    }
+
+    #[test]
+    fn omp_adapter_reuses_pi_layout_with_omp_resume_binary() {
+        let temp = tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let session_id = "22222222-2222-4222-8222-222222222222";
+        let session_file =
+            sessions_dir.join(format!("2026-07-30T10-00-00-000Z_{session_id}.jsonl"));
+        write_jsonl(
+            &session_file,
+            &[
+                json!({"type":"session","version":3,"id":session_id,"timestamp":"2026-07-30T10:00:00.000Z","cwd":"/repo/omp"}),
+                json!({"type":"message","id":"m1","parentId":null,"timestamp":"2026-07-30T10:00:01.000Z","message":{"role":"user","content":"Add omp adapter"}}),
+                json!({"type":"message","id":"m2","parentId":"m1","timestamp":"2026-07-30T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Done"}]}}),
+            ],
+        );
+
+        let adapter = PiAdapter::omp_with_dir(sessions_dir);
+        assert_eq!(adapter.name(), "omp");
+        let sessions = adapter.find_sessions();
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.agent, "omp");
+        assert_eq!(session.id, session_id);
+        assert_eq!(
+            adapter.resume_command(session, false),
+            vec![
+                "omp".to_string(),
+                "--session".to_string(),
+                session_id.to_string(),
+            ]
+        );
     }
 }

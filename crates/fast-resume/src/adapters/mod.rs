@@ -90,6 +90,7 @@ pub fn all_adapters() -> Vec<Box<dyn Adapter>> {
         Box::new(KimiAdapter::default()),
         Box::new(OpenCodeAdapter::default()),
         Box::new(PiAdapter::default()),
+        Box::new(PiAdapter::omp()),
         Box::new(VibeAdapter::default()),
     ]
 }
