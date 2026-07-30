@@ -173,27 +173,35 @@ where
     tokio::fs::create_dir_all(dest_dir)
         .await
         .with_context(|| format!("create update directory {}", dest_dir.display()))?;
-    let manifest = client
-        .get(&installer.checksums.browser_download_url)
+    let checksum_url = installer.checksums.browser_download_url.as_str();
+    let response = client
+        .get(checksum_url)
+        .header("Accept", "text/plain, */*")
         .send()
         .await
-        .context("download SHA256SUMS")?
-        .error_for_status()
-        .context("SHA256SUMS download returned an error")?
+        .with_context(|| format!("download SHA256SUMS from {checksum_url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("SHA256SUMS download from {checksum_url} returned HTTP {status}");
+    }
+    let manifest = response
         .text()
         .await
-        .context("read SHA256SUMS")?;
+        .with_context(|| format!("read SHA256SUMS body from {checksum_url}"))?;
     let expected = checksum_for(&manifest, &installer.msi.name)?.to_owned();
 
     let final_path = dest_dir.join(&installer.msi.name);
     let part_path = final_path.with_extension("msi.part");
+    let msi_url = installer.msi.browser_download_url.as_str();
     let response = client
-        .get(&installer.msi.browser_download_url)
+        .get(msi_url)
         .send()
         .await
-        .context("download MSI")?
-        .error_for_status()
-        .context("MSI download returned an error")?;
+        .with_context(|| format!("download MSI from {msi_url}"))?;
+    let msi_status = response.status();
+    if !msi_status.is_success() {
+        bail!("MSI download from {msi_url} returned HTTP {msi_status}");
+    }
     let total = response.content_length().unwrap_or(installer.msi.size);
     let mut file = tokio::fs::File::create(&part_path)
         .await

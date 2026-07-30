@@ -535,6 +535,10 @@ pub struct App {
     /// Popup rect of the acknowledgement overlay, cached last frame
     /// so `on_mouse` can detect click-outside without recomputing.
     last_ack_popup_rect: Option<Rect>,
+    /// Popup rect of the online-upgrade overlay, cached last frame so
+    /// `on_mouse` can close only on click-outside (clicking inside the
+    /// dialog itself MUST NOT dismiss it — mirrors ack overlay).
+    last_upgrade_popup_rect: Option<Rect>,
     settings_state: crate::settings::SettingsState,
     ack_state: crate::acknowledgement::AckOverlayState,
     upgrade_state: crate::upgrade::UpgradeState,
@@ -963,6 +967,7 @@ impl App {
             last_picker_popup_rect: None,
             last_settings_popup_rect: None,
             last_ack_popup_rect: None,
+            last_upgrade_popup_rect: None,
             ack_state: crate::acknowledgement::AckOverlayState::default(),
             upgrade_state: crate::upgrade::UpgradeState::default(),
             upgrade_tx,
@@ -1946,8 +1951,19 @@ impl App {
                 return;
             }
             if self.upgrade_is_open() {
-                self.close_upgrade_overlay();
-                let _ = self.redraw_tx.send(());
+                // Click-outside closes; click-inside is swallowed so
+                // buttons on the dialog don't dismiss it. Falls through
+                // to a bare close if the render-cached rect is missing
+                // (first frame, or overlay opened this tick).
+                if let Some(popup) = self.last_upgrade_popup_rect {
+                    if !point_in_rect(m.column, m.row, popup) {
+                        self.close_upgrade_overlay();
+                        let _ = self.redraw_tx.send(());
+                    }
+                } else {
+                    self.close_upgrade_overlay();
+                    let _ = self.redraw_tx.send(());
+                }
                 return;
             }
             if self.ack_state.open {
@@ -3035,7 +3051,9 @@ impl App {
             self.last_ack_popup_rect = Some(rect);
         }
         if self.upgrade_state.open {
+            let rect = crate::upgrade::UpgradeState::popup_rect(area);
             self.upgrade_state.render(area, frame.buffer_mut());
+            self.last_upgrade_popup_rect = Some(rect);
         }
 
         // Suppress the caret when any overlay owns the input focus.
