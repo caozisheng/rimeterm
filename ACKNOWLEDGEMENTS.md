@@ -85,6 +85,13 @@ processes. The stack:
   mutation APIs).
 - [gix](https://github.com/GitoxideLabs/gitoxide) / [gix-diff] — MIT /
   Apache-2.0. Pure-Rust Git implementation powering `GitPane`.
+- [serie](https://github.com/lusingander/serie) — MIT. Two-pass commit-graph
+  layout algorithm (`src/graph/calc.rs` @ commit
+  `9488f60ff509620513b2128a1acc14abf4786bbd`) ported into
+  `rimeterm-tui::git_worker::{assign_columns,build_edges}`; rimeterm draws
+  the resulting edges as Unicode box-drawing glyphs instead of the upstream
+  kitty / iTerm2 image-protocol tiles, so the Commits list works in every
+  terminal (Windows Terminal, WezTerm, kitty, etc.).
 - [tree-sitter](https://tree-sitter.github.io/tree-sitter/) +
   [tree-sitter-highlight] — MIT. Incremental parser used for diff syntax
   highlighting. Grammars: `tree-sitter-{rust,c,cpp,python,javascript,typescript,json,toml-ng,yaml,bash}` (all MIT).
