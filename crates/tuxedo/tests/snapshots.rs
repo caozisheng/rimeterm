@@ -13,7 +13,7 @@
 //! snapshots, or `INSTA_UPDATE=auto cargo test --test snapshots` to bulk-accept
 //! during local iteration.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -49,7 +49,11 @@ fn make_app() -> App {
     // `last_disk`) sees a consistent state. The file contents match what
     // we hand `App::new` as the in-memory body, so the comparison passes
     // without forcing a reload.
-    std::fs::write(FIXTURE_PATH, sample::TODO_RAW).expect("seed fixture file");
+    let fixture = Path::new(FIXTURE_PATH);
+    if let Some(parent) = fixture.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(fixture, sample::TODO_RAW).expect("seed fixture file");
     let mut app = App::new(
         PathBuf::from(FIXTURE_PATH),
         sample::TODO_RAW.to_string(),
@@ -278,7 +282,11 @@ fn list_sidebar_empty_hints() {
     // should fall back to the "tag with +project" / "tag with @context" hints
     // instead of leaving the PROJECTS / CONTEXTS sections blank.
     let body = "(A) Buy milk\n(B) Call mom\nWrite up notes\n";
-    std::fs::write(FIXTURE_PATH, body).expect("seed fixture file");
+    let fixture = Path::new(FIXTURE_PATH);
+    if let Some(parent) = fixture.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(fixture, body).expect("seed fixture file");
     let mut app = App::new(
         PathBuf::from(FIXTURE_PATH),
         body.to_string(),
