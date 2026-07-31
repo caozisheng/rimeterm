@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
@@ -167,6 +168,8 @@ struct FrState {
     selected: usize,
     preview_scroll: u16,
     status: String,
+    /// Directories whose sessions are visually collapsed in the tree.
+    collapsed_dirs: HashSet<String>,
 }
 
 impl FrState {
@@ -181,6 +184,9 @@ impl FrState {
                     Some(target) => return Some(FrAction::Resume(target)),
                     None => self.status = format!("{} cannot be resumed", session.agent),
                 }
+            }
+            (KeyCode::Char(' '), KeyModifiers::CONTROL) => {
+                self.toggle_selected_dir();
             }
             (KeyCode::Up, modifiers) if modifiers.contains(KeyModifiers::ALT) => {
                 self.preview_scroll = self.preview_scroll.saturating_sub(3);
@@ -278,8 +284,77 @@ impl FrState {
             return;
         }
         let last = self.results.len() as isize - 1;
-        self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
+        let step = if delta > 0 { 1isize } else { -1 };
+        let mut remaining = delta.unsigned_abs();
+        let mut pos = self.selected as isize;
+        while remaining > 0 {
+            pos += step;
+            if pos < 0 || pos > last {
+                pos = pos.clamp(0, last);
+                break;
+            }
+            if !self.is_collapsed(pos as usize) {
+                remaining -= 1;
+            }
+        }
+        // If we landed on a collapsed session, scan forward to the next visible one.
+        while pos <= last && self.is_collapsed(pos as usize) {
+            pos += step;
+        }
+        if pos < 0 || pos > last || self.is_collapsed(pos as usize) {
+            // Scan the other direction.
+            pos = self.selected as isize;
+        }
+        self.selected = pos.clamp(0, last) as usize;
         self.preview_scroll = 0;
+    }
+
+    /// Returns true if session at `idx` belongs to a collapsed directory.
+    fn is_collapsed(&self, idx: usize) -> bool {
+        self.results
+            .get(idx)
+            .is_some_and(|s| self.collapsed_dirs.contains(&s.directory))
+    }
+
+    /// Toggle collapse for the directory of the currently selected session.
+    fn toggle_selected_dir(&mut self) {
+        let Some(session) = self.results.get(self.selected) else {
+            return;
+        };
+        let dir = session.directory.clone();
+        if self.collapsed_dirs.contains(&dir) {
+            self.collapsed_dirs.remove(&dir);
+        } else {
+            self.collapsed_dirs.insert(dir);
+            // If selected is now hidden, find next visible.
+            self.ensure_selection_visible();
+        }
+    }
+
+    /// Move selection to the nearest visible (non-collapsed) session.
+    fn ensure_selection_visible(&mut self) {
+        if self.results.is_empty() {
+            return;
+        }
+        if !self.is_collapsed(self.selected) {
+            return;
+        }
+        // Search forward first.
+        for i in self.selected + 1..self.results.len() {
+            if !self.is_collapsed(i) {
+                self.selected = i;
+                self.preview_scroll = 0;
+                return;
+            }
+        }
+        // Search backward.
+        for i in (0..self.selected).rev() {
+            if !self.is_collapsed(i) {
+                self.selected = i;
+                self.preview_scroll = 0;
+                return;
+            }
+        }
     }
 
     fn cycle_agent(&mut self, reverse: bool) {
@@ -529,11 +604,23 @@ impl PaneProvider for FrPane {
                     .row
                     .saturating_sub(self.results_rect.y.saturating_add(1))
                     as usize;
-                let display = build_display_rows(&self.state.results);
+                let display = build_display_rows(&self.state.results, &self.state.collapsed_dirs);
                 let abs_row = self.results_offset.saturating_add(click_row);
-                if let Some(DisplayRow::Session(idx)) = display.get(abs_row) {
-                    self.state.selected = *idx;
-                    self.state.preview_scroll = 0;
+                match display.get(abs_row) {
+                    Some(DisplayRow::Header { dir, .. }) => {
+                        let dir = dir.clone();
+                        if self.state.collapsed_dirs.contains(&dir) {
+                            self.state.collapsed_dirs.remove(&dir);
+                        } else {
+                            self.state.collapsed_dirs.insert(dir);
+                            self.state.ensure_selection_visible();
+                        }
+                    }
+                    Some(DisplayRow::Session(idx)) => {
+                        self.state.selected = *idx;
+                        self.state.preview_scroll = 0;
+                    }
+                    None => {}
                 }
                 true
             }
@@ -650,7 +737,7 @@ fn render_results(frame: &mut ratatui::Frame<'_>, area: Rect, state: &FrState) -
         return 0;
     }
 
-    let display = build_display_rows(&state.results);
+    let display = build_display_rows(&state.results, &state.collapsed_dirs);
     let total = display.len();
 
     // Find the display row for the selected session.
@@ -671,12 +758,18 @@ fn render_results(frame: &mut ratatui::Frame<'_>, area: Rect, state: &FrState) -
     for (screen_row, display_row) in display[start..end].iter().enumerate() {
         let y = inner.y + screen_row as u16;
         match display_row {
-            DisplayRow::Header { name, count } => {
+            DisplayRow::Header {
+                name,
+                count,
+                collapsed,
+                ..
+            } => {
+                let arrow = if *collapsed { "  ▸ " } else { "  ▾ " };
                 let count_str = format!(" ({})", count);
                 let max_name = (inner.width as usize).saturating_sub(4 + count_str.len());
                 let label = truncate_display(name, max_name);
                 let line = Line::from(vec![
-                    Span::styled("  ▾ ", Style::default().fg(DIR_HEADER_FG).bold()),
+                    Span::styled(arrow, Style::default().fg(DIR_HEADER_FG).bold()),
                     Span::styled(label, Style::default().fg(DIR_HEADER_FG).bold()),
                     Span::styled(count_str, Style::default().fg(Color::DarkGray)),
                 ]);
@@ -695,11 +788,16 @@ fn render_results(frame: &mut ratatui::Frame<'_>, area: Rect, state: &FrState) -
 const DIR_HEADER_FG: Color = Color::Rgb(140, 160, 180);
 
 enum DisplayRow {
-    Header { name: String, count: usize },
+    Header {
+        name: String,
+        count: usize,
+        dir: String,
+        collapsed: bool,
+    },
     Session(usize),
 }
 
-fn build_display_rows(sessions: &[Session]) -> Vec<DisplayRow> {
+fn build_display_rows(sessions: &[Session], collapsed: &HashSet<String>) -> Vec<DisplayRow> {
     let mut rows = Vec::new();
     let mut i = 0;
     while i < sessions.len() {
@@ -708,12 +806,17 @@ fn build_display_rows(sessions: &[Session]) -> Vec<DisplayRow> {
         while i < sessions.len() && sessions[i].directory == *dir {
             i += 1;
         }
+        let is_collapsed = collapsed.contains(dir.as_str());
         rows.push(DisplayRow::Header {
             name: sessions[group_start].workspace_name().to_string(),
             count: i - group_start,
+            dir: dir.clone(),
+            collapsed: is_collapsed,
         });
-        for idx in group_start..i {
-            rows.push(DisplayRow::Session(idx));
+        if !is_collapsed {
+            for idx in group_start..i {
+                rows.push(DisplayRow::Session(idx));
+            }
         }
     }
     rows
@@ -861,7 +964,7 @@ fn blit_buffer(src: &Buffer, dst: &mut Buffer, dst_origin: (u16, u16)) {
 }
 
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, state: &FrState) {
-    let hints = "↑↓ select  Alt+↑↓ preview  Tab agent  Ctrl+R resume";
+    let hints = "↑↓ select  C-Space fold  Alt+↑↓ preview  Tab agent  C-R resume";
     let width = area.width as usize;
     let status_width = UnicodeWidthStr::width(state.status.as_str());
     let hint_width = UnicodeWidthStr::width(hints);
