@@ -1,5 +1,5 @@
 ---
-source: tests/snapshots.rs
+source: crates/tuxedo/tests/snapshots.rs
 expression: buffer_to_text(&buf)
 ---
  FILTERS                   ▶▮◀ /tmp/tuxedo-snapshot.txt  •  3 task DETAIL                           
