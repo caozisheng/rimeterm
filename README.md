@@ -4,6 +4,9 @@
 
 <img width="1899" height="1108" alt="image" src="https://github.com/user-attachments/assets/c00be4a8-4526-495c-87e5-b730269e43e0" />
 
+<img width="1903" height="1112" alt="image" src="https://github.com/user-attachments/assets/9c516ec9-6c66-491f-bd29-9a9ce77c34a0" />
+
+
 ## Layout
 
 One screen, four zones in a 2×2 grid:
