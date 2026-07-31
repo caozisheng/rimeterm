@@ -70,6 +70,8 @@ bollard = { workspace = true }
 # blocking worker thread. Data types + fetch layer ported from
 # reyamira/models (MIT) into `rimeterm-models`.
 rimeterm-models = { workspace = true }
+# Complete in-tree Tuxedo fork with a bounded embedding API for TodoPane.
+tuxedo = { workspace = true }
 
 # procfs has a Linux-only build.rs; conditional-target keeps
 # Windows/macOS builds compiling. Its worker code lives behind

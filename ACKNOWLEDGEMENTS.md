@@ -165,6 +165,14 @@ failing startup.
 - [procfs](https://github.com/eminence/procfs) — MIT / Apache-2.0 (Linux
   only). `/proc/self/cgroup` decoder for the cgroup badge on Linux.
 
+## Todo
+
+- [tuxedo](https://github.com/webstonehq/tuxedo) — MIT. The complete source
+  at commit `8c990c0e1f57462115c0d2dffdfffb3f0b63b7db` is vendored in
+  `crates/tuxedo`; rimeterm adds a bounded embedding API and native Todo pane
+  while retaining the upstream todo.txt engine, TUI, CLI, and standalone
+  `tuxedo` binary.
+
 ## Terminal / TUI design lineage
 
 - [zellij](https://github.com/zellij-org/zellij) and

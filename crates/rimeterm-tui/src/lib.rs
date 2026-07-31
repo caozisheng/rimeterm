@@ -36,6 +36,7 @@ pub mod sysmon_pane;
 pub mod sysmon_worker;
 pub mod tab_strip;
 pub mod terminal;
+pub mod todo_pane;
 pub mod updater;
 pub mod upgrade;
 pub mod viewer;

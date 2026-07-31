@@ -67,6 +67,7 @@ use crate::shell_factory::spawn_shell;
 use crate::status_bar::{StatusBarHits, StatusBarHover, render as render_status_bar};
 use crate::tab_strip::render as render_tab_strip;
 use crate::terminal::TerminalGuard;
+use crate::todo_pane::{TodoAction, TodoPane};
 use crate::viewer::{
     self, SelectionSnapshot, SourceMeta, ViewerCompletion, ViewerKind, ViewerOverlayState,
 };
@@ -445,6 +446,30 @@ fn paths_for_group(gid: rimeterm_core::TabGroupId) -> Vec<rimeterm_core::layout:
     }
 }
 
+/// Resolve the **effective workspace root** for a directory `cwd`.
+///
+/// Walks up from `cwd` and returns the first ancestor (including
+/// `cwd` itself) that contains a `.git` entry — the file or the
+/// directory form, so both plain repos and git worktrees anchor
+/// correctly. If no ancestor is a git repo the raw `cwd` is
+/// returned unchanged.
+///
+/// This is the single source of truth for "what does the workspace
+/// mean right now" — the file manager can hover anywhere it likes,
+/// but the git pane, freshly-spawned agents / shells, and the
+/// persisted `session.state.toml` pivot around whatever this returns.
+fn resolve_workspace_root(cwd: &std::path::Path) -> PathBuf {
+    for ancestor in cwd.ancestors() {
+        let git = ancestor.join(".git");
+        // `.git` is a directory in a normal clone and a plain file
+        // inside a worktree — accept either.
+        if git.exists() {
+            return ancestor.to_path_buf();
+        }
+    }
+    cwd.to_path_buf()
+}
+
 #[allow(dead_code)] // config / event_bus are wired in later milestones
 pub struct App {
     workspace_root: PathBuf,
@@ -483,6 +508,8 @@ pub struct App {
     osc_tx: mpsc::UnboundedSender<(PaneId, String)>,
     /// Native FR pane actions are resolved by App because only App owns tab/PTY state.
     fr_action_rx: mpsc::UnboundedReceiver<FrAction>,
+    /// Embedded Todo pane requests that require App-owned tab/focus changes.
+    todo_action_rx: mpsc::UnboundedReceiver<TodoAction>,
     /// §C24: The viewer is a single modal overlay (not a tab). Only
     /// one file can be previewed at a time; opening a new one
     /// replaces the previous snapshot. Occupies the entire left
@@ -503,10 +530,13 @@ pub struct App {
     /// viewer snapshot and by the right-arrow shortcut that opens the
     /// hovered file in the modal viewer.
     last_file_selection: Option<SelectionSnapshot>,
-    /// Effective "current workspace root" — where the status bar's
-    /// `workspace: xxx` label points, and the cwd handed to freshly
-    /// spawned agent tabs. Seeded from the launch-time `workspace_root`
-    /// and mutated only by explicit `workspace.cwd.set` IPC calls.
+    /// Effective **workspace root** — the git-anchored ancestor of
+    /// the tracked cwd (see [`resolve_workspace_root`]). Powers the
+    /// status-bar `workspace:` label, the cwd handed to freshly
+    /// spawned agent/shell tabs, the git pane, and the persisted
+    /// `session.state.toml`. Kept in step with the file manager via
+    /// [`Self::sync_from_file_manager`]; explicit IPC callers pin it
+    /// via [`Self::set_active_root`].
     active_root: PathBuf,
     /// Worker channel: async Markdown/image loaders push completions
     /// here; main loop drains them into [`ViewerOverlayState`].
@@ -647,6 +677,15 @@ impl App {
             parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
         > = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+        // Effective workspace root — the git-anchored ancestor of the
+        // launch cwd, per [`resolve_workspace_root`]. Git and freshly-spawned
+        // agent/shell tabs pivot around this.
+        // File manager keeps its raw launch cwd so users still see
+        // where they started; the resolver runs again on every file
+        // manager navigation in `sync_from_file_manager`.
+        let resolved_root = resolve_workspace_root(&workspace_root);
+        let viewer_markdown_theme = parse_markdown_theme(&config.viewer.markdown.theme);
+
         // Event bus is created up front so the native file manager can
         // publish selection / cwd events during construction.
         let event_bus = EventBus::default();
@@ -655,7 +694,7 @@ impl App {
         let mut pinned_pane_ids: std::collections::HashSet<PaneId> =
             std::collections::HashSet::new();
 
-        // Files group — native two-pane explorer followed by embedded Fast Resume.
+        // Files group — native explorer, global Todo, then Fast Resume.
         let file_manager_pane = FileManagerPane::with_event_bus(
             workspace_root.clone(),
             workspace_root.clone(),
@@ -664,6 +703,11 @@ impl App {
         let file_manager_pane_id = file_manager_pane.id();
         panes.insert(Box::new(file_manager_pane));
         pinned_pane_ids.insert(file_manager_pane_id);
+        let (todo_action_tx, todo_action_rx) = mpsc::unbounded_channel();
+        let todo_pane = TodoPane::new(todo_action_tx, viewer_markdown_theme);
+        let todo_pane_id = todo_pane.id();
+        panes.insert(Box::new(todo_pane));
+        pinned_pane_ids.insert(todo_pane_id);
 
         let (fr_action_tx, fr_action_rx) = mpsc::unbounded_channel();
         let fr_pane = FrPane::new(fr_action_tx);
@@ -674,7 +718,7 @@ impl App {
         // Native Git pane — read-only workspace Git panel backed by
         // `gix`. Follows files-cwd via `SetActiveRoot` in the main loop
         // (see `handle_set_active_root`); F5 issues `workspace.pane.reload`.
-        let git_pane = crate::git_pane::GitPane::new(workspace_root.clone());
+        let git_pane = crate::git_pane::GitPane::new(resolved_root.clone());
         let git_pane_id = git_pane.id();
         panes.insert(Box::new(git_pane));
         pinned_pane_ids.insert(git_pane_id);
@@ -845,7 +889,7 @@ impl App {
             pane.set_right_click_paste(config.mouse.right_click_paste);
             pane.set_scrollback_enabled(true);
         }
-        let files = build_files_group(file_manager_pane_id, fr_pane_id);
+        let files = build_files_group(file_manager_pane_id, todo_pane_id, fr_pane_id);
         shells_members.push(first_id);
 
         // Groups.
@@ -944,10 +988,9 @@ impl App {
         // build an image protocol. Halfblocks fallback keeps the viewer
         // usable everywhere.
         let viewer_picker = ratatui_image::picker::Picker::from_query_stdio().ok();
-        let viewer_markdown_theme = parse_markdown_theme(&config.viewer.markdown.theme);
 
         Ok(Self {
-            active_root: workspace_root.clone(),
+            active_root: resolved_root,
             last_file_manager_cwd: Some(workspace_root.clone()),
             workspace_root,
             config,
@@ -967,6 +1010,7 @@ impl App {
             osc_rx,
             osc_tx,
             fr_action_rx,
+            todo_action_rx,
             viewer: ViewerOverlayState::default(),
             file_manager_pane_id: Some(file_manager_pane_id),
             git_pane_id: Some(git_pane_id),
@@ -1045,6 +1089,7 @@ impl App {
                 self.needs_redraw = true;
             }
 
+            self.drain_todo_actions();
             tokio::select! {
                 Some(evt) = input.next() => {
                     self.needs_redraw = true;
@@ -1537,8 +1582,25 @@ impl App {
     /// `SettingsState` and the F9 picker. Persistence to disk is
     /// future work — runtime state resets to the config value on
     /// restart.
+
     fn set_markdown_theme(&mut self, theme: rimeterm_markdown::Theme) {
         self.viewer_markdown_theme = theme;
+        for id in self
+            .tree
+            .tab_groups()
+            .iter()
+            .flat_map(|group| group.members())
+        {
+            if let Some(todo) = self
+                .panes
+                .get_mut(*id)
+                .and_then(|pane| pane.as_any_mut())
+                .and_then(|any| any.downcast_mut::<TodoPane>())
+            {
+                todo.set_theme(theme);
+                break;
+            }
+        }
         self.set_hint(format!("theme → {}", theme.label()));
     }
 
@@ -3420,6 +3482,15 @@ impl App {
         self.new_shell_tab_in(gid)
     }
 
+    fn drain_todo_actions(&mut self) {
+        while let Ok(action) = self.todo_action_rx.try_recv() {
+            match action {
+                TodoAction::ExitRequested => self.activate_tab(BUILTIN_FILES, 0),
+            }
+            self.needs_redraw = true;
+        }
+    }
+
     fn drain_fr_actions(&mut self) {
         while let Ok(action) = self.fr_action_rx.try_recv() {
             match action {
@@ -3910,34 +3981,36 @@ impl App {
             path,
         });
 
-        // Git pane + active_root: fresh whenever the tracked cwd changes.
+        // Workspace-aware panes track the **resolved** workspace
+        // root, not the raw cwd — a file-manager hover into
+        // `crates/foo/src/` pivots git / the agent-spawn cwd around
+        // whatever ancestor holds `.git`. If nothing up the chain is
+        // a repo we fall back to the raw cwd, matching the resolver's
+        // contract.
         let cwd_changed = self.last_file_manager_cwd.as_deref() != Some(current_cwd.as_path());
         if !cwd_changed {
             return;
         }
         self.last_file_manager_cwd = Some(current_cwd.clone());
-        // Keep the effective workspace root in step with the file
-        // manager: the status-bar `workspace:` label, the cwd handed
-        // to freshly-spawned agent tabs, and the `session.state.toml`
-        // that resumes the next launch all read `active_root`. This
-        // is the silent sibling of `set_active_root` — no toast,
-        // because file manager navigation is the user's own action.
-        if self.active_root != current_cwd {
-            self.active_root = current_cwd.clone();
+        let resolved = resolve_workspace_root(&current_cwd);
+        let workspace_changed = self.active_root != resolved;
+        if workspace_changed {
+            self.active_root = resolved.clone();
         }
-        let Some(git_id) = self.git_pane_id else {
-            return;
-        };
-        if let Some(pane) = self.panes.get_mut(git_id) {
-            if let Some(git) = pane
-                .as_any_mut()
-                .and_then(|any| any.downcast_mut::<crate::git_pane::GitPane>())
-            {
-                git.refresh_for(&current_cwd);
+        if let Some(git_id) = self.git_pane_id {
+            if let Some(pane) = self.panes.get_mut(git_id) {
+                if let Some(git) = pane
+                    .as_any_mut()
+                    .and_then(|any| any.downcast_mut::<crate::git_pane::GitPane>())
+                {
+                    // Git already walks up on its own, but feeding it
+                    // the resolved root keeps its current_root in
+                    // step with what agents / status bar are showing.
+                    git.refresh_for(&resolved);
+                }
             }
         }
     }
-
     /// Clear the boot-progress spinner if either the target pane has
     /// produced first output or the timeout deadline hit. Called each
     /// tick alongside `expire_hint`. The classification decision is
@@ -4372,10 +4445,14 @@ fn resume_spawn_spec(target: ResumeTarget) -> Result<ResumeSpawnSpec> {
     })
 }
 
-fn build_files_group(file_manager_pane_id: PaneId, fr_pane_id: PaneId) -> TabGroup {
+fn build_files_group(
+    file_manager_pane_id: PaneId,
+    todo_pane_id: PaneId,
+    fr_pane_id: PaneId,
+) -> TabGroup {
     TabGroup::new(
         BUILTIN_FILES,
-        vec![file_manager_pane_id, fr_pane_id],
+        vec![file_manager_pane_id, todo_pane_id, fr_pane_id],
         MembersPolicy::Fixed,
         PaneKind::Files,
     )
@@ -6338,14 +6415,49 @@ mod tests {
     use crossterm::event::MouseButton;
 
     #[test]
-    fn files_group_contains_files_then_fr_and_is_fixed() {
+    fn files_group_contains_files_then_todo_then_fr_and_is_fixed() {
         let files_id = PaneId(41);
-        let fr_id = PaneId(42);
+        let todo_id = PaneId(42);
+        let fr_id = PaneId(43);
 
-        let group = build_files_group(files_id, fr_id);
+        let group = build_files_group(files_id, todo_id, fr_id);
 
-        assert_eq!(group.members(), &[files_id, fr_id]);
+        assert_eq!(group.members(), &[files_id, todo_id, fr_id]);
         assert_eq!(group.policy(), MembersPolicy::Fixed);
+    }
+
+    #[test]
+    fn resolve_workspace_root_returns_cwd_when_no_git_up_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `.git` anywhere in the ancestor chain.
+        assert_eq!(resolve_workspace_root(dir.path()), dir.path());
+    }
+
+    #[test]
+    fn resolve_workspace_root_walks_up_to_git_dir() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        let deep = root.path().join("crates").join("foo").join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(resolve_workspace_root(&deep), root.path());
+    }
+
+    #[test]
+    fn resolve_workspace_root_accepts_git_file_worktree() {
+        // A git worktree has a `.git` FILE (with `gitdir:` pointer), not a
+        // directory. `resolve_workspace_root` must still anchor on it.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".git"), b"gitdir: /elsewhere").unwrap();
+        let deep = root.path().join("subdir");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(resolve_workspace_root(&deep), root.path());
+    }
+
+    #[test]
+    fn resolve_workspace_root_returns_git_dir_itself_when_pointed_at_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        assert_eq!(resolve_workspace_root(root.path()), root.path());
     }
 
     #[test]
