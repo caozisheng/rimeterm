@@ -2,7 +2,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use fast_resume::config::AGENT_ORDER;
+use fast_resume::config::{AGENT_ORDER, AGENTS};
 use fast_resume::embed::{
     EmbeddedEngine, ResumeTarget, SearchRequest, SearchResult, resume_target,
 };
@@ -11,7 +11,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
 use tokio::sync::mpsc::UnboundedSender;
 use unicode_width::UnicodeWidthStr;
@@ -265,6 +265,7 @@ impl FrState {
                 session
             })
             .collect();
+        group_by_directory(&mut self.results);
         self.selected = 0;
         self.preview_scroll = 0;
         self.status = format!("{} sessions", self.results.len());
@@ -457,7 +458,7 @@ impl PaneProvider for FrPane {
         let body = match FrState::split_axis(rows[1].width) {
             SplitAxis::Horizontal => Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .split(rows[1]),
             SplitAxis::Vertical => Layout::default()
                 .direction(Direction::Vertical)
@@ -524,13 +525,14 @@ impl PaneProvider for FrPane {
                 true
             }
             MouseEventKind::Down(MouseButton::Left) if point_in(self.results_rect) => {
-                let row = event
+                let click_row = event
                     .row
                     .saturating_sub(self.results_rect.y.saturating_add(1))
                     as usize;
-                let selected = self.results_offset.saturating_add(row);
-                if selected < self.state.results.len() {
-                    self.state.selected = selected;
+                let display = build_display_rows(&self.state.results);
+                let abs_row = self.results_offset.saturating_add(click_row);
+                if let Some(DisplayRow::Session(idx)) = display.get(abs_row) {
+                    self.state.selected = *idx;
                     self.state.preview_scroll = 0;
                 }
                 true
@@ -632,30 +634,201 @@ fn render_search(frame: &mut ratatui::Frame<'_>, area: Rect, state: &FrState) {
 }
 
 fn render_results(frame: &mut ratatui::Frame<'_>, area: Rect, state: &FrState) -> usize {
-    let items = state.results.iter().map(|session| {
-        ListItem::new(Line::from(vec![
-            Span::styled(
-                format!("{} ", session.agent),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw(session.title.as_str()),
-        ]))
-    });
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Results "))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("› ");
-    let visible = area.height.saturating_sub(2) as usize;
-    let offset = if visible == 0 {
-        0
+    let block = Block::default().borders(Borders::ALL).title(" Results ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return 0;
+    }
+
+    if state.results.is_empty() {
+        frame.render_widget(
+            Paragraph::new("  No sessions found").style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return 0;
+    }
+
+    let display = build_display_rows(&state.results);
+    let total = display.len();
+
+    // Find the display row for the selected session.
+    let selected_display = display
+        .iter()
+        .position(|row| matches!(row, DisplayRow::Session(idx) if *idx == state.selected))
+        .unwrap_or(0);
+
+    let max_rows = inner.height as usize;
+    if max_rows == 0 {
+        return 0;
+    }
+    let start = selected_display
+        .saturating_sub(max_rows.saturating_sub(1))
+        .min(total.saturating_sub(1));
+    let end = (start + max_rows).min(total);
+
+    for (screen_row, display_row) in display[start..end].iter().enumerate() {
+        let y = inner.y + screen_row as u16;
+        match display_row {
+            DisplayRow::Header { name, count } => {
+                let count_str = format!(" ({})", count);
+                let max_name = (inner.width as usize).saturating_sub(4 + count_str.len());
+                let label = truncate_display(name, max_name);
+                let line = Line::from(vec![
+                    Span::styled("  ▾ ", Style::default().fg(DIR_HEADER_FG).bold()),
+                    Span::styled(label, Style::default().fg(DIR_HEADER_FG).bold()),
+                    Span::styled(count_str, Style::default().fg(Color::DarkGray)),
+                ]);
+                frame.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
+            }
+            DisplayRow::Session(idx) => {
+                let session = &state.results[*idx];
+                let selected = *idx == state.selected;
+                render_session_row(frame, inner, y, session, selected);
+            }
+        }
+    }
+    start
+}
+
+const DIR_HEADER_FG: Color = Color::Rgb(140, 160, 180);
+
+enum DisplayRow {
+    Header { name: String, count: usize },
+    Session(usize),
+}
+
+fn build_display_rows(sessions: &[Session]) -> Vec<DisplayRow> {
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < sessions.len() {
+        let dir = &sessions[i].directory;
+        let group_start = i;
+        while i < sessions.len() && sessions[i].directory == *dir {
+            i += 1;
+        }
+        rows.push(DisplayRow::Header {
+            name: sessions[group_start].workspace_name().to_string(),
+            count: i - group_start,
+        });
+        for idx in group_start..i {
+            rows.push(DisplayRow::Session(idx));
+        }
+    }
+    rows
+}
+
+fn render_session_row(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    y: u16,
+    session: &Session,
+    selected: bool,
+) {
+    let row_style = if selected {
+        Style::default().bg(Color::Rgb(68, 52, 34)).fg(Color::White)
     } else {
-        state.selected.saturating_add(1).saturating_sub(visible)
+        Style::default()
     };
-    let mut list_state =
-        ListState::default().with_selected((!state.results.is_empty()).then_some(state.selected));
-    *list_state.offset_mut() = offset;
-    frame.render_stateful_widget(list, area, &mut list_state);
-    offset
+
+    // Fill background.
+    frame.render_widget(
+        Paragraph::new(" ".repeat(area.width as usize)).style(row_style),
+        Rect::new(area.x, y, area.width, 1),
+    );
+
+    let agent_config = AGENTS.get(session.agent.as_str());
+    let agent_color = agent_config.map(|a| a.color).unwrap_or(Color::White);
+    let agent_label = agent_config
+        .map(|a| a.badge)
+        .unwrap_or(session.agent.as_str());
+    let age_text = fast_resume::tui::text::time_ago(session.timestamp);
+    let pointer = if selected { "› " } else { "  " };
+
+    // "    › agent  3h  title..."
+    let indent: u16 = 4;
+    let mut spans: Vec<Span<'_>> = Vec::new();
+    let mut used: u16 = indent;
+
+    // Pointer.
+    spans.push(Span::styled(
+        format!("{:>w$}", pointer, w = indent as usize),
+        row_style,
+    ));
+
+    // Agent badge (colored, bold).
+    let aw = (agent_label.width() as u16).min(area.width.saturating_sub(used));
+    spans.push(Span::styled(
+        truncate_display(agent_label, aw as usize),
+        row_style.fg(agent_color).add_modifier(Modifier::BOLD),
+    ));
+    used += aw;
+
+    // Gap + age (gray).
+    if used < area.width {
+        spans.push(Span::styled(" ", row_style));
+        used += 1;
+        let age_w = (age_text.width() as u16).min(area.width.saturating_sub(used));
+        spans.push(Span::styled(
+            truncate_display(&age_text, age_w as usize),
+            row_style.fg(Color::DarkGray),
+        ));
+        used += age_w;
+    }
+
+    // Gap + title.
+    if used < area.width {
+        spans.push(Span::styled(" ", row_style));
+        used += 1;
+        let title_w = area.width.saturating_sub(used) as usize;
+        spans.push(Span::styled(
+            truncate_display(&session.title, title_w),
+            row_style,
+        ));
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(area.x, y, area.width, 1),
+    );
+}
+
+/// Truncate a display string to `max_width` columns, appending "..." if needed.
+fn truncate_display(value: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_string();
+    }
+    let keep = max_width.saturating_sub(3);
+    let mut out = String::new();
+    for ch in value.chars() {
+        if UnicodeWidthStr::width(out.as_str())
+            + unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+            > keep
+        {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+/// Reorder sessions so they are clustered by directory.
+/// Groups are ordered by first appearance (= most recent session).
+fn group_by_directory(sessions: &mut Vec<Session>) {
+    if sessions.len() <= 1 {
+        return;
+    }
+    let mut dir_rank = std::collections::HashMap::<String, usize>::new();
+    for session in sessions.iter() {
+        let len = dir_rank.len();
+        dir_rank.entry(session.directory.clone()).or_insert(len);
+    }
+    sessions.sort_by_key(|s| dir_rank.get(&s.directory).copied().unwrap_or(usize::MAX));
 }
 
 fn render_preview_into(buf: &mut Buffer, area: Rect, state: &FrState) {

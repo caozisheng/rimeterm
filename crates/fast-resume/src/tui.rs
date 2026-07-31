@@ -25,7 +25,7 @@ mod layout;
 mod preview;
 mod render;
 mod state;
-mod text;
+pub mod text;
 
 use images::AgentImages;
 use input::handle_key;

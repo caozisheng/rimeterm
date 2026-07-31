@@ -157,7 +157,7 @@ fn valid_search_date_value(value: &str) -> bool {
     matches!(unit, "m" | "h" | "d" | "w" | "mo" | "y")
 }
 
-pub(super) fn time_ago(timestamp: DateTime<Local>) -> String {
+pub fn time_ago(timestamp: DateTime<Local>) -> String {
     let delta = Local::now().signed_duration_since(timestamp);
     if delta.num_minutes() < 1 {
         "now".to_string()
