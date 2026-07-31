@@ -84,7 +84,7 @@ fn main(area: Rect, show_preview: bool) -> MainLayout {
     if area.width >= 116 {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
             .split(area);
         MainLayout::Split {
             results: chunks[0],

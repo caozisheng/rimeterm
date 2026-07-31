@@ -51,6 +51,18 @@ impl Session {
             self.directory.clone()
         }
     }
+
+    /// Returns just the last component of the directory path for tree headers.
+    pub fn workspace_name(&self) -> &str {
+        if self.directory.is_empty() {
+            return "n/a";
+        }
+        let trimmed = self.directory.trim_end_matches(['/', '\\']);
+        trimmed
+            .rsplit_once(['/', '\\'])
+            .map(|(_, name)| name)
+            .unwrap_or(trimmed)
+    }
 }
 
 #[derive(Debug, Clone)]

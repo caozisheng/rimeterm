@@ -174,6 +174,7 @@ pub(super) fn time_ago(timestamp: DateTime<Local>) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn age_style(timestamp: DateTime<Local>) -> Style {
     let hours = Local::now()
         .signed_duration_since(timestamp)

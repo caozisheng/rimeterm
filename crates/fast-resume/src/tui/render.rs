@@ -12,9 +12,7 @@ use crate::model::Session;
 use super::layout::{self, MainLayout};
 use super::preview::render_preview_lines;
 use super::state::{AppState, PendingAction, YoloModal};
-use super::text::{
-    age_style, display_width_until, line_width, search_query_spans, time_ago, truncate,
-};
+use super::text::{display_width_until, line_width, search_query_spans, time_ago, truncate};
 
 const ACCENT: Color = Color::Rgb(224, 150, 70);
 const FILTER_SELECTED_BG: Color = Color::Rgb(42, 46, 54);
@@ -455,81 +453,188 @@ fn draw_results(frame: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    let columns = result_columns(inner.width);
-    draw_result_header(frame, inner, columns);
-
-    let rows_area = Rect::new(
-        inner.x,
-        inner.y.saturating_add(1),
-        inner.width,
-        inner.height.saturating_sub(1),
-    );
-
     if state.visible.is_empty() {
         frame.render_widget(
             Paragraph::new("  No sessions found").style(Style::new().fg(Color::DarkGray).italic()),
-            rows_area,
+            inner,
         );
         return;
     }
 
-    let max_rows = rows_area.height as usize;
+    // Build display rows: directory headers interleaved with session indices.
+    let display_rows = build_display_rows(&state.visible);
+    let total_display = display_rows.len();
+
+    // Find the display row that corresponds to the selected session.
+    let selected_display = display_rows
+        .iter()
+        .position(
+            |row| matches!(row, DisplayRow::Session { index, .. } if *index == state.selected),
+        )
+        .unwrap_or(0);
+
+    // Calculate scroll window.
+    let max_rows = inner.height as usize;
     if max_rows == 0 {
         return;
     }
-    let start = state
-        .selected
+    let start = selected_display
         .saturating_sub(max_rows.saturating_sub(1))
-        .min(state.visible.len().saturating_sub(1));
-    let end = (start + max_rows).min(state.visible.len());
+        .min(total_display.saturating_sub(1));
+    let end = (start + max_rows).min(total_display);
 
-    for (screen_row, session) in state.visible[start..end].iter().enumerate() {
-        let row_y = rows_area.y + screen_row as u16;
-        let selected = start + screen_row == state.selected;
-        draw_result_row(frame, rows_area, row_y, columns, session, selected, state);
+    for (screen_row, display_row) in display_rows[start..end].iter().enumerate() {
+        let y = inner.y + screen_row as u16;
+        match display_row {
+            DisplayRow::DirectoryHeader { name, count } => {
+                draw_directory_header(frame, inner, y, name, *count);
+            }
+            DisplayRow::Session { index, .. } => {
+                let session = &state.visible[*index];
+                let selected = *index == state.selected;
+                draw_session_row(frame, inner, y, session, selected, state);
+            }
+        }
     }
 }
 
-#[derive(Clone, Copy)]
-struct ResultColumns {
-    agent_x: u16,
-    agent_w: u16,
-    title_x: u16,
-    title_w: u16,
-    dir_x: u16,
-    dir_w: u16,
-    turns_x: u16,
-    turns_w: u16,
-    age_x: u16,
-    age_w: u16,
+/// A row in the tree display — either a directory header or a session entry.
+enum DisplayRow {
+    DirectoryHeader { name: String, count: usize },
+    Session { index: usize },
 }
 
-fn result_columns(width: u16) -> ResultColumns {
-    let (agent_w, dir_w, turns_w, age_w) = if width >= 100 {
-        (15, 32, 7, 10)
-    } else if width >= 72 {
-        (13, 22, 6, 9)
+/// Build a flat list of display rows from grouped sessions.
+/// Assumes `visible` is already clustered by directory (via `group_visible_by_directory`).
+fn build_display_rows(visible: &[Session]) -> Vec<DisplayRow> {
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < visible.len() {
+        let dir = &visible[i].directory;
+        let group_start = i;
+        while i < visible.len() && visible[i].directory == *dir {
+            i += 1;
+        }
+        let count = i - group_start;
+        rows.push(DisplayRow::DirectoryHeader {
+            name: visible[group_start].workspace_name().to_string(),
+            count,
+        });
+        for idx in group_start..i {
+            rows.push(DisplayRow::Session { index: idx });
+        }
+    }
+    rows
+}
+
+const DIR_HEADER_FG: Color = Color::Rgb(140, 160, 180);
+
+fn draw_directory_header(frame: &mut Frame, area: Rect, y: u16, name: &str, count: usize) {
+    let w = area.width as usize;
+    // "▾ dirname (N)"
+    let count_str = format!(" ({})", count);
+    let max_name = w.saturating_sub(4 + count_str.len()); // 2 indent + "▾ " + count
+    let label = truncate(name, max_name);
+    let line = Line::from(vec![
+        Span::styled("  ▾ ", Style::new().fg(DIR_HEADER_FG).bold()),
+        Span::styled(label, Style::new().fg(DIR_HEADER_FG).bold()),
+        Span::styled(count_str, Style::new().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(line), Rect::new(area.x, y, area.width, 1));
+}
+
+fn draw_session_row(
+    frame: &mut Frame,
+    area: Rect,
+    y: u16,
+    session: &Session,
+    selected: bool,
+    state: &AppState,
+) {
+    let row_style = if selected {
+        Style::new().bg(SELECTED_BG).fg(Color::White)
     } else {
-        (13, 0, 5, 8)
+        Style::new()
     };
-    let fixed = agent_w + dir_w + turns_w + age_w + 4;
-    let title_w = width.saturating_sub(fixed).max(16);
-    let agent_x = 0;
-    let title_x = agent_x + agent_w + 1;
-    let dir_x = title_x + title_w + 1;
-    let turns_x = dir_x + dir_w + 1;
-    let age_x = turns_x + turns_w + 1;
-    ResultColumns {
-        agent_x,
+    // Draw background fill.
+    frame.render_widget(
+        Paragraph::new(" ".repeat(area.width as usize)).style(row_style),
+        Rect::new(area.x, y, area.width, 1),
+    );
+
+    let agent_config = AGENTS.get(session.agent.as_str());
+    let agent_color = agent_config.map(|a| a.color).unwrap_or(Color::White);
+    let agent_label = agent_badge(&session.agent);
+    let age_text = time_ago(session.timestamp);
+
+    // Layout: "  ▸ [icon] agent  age  title..."
+    //          ^indent(4)
+    let pointer = if selected { "▸" } else { " " };
+    let indent: u16 = 4; // "    " tree indent
+
+    // Draw pointer at indent - 2.
+    draw_cell(
+        frame,
+        area,
+        indent.saturating_sub(2),
+        y - area.y,
+        1,
+        pointer,
+        row_style,
+    );
+
+    // Agent icon (if available).
+    let mut text_x = indent;
+    if let Some(protocol) = state
+        .images
+        .as_ref()
+        .and_then(|images| images.row.get(&session.agent))
+    {
+        frame.render_widget(
+            TuiImage::new(protocol).allow_clipping(true),
+            Rect::new(area.x + text_x, y, 2, 1),
+        );
+        text_x += 3;
+    }
+
+    // Agent badge (colored, bold).
+    let agent_w = (agent_label.width() as u16).min(area.width.saturating_sub(text_x));
+    draw_cell(
+        frame,
+        area,
+        text_x,
+        y - area.y,
         agent_w,
-        title_x,
-        title_w,
-        dir_x,
-        dir_w,
-        turns_x,
-        turns_w,
-        age_x,
+        agent_label,
+        row_style.fg(agent_color).add_modifier(Modifier::BOLD),
+    );
+    text_x += agent_w + 1; // 1 space gap
+
+    // Age (gray).
+    let age_w = (age_text.width() as u16).min(area.width.saturating_sub(text_x));
+    draw_cell(
+        frame,
+        area,
+        text_x,
+        y - area.y,
         age_w,
+        &age_text,
+        row_style.fg(Color::DarkGray),
+    );
+    text_x += age_w + 1; // 1 space gap
+
+    // Title (remaining width).
+    let title_w = area.width.saturating_sub(text_x);
+    if title_w > 0 {
+        draw_cell(
+            frame,
+            area,
+            text_x,
+            y - area.y,
+            title_w,
+            &truncate(&session.title, title_w as usize),
+            row_style,
+        );
     }
 }
 
@@ -542,150 +647,6 @@ fn agent_badge(agent: &str) -> &str {
         .get(agent)
         .map(|config| config.badge)
         .unwrap_or(agent)
-}
-
-fn draw_result_header(frame: &mut Frame, inner: Rect, columns: ResultColumns) {
-    let style = Style::new().fg(Color::Gray).bold();
-    draw_cell(
-        frame,
-        inner,
-        columns.agent_x,
-        0,
-        columns.agent_w,
-        "  Agent",
-        style,
-    );
-    draw_cell(
-        frame,
-        inner,
-        columns.title_x,
-        0,
-        columns.title_w,
-        "Title",
-        style,
-    );
-    if columns.dir_w > 0 {
-        draw_cell(
-            frame,
-            inner,
-            columns.dir_x,
-            0,
-            columns.dir_w,
-            "Directory",
-            style,
-        );
-    }
-    draw_cell(
-        frame,
-        inner,
-        columns.turns_x,
-        0,
-        columns.turns_w,
-        "Turns",
-        style,
-    );
-    draw_cell(frame, inner, columns.age_x, 0, columns.age_w, "Age", style);
-}
-
-fn draw_result_row(
-    frame: &mut Frame,
-    rows_area: Rect,
-    row_y: u16,
-    columns: ResultColumns,
-    session: &Session,
-    selected: bool,
-    state: &AppState,
-) {
-    let row_style = if selected {
-        Style::new().bg(SELECTED_BG).fg(Color::White)
-    } else {
-        Style::new()
-    };
-    frame.render_widget(
-        Paragraph::new(" ".repeat(rows_area.width as usize)).style(row_style),
-        Rect::new(rows_area.x, row_y, rows_area.width, 1),
-    );
-
-    let agent_config = AGENTS.get(session.agent.as_str());
-    let agent_color = agent_config
-        .map(|agent| agent.color)
-        .unwrap_or(Color::White);
-    let agent_label = agent_badge(&session.agent);
-    let pointer = if selected { "▸" } else { " " };
-    draw_cell(
-        frame,
-        rows_area,
-        0,
-        row_y - rows_area.y,
-        1,
-        pointer,
-        row_style,
-    );
-
-    let label_x = if let Some(protocol) = state
-        .images
-        .as_ref()
-        .and_then(|images| images.row.get(&session.agent))
-    {
-        frame.render_widget(
-            TuiImage::new(protocol).allow_clipping(true),
-            Rect::new(rows_area.x + 2, row_y, 2, 1),
-        );
-        5
-    } else {
-        2
-    };
-
-    draw_cell(
-        frame,
-        rows_area,
-        label_x,
-        row_y - rows_area.y,
-        columns.agent_w.saturating_sub(label_x),
-        &truncate(
-            agent_label,
-            columns.agent_w.saturating_sub(label_x) as usize,
-        ),
-        row_style.fg(agent_color).add_modifier(Modifier::BOLD),
-    );
-    draw_cell(
-        frame,
-        rows_area,
-        columns.title_x,
-        row_y - rows_area.y,
-        columns.title_w,
-        &truncate(&session.title, columns.title_w as usize),
-        row_style,
-    );
-    if columns.dir_w > 0 {
-        draw_cell(
-            frame,
-            rows_area,
-            columns.dir_x,
-            row_y - rows_area.y,
-            columns.dir_w,
-            &truncate(&session.display_directory(), columns.dir_w as usize),
-            row_style.fg(Color::DarkGray),
-        );
-    }
-    draw_cell(
-        frame,
-        rows_area,
-        columns.turns_x,
-        row_y - rows_area.y,
-        columns.turns_w,
-        &session.message_count.to_string(),
-        row_style,
-    );
-    draw_cell(
-        frame,
-        rows_area,
-        columns.age_x,
-        row_y - rows_area.y,
-        columns.age_w,
-        &time_ago(session.timestamp),
-        age_style(session.timestamp).bg(row_style.bg.unwrap_or(Color::Reset)),
-    );
 }
 
 fn draw_cell(frame: &mut Frame, area: Rect, x: u16, y: u16, width: u16, text: &str, style: Style) {
@@ -981,11 +942,25 @@ mod tests {
     }
 
     #[test]
-    fn narrow_results_reserve_room_for_the_longest_agent_badge() {
-        let columns = result_columns(60);
-
-        assert_eq!(columns.agent_w, 13);
-        assert_eq!(columns.agent_w - 5, "opencode".width() as u16);
+    fn display_rows_groups_sessions_by_directory() {
+        use chrono::Local;
+        let now = Local::now();
+        let sessions = vec![
+            Session::new("1", "claude", "fix bug", "/home/user/foo", now, "", 5),
+            Session::new("2", "codex", "add test", "/home/user/foo", now, "", 3),
+            Session::new("3", "pi", "refactor", "/home/user/bar", now, "", 2),
+        ];
+        let rows = build_display_rows(&sessions);
+        assert_eq!(rows.len(), 5); // 2 headers + 3 sessions
+        assert!(
+            matches!(&rows[0], DisplayRow::DirectoryHeader { name, count } if name == "foo" && *count == 2)
+        );
+        assert!(matches!(&rows[1], DisplayRow::Session { index: 0 }));
+        assert!(matches!(&rows[2], DisplayRow::Session { index: 1 }));
+        assert!(
+            matches!(&rows[3], DisplayRow::DirectoryHeader { name, count } if name == "bar" && *count == 1)
+        );
+        assert!(matches!(&rows[4], DisplayRow::Session { index: 2 }));
     }
 
     #[test]

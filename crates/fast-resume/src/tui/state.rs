@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::config::{AGENT_ORDER, is_agent};
@@ -135,6 +136,7 @@ impl AppState {
             directory_filter.as_deref(),
             100,
         );
+        self.group_visible_by_directory();
         self.last_search_ms = start.elapsed().as_secs_f64() * 1000.0;
         self.update_selection_after_search(selected_session.as_ref());
         self.preview_scroll = 0;
@@ -188,6 +190,7 @@ impl AppState {
         let selected_session = preserve_selection.and_then(|_| self.selected_session_key());
         self.visible = visible;
         self.last_search_ms = elapsed_ms;
+        self.group_visible_by_directory();
         self.applied_search_generation = generation;
         self.update_selection_after_search(selected_session.as_ref());
         self.search_preserve_selection = None;
@@ -394,6 +397,24 @@ impl AppState {
         if query_has_agent_filter(&self.query) {
             self.agent_filter = None;
         }
+    }
+
+    /// Reorder `visible` so sessions are clustered by directory.
+    /// Directory groups are ordered by the most recent session in each group.
+    /// Sessions within a group keep their original (recency) order.
+    fn group_visible_by_directory(&mut self) {
+        if self.visible.len() <= 1 {
+            return;
+        }
+        // Assign each directory a rank based on first appearance (= most recent session).
+        let mut dir_rank: HashMap<String, usize> = HashMap::new();
+        for session in &self.visible {
+            let len = dir_rank.len();
+            dir_rank.entry(session.directory.clone()).or_insert(len);
+        }
+        // Stable sort by directory rank preserves recency within each group.
+        self.visible
+            .sort_by_key(|s| dir_rank.get(&s.directory).copied().unwrap_or(usize::MAX));
     }
 }
 
