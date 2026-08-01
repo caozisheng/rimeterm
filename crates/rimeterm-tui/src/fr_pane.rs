@@ -437,7 +437,7 @@ impl FrPane {
         worker.refresh();
         Self {
             id: PaneId::next(),
-            title: "FR".to_string(),
+            title: "sessions".to_string(),
             state,
             worker,
             action_tx,
