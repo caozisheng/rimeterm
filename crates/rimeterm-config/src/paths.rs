@@ -68,6 +68,12 @@ pub fn data_dir() -> Option<PathBuf> {
     home().map(|d| d.join("data"))
 }
 
+/// Global stock watchlist. It follows the user rather than the active
+/// workspace, like the Todo store.
+pub fn stock_watchlist_file() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("stock").join("watchlist.toml"))
+}
+
 /// `~/.rimeterm/bin/` — essentials binaries live here (C21.5).
 ///
 /// Populated at first launch by [`crate::essentials::materialize`] from
@@ -458,5 +464,15 @@ mod tests {
             strip_extended_prefix(r"C:\Users\z\workspace"),
             r"C:\Users\z\workspace"
         );
+    }
+
+    #[test]
+    fn stock_watchlist_lives_in_global_data_dir() {
+        with_rimeterm_home(|root| {
+            assert_eq!(
+                stock_watchlist_file(),
+                Some(root.join("data").join("stock").join("watchlist.toml")),
+            );
+        });
     }
 }

@@ -81,7 +81,13 @@ ships.
   Benchmarks / Status stay in upstream `modelsdev` for users who
   want the full experience.
 - [reqwest](https://github.com/seanmonstar/reqwest) — MIT / Apache-2.0.
-  Blocking HTTP client used by the fetcher.
+
+## Native stock market pane
+
+- [akshare-rs](https://github.com/Cricle/akshare-rs) — MIT / Apache-2.0.
+  Pinned at the `e7291600ab99ee95e6b38b0ce1301154d6eb46d8` revision and used
+  by the in-process `rimeterm-stock` crate for A-share, HK, US quotes,
+  indices, search, historical candles, and financial news.
 
 ## Native session search
 

@@ -39,6 +39,7 @@ pub struct Config {
     pub sysmon: SysmonConfig,
     pub mouse: MouseConfig,
     pub viewer: ViewerConfig,
+    pub stock: StockConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -276,6 +277,32 @@ impl Default for SysmonConfig {
     }
 }
 
+/// Stock-pane refresh policy. Open-market updates are capped at the configured
+/// rate; closed markets use a slow poll so stale quotes can still catch up.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StockConfig {
+    /// Open-market refresh rate in Hz. `1` means one refresh per second.
+    pub open_refresh_hz: u16,
+    /// Closed-market refresh interval in seconds.
+    pub closed_refresh_secs: u64,
+    /// Optional HTTP(S) proxy used by akshare requests.
+    pub http_proxy: Option<String>,
+    /// Optional Tushare token used by akshare's A-share fallback.
+    pub tushare_token: Option<String>,
+}
+
+impl Default for StockConfig {
+    fn default() -> Self {
+        Self {
+            open_refresh_hz: 1,
+            closed_refresh_secs: 60,
+            http_proxy: None,
+            tushare_token: None,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("I/O error reading `{path}`: {source}")]
@@ -406,5 +433,21 @@ install_hint = "brew install yazi"
         let err_scroll =
             toml::from_str::<Config>("[mouse]\nquicklook_scrollbar = true\n").unwrap_err();
         assert!(err_scroll.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn stock_config_defaults_to_one_hz_open_and_slow_closed() {
+        let stock = StockConfig::default();
+        assert_eq!((stock.open_refresh_hz, stock.closed_refresh_secs), (1, 60));
+    }
+
+    #[test]
+    fn stock_config_partial_toml_overrides_refresh_rates() {
+        let cfg: Config =
+            toml::from_str("[stock]\nopen_refresh_hz = 2\nclosed_refresh_secs = 120\n").unwrap();
+        assert_eq!(
+            (cfg.stock.open_refresh_hz, cfg.stock.closed_refresh_secs),
+            (2, 120)
+        );
     }
 }

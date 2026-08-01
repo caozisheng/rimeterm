@@ -863,6 +863,16 @@ impl App {
         pinned_pane_ids.insert(models_id);
         git_members.push(models_id);
 
+        // Left-bottom group fifth tab: Native stock watchlist and market view.
+        // Data access stays in rimeterm-stock; this pane remains pinned.
+        let stock_watchlist = rimeterm_config::paths::stock_watchlist_file()
+            .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-stock-watchlist.toml"));
+        let stock = crate::stock_pane::StockPane::new(config.stock.clone(), stock_watchlist);
+        let stock_id = stock.id();
+        panes.insert(Box::new(stock));
+        pinned_pane_ids.insert(stock_id);
+        git_members.push(stock_id);
+
         // Shells group: always at least one interactive shell. Bottom
         // moved to the left-bottom (git) group, so shells is single-
         // purpose now.
@@ -2954,6 +2964,12 @@ impl App {
                     &closable,
                     tab_hover,
                 );
+                let active_id = group.active_pane();
+                for member_id in group.members() {
+                    if let Some(pane) = self.panes.get_mut(*member_id) {
+                        pane.set_visible(active_id == Some(*member_id));
+                    }
+                }
                 if let Some(active_id) = group.active_pane() {
                     self.last_pane_outer_rects.push((active_id, pane_rect));
                     if let Some(pane) = self.panes.get_mut(active_id) {

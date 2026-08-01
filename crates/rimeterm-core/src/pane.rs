@@ -160,6 +160,12 @@ pub trait PaneProvider: Send + 'static {
         false
     }
 
+    /// Inform the provider whether its tab is the active member of its group.
+    /// Data panes use this to lower background refresh frequency while hidden.
+    fn set_visible(&mut self, visible: bool) {
+        let _ = visible;
+    }
+
     /// Reload the pane's content in place. Providers that source data
     /// from disk (native file manager, editor) reread it and drop any
     /// caches; PTY / placeholder providers keep the default no-op. Bound

@@ -15,6 +15,7 @@ rimeterm-config = { workspace = true }
 rimeterm-pty = { workspace = true }
 rimeterm-ipc = { workspace = true }
 fast-resume = { workspace = true }
+rimeterm-stock = { workspace = true }
 serde_json = "1"
 parking_lot = "0.12"
 serde = { workspace = true }
@@ -25,6 +26,7 @@ tokio = { workspace = true, features = ["fs"] }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
 regex = "1.10"
+chrono = { workspace = true }
 futures = { version = "0.3", default-features = false, features = ["std"] }
 which = { workspace = true }
 unicode-width = { workspace = true }
