@@ -1222,18 +1222,21 @@ impl App {
         }
 
         // When the viewer overlay is up:
-        //   - bare `←` and `Esc` always close (matches C22's `→ = open`)
-        //     regardless of which pane owns focus, because the overlay
-        //     visually covers the left column and the user expects the
-        //     dismiss chord to work as long as they can see it.
-        //   - other modal keys (j/k/PgUp/PgDn/g/G/+/-/0) only fire when
-        //     `viewer_focused` is true (i.e. the overlay was opened
-        //     from yazi/gitui so keys route to it). Otherwise the user
-        //     is typing into agents/shells and their keystrokes must
-        //     reach that pane.
+        //   - bare `←` and `Esc` close the overlay UNLESS the focused
+        //     pane is a PTY (agents / shells group), because those
+        //     panes need bare `←` for readline left-motion and `Esc`
+        //     for vim's normal-mode exit. Files / git panes (and the
+        //     "no focus" bootstrap window) don't compete for those
+        //     keys, so the overlay is the natural dismiss target from
+        //     the left column. Global dismissals stay available via
+        //     `Alt+V`, the `[×]` mouse affordance, and the
+        //     `viewer.close` command.
+        //   - other modal keys (j/k/PgUp/PgDn/g/G/+/-/0) only fire
+        //     when `viewer_focused` is true (i.e. focus is on
+        //     files/git). Otherwise the user is typing into
+        //     agents/shells and their keystrokes must reach that pane.
         if overlay_open {
-            let bare_left = matches!(key.code, KeyCode::Left) && key.modifiers.is_empty();
-            if matches!(key.code, KeyCode::Esc) || bare_left {
+            if should_dismiss_viewer_overlay(key, true, self.focus.focused_group()) {
                 self.close_viewer_overlay();
                 return true;
             }
@@ -4012,6 +4015,10 @@ impl App {
         let workspace_changed = self.active_root != resolved;
         if workspace_changed {
             self.active_root = resolved.clone();
+            // Persist immediately so a hard terminal close (window `×`,
+            // SIGTERM, killed shell) still remembers the last workspace
+            // — `shutdown()` may not run in those paths.
+            self.persist_session_state();
         }
         if let Some(git_id) = self.git_pane_id {
             if let Some(pane) = self.panes.get_mut(git_id) {
@@ -4142,6 +4149,10 @@ impl App {
             return Ok(abs.display().to_string());
         }
         self.active_root = abs.clone();
+        // Persist immediately — same rationale as `sync_from_file_manager`:
+        // a hard terminal close between now and `shutdown()` would
+        // otherwise silently drop the switch.
+        self.persist_session_state();
         self.set_hint(format!("cwd → {}", abs.display()));
         Ok(abs.display().to_string())
     }
@@ -6415,6 +6426,50 @@ fn should_hijack_right_for_viewer_with_editing(
     selection.is_some()
 }
 
+/// Decide whether an incoming key should dismiss the currently-open
+/// viewer overlay.
+///
+/// Rule: bare `←` and `Esc` close the overlay UNLESS the focused pane
+/// is a PTY that would consume the key for its own line editing —
+/// i.e. focus is on the agents or shells group. When focus is on the
+/// files/git column, on no pane at all, or anywhere else, the overlay
+/// is the natural target for the dismiss chord and should close.
+///
+/// Mirrors the `→ = open` gate in
+/// [`should_hijack_right_for_viewer_with_editing`]: `→` is the
+/// symmetric "open" affordance from the file manager, `←`/`Esc` is the
+/// symmetric "close" affordance from anywhere that isn't actively
+/// swallowing the key. Global dismissals also stay available via
+/// `Alt+V`, the `[×]` mouse affordance, and the `viewer.close`
+/// command.
+///
+/// Any modifier (`Ctrl` / `Alt` / `Shift`) falls through so global
+/// chords such as `Alt+HJKL` and `Ctrl+Q` still work; the modifier
+/// filter matches the sibling right-arrow rule.
+///
+/// Pure — no `App` / focus / filesystem access, so the routing logic
+/// is unit-testable without spinning up a live App.
+fn should_dismiss_viewer_overlay(
+    key: KeyEvent,
+    overlay_open: bool,
+    focused_group: Option<TabGroupId>,
+) -> bool {
+    use crossterm::event::KeyCode;
+    if !overlay_open {
+        return false;
+    }
+    if !key.modifiers.is_empty() {
+        return false;
+    }
+    if !matches!(key.code, KeyCode::Left | KeyCode::Esc) {
+        return false;
+    }
+    // Only agents / shells swallow bare `←`/`Esc` for their PTY line
+    // editor. Everything else (files / git / no focus) yields the key
+    // to the overlay so the user can dismiss it.
+    !matches!(focused_group, Some(g) if g == BUILTIN_AGENTS || g == BUILTIN_SHELLS)
+}
+
 fn should_route_pane_mouse(kind: MouseEventKind, hit: PaneId, focused: Option<PaneId>) -> bool {
     !matches!(
         kind,
@@ -7576,6 +7631,132 @@ mod tests {
         let fm = PaneId::next();
         let sel = selection("/x/README.md");
         assert!(!should_hijack_right_for_viewer(Some(fm), None, Some(&sel),));
+    }
+
+    // --- Left/Esc dismiss gating (viewer overlay) --------------------
+
+    fn key(code: crossterm::event::KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn key_with(code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn bare_left_closes_from_left_column_but_yields_to_agent_shell_pty() {
+        use crossterm::event::KeyCode;
+        // Focus on files / git → left column has no live editor, so
+        // `←` dismisses the overlay.
+        assert!(should_dismiss_viewer_overlay(
+            key(KeyCode::Left),
+            true,
+            Some(BUILTIN_FILES),
+        ));
+        assert!(should_dismiss_viewer_overlay(
+            key(KeyCode::Left),
+            true,
+            Some(BUILTIN_GIT),
+        ));
+        // Focus on agents / shells → PTY line editor eats `←`; the
+        // overlay MUST leave it alone or shell readline breaks.
+        assert!(!should_dismiss_viewer_overlay(
+            key(KeyCode::Left),
+            true,
+            Some(BUILTIN_AGENTS),
+        ));
+        assert!(!should_dismiss_viewer_overlay(
+            key(KeyCode::Left),
+            true,
+            Some(BUILTIN_SHELLS),
+        ));
+    }
+
+    #[test]
+    fn bare_esc_closes_from_left_column_but_yields_to_agent_shell_pty() {
+        use crossterm::event::KeyCode;
+        // Symmetric to bare-Left: `Esc` closes overlay when focus is
+        // on files/git, but passes through when a PTY pane is focused
+        // so `vim <Esc>` still exits insert mode.
+        assert!(should_dismiss_viewer_overlay(
+            key(KeyCode::Esc),
+            true,
+            Some(BUILTIN_FILES),
+        ));
+        assert!(!should_dismiss_viewer_overlay(
+            key(KeyCode::Esc),
+            true,
+            Some(BUILTIN_SHELLS),
+        ));
+    }
+
+    #[test]
+    fn bare_left_closes_when_no_pane_focused() {
+        use crossterm::event::KeyCode;
+        // Bootstrap edge case (first tick, focus not yet assigned):
+        // no pane can consume the key, so treat the overlay as the
+        // dismiss target rather than swallowing the keystroke.
+        assert!(should_dismiss_viewer_overlay(
+            key(KeyCode::Left),
+            true,
+            None,
+        ));
+    }
+
+    #[test]
+    fn dismiss_disabled_when_overlay_closed() {
+        use crossterm::event::KeyCode;
+        // No overlay → nothing to dismiss. Even a left-column focus
+        // MUST leave the key to the underlying pane handler.
+        assert!(!should_dismiss_viewer_overlay(
+            key(KeyCode::Left),
+            false,
+            Some(BUILTIN_FILES),
+        ));
+    }
+
+    #[test]
+    fn modified_left_never_dismisses() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Ctrl+Left / Alt+Left / Shift+Left are all global chords the
+        // rest of the app cares about (word-motion, focus-move); the
+        // dismiss gate MUST leave them alone regardless of focus.
+        for mods in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            assert!(!should_dismiss_viewer_overlay(
+                key_with(KeyCode::Left, mods),
+                true,
+                Some(BUILTIN_FILES),
+            ));
+        }
+    }
+
+    #[test]
+    fn non_dismiss_keys_never_close_via_this_path() {
+        use crossterm::event::KeyCode;
+        // The dismiss gate is deliberately narrow: only bare Left / Esc.
+        // Everything else (arrows the modal scrolls with, Enter, letters)
+        // is routed through `on_viewer_modal_key` and must not short-
+        // circuit into `close_viewer_overlay`.
+        for code in [
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Enter,
+            KeyCode::Char('j'),
+            KeyCode::Char('q'),
+            KeyCode::PageDown,
+        ] {
+            assert!(!should_dismiss_viewer_overlay(
+                key(code),
+                true,
+                Some(BUILTIN_FILES),
+            ));
+        }
     }
 
     // --- pane reload command (F5) -------------------------------------
