@@ -1,7 +1,7 @@
 //! Shared CLI helpers used by the TUI entry point and the one-shot CLI
 //! commands. Kept in the library crate so both resolve target paths the same
 //! way. This module is the single place that reads the todo.txt environment
-//! variables (`TODO_FILE`, `TODO_DIR`, `DONE_FILE`) — the core stays env-free.
+//! variables (`TODO_FILE`, `TODO_DIR`, `ARCHIVE_FILE`) — the core stays env-free.
 
 use std::fs::OpenOptions;
 use std::io;
@@ -37,16 +37,17 @@ pub fn resolve_path(arg: Option<String>) -> io::Result<PathBuf> {
     sample_path()
 }
 
-/// Resolve the `done.txt` path for archiving. Honors `$DONE_FILE`; otherwise
-/// the sibling `done.txt` next to the todo file (the core's default).
-pub fn done_path(todo_path: &Path) -> PathBuf {
-    if let Some(f) = std::env::var_os("DONE_FILE") {
+/// Resolve the `archive.txt` path for archiving. Honors `$ARCHIVE_FILE`;
+/// otherwise the sibling `archive.txt` next to the todo file (the core's
+/// default).
+pub fn archive_path(todo_path: &Path) -> PathBuf {
+    if let Some(f) = std::env::var_os("ARCHIVE_FILE") {
         return PathBuf::from(f);
     }
     todo_path
         .parent()
-        .map(|p| p.join("done.txt"))
-        .unwrap_or_else(|| PathBuf::from("done.txt"))
+        .map(|p| p.join("archive.txt"))
+        .unwrap_or_else(|| PathBuf::from("archive.txt"))
 }
 
 /// Create `pb` (and any missing parent directories) if it doesn't exist, then
@@ -122,13 +123,13 @@ enum TargetDecision {
 }
 
 /// Write the bundled sample todo.txt to the system temp dir and return
-/// its path. Also resets the sibling `done.txt` so a previous session's
+/// its path. Also resets the sibling `archive.txt` so a previous session's
 /// archived rows don't leak back as duplicates.
 pub fn sample_path() -> io::Result<PathBuf> {
     let dir = std::env::temp_dir();
     let pb = dir.join("tuxedo-sample.txt");
     std::fs::write(&pb, sample::TODO_RAW)?;
-    match std::fs::remove_file(dir.join("done.txt")) {
+    match std::fs::remove_file(dir.join("archive.txt")) {
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),

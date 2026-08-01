@@ -2,7 +2,7 @@
 source: crates/tuxedo/tests/snapshots.rs
 expression: buffer_to_text(&buf)
 ---
- FILTERS                   ▶▮◀ /tmp/tuxedo-snapshot.txt  •  15 tas DETAIL                           
+ FILTERS                   ▶▮◀ /tmp/tuxedo-snapshot.txt  •  18 tas DETAIL                           
      ┌ tuxedo · help ─────────────────────────────────────────────────────────────────────────┐     
  PROJ│  NAVIGATION                                  VIEW                                      │     
    +w│    j / ↓             next task                 /                 fuzzy search          │     
@@ -11,26 +11,26 @@ expression: buffer_to_text(&buf)
    +h│    G                 last task                 S                 cycle sort            │     
    +l│    Ctrl-d / Ctrl-u   page down / up            v                 visual / multi-select │     
    +p│                                                l                 list view             │     
-   +t│  EDITING                                       a                 archive view          │     
-     │    n                 new task                  A                 archive completed     │rd   
- CONT│    e                 edit line (normal)        H                 show done in list     │     
-   @e│    i                 edit line (insert)        F                 show future in list   │     
-   @h│    r                 reschedule task           [ / ]             toggle filter / detail│     
-   @l│    x                 toggle complete           T                 cycle theme           │     
-   @p│    dd                delete task               D                 cycle density         │     
-     │    p                 cycle priority A→B→C→·    L                 toggle line numbers   │     
-     │    c                 add/remove context                                                │     
-     │    +                 add project             SYSTEM                                    │     
-     │    yy                copy line to clipboard    : / Ctrl-P        command palette       │     
-     │    yb                copy body only            s                 share capture QR      │     
-     │    u                 undo                      ? / ,             help / settings       │     
-     │                                                q                 quit                  │     
+   +t│  EDITING                                       a                 archive view (dd resto│     
+     │    n                 new task                  F                 show future in list   │rd   
+ CONT│    e                 edit line (normal)        [ / ]             toggle filter / detail│     
+   @e│    i                 edit line (insert)        T                 cycle theme           │     
+   @h│    r                 reschedule task           D                 cycle density         │     
+   @l│    x                 toggle complete           L                 toggle line numbers   │     
+   @p│    dd                archive task (list); restore (archive)                            │     
+     │    p                 cycle priority A→B→C→·  SYSTEM                                    │     
+     │    c                 add/remove context        : / Ctrl-P        command palette       │     
+     │    +                 add project               s                 share capture QR      │     
+     │    yy                copy line to clipboard    ? / ,             help / settings       │     
+     │    yb                copy body only            q                 quit                  │     
+     │    u                 undo                                                              │     
      │────────────────────────────────────────────────────────────────────────────────────────│     
      │  FORMAT                                                                                │     
      │    (A)               priority A-Z              due:YYYY-MM-DD    due date              │     
      │    YYYY-MM-DD        creation / done date      rec:Nu            recur (u in d/w/m/y/b)│     
      │    +project          project tag(s)            rec:+Nu           strict: anchor on due:│     
      │    @context          context tag(s)            x DATE BODY       completed task prefix │     
+     │                                                                                        │     
      └────────────────────────────────────────────────────────────────────────────────────────┘     
                                                                                                     
- HELP   ? close help                                         15 open · 2026-05-06 · tuxedo 2026.7.1
+ HELP   ? close help                                         18 open · 2026-05-06 · tuxedo 2026.7.1

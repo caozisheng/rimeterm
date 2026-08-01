@@ -38,7 +38,7 @@ pub const ENTRIES: &[PaletteEntry] = &[
         action: Action::ToggleComplete,
     },
     PaletteEntry {
-        label: "delete task",
+        label: "archive task",
         keys: "dd",
         action: Action::Delete,
     },
@@ -161,16 +161,6 @@ pub const ENTRIES: &[PaletteEntry] = &[
         label: "toggle archive view",
         keys: "a",
         action: Action::ToggleArchiveView,
-    },
-    PaletteEntry {
-        label: "archive completed tasks",
-        keys: "A",
-        action: Action::ArchiveCompleted,
-    },
-    PaletteEntry {
-        label: "show done in list",
-        keys: "H",
-        action: Action::ToggleShowDone,
     },
     PaletteEntry {
         label: "show future in list",
@@ -448,12 +438,12 @@ mod tests {
 
     #[test]
     fn start_of_label_ranks_above_mid_label() {
-        // "arch" appears at byte 0 of "archive completed tasks", after a
-        // space in "toggle archive view", and mid-word in "fuzzy search".
+        // "arch" appears at byte 0 of "archive task", after a space in
+        // "toggle archive view", and mid-word in "fuzzy search".
         // Start-of-label must win.
         let hits = filtered("arch");
         let labels: Vec<&str> = hits.iter().map(|h| ENTRIES[h.entry_idx].label).collect();
-        assert_eq!(labels.first().copied(), Some("archive completed tasks"));
+        assert_eq!(labels.first().copied(), Some("archive task"));
     }
 
     #[test]
@@ -528,7 +518,6 @@ mod tests {
             Action::ToggleSelected,
             Action::GoList,
             Action::ToggleArchiveView,
-            Action::ArchiveCompleted,
             Action::PickProject,
             Action::PickContext,
             Action::CycleSort,
@@ -539,7 +528,6 @@ mod tests {
             Action::CycleTheme,
             Action::CycleDensity,
             Action::ToggleLineNum,
-            Action::ToggleShowDone,
             Action::ToggleShowFuture,
             Action::CopyLine,
             Action::CopyBody,

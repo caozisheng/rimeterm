@@ -164,21 +164,21 @@ pub struct App {
 }
 
 impl App {
-    /// Construct an App whose archive is the sibling `done.txt` of `file_path`.
+    /// Construct an App whose archive is the sibling `archive.txt` of `file_path`.
     pub fn new(file_path: PathBuf, body: String, today: String, cfg: Config) -> Self {
         let store = Store::new(file_path.clone(), body, today);
         Self::from_store(store, file_path, cfg)
     }
 
-    /// Like [`App::new`] but with an explicit `done.txt` path (e.g. `DONE_FILE`).
-    pub fn new_with_done(
+    /// Like [`App::new`] but with an explicit `archive.txt` path (e.g. `ARCHIVE_FILE`).
+    pub fn new_with_archive(
         file_path: PathBuf,
-        done_path: PathBuf,
+        archive_path: PathBuf,
         body: String,
         today: String,
         cfg: Config,
     ) -> Self {
-        let store = Store::new_with_done(file_path.clone(), done_path, body, today);
+        let store = Store::new_with_archive(file_path.clone(), archive_path, body, today);
         Self::from_store(store, file_path, cfg)
     }
 
@@ -232,13 +232,13 @@ impl App {
 
     /// Rebind the App to a different on-disk file at runtime, replacing the
     /// store (tasks, archive, history, external-change baseline) with a fresh
-    /// one for `file_path`/`done_path` loaded from `body`. Prefs, saved
+    /// one for `file_path`/`archive_path` loaded from `body`. Prefs, saved
     /// filters, theme, and config live on `App` and are left intact. Used by
     /// the first-run welcome prompt to swap from the placeholder file to the
     /// chosen one. Resets the cursor and recomputes the visible cache.
-    pub fn open_file(&mut self, file_path: PathBuf, done_path: PathBuf, body: String) {
+    pub fn open_file(&mut self, file_path: PathBuf, archive_path: PathBuf, body: String) {
         let today = self.store.today().to_string();
-        self.store = Store::new_with_done(file_path.clone(), done_path, body, today);
+        self.store = Store::new_with_archive(file_path.clone(), archive_path, body, today);
         self.file_path = file_path;
         self.cursor = 0;
         self.recompute_visible();
@@ -438,7 +438,7 @@ impl App {
         self.store.tasks()
     }
 
-    /// Read-only view of the archived (`done.txt`) tasks.
+    /// Read-only view of the archived (`archive.txt`) tasks.
     pub fn archive(&self) -> &Archive {
         self.store.archive()
     }
@@ -483,7 +483,7 @@ impl App {
         }
     }
 
-    /// Pump archive state (startup loader + external `done.txt` edits). Returns
+    /// Pump archive state (startup loader + external `archive.txt` edits). Returns
     /// true when the visible archive changed, so the caller redraws. Refreshes
     /// the visible cache when the Archive view is active.
     pub fn poll_archive(&mut self) -> bool {

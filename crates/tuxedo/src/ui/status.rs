@@ -38,26 +38,32 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         mode_label = format!("{mode_label} · {f}").into();
     }
 
-    let hint = match app.mode {
-        Mode::Insert => match app.draft.input_mode() {
-            DialogInputMode::Normal => {
-                "h/l navigate · w/b/e word · i/a insert · Enter save · Esc cancel"
+    let hint = if matches!(app.view, View::Archive) && app.mode == Mode::Normal {
+        "j/k · dd restore · a back to list · q quit"
+    } else {
+        match app.mode {
+            Mode::Insert => match app.draft.input_mode() {
+                DialogInputMode::Normal => {
+                    "h/l navigate · w/b/e word · i/a insert · Enter save · Esc cancel"
+                }
+                DialogInputMode::Insert => "Enter save · Esc normal",
+            },
+            Mode::Visual => "space toggle · x complete · dd archive · Esc cancel",
+            Mode::Help => "? close help",
+            Mode::Settings => "Esc back",
+            Mode::PromptProject => "type +project name · Enter save · Esc cancel",
+            Mode::PromptContext => "type @context name · Enter toggle · Esc cancel",
+            Mode::PickProject => "j/k or ↑↓ cycle projects · Enter keep · Esc clear",
+            Mode::PickContext => "j/k or ↑↓ cycle contexts · Enter keep · Esc clear",
+            Mode::PickSavedFilter => "j/k or ↑↓ cycle filters · Enter keep · Esc revert",
+            Mode::PromptSaveFilter => "type a filter name · Enter save · Esc cancel",
+            Mode::CommandPalette => "type to filter · Enter run · Esc cancel",
+            Mode::Share => "scan the QR · any key dismisses",
+            Mode::Welcome => "c create ./todo.txt · s open sample · q quit",
+            _ => {
+                "j/k · n new · x done · dd archive · a archived · / search · ? help · u undo · q quit"
             }
-            DialogInputMode::Insert => "Enter save · Esc normal",
-        },
-        Mode::Visual => "space toggle · x complete · dd delete · Esc cancel",
-        Mode::Help => "? close help",
-        Mode::Settings => "Esc back",
-        Mode::PromptProject => "type +project name · Enter save · Esc cancel",
-        Mode::PromptContext => "type @context name · Enter toggle · Esc cancel",
-        Mode::PickProject => "j/k or ↑↓ cycle projects · Enter keep · Esc clear",
-        Mode::PickContext => "j/k or ↑↓ cycle contexts · Enter keep · Esc clear",
-        Mode::PickSavedFilter => "j/k or ↑↓ cycle filters · Enter keep · Esc revert",
-        Mode::PromptSaveFilter => "type a filter name · Enter save · Esc cancel",
-        Mode::CommandPalette => "type to filter · Enter run · Esc cancel",
-        Mode::Share => "scan the QR · any key dismisses",
-        Mode::Welcome => "c create ./todo.txt · s open sample · q quit",
-        _ => "j/k · n new · r reschedule · x done · / search · ? help · u undo · q quit",
+        }
     };
 
     let mut right_parts = Vec::new();

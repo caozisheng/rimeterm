@@ -106,7 +106,7 @@ fn handle_welcome(app: &mut App, key: KeyEvent) {
         },
         KeyCode::Char('s') => match cli::sample_path() {
             Ok(sample) => {
-                let done = cli::done_path(&sample);
+                let done = cli::archive_path(&sample);
                 let body = std::fs::read_to_string(&sample).unwrap_or_default();
                 app.open_file(sample, done, body);
                 app.mode = Mode::Normal;
@@ -756,7 +756,6 @@ fn resolve_normal_key(app: &mut App, key: KeyEvent, keybinds: &KeyBindings) -> O
         KeyCode::Char('u') => Action::Undo,
         KeyCode::Char('v') => Action::ToggleVisual,
         KeyCode::Char(' ') => Action::ToggleSelected,
-        KeyCode::Char('A') => Action::ArchiveCompleted,
         // First 'f' arms the leader; a second 'f' (`ff`) opens the saved-
         // search picker. Mirrors the `fp`/`fc` pattern below.
         KeyCode::Char('f') => {
@@ -781,7 +780,6 @@ fn resolve_normal_key(app: &mut App, key: KeyEvent, keybinds: &KeyBindings) -> O
         KeyCode::Char('T') => Action::OpenThemePicker,
         KeyCode::Char('D') => Action::CycleDensity,
         KeyCode::Char('L') => Action::ToggleLineNum,
-        KeyCode::Char('H') => Action::ToggleShowDone,
         KeyCode::Char('F') => Action::ToggleShowFuture,
         KeyCode::Esc => Action::EscapeStack,
         KeyCode::Char('W') => Action::ChangeWeekStart,
@@ -790,23 +788,22 @@ fn resolve_normal_key(app: &mut App, key: KeyEvent, keybinds: &KeyBindings) -> O
 }
 
 fn apply_action(app: &mut App, action: Action, features: ControllerFeatures) -> bool {
-    // Archive view is read-only with two exceptions: `x` un-archives the
-    // row at the cursor, `dd` permanently removes it from done.txt. Other
-    // mutating actions flash a hint and abort. Navigation, view-switch,
-    // theme/density/layout toggles, and overlays (help/settings) fall
-    // through to the normal handler below.
+    // Archive view is read-only with one exception: `dd` restores the row at
+    // the cursor to the live list (state preserved). `x` is deliberately a
+    // no-op here — there's no complete/uncomplete concept in the archive.
+    // Every other mutating action flashes a hint and aborts. Navigation,
+    // view-switch, theme/density/layout toggles, and overlays (help/settings)
+    // fall through to the normal handler below.
     if app.view() == View::Archive {
         match action {
-            Action::ToggleComplete => {
+            Action::Delete => {
                 if let Some(idx) = app.cur_abs() {
                     app.unarchive(idx);
                 }
                 return false;
             }
-            Action::Delete => {
-                if let Some(idx) = app.cur_abs() {
-                    app.archive_delete(idx);
-                }
+            Action::ToggleComplete => {
+                app.flash("x disabled in archive · dd restores");
                 return false;
             }
             Action::BeginAdd
@@ -823,7 +820,6 @@ fn apply_action(app: &mut App, action: Action, features: ControllerFeatures) -> 
             | Action::PickSavedFilter
             | Action::SaveCurrentFilter
             | Action::CycleSort
-            | Action::ToggleShowDone
             | Action::ToggleShowFuture
             | Action::Undo => {
                 app.flash("read-only in archive");
@@ -883,9 +879,9 @@ fn apply_action(app: &mut App, action: Action, features: ControllerFeatures) -> 
         }
         Action::Delete => {
             if app.mode == Mode::Visual && !app.selection.is_empty() {
-                app.delete_selected();
+                app.archive_selected();
             } else if let Some(abs) = app.cur_abs() {
-                app.delete(abs);
+                app.archive_at(abs);
             }
         }
         Action::CyclePriority => {
@@ -933,15 +929,6 @@ fn apply_action(app: &mut App, action: Action, features: ControllerFeatures) -> 
                 View::Archive
             };
             app.set_view(next);
-        }
-        Action::ArchiveCompleted => {
-            if app.view() == View::Archive {
-                app.flash("already in archive");
-            } else if app.has_completed_tasks() {
-                app.archive_completed();
-            } else {
-                app.flash("no completed tasks to archive");
-            }
         }
         Action::ArmF => app.chord.arm('f'),
         Action::PickProject => app.enter_pick_project(),
@@ -994,15 +981,6 @@ fn apply_action(app: &mut App, action: Action, features: ControllerFeatures) -> 
         }
         Action::ToggleLineNum => {
             app.prefs.toggle_line_num();
-            app.save_prefs();
-        }
-        Action::ToggleShowDone if !features.config => {
-            app.flash("display settings unavailable when embedded")
-        }
-        Action::ToggleShowDone => {
-            app.prefs.toggle_show_done();
-            app.cursor = 0;
-            app.recompute_visible();
             app.save_prefs();
         }
         Action::ToggleShowFuture if !features.config => {

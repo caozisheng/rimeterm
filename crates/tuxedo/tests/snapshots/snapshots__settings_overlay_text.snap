@@ -15,7 +15,6 @@ expression: buffer_to_text(&buf)
    status bar                  on                                                                   
    filter sidebar              on  ([ to toggle)                                                    
    detail sidebar              on  (] to toggle)                                                    
-   show done in list           off  (H to toggle)                                                   
    show future in list         off  (F to toggle)                                                   
                                                                                                     
  BEHAVIOR                                                                                           
@@ -33,4 +32,5 @@ expression: buffer_to_text(&buf)
                                                                                                     
                                                                                                     
                                                                                                     
- SETTINGS   Esc back                                         15 open · 2026-05-06 · tuxedo 2026.7.1
+                                                                                                    
+ SETTINGS   Esc back                                         18 open · 2026-05-06 · tuxedo 2026.7.1

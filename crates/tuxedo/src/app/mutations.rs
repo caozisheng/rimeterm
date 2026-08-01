@@ -8,8 +8,8 @@ use super::types::{AddOutcome, View};
 use crate::app::WeekStart;
 use crate::core::AddOutcome as CoreAdd;
 use crate::core::{
-    ArchiveDeleteOutcome, ArchiveOutcome, CompleteOutcome, DeleteOutcome, EditOutcome,
-    PriorityOutcome, TagOutcome, UnarchiveOutcome, UndoOutcome,
+    ArchiveOutcome, CompleteOutcome, EditOutcome, PriorityOutcome, TagOutcome, UnarchiveOutcome,
+    UndoOutcome,
 };
 use crate::nl;
 use crate::note;
@@ -44,16 +44,18 @@ impl App {
         }
     }
 
-    pub fn delete(&mut self, abs: usize) {
-        match self.store.delete(abs) {
-            DeleteOutcome::Deleted { .. } => {
-                self.flash("deleted");
+    /// Archive the task at `abs`: move it (raw line, state preserved) into
+    /// `archive.txt`. Powers `dd` in the live list.
+    pub fn archive_at(&mut self, abs: usize) {
+        match self.store.archive_task(abs) {
+            ArchiveOutcome::Archived { count: _ } => {
+                self.flash("archived");
                 self.recompute_visible();
                 self.clamp_cursor();
             }
-            DeleteOutcome::Aborted(r) => self.handle_reconcile_abort(r),
-            DeleteOutcome::OutOfRange => {}
-            DeleteOutcome::Error(e) => self.flash(format!("write failed: {e}")),
+            ArchiveOutcome::Nothing => {}
+            ArchiveOutcome::Aborted(r) => self.handle_reconcile_abort(r),
+            ArchiveOutcome::Error(e) => self.flash(format!("archive failed: {e}")),
         }
     }
 
@@ -229,19 +231,6 @@ impl App {
         }
     }
 
-    pub fn archive_completed(&mut self) {
-        match self.store.archive_completed() {
-            ArchiveOutcome::Archived { count } => {
-                self.flash(format!("archived {count}"));
-                self.recompute_visible();
-                self.clamp_cursor();
-            }
-            ArchiveOutcome::Nothing => self.flash("nothing to archive"),
-            ArchiveOutcome::Aborted(r) => self.handle_reconcile_abort(r),
-            ArchiveOutcome::Error(e) => self.flash(format!("archive failed: {e}")),
-        }
-    }
-
     /// Move an archived task back into the live list. `archive_idx` indexes
     /// `archive().tasks()` (the cursor source in Archive view).
     pub fn unarchive(&mut self, archive_idx: usize) {
@@ -253,30 +242,12 @@ impl App {
             }
             UnarchiveOutcome::OutOfRange => {}
             UnarchiveOutcome::Aborted(r) => self.handle_reconcile_abort(r),
-            UnarchiveOutcome::DoneReloaded => {
-                self.flash("done.txt changed on disk — reloaded");
+            UnarchiveOutcome::ArchiveReloaded => {
+                self.flash("archive.txt changed on disk — reloaded");
                 self.recompute_visible();
                 self.clamp_cursor();
             }
             UnarchiveOutcome::Error(e) => self.flash(format!("unarchive failed: {e}")),
-        }
-    }
-
-    /// Permanently remove an archived task from `done.txt`.
-    pub fn archive_delete(&mut self, archive_idx: usize) {
-        match self.store.archive_delete(archive_idx) {
-            ArchiveDeleteOutcome::Deleted => {
-                self.flash("deleted from archive");
-                self.recompute_visible();
-                self.clamp_cursor();
-            }
-            ArchiveDeleteOutcome::OutOfRange => {}
-            ArchiveDeleteOutcome::DoneReloaded => {
-                self.flash("done.txt changed on disk — reloaded");
-                self.recompute_visible();
-                self.clamp_cursor();
-            }
-            ArchiveDeleteOutcome::Error(e) => self.flash(format!("delete failed: {e}")),
         }
     }
 
@@ -303,7 +274,7 @@ mod tests {
         let mut app = build_app("old one\nold two\nold three\n");
         app.cursor = 2;
         let new_path = test_path();
-        let done = new_path.parent().expect("temp parent").join("done.txt");
+        let done = new_path.parent().expect("temp parent").join("archive.txt");
 
         app.open_file(new_path.clone(), done, "fresh task\n".into());
 

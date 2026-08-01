@@ -3,12 +3,10 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
 use super::Store;
-use super::outcome::{
-    ArchiveDeleteOutcome, ArchiveOutcome, Reconcile, StoreError, UnarchiveOutcome,
-};
+use super::outcome::{ArchiveOutcome, Reconcile, StoreError, UnarchiveOutcome};
 use crate::todo::{self, Task};
 
-/// Owns the archived (`done.txt`) tasks and the lifecycle around loading them
+/// Owns the archived (`archive.txt`) tasks and the lifecycle around loading them
 /// off-thread at startup. Fields are `pub(crate)` so the `Store` methods in this
 /// file can mutate the archive directly; external callers go through the read
 /// methods.
@@ -19,23 +17,23 @@ pub struct Archive {
     pub(crate) loader: Option<Receiver<(String, Vec<Task>)>>,
 }
 
-fn done_path(todo_path: &Path) -> PathBuf {
+fn default_archive_path(todo_path: &Path) -> PathBuf {
     todo_path
         .parent()
-        .map(|p| p.join("done.txt"))
-        .unwrap_or_else(|| PathBuf::from("done.txt"))
+        .map(|p| p.join("archive.txt"))
+        .unwrap_or_else(|| PathBuf::from("archive.txt"))
 }
 
 impl Archive {
-    /// Construct an `Archive` for the sibling `done.txt` of `todo_path` and
+    /// Construct an `Archive` for the sibling `archive.txt` of `todo_path` and
     /// spawn a worker thread to read+parse it. The first frame can render
     /// `todo.txt` immediately while the loader runs in the background.
     pub fn spawn(todo_path: &Path) -> Self {
-        Self::spawn_at(done_path(todo_path))
+        Self::spawn_at(default_archive_path(todo_path))
     }
 
-    /// Like [`Archive::spawn`] but for an explicit `done.txt` path (e.g. a
-    /// `DONE_FILE` that isn't a sibling of the todo file).
+    /// Like [`Archive::spawn`] but for an explicit `archive.txt` path (e.g. a
+    /// `ARCHIVE_FILE` that isn't a sibling of the todo file).
     pub fn spawn_at(path: PathBuf) -> Self {
         let loader_path = path.clone();
         let (tx, rx) = mpsc::sync_channel::<(String, Vec<Task>)>(1);
@@ -52,13 +50,13 @@ impl Archive {
         }
     }
 
-    /// Read and parse the sibling `done.txt` inline (no background thread).
+    /// Read and parse the sibling `archive.txt` inline (no background thread).
     /// Used by the one-shot CLI, where spawning a loader would be wasteful.
     pub fn load_sync(todo_path: &Path) -> Self {
-        Self::load_sync_at(done_path(todo_path))
+        Self::load_sync_at(default_archive_path(todo_path))
     }
 
-    /// Like [`Archive::load_sync`] but for an explicit `done.txt` path.
+    /// Like [`Archive::load_sync`] but for an explicit `archive.txt` path.
     pub fn load_sync_at(path: PathBuf) -> Self {
         let body = std::fs::read_to_string(&path).unwrap_or_default();
         let tasks = todo::parse_file(&body);
@@ -99,7 +97,7 @@ impl Archive {
     }
 }
 
-/// Internal result of refreshing `done.txt` before a mutation that writes it.
+/// Internal result of refreshing `archive.txt` before a mutation that writes it.
 enum ArchiveRefresh {
     Ready,
     Reloaded,
@@ -131,7 +129,7 @@ impl Store {
     }
 
     /// Pump archive state. Returns true when the visible archive changed: the
-    /// startup loader landed, or an external edit to `done.txt` was picked up.
+    /// startup loader landed, or an external edit to `archive.txt` was picked up.
     /// Non-blocking. The caller (TUI) is responsible for any view recompute.
     pub fn poll_archive(&mut self) -> bool {
         let mut changed = false;
@@ -156,7 +154,7 @@ impl Store {
         changed
     }
 
-    /// Apply a read result for `done.txt`. `NotFound` is treated as an empty
+    /// Apply a read result for `archive.txt`. `NotFound` is treated as an empty
     /// archive; any other I/O error preserves in-memory state and returns
     /// `false` rather than wiping the archive.
     pub(crate) fn apply_archive_read(&mut self, read: std::io::Result<String>) -> bool {
@@ -173,16 +171,57 @@ impl Store {
         true
     }
 
+    /// Bulk move: shove every currently-completed task into `archive.txt`.
+    /// Retained for the CLI `archive` command, which still means
+    /// "flush every `x`-marked task at once".
     pub fn archive_completed(&mut self) -> ArchiveOutcome {
+        let completed: Vec<usize> = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.done)
+            .map(|(i, _)| i)
+            .collect();
+        if completed.is_empty() {
+            return ArchiveOutcome::Nothing;
+        }
+        self.archive_many(&completed)
+    }
+
+    /// Move the single task at `abs` into `archive.txt`, preserving its
+    /// exact raw line (done or pending). Powers the TUI `dd` action.
+    pub fn archive_task(&mut self, abs: usize) -> ArchiveOutcome {
+        if abs >= self.tasks.len() {
+            return ArchiveOutcome::Nothing;
+        }
+        self.archive_many(&[abs])
+    }
+
+    /// Move every task at `indices` into `archive.txt` atomically.
+    /// Out-of-range indices are dropped; duplicates collapsed.
+    ///
+    /// Contract:
+    /// - Preserves each task's raw line (done or pending) — no state rewrites.
+    /// - Reconciles the live todo file first; aborts on external change.
+    /// - Writes archive first, then rewrites todo. On todo-write failure the
+    ///   archive is rolled back so no row is lost.
+    pub fn archive_many(&mut self, indices: &[usize]) -> ArchiveOutcome {
         match self.reconcile() {
             Reconcile::Unchanged => {}
             other => return ArchiveOutcome::Aborted(other),
         }
-        let to_move: Vec<Task> = self.tasks.iter().filter(|t| t.done).cloned().collect();
-        if to_move.is_empty() {
+        let mut idxs: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| i < self.tasks.len())
+            .collect();
+        idxs.sort_unstable();
+        idxs.dedup();
+        if idxs.is_empty() {
             return ArchiveOutcome::Nothing;
         }
-        // Read fresh so an external edit to done.txt since startup isn't lost.
+        let to_move: Vec<Task> = idxs.iter().map(|&i| self.tasks[i].clone()).collect();
+        // Read fresh so an external edit to archive.txt since startup isn't lost.
         let previous_archive_body = match self.read_archive_body() {
             Ok(b) => b,
             Err(e) => return ArchiveOutcome::Error(StoreError::ArchiveIo(e)),
@@ -192,12 +231,19 @@ impl Store {
             combined.push('\n');
         }
         combined.push_str(&todo::serialize(&to_move));
-        // Write done.txt before truncating todo.txt so a failed archive can't
-        // lose data; if the todo write fails, roll done.txt back.
+        // Write archive.txt before truncating todo.txt so a failed archive can't
+        // lose data; if the todo write fails, roll archive.txt back.
         if let Err(e) = todo::write_atomic(&self.archive.path, &combined) {
             return ArchiveOutcome::Error(StoreError::ArchiveIo(e));
         }
-        let remaining: Vec<Task> = self.tasks.iter().filter(|t| !t.done).cloned().collect();
+        let keep: std::collections::HashSet<usize> = idxs.iter().copied().collect();
+        let remaining: Vec<Task> = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !keep.contains(i))
+            .map(|(_, t)| t.clone())
+            .collect();
         let remaining_body = todo::serialize(&remaining);
         if let Err(e) = todo::write_atomic(&self.file_path, &remaining_body) {
             let _ = todo::write_atomic(&self.archive.path, &previous_archive_body);
@@ -215,6 +261,11 @@ impl Store {
 
     /// Move an archived task back into the live list. `archive_idx` indexes
     /// `self.archive.tasks()`.
+    ///
+    /// State is preserved verbatim: a task archived while done comes back done,
+    /// a task archived while pending comes back pending. Restoration point is
+    /// the tail of the live list — priority/due-based sorts will place it
+    /// visually next to its peers.
     pub fn unarchive(&mut self, archive_idx: usize) -> UnarchiveOutcome {
         match self.reconcile() {
             Reconcile::Unchanged => {}
@@ -222,16 +273,13 @@ impl Store {
         }
         match self.refresh_archive_for_mutation() {
             ArchiveRefresh::Ready => {}
-            ArchiveRefresh::Reloaded => return UnarchiveOutcome::DoneReloaded,
+            ArchiveRefresh::Reloaded => return UnarchiveOutcome::ArchiveReloaded,
             ArchiveRefresh::Error(e) => return UnarchiveOutcome::Error(StoreError::ArchiveIo(e)),
         }
         if archive_idx >= self.archive.tasks.len() {
             return UnarchiveOutcome::OutOfRange;
         }
-        let mut task = self.archive.tasks[archive_idx].clone();
-        if let Err(e) = task.unmark_done() {
-            return UnarchiveOutcome::Error(StoreError::Parse(e));
-        }
+        let task = self.archive.tasks[archive_idx].clone();
         let new_archive: Vec<Task> = self
             .archive
             .tasks
@@ -252,35 +300,6 @@ impl Store {
             return UnarchiveOutcome::Error(e);
         }
         UnarchiveOutcome::Unarchived
-    }
-
-    /// Permanently remove an archived task from `done.txt`.
-    pub fn archive_delete(&mut self, archive_idx: usize) -> ArchiveDeleteOutcome {
-        match self.refresh_archive_for_mutation() {
-            ArchiveRefresh::Ready => {}
-            ArchiveRefresh::Reloaded => return ArchiveDeleteOutcome::DoneReloaded,
-            ArchiveRefresh::Error(e) => {
-                return ArchiveDeleteOutcome::Error(StoreError::ArchiveIo(e));
-            }
-        }
-        if archive_idx >= self.archive.tasks.len() {
-            return ArchiveDeleteOutcome::OutOfRange;
-        }
-        let new_archive: Vec<Task> = self
-            .archive
-            .tasks
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != archive_idx)
-            .map(|(_, t)| t.clone())
-            .collect();
-        let archive_body = todo::serialize(&new_archive);
-        if let Err(e) = todo::write_atomic(&self.archive.path, &archive_body) {
-            return ArchiveDeleteOutcome::Error(StoreError::ArchiveIo(e));
-        }
-        self.archive.tasks = new_archive;
-        self.archive.last_disk = archive_body;
-        ArchiveDeleteOutcome::Deleted
     }
 
     pub(crate) fn persist(&mut self) -> Result<(), StoreError> {
@@ -315,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_writes_done_file_then_truncates_todo() {
+    fn archive_writes_archive_file_then_truncates_todo() {
         let dir = dir_for("ok");
         let todo_path = dir.join("todo.txt");
         let raw = "(A) 2026-05-01 keep this +work\n\
@@ -326,8 +345,8 @@ mod tests {
             store.archive_completed(),
             ArchiveOutcome::Archived { count: 1 }
         ));
-        let done = std::fs::read_to_string(dir.join("done.txt")).unwrap();
-        assert!(done.contains("archive this"));
+        let archived = std::fs::read_to_string(dir.join("archive.txt")).unwrap();
+        assert!(archived.contains("archive this"));
         let todo = std::fs::read_to_string(&todo_path).unwrap();
         assert!(todo.contains("keep this"));
         assert!(!todo.contains("archive this"));
@@ -335,17 +354,17 @@ mod tests {
     }
 
     #[test]
-    fn archive_appends_to_existing_done_file() {
+    fn archive_appends_to_existing_archive_file() {
         let dir = dir_for("append");
         let todo_path = dir.join("todo.txt");
-        std::fs::write(dir.join("done.txt"), "x 2026-04-01 2026-03-01 prior\n").unwrap();
+        std::fs::write(dir.join("archive.txt"), "x 2026-04-01 2026-03-01 prior\n").unwrap();
         let raw = "x 2026-05-05 2026-05-01 fresh +work\n";
         std::fs::write(&todo_path, raw).unwrap();
         let mut store = Store::open_sync(todo_path, raw.to_string(), "2026-05-06".into());
         store.archive_completed();
-        let done = std::fs::read_to_string(dir.join("done.txt")).unwrap();
-        assert!(done.contains("prior"));
-        assert!(done.contains("fresh"));
+        let archived = std::fs::read_to_string(dir.join("archive.txt")).unwrap();
+        assert!(archived.contains("prior"));
+        assert!(archived.contains("fresh"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -365,11 +384,11 @@ mod tests {
     }
 
     #[test]
-    fn archive_loader_populates_archived_from_done_file() {
+    fn archive_loader_populates_archived_from_archive_file() {
         let dir = dir_for("loader");
         let todo_path = dir.join("todo.txt");
         std::fs::write(
-            dir.join("done.txt"),
+            dir.join("archive.txt"),
             "x 2026-05-01 2026-04-01 first\nx 2026-05-02 2026-04-15 second\n",
         )
         .unwrap();
@@ -409,11 +428,11 @@ mod tests {
     }
 
     #[test]
-    fn poll_archive_detects_external_done_edit() {
+    fn poll_archive_detects_external_archive_edit() {
         let dir = dir_for("external");
         let todo_path = dir.join("todo.txt");
         std::fs::write(&todo_path, "(A) 2026-05-06 a\n").unwrap();
-        std::fs::write(dir.join("done.txt"), "").unwrap();
+        std::fs::write(dir.join("archive.txt"), "").unwrap();
         let mut store = Store::new(
             todo_path,
             "(A) 2026-05-06 a\n".to_string(),
@@ -422,7 +441,7 @@ mod tests {
         wait_archive_loaded(&mut store);
         assert!(store.archive.is_empty());
         std::fs::write(
-            dir.join("done.txt"),
+            dir.join("archive.txt"),
             "x 2026-05-05 2026-05-01 added externally\n",
         )
         .unwrap();
@@ -448,31 +467,12 @@ mod tests {
     }
 
     #[test]
-    fn archive_delete_refreshes_done_txt_before_writing() {
-        let dir = dir_for("delete-refresh");
-        let todo_path = dir.join("todo.txt");
-        let done_path = dir.join("done.txt");
-        std::fs::write(&todo_path, "open\n").unwrap();
-        std::fs::write(&done_path, "x 2026-05-01 2026-04-01 stale\n").unwrap();
-        let mut store = Store::new(todo_path, "open\n".to_string(), "2026-05-06".into());
-        wait_archive_loaded(&mut store);
-        std::fs::write(
-            &done_path,
-            "x 2026-05-01 2026-04-01 stale\nx 2026-05-02 2026-04-02 external\n",
-        )
-        .unwrap();
-        assert!(matches!(
-            store.archive_delete(0),
-            ArchiveDeleteOutcome::DoneReloaded
-        ));
-        let done = std::fs::read_to_string(&done_path).unwrap();
-        assert!(done.contains("stale"));
-        assert!(done.contains("external"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn unarchive_recomplete_does_not_duplicate_recurring_successor() {
+    fn unarchive_preserves_done_state_after_recurrence_roundtrip() {
+        // Complete a recurring task → spawns a live successor and marks the
+        // original done. Archive → the done one leaves the live list.
+        // Unarchive → the original returns done (state preserved). We must
+        // end with exactly one pending row and one done row, and the
+        // recurrence successor is not duplicated on the roundtrip.
         let dir = dir_for("rec-roundtrip");
         let todo_path = dir.join("todo.txt");
         let raw = "Water plants due:2026-05-06 rec:1d\n";
@@ -482,22 +482,14 @@ mod tests {
         assert_eq!(store.tasks().len(), 2);
         store.archive_completed();
         assert_eq!(store.tasks().len(), 1);
+        assert!(!store.tasks()[0].done);
         assert_eq!(store.archive.len(), 1);
         store.unarchive(0);
         assert_eq!(store.tasks().len(), 2);
-        let idx = store
-            .tasks()
-            .iter()
-            .position(|t| !t.done && t.due.as_deref() == Some("2026-05-06"))
-            .unwrap();
-        store.toggle_complete(idx);
-        assert_eq!(store.tasks().len(), 2);
-        let next_count = store
-            .tasks()
-            .iter()
-            .filter(|t| !t.done && t.due.as_deref() == Some("2026-05-07"))
-            .count();
-        assert_eq!(next_count, 1);
+        let done_count = store.tasks().iter().filter(|t| t.done).count();
+        let pending_count = store.tasks().iter().filter(|t| !t.done).count();
+        assert_eq!(done_count, 1, "unarchive must preserve done state");
+        assert_eq!(pending_count, 1, "successor stays untouched by roundtrip");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

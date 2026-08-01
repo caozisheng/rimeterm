@@ -4,14 +4,18 @@ use crate::core::filter::{self, ListDueBucket};
 
 /// One entry per visible row, parallel to `visible_cache`. Renderers detect
 /// group transitions by comparing successive entries; under `Sort::File` every
-/// row is `None` so the renderer skips headers.
+/// row is `GroupKey::None` so the renderer skips headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupKey {
     None,
-    ArchiveDate(String),
+    /// Archive view groups everything under one heading.
+    Archive,
     /// `Some('A'..='Z')` for a graded priority, `None` for unprioritized.
     ListPriority(Option<char>),
     ListDue(ListDueBucket),
+    /// Completed tasks under `Sort::Priority` / `Sort::Due`. Rendered as a
+    /// COMPLETED section pinned to the bottom of the live list.
+    Completed,
 }
 
 impl App {
@@ -41,58 +45,83 @@ impl App {
         let tasks = self.store.tasks();
         let today = self.store.today();
 
-        let mut idxs: Vec<usize> = (0..tasks.len())
+        // Partition into pending vs done so the COMPLETED group can be pinned
+        // to the bottom under Priority/Due sorts. File sort keeps disk order.
+        let (mut pending, mut done): (Vec<usize>, Vec<usize>) = (0..tasks.len())
             .filter(|&i| {
                 filter::list_predicate(
                     &tasks[i],
-                    self.prefs.show_done,
                     self.prefs.show_future,
                     today,
                     &self.filter,
                     needle,
                 )
             })
-            .collect();
+            .partition(|&i| !tasks[i].done);
 
-        filter::sort_by_prefs(&mut idxs, tasks, self.prefs.sort);
+        filter::sort_by_prefs(&mut pending, tasks, self.prefs.sort);
+        filter::sort_by_prefs(&mut done, tasks, self.prefs.sort);
 
         let week_start = &self.week_start;
-
-        let groups: Vec<GroupKey> = match self.prefs.sort {
-            Sort::File => vec![GroupKey::None; idxs.len()],
-            Sort::Priority => idxs
-                .iter()
-                .map(|&i| GroupKey::ListPriority(tasks[i].priority))
-                .collect(),
-            Sort::Due => idxs
-                .iter()
-                .map(|&i| GroupKey::ListDue(filter::due_bucket(&tasks[i], today, week_start)))
-                .collect(),
+        let (idxs, groups): (Vec<usize>, Vec<GroupKey>) = match self.prefs.sort {
+            Sort::File => {
+                // File sort preserves disk order — done/pending stay interleaved.
+                let mut idxs: Vec<usize> = (0..tasks.len())
+                    .filter(|&i| {
+                        filter::list_predicate(
+                            &tasks[i],
+                            self.prefs.show_future,
+                            today,
+                            &self.filter,
+                            needle,
+                        )
+                    })
+                    .collect();
+                filter::sort_by_prefs(&mut idxs, tasks, Sort::File);
+                let groups = vec![GroupKey::None; idxs.len()];
+                (idxs, groups)
+            }
+            Sort::Priority => {
+                let mut idxs = Vec::with_capacity(pending.len() + done.len());
+                let mut groups = Vec::with_capacity(pending.len() + done.len());
+                for &i in &pending {
+                    groups.push(GroupKey::ListPriority(tasks[i].priority));
+                    idxs.push(i);
+                }
+                for &i in &done {
+                    groups.push(GroupKey::Completed);
+                    idxs.push(i);
+                }
+                (idxs, groups)
+            }
+            Sort::Due => {
+                let mut idxs = Vec::with_capacity(pending.len() + done.len());
+                let mut groups = Vec::with_capacity(pending.len() + done.len());
+                for &i in &pending {
+                    groups.push(GroupKey::ListDue(filter::due_bucket(
+                        &tasks[i], today, week_start,
+                    )));
+                    idxs.push(i);
+                }
+                for &i in &done {
+                    groups.push(GroupKey::Completed);
+                    idxs.push(i);
+                }
+                (idxs, groups)
+            }
         };
+
         self.visible_groups = groups;
         self.visible_cache = idxs;
     }
 
     fn rebuild_archive_cache(&mut self) {
+        // Archive view now holds mixed done/pending rows (post-redesign the
+        // `dd` action moves any task here, state preserved). Display order
+        // mirrors on-disk order so an unarchive is a stable reversal.
         let archive = self.store.archive().tasks();
-        let mut idxs: Vec<usize> = (0..archive.len()).collect();
-        idxs.sort_by(|&a, &b| {
-            archive[b]
-                .done_date
-                .as_deref()
-                .unwrap_or("")
-                .cmp(archive[a].done_date.as_deref().unwrap_or(""))
-        });
-        let groups: Vec<GroupKey> = idxs
-            .iter()
-            .map(|&i| {
-                let date = archive[i]
-                    .done_date
-                    .clone()
-                    .unwrap_or_else(|| "unknown".into());
-                GroupKey::ArchiveDate(date)
-            })
-            .collect();
+        let idxs: Vec<usize> = (0..archive.len()).collect();
+        let groups = vec![GroupKey::Archive; idxs.len()];
         self.visible_cache = idxs;
         self.visible_groups = groups;
     }
@@ -264,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_visible_groups_are_done_date_desc() {
+    fn archive_visible_groups_all_use_archive_key() {
         let mut app = build_app("a\n");
         let path = app.archive().path().to_path_buf();
         app.store.archive = crate::app::Archive::for_test(
@@ -277,15 +306,46 @@ mod tests {
         app.set_view(View::Archive);
         let groups = app.visible_groups();
         assert_eq!(groups.len(), 2);
-        let first = match &groups[0] {
-            GroupKey::ArchiveDate(d) => d.as_str(),
-            _ => panic!("expected ArchiveDate"),
-        };
-        let second = match &groups[1] {
-            GroupKey::ArchiveDate(d) => d.as_str(),
-            _ => panic!("expected ArchiveDate"),
-        };
-        assert_eq!(first, "2026-05-02");
-        assert_eq!(second, "2026-04-01");
+        assert!(matches!(groups[0], GroupKey::Archive));
+        assert!(matches!(groups[1], GroupKey::Archive));
+    }
+
+    #[test]
+    fn completed_tasks_sink_under_priority_sort() {
+        // Done rows always visible; they anchor at the bottom under a
+        // COMPLETED group regardless of the priority they had before.
+        let mut app = build_app("(A) top\nmiddle\nx 2026-05-05 done-hi\n");
+        app.prefs.sort = Sort::Priority;
+        app.recompute_visible();
+        let groups = app.visible_groups();
+        let idxs = app.visible_indices();
+        assert_eq!(groups.len(), 3);
+        assert!(matches!(groups[0], GroupKey::ListPriority(Some('A'))));
+        assert!(matches!(groups[1], GroupKey::ListPriority(None)));
+        assert!(matches!(groups[2], GroupKey::Completed));
+        assert!(app.tasks()[idxs[2]].done);
+    }
+
+    #[test]
+    fn completed_tasks_sink_under_due_sort() {
+        let mut app = build_app("a due:2026-05-04\nx 2026-05-05 done\n");
+        app.prefs.sort = Sort::Due;
+        app.recompute_visible();
+        let groups = app.visible_groups();
+        assert_eq!(groups.len(), 2);
+        assert!(matches!(groups[0], GroupKey::ListDue(_)));
+        assert!(matches!(groups[1], GroupKey::Completed));
+    }
+
+    #[test]
+    fn file_sort_keeps_done_interleaved() {
+        let mut app = build_app("a\nx 2026-05-05 done\nb\n");
+        app.prefs.sort = Sort::File;
+        app.recompute_visible();
+        let idxs = app.visible_indices();
+        assert_eq!(idxs, &[0, 1, 2]);
+        for g in app.visible_groups() {
+            assert!(matches!(g, GroupKey::None));
+        }
     }
 }

@@ -148,8 +148,9 @@ fn group_count_key(gk: &GroupKey) -> String {
         GroupKey::ListPriority(Some(c)) => format!("p:{c}"),
         GroupKey::ListPriority(None) => "p:_".to_string(),
         GroupKey::ListDue(b) => format!("d:{}", b.label()),
+        GroupKey::Completed => "completed".to_string(),
         // Not produced for List view; encode defensively.
-        GroupKey::ArchiveDate(d) => format!("a:{d}"),
+        GroupKey::Archive => "archive".to_string(),
         GroupKey::None => String::new(),
     }
 }
@@ -159,8 +160,9 @@ fn group_header<'a>(theme: &Theme, gk: &GroupKey, count: usize) -> Line<'a> {
         GroupKey::ListPriority(Some(c)) => (format!("PRIORITY {c}"), theme.priority_color(*c)),
         GroupKey::ListPriority(None) => ("NO PRIORITY".to_string(), theme.dim),
         GroupKey::ListDue(b) => (b.label().to_string(), due_bucket_color(theme, *b)),
+        GroupKey::Completed => ("COMPLETED".to_string(), theme.dim),
         // Defensive fallthrough — not produced under List view.
-        GroupKey::ArchiveDate(d) => (d.clone(), theme.accent),
+        GroupKey::Archive => ("ARCHIVE".to_string(), theme.accent),
         GroupKey::None => (String::new(), theme.fg),
     };
 

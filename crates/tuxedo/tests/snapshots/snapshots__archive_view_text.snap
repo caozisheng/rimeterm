@@ -2,9 +2,9 @@
 source: crates/tuxedo/tests/snapshots.rs
 expression: buffer_to_text(&buf)
 ---
- FILTERS                   ▶▮◀ done.txt  •  0 tasks  •  sort:compl DETAIL                           
+ FILTERS                   ▶▮◀ archive.txt  •  0 tasks  •  sort:fi DETAIL                           
                                                                                                     
- PROJECTS                    no completed tasks yet                (no task)                        
+ PROJECTS                    no archived tasks                     (no task)                        
    +work             4                                                                              
    +health           3                                                                              
    +finance          2                                                                              
@@ -33,4 +33,4 @@ expression: buffer_to_text(&buf)
                                                                                                     
                                                                                                     
                                                                                                     
- ARCHIVE   j/k · n new · r reschedule · x done · / search 0 archived · 2026-05-06 · tuxedo 2026.7.1
+ ARCHIVE   j/k · dd restore · a back to list · q quit     0 archived · 2026-05-06 · tuxedo 2026.7.1

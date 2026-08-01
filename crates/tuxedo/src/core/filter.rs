@@ -109,16 +109,16 @@ pub fn passes_user_filter(t: &Task, filter: &Filter, needle: Option<&str>) -> bo
 
 pub fn list_predicate(
     t: &Task,
-    show_done: bool,
     show_future: bool,
     today: &str,
     filter: &Filter,
     needle: Option<&str>,
 ) -> bool {
-    if t.done && !show_done {
-        return false;
-    }
-    if !show_future && is_future_threshold(t, today) {
+    // Done tasks are always visible in the live list — the COMPLETED group at
+    // the bottom of the sidebar catches them (see `visibility::rebuild_list_cache`).
+    // The future-threshold filter still applies to pending tasks; done tasks
+    // never carry a meaningful deferral, so they skip it.
+    if !t.done && !show_future && is_future_threshold(t, today) {
         return false;
     }
     passes_user_filter(t, filter, needle)

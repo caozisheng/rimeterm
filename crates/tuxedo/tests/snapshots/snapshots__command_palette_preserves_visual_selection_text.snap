@@ -2,7 +2,7 @@
 source: crates/tuxedo/tests/snapshots.rs
 expression: buffer_to_text(&buf)
 ---
- FILTERS                   ▶▮◀ /tmp/tuxedo-snapshot.txt  •  15 tas DETAIL                           
+ FILTERS                   ▶▮◀ /tmp/tuxedo-snapshot.txt  •  18 tas DETAIL                           
                                                                                                     
  PROJECTS                  (2)  PRIORITY A  ────────────────────── priority  (A)                    
    +work             4      1 [x] ▸ (A) Finish Q2 board deck +work created   2026-05-01             
@@ -15,7 +15,7 @@ expression: buffer_to_text(&buf)
                     │   edit current task (normal mode)                      e │1 Finish Q2 board   
  CONTEXTS           │   edit current task (insert mode)                      i │aptop               
    @errands         │   toggle complete                                      x │6                   
-   @home            │   delete task                                         dd │                    
+   @home            │   archive task                                        dd │                    
    @laptop          │   cycle priority                                       p │                    
    @phone           │   add project to current task                          + │                    
                     │   add or remove context on current task                c │                    
@@ -33,4 +33,4 @@ expression: buffer_to_text(&buf)
                                                                                                     
                                                                                                     
                                                                                                     
- COMMAND   type to filter · Enter run · Esc canc15 open · 2 selected · 2026-05-06 · tuxedo 2026.7.1
+ COMMAND   type to filter · Enter run · Esc canc18 open · 2 selected · 2026-05-06 · tuxedo 2026.7.1

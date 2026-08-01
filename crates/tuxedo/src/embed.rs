@@ -46,30 +46,35 @@ pub enum EmbeddedOutcome {
 pub struct EmbeddedApp {
     app: App,
     keybinds: KeyBindings,
-    done_path: PathBuf,
+    archive_path: PathBuf,
     features: EmbeddedFeatures,
 }
 
 impl EmbeddedApp {
-    /// Construct from explicit todo/done paths and an already-read todo body.
+    /// Construct from explicit todo/archive paths and an already-read todo body.
     ///
     /// This uses [`Config::default`], default key bindings, and does not read
     /// independent Tuxedo config, keybinding, theme, or update state.
-    pub fn new(todo_path: PathBuf, done_path: PathBuf, todo_body: String) -> Self {
-        Self::with_features(todo_path, done_path, todo_body, EmbeddedFeatures::default())
+    pub fn new(todo_path: PathBuf, archive_path: PathBuf, todo_body: String) -> Self {
+        Self::with_features(
+            todo_path,
+            archive_path,
+            todo_body,
+            EmbeddedFeatures::default(),
+        )
     }
 
     /// Construct with explicit embedded feature flags.
     pub fn with_features(
         todo_path: PathBuf,
-        done_path: PathBuf,
+        archive_path: PathBuf,
         todo_body: String,
         features: EmbeddedFeatures,
     ) -> Self {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let app = App::new_with_done(
+        let app = App::new_with_archive(
             todo_path,
-            done_path.clone(),
+            archive_path.clone(),
             todo_body,
             today,
             Config::default(),
@@ -77,7 +82,7 @@ impl EmbeddedApp {
         Self {
             app,
             keybinds: KeyBindings::default(),
-            done_path,
+            archive_path,
             features,
         }
     }
@@ -88,8 +93,8 @@ impl EmbeddedApp {
     }
 
     /// Explicit archive path supplied at construction.
-    pub fn done_path(&self) -> &Path {
-        &self.done_path
+    pub fn archive_path(&self) -> &Path {
+        &self.archive_path
     }
 
     /// Handle one key without reading terminal events or launching an editor.
@@ -117,7 +122,7 @@ impl EmbeddedApp {
         controller::next_deadline(&self.app)
     }
 
-    /// Poll archive loading, external todo/done edits, inbox, midnight, and expiries.
+    /// Poll archive loading, external todo/archive edits, inbox, midnight, and expiries.
     ///
     /// No network update checker or configuration watcher is started.
     pub fn poll_background(&mut self) -> EmbeddedOutcome {
@@ -138,7 +143,8 @@ impl EmbeddedApp {
     pub fn reload(&mut self) -> io::Result<EmbeddedOutcome> {
         let body = fs::read_to_string(&self.app.file_path)?;
         let todo_path = self.app.file_path.clone();
-        self.app.open_file(todo_path, self.done_path.clone(), body);
+        self.app
+            .open_file(todo_path, self.archive_path.clone(), body);
         Ok(EmbeddedOutcome::Changed)
     }
 }
@@ -165,15 +171,15 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create fixture directory");
-        (root.join("todo.txt"), root.join("custom-done.txt"))
+        (root.join("todo.txt"), root.join("custom-archive.txt"))
     }
 
     #[test]
-    fn constructor_uses_explicit_done_path() {
-        let (todo, done) = paths("done-path");
+    fn constructor_uses_explicit_archive_path() {
+        let (todo, archive) = paths("archive-path");
         std::fs::write(&todo, "live\n").expect("write todo");
-        std::fs::write(&done, "x 2026-05-02 archived\n").expect("write done");
-        let mut embedded = EmbeddedApp::new(todo, done.clone(), "live\n".into());
+        std::fs::write(&archive, "x 2026-05-02 archived\n").expect("write archive");
+        let mut embedded = EmbeddedApp::new(todo, archive.clone(), "live\n".into());
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while embedded.app().archive().is_empty() && Instant::now() < deadline {
@@ -181,7 +187,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
 
-        assert_eq!(embedded.done_path(), done);
+        assert_eq!(embedded.archive_path(), archive);
         assert_eq!(embedded.app().archive().len(), 1);
     }
 

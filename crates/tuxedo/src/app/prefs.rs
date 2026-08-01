@@ -33,7 +33,6 @@ pub struct Prefs {
     pub density: Density,
     pub sort: Sort,
     pub layout: Layout,
-    pub show_done: bool,
     pub show_future: bool,
     /// Metadata keys whose `key:value` tokens are hidden from task rows.
     /// Config-only (no in-app toggle); see `Config::hidden_keys`.
@@ -58,7 +57,6 @@ impl Prefs {
                 line_num: cfg.show_line_num.unwrap_or(true),
                 status_bar: cfg.show_status_bar.unwrap_or(true),
             },
-            show_done: cfg.show_done.unwrap_or(false),
             show_future: cfg.show_future.unwrap_or(false),
             hidden_keys: cfg.hidden_keys,
             week_start: cfg.week_start.unwrap_or(WeekStart::Sunday),
@@ -120,10 +118,6 @@ impl Prefs {
         self.layout.line_num = !self.layout.line_num;
     }
 
-    pub fn toggle_show_done(&mut self) {
-        self.show_done = !self.show_done;
-    }
-
     pub fn toggle_show_future(&mut self) {
         self.show_future = !self.show_future;
     }
@@ -153,7 +147,6 @@ impl Prefs {
         cfg.show_right = Some(self.layout.right);
         cfg.show_line_num = Some(self.layout.line_num);
         cfg.show_status_bar = Some(self.layout.status_bar);
-        cfg.show_done = Some(self.show_done);
         cfg.show_future = Some(self.show_future);
         cfg.hidden_keys = self.hidden_keys.clone();
         cfg.save()

@@ -24,7 +24,6 @@ pub struct Config {
     pub show_right: Option<bool>,
     pub show_line_num: Option<bool>,
     pub show_status_bar: Option<bool>,
-    pub show_done: Option<bool>,
     pub show_future: Option<bool>,
     /// 64-character lowercase-hex token gating the in-TUI capture server.
     /// Persisted across sessions so phone bookmarks survive a relaunch.
@@ -147,7 +146,6 @@ fn parse(s: &str) -> Config {
             "show_right" => c.show_right = parse_bool(v),
             "show_line_num" => c.show_line_num = parse_bool(v),
             "show_status_bar" => c.show_status_bar = parse_bool(v),
-            "show_done" => c.show_done = parse_bool(v),
             "show_future" => c.show_future = parse_bool(v),
             // Reject anything that isn't a valid hex token so we don't
             // carry forward a corrupt value that the server would later
@@ -214,9 +212,6 @@ fn serialize(c: &Config) -> String {
     if let Some(v) = c.show_status_bar {
         let _ = writeln!(out, "show_status_bar = {v}");
     }
-    if let Some(v) = c.show_done {
-        let _ = writeln!(out, "show_done = {v}");
-    }
     if let Some(v) = c.show_future {
         let _ = writeln!(out, "show_future = {v}");
     }
@@ -272,7 +267,6 @@ mod tests {
             show_right: Some(true),
             show_line_num: Some(false),
             show_status_bar: Some(true),
-            show_done: Some(true),
             show_future: Some(true),
             share_token: Some("a".repeat(64)),
             share_port: Some(18080),
@@ -431,7 +425,6 @@ mod tests {
             show_right: Some(false),
             show_line_num: Some(true),
             show_status_bar: Some(false),
-            show_done: Some(true),
             show_future: Some(false),
             share_token: None,
             share_port: None,

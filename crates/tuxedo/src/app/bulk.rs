@@ -1,6 +1,6 @@
 use super::App;
 use super::types::Mode;
-use crate::core::{BulkCompleteOutcome, BulkDeleteOutcome};
+use crate::core::{ArchiveOutcome, BulkCompleteOutcome};
 
 impl App {
     /// Bulk-complete every task in the selection that isn't already done.
@@ -33,26 +33,27 @@ impl App {
         }
     }
 
-    /// Bulk-delete every task in the selection.
-    pub fn delete_selected(&mut self) {
+    /// Bulk-archive every task in the selection: move each row (state
+    /// preserved) to `archive.txt`. Powers `dd` in Visual mode.
+    pub fn archive_selected(&mut self) {
         if self.selection.is_empty() {
             return;
         }
         let indices: Vec<usize> = self.selection.iter().collect();
-        match self.store.delete_many(&indices) {
-            BulkDeleteOutcome::Done { deleted } => {
+        match self.store.archive_many(&indices) {
+            ArchiveOutcome::Archived { count } => {
                 self.selection.clear();
                 self.mode = Mode::Normal;
-                self.flash(format!("deleted {deleted}"));
+                self.flash(format!("archived {count}"));
                 self.recompute_visible();
                 self.clamp_cursor();
             }
-            BulkDeleteOutcome::Nothing => {
+            ArchiveOutcome::Nothing => {
                 self.selection.clear();
                 self.mode = Mode::Normal;
             }
-            BulkDeleteOutcome::Aborted(r) => self.handle_reconcile_abort(r),
-            BulkDeleteOutcome::Error(e) => self.flash(format!("write failed: {e}")),
+            ArchiveOutcome::Aborted(r) => self.handle_reconcile_abort(r),
+            ArchiveOutcome::Error(e) => self.flash(format!("archive failed: {e}")),
         }
     }
 }
@@ -90,16 +91,17 @@ mod tests {
     }
 
     #[test]
-    fn delete_selected_removes_all_in_selection() {
+    fn archive_selected_moves_all_in_selection_to_archive() {
         let mut app = build_app("a\nb\nc\nd\n");
         app.selection.toggle(1);
         app.selection.toggle(3);
         app.mode = Mode::Visual;
-        app.delete_selected();
+        app.archive_selected();
         assert_eq!(app.tasks().len(), 2);
         assert_eq!(app.tasks()[0].raw, "a");
         assert_eq!(app.tasks()[1].raw, "c");
         assert!(app.selection.is_empty());
         assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.flash_active(), Some("archived 2"));
     }
 }

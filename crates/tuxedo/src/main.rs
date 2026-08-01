@@ -86,8 +86,8 @@ fn main() -> Result<()> {
             Vec::new()
         }
     };
-    let done = cli::done_path(&path);
-    let mut app_state = App::new_with_done(path.clone(), done, body, today, cfg);
+    let archive = cli::archive_path(&path);
+    let mut app_state = App::new_with_archive(path.clone(), archive, body, today, cfg);
     app_state.config_path = Config::path();
     app_state.mode = start_mode;
     // Start the config hot-reload watcher.
@@ -153,9 +153,9 @@ fn print_usage() {
     println!("  depri, dp N...            remove priority from task N");
     println!("  done, do N...             mark task N complete");
     println!("  del, rm N [TERM]          delete task N (prompts; -f to force), or remove TERM");
-    println!("  archive                   move completed tasks to done.txt");
+    println!("  archive                   move completed tasks to archive.txt");
     println!("  list, ls [TERM...]        list tasks (TERM: +project @context or text)");
-    println!("  listall, lsa [TERM...]    list todo.txt and done.txt");
+    println!("  listall, lsa [TERM...]    list todo.txt and archive.txt");
     println!("  listpri, lsp [PRIORITY]   list prioritized tasks");
     println!("  listproj, lsprj           list +projects");
     println!("  listcon, lsc              list @contexts");
@@ -169,9 +169,9 @@ fn print_usage() {
     println!("      --sample     open the sample todo.txt in the TUI");
     println!();
     println!("Environment:");
-    println!("  TODO_DIR     directory holding todo.txt / done.txt");
-    println!("  TODO_FILE    path to the todo file (default $TODO_DIR/todo.txt)");
-    println!("  DONE_FILE    path to the archive file (default sibling done.txt)");
+    println!("  TODO_DIR      directory holding todo.txt / archive.txt");
+    println!("  TODO_FILE     path to the todo file (default $TODO_DIR/todo.txt)");
+    println!("  ARCHIVE_FILE  path to the archive file (default sibling archive.txt)");
 }
 
 fn run(
@@ -188,7 +188,7 @@ fn run(
             dirty = true;
         }
         // Drain the startup archive loader (and pick up external edits to
-        // done.txt). Non-blocking: the first frame can render todo.txt
+        // archive.txt). Non-blocking: the first frame can render todo.txt
         // before the archive read completes.
         if app.poll_archive() {
             dirty = true;

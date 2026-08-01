@@ -12,7 +12,7 @@ use crate::todo::{ParseError, TagError};
 pub enum StoreError {
     /// Writing the todo file (`write_atomic`) failed.
     Write(std::io::Error),
-    /// Reading or writing the sibling `done.txt` failed.
+    /// Reading or writing the sibling `archive.txt` failed.
     ArchiveIo(std::io::Error),
     /// A constructed line failed to parse.
     Parse(ParseError),
@@ -24,7 +24,7 @@ impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StoreError::Write(e) => write!(f, "write failed: {e}"),
-            StoreError::ArchiveIo(e) => write!(f, "done.txt: {e}"),
+            StoreError::ArchiveIo(e) => write!(f, "archive.txt: {e}"),
             StoreError::Parse(e) => write!(f, "{e}"),
             StoreError::Tag(e) => write!(f, "{e}"),
         }
@@ -152,17 +152,9 @@ pub enum UnarchiveOutcome {
     Unarchived,
     OutOfRange,
     Aborted(Reconcile),
-    /// `done.txt` changed under us; the mutation was refused and the archive
-    /// reloaded from disk.
-    DoneReloaded,
-    Error(StoreError),
-}
-
-#[derive(Debug)]
-pub enum ArchiveDeleteOutcome {
-    Deleted,
-    OutOfRange,
-    DoneReloaded,
+    /// `archive.txt` changed under us; the mutation was refused and the
+    /// archive reloaded from disk.
+    ArchiveReloaded,
     Error(StoreError),
 }
 

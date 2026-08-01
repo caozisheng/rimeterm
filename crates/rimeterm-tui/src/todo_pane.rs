@@ -27,7 +27,7 @@ pub struct TodoPane {
     id: PaneId,
     action_tx: mpsc::UnboundedSender<TodoAction>,
     todo_path: PathBuf,
-    done_path: PathBuf,
+    archive_path: PathBuf,
     theme: rimeterm_markdown::Theme,
     next_poll: Instant,
     state: TodoState,
@@ -40,23 +40,23 @@ impl TodoPane {
     ) -> Self {
         let todo_path = rimeterm_config::paths::todo_file()
             .unwrap_or_else(|| PathBuf::from(".rimeterm/tuxedo/todo.txt"));
-        let done_path = rimeterm_config::paths::done_file()
-            .unwrap_or_else(|| PathBuf::from(".rimeterm/tuxedo/done.txt"));
-        Self::with_paths(action_tx, theme, todo_path, done_path)
+        let archive_path = rimeterm_config::paths::archive_file()
+            .unwrap_or_else(|| PathBuf::from(".rimeterm/tuxedo/archive.txt"));
+        Self::with_paths(action_tx, theme, todo_path, archive_path)
     }
 
     fn with_paths(
         action_tx: mpsc::UnboundedSender<TodoAction>,
         theme: rimeterm_markdown::Theme,
         todo_path: PathBuf,
-        done_path: PathBuf,
+        archive_path: PathBuf,
     ) -> Self {
-        let state = load_embedded(&todo_path, &done_path);
+        let state = load_embedded(&todo_path, &archive_path);
         Self {
             id: PaneId::next(),
             action_tx,
             todo_path,
-            done_path,
+            archive_path,
             theme,
             next_poll: Instant::now(),
             state,
@@ -68,16 +68,16 @@ impl TodoPane {
     }
 
     fn retry_load(&mut self) {
-        self.state = load_embedded(&self.todo_path, &self.done_path);
+        self.state = load_embedded(&self.todo_path, &self.archive_path);
     }
 
     #[cfg(test)]
     fn paths(&self) -> (&Path, &Path) {
-        (&self.todo_path, &self.done_path)
+        (&self.todo_path, &self.archive_path)
     }
 }
 
-fn load_embedded(todo_path: &Path, done_path: &Path) -> TodoState {
+fn load_embedded(todo_path: &Path, archive_path: &Path) -> TodoState {
     let body = match std::fs::read_to_string(todo_path) {
         Ok(body) => body,
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
@@ -87,7 +87,7 @@ fn load_embedded(todo_path: &Path, done_path: &Path) -> TodoState {
     };
     TodoState::Ready(EmbeddedApp::new(
         todo_path.to_path_buf(),
-        done_path.to_path_buf(),
+        archive_path.to_path_buf(),
         body,
     ))
 }
@@ -226,7 +226,7 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        (root.join("todo.txt"), root.join("done.txt"))
+        (root.join("todo.txt"), root.join("archive.txt"))
     }
 
     #[test]

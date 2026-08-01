@@ -162,8 +162,8 @@ pub fn todo_file() -> Option<PathBuf> {
 }
 
 /// Global archive file used by the embedded Tuxedo pane.
-pub fn done_file() -> Option<PathBuf> {
-    tuxedo_dir().map(|d| d.join("done.txt"))
+pub fn archive_file() -> Option<PathBuf> {
+    tuxedo_dir().map(|d| d.join("archive.txt"))
 }
 
 /// Build a `("PATH", "<bin_dir>:<plugin bins…>:<existing PATH>")` env
@@ -335,7 +335,10 @@ mod tests {
             assert_eq!(bottom_config_dir(), Some(root.join("bottom")));
             assert_eq!(tuxedo_dir(), Some(root.join("tuxedo")));
             assert_eq!(todo_file(), Some(root.join("tuxedo").join("todo.txt")));
-            assert_eq!(done_file(), Some(root.join("tuxedo").join("done.txt")));
+            assert_eq!(
+                archive_file(),
+                Some(root.join("tuxedo").join("archive.txt"))
+            );
         });
     }
 
