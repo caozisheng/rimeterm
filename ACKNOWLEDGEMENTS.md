@@ -84,10 +84,21 @@ ships.
 
 ## Native stock market pane
 
+`StockPane` renders the three-column A / HK / US stock tab in-process; no
+external binary ships.
+
 - [akshare-rs](https://github.com/Cricle/akshare-rs) — MIT / Apache-2.0.
-  Pinned at the `e7291600ab99ee95e6b38b0ce1301154d6eb46d8` revision and used
-  by the in-process `rimeterm-stock` crate for A-share, HK, US quotes,
-  indices, search, historical candles, and financial news.
+  Pure-Rust port of the upstream Python `akshare` client. Pinned at commit
+  `e7291600ab99ee95e6b38b0ce1301154d6eb46d8` (v0.1.14) via a Cargo `git`
+  dep with the `mod-stock` / `mod-index` / `mod-news` features. The
+  `rimeterm-stock` crate wraps `AkShareClient` to serve A-share, HK, and
+  US search, quotes, historical candles, fundamentals (PE / PB / market
+  cap), watchlist enrichment, indices (沪深重要指数 / HSI / DJIA-SPX-NDX),
+  and Eastmoney-sourced news. Optional `stock.http_proxy` and
+  `stock.tushare_token` config knobs plumb through to akshare's proxy
+  builder and the Tushare Pro A-share fundamentals fallback. The rest of
+  the pane (blocking worker on a dedicated OS thread, ratatui three-column
+  layout, filter / sort / cursor UX) is rimeterm-native.
 
 ## Native session search
 
