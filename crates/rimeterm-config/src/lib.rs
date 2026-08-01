@@ -15,6 +15,7 @@ pub mod env;
 pub mod files_state;
 pub mod install_hint;
 pub mod layout_state;
+pub mod left_tabs_state;
 pub mod migrate;
 pub mod paths;
 pub mod session_state;

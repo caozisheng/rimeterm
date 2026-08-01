@@ -24,6 +24,11 @@ pub enum SettingsTab {
     /// new shell tab. Rows are populated by
     /// [`rimeterm_pty::detect_all_shells`].
     Shell,
+    /// Left-column tab picker: choose which optional tabs are visible
+    /// in the left-top (`files`) and left-bottom (`git`) groups and in
+    /// what order. Files and Git anchor each group and are always
+    /// visible at position 0.
+    Tabs,
     /// OS-shell integration: install / uninstall the "Open with
     /// rimeterm here" right-click entry on Explorer folder + folder
     /// background. Windows-only for now (writes HKCU registry
@@ -36,6 +41,15 @@ impl Default for SettingsTab {
     fn default() -> Self {
         Self::Agents
     }
+}
+
+/// Which left-column tab group a mutation is aimed at.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum LeftGroup {
+    /// Top group in the left column (`files`).
+    Top,
+    /// Bottom group in the left column (`git`).
+    Bottom,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +70,14 @@ pub enum SettingsAction {
     /// Remove the "Open with rimeterm here" Explorer right-click
     /// entry (Windows: HKCU registry delete).
     UninstallContextMenu,
+    /// Left-column tab list has been mutated (visibility toggled or
+    /// reordered). Payload is the FULL new state — App swaps its own
+    /// copy, rebuilds the matching tab group's members via
+    /// `TabGroup::set_members`, and flushes to disk. Whole-state
+    /// replace keeps the two sides of the mutation in lock-step, and
+    /// avoids re-implementing normalize / anchor rules on the App
+    /// side.
+    SetLeftTabsState(rimeterm_config::left_tabs_state::LeftTabsState),
     Refresh,
     Close,
 }
@@ -86,6 +108,17 @@ pub struct SettingsState {
     /// (or the platform isn't supported). Refreshed by
     /// [`Self::refresh`] and after each install / uninstall.
     pub integration_installed: Option<bool>,
+    /// Live copy of the persisted left-column tab visibility + order,
+    /// seeded from App on open. All mutations happen here (Space
+    /// toggle, Shift+Up/Down reorder); each yields a
+    /// [`SettingsAction::SetLeftTabsState`] with the fresh state so
+    /// App can rebuild the tab groups and flush to disk in one step.
+    pub left_tabs_state: rimeterm_config::left_tabs_state::LeftTabsState,
+    /// Human-readable labels for every left-column tab id shown in
+    /// the Tabs panel. Missing ids render as their raw id string
+    /// (harmless fallback, but should not happen — App seeds every
+    /// catalog entry).
+    pub left_tab_labels: std::collections::HashMap<String, String>,
 }
 
 impl Default for SettingsState {
@@ -100,6 +133,8 @@ impl Default for SettingsState {
             markdown_theme: rimeterm_markdown::Theme::default(),
             current_shell: ShellChoice::None,
             integration_installed: None,
+            left_tabs_state: rimeterm_config::left_tabs_state::LeftTabsState::default(),
+            left_tab_labels: std::collections::HashMap::new(),
         }
     }
 }
@@ -152,11 +187,27 @@ impl SettingsState {
         self.integration_installed = installed;
     }
 
+    /// Seed the left-column tab state so the Tabs panel matches the
+    /// live workspace when the overlay opens. Called from
+    /// `App::open_settings_overlay` right after `open()`. `labels`
+    /// pairs stable ids with display strings for both groups; anything
+    /// missing from the map falls back to the raw id in the row
+    /// renderer.
+    pub fn set_left_tabs_state(
+        &mut self,
+        state: rimeterm_config::left_tabs_state::LeftTabsState,
+        labels: std::collections::HashMap<String, String>,
+    ) {
+        self.left_tabs_state = state;
+        self.left_tab_labels = labels;
+    }
+
     fn row_count(&self) -> usize {
         match self.tab {
             SettingsTab::Agents => self.agents.len(),
             SettingsTab::Viewer => rimeterm_markdown::Theme::ALL.len(),
             SettingsTab::Shell => self.shells.len(),
+            SettingsTab::Tabs => self.left_tabs_state.top.len() + self.left_tabs_state.bottom.len(),
             // Integration: two rows on Windows (Install / Uninstall);
             // on other platforms zero rows — the body is a static
             // "not supported" notice.
@@ -170,6 +221,20 @@ impl SettingsState {
         }
     }
 
+    /// Translate the flat cursor index used by the Tabs panel into
+    /// (group, index-within-group). Returns `None` for cursors that
+    /// fall outside both groups (should not happen when
+    /// [`Self::row_count`] is honored).
+    fn tabs_cursor_target(&self) -> Option<(LeftGroup, usize)> {
+        let top_len = self.left_tabs_state.top.len();
+        if self.cursor < top_len {
+            Some((LeftGroup::Top, self.cursor))
+        } else {
+            let idx = self.cursor - top_len;
+            (idx < self.left_tabs_state.bottom.len()).then_some((LeftGroup::Bottom, idx))
+        }
+    }
+
     fn move_cursor(&mut self, delta: isize) {
         let count = self.row_count();
         if count == 0 {
@@ -179,18 +244,108 @@ impl SettingsState {
         self.cursor = ((self.cursor as isize + delta).rem_euclid(count as isize)) as usize;
     }
 
+    /// Toggle visibility of the row under the cursor in the Tabs panel.
+    /// Anchor rows silently reject the toggle — the row rendering
+    /// carries the `[locked]` badge that explains why. Returns the
+    /// [`SettingsAction::SetLeftTabsState`] payload when the mutation
+    /// actually changes state.
+    fn toggle_left_tab_at_cursor(&mut self) -> Option<SettingsAction> {
+        let (group, idx) = self.tabs_cursor_target()?;
+        let list = self.left_tabs_state_list_mut(group);
+        let entry = list.get_mut(idx)?;
+        if is_anchor(group, &entry.id) {
+            return None; // Files / Git are mandatory — refuse the flip.
+        }
+        entry.visible = !entry.visible;
+        Some(SettingsAction::SetLeftTabsState(
+            self.left_tabs_state.clone(),
+        ))
+    }
+
+    /// Move the row under the cursor by `delta` positions within its
+    /// group. Anchors stay pinned at index 0 (both the anchor row
+    /// itself and its neighbor refuse to swap past it). Returns the
+    /// payload action when the mutation succeeded, or `None` when the
+    /// move would violate the anchor pin or run off either end.
+    fn move_left_tab_at_cursor(&mut self, delta: isize) -> Option<SettingsAction> {
+        let (group, idx) = self.tabs_cursor_target()?;
+        if is_anchor(group, &self.left_tabs_state_list(group)[idx].id) {
+            return None; // Anchor never moves.
+        }
+        let target_idx = (idx as isize).checked_add(delta)?;
+        let list = self.left_tabs_state_list_mut(group);
+        if target_idx < 1 || target_idx as usize >= list.len() {
+            // Position 0 is reserved for the anchor; refuse to swap
+            // into it. Off-the-end is a normal boundary case.
+            return None;
+        }
+        let target_idx = target_idx as usize;
+        list.swap(idx, target_idx);
+        // Follow the moved row so repeated Shift+↑/Shift+↓ keeps
+        // pushing the same entry — matches how VS Code, Firefox tab
+        // reorder, and every file manager treats keyboard reorders.
+        let top_len = self.left_tabs_state.top.len();
+        self.cursor = match group {
+            LeftGroup::Top => target_idx,
+            LeftGroup::Bottom => top_len + target_idx,
+        };
+        Some(SettingsAction::SetLeftTabsState(
+            self.left_tabs_state.clone(),
+        ))
+    }
+
+    fn left_tabs_state_list(
+        &self,
+        group: LeftGroup,
+    ) -> &[rimeterm_config::left_tabs_state::LeftTab] {
+        match group {
+            LeftGroup::Top => &self.left_tabs_state.top,
+            LeftGroup::Bottom => &self.left_tabs_state.bottom,
+        }
+    }
+
+    fn left_tabs_state_list_mut(
+        &mut self,
+        group: LeftGroup,
+    ) -> &mut Vec<rimeterm_config::left_tabs_state::LeftTab> {
+        match group {
+            LeftGroup::Top => &mut self.left_tabs_state.top,
+            LeftGroup::Bottom => &mut self.left_tabs_state.bottom,
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<SettingsAction> {
+        use crossterm::event::KeyModifiers;
         if !self.open {
             return None;
+        }
+        // Tabs-panel-specific mutation keys are checked BEFORE the
+        // shared arrow-key cursor movement so `Shift+Up` reorders
+        // instead of just moving the cursor.
+        if self.tab == SettingsTab::Tabs {
+            let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
+            match key.code {
+                KeyCode::Char(' ') => return self.toggle_left_tab_at_cursor(),
+                KeyCode::Char('+') | KeyCode::Char(']') => {
+                    return self.move_left_tab_at_cursor(1);
+                }
+                KeyCode::Char('-') | KeyCode::Char('[') => {
+                    return self.move_left_tab_at_cursor(-1);
+                }
+                KeyCode::Up if shifted => return self.move_left_tab_at_cursor(-1),
+                KeyCode::Down if shifted => return self.move_left_tab_at_cursor(1),
+                _ => {}
+            }
         }
         match key.code {
             KeyCode::Esc => Some(SettingsAction::Close),
             KeyCode::Tab => {
-                // Cycle Agents → Viewer → Shell → Integration → Agents.
+                // Cycle Agents → Viewer → Shell → Tabs → Integration → Agents.
                 self.tab = match self.tab {
                     SettingsTab::Agents => SettingsTab::Viewer,
                     SettingsTab::Viewer => SettingsTab::Shell,
-                    SettingsTab::Shell => SettingsTab::Integration,
+                    SettingsTab::Shell => SettingsTab::Tabs,
+                    SettingsTab::Tabs => SettingsTab::Integration,
                     SettingsTab::Integration => SettingsTab::Agents,
                 };
                 self.reset_cursor_for_tab();
@@ -201,7 +356,8 @@ impl SettingsState {
                     SettingsTab::Agents => SettingsTab::Integration,
                     SettingsTab::Viewer => SettingsTab::Agents,
                     SettingsTab::Shell => SettingsTab::Viewer,
-                    SettingsTab::Integration => SettingsTab::Shell,
+                    SettingsTab::Tabs => SettingsTab::Shell,
+                    SettingsTab::Integration => SettingsTab::Tabs,
                 };
                 self.reset_cursor_for_tab();
                 None
@@ -210,7 +366,8 @@ impl SettingsState {
                 self.tab = match self.tab {
                     SettingsTab::Agents => SettingsTab::Viewer,
                     SettingsTab::Viewer => SettingsTab::Shell,
-                    SettingsTab::Shell => SettingsTab::Integration,
+                    SettingsTab::Shell => SettingsTab::Tabs,
+                    SettingsTab::Tabs => SettingsTab::Integration,
                     SettingsTab::Integration => SettingsTab::Agents,
                 };
                 self.reset_cursor_for_tab();
@@ -230,7 +387,7 @@ impl SettingsState {
         }
     }
 
-    fn selected_action(&self) -> Option<SettingsAction> {
+    fn selected_action(&mut self) -> Option<SettingsAction> {
         match self.tab {
             SettingsTab::Agents => self.agents.get(self.cursor).and_then(|agent| {
                 agent.is_available().then(|| SettingsAction::Agent {
@@ -246,6 +403,11 @@ impl SettingsState {
                 .get(self.cursor)
                 .cloned()
                 .map(SettingsAction::SetShell),
+            // Enter on the Tabs panel is treated as "toggle" so users
+            // who never notice the Space hint still discover the flow.
+            // toggle_left_tab_at_cursor takes &mut self, hence the
+            // outer method also needs &mut self.
+            SettingsTab::Tabs => self.toggle_left_tab_at_cursor(),
             // Row 0 = Install, row 1 = Uninstall on Windows; other
             // platforms have no rows so the match arm is dead.
             SettingsTab::Integration => {
@@ -277,6 +439,18 @@ impl SettingsState {
                 .iter()
                 .position(|s| s.path() == self.current_shell.path())
                 .unwrap_or(0),
+            // Tabs: land on the first non-anchor row (row 1 within the
+            // top group) so Shift+↑/Shift+↓ + Space discovery works
+            // without a wasted key press on the locked anchor. Falls
+            // back to 0 for the degenerate "top group has only the
+            // anchor" case.
+            SettingsTab::Tabs => {
+                if self.left_tabs_state.top.len() > 1 {
+                    1
+                } else {
+                    0
+                }
+            }
             // Integration: snap to Uninstall when already installed
             // so Enter defaults to the "toggle" action; otherwise
             // snap to Install.
@@ -322,7 +496,7 @@ impl SettingsState {
         };
         Clear.render(popup, buf);
         let block = Block::default()
-            .title(" Settings · Agents / Viewer / Shell / Integration ")
+            .title(" Settings · Agents / Viewer / Shell / Tabs / Integration ")
             .borders(Borders::ALL);
         let inner = block.inner(popup);
         block.render(popup, buf);
@@ -340,6 +514,8 @@ impl SettingsState {
             ),
             Span::raw("  "),
             Span::styled(" Shell ", tab_style(self.tab == SettingsTab::Shell, accent)),
+            Span::raw("  "),
+            Span::styled(" Tabs ", tab_style(self.tab == SettingsTab::Tabs, accent)),
             Span::raw("  "),
             Span::styled(
                 " Integration ",
@@ -420,6 +596,25 @@ impl SettingsState {
                     }
                 }
             }
+            SettingsTab::Tabs => {
+                lines.push(Line::styled(
+                    " ↑/↓ move cursor · Shift+↑/↓ reorder · [Space] toggle · [Enter] toggle",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                lines.push(Line::styled(
+                    "  Files and Git are pinned to position 1 in their column.",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                lines.push(Line::raw(""));
+                self.render_tabs_group(&mut lines, "Left top (files column)", LeftGroup::Top, 0);
+                lines.push(Line::raw(""));
+                self.render_tabs_group(
+                    &mut lines,
+                    "Left bottom (git column)",
+                    LeftGroup::Bottom,
+                    self.left_tabs_state.top.len(),
+                );
+            }
             SettingsTab::Integration => {
                 if !cfg!(windows) {
                     lines.push(Line::styled(
@@ -478,6 +673,47 @@ impl SettingsState {
             ));
         }
         Paragraph::new(lines).render(body, buf);
+    }
+
+    /// Emit lines for one left-column group: a subheading followed by
+    /// one row per catalog entry. `offset` = index in the flat cursor
+    /// where this group's rows begin (0 for top, `top.len()` for
+    /// bottom).
+    fn render_tabs_group(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        heading: &str,
+        group: LeftGroup,
+        offset: usize,
+    ) {
+        lines.push(Line::styled(
+            format!(" {heading}"),
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        ));
+        let list = self.left_tabs_state_list(group);
+        for (idx, tab) in list.iter().enumerate() {
+            let checkbox = if tab.visible { "[x]" } else { "[ ]" };
+            let label = self
+                .left_tab_labels
+                .get(&tab.id)
+                .cloned()
+                .unwrap_or_else(|| tab.id.clone());
+            let position = idx + 1;
+            let anchor_note = if is_anchor(group, &tab.id) {
+                "  (locked)"
+            } else {
+                ""
+            };
+            let text = format!("  {position}. {checkbox} {label:<14}{anchor_note}");
+            lines.push(Line::styled(text, row_style(offset + idx == self.cursor)));
+        }
+    }
+}
+
+fn is_anchor(group: LeftGroup, id: &str) -> bool {
+    match group {
+        LeftGroup::Top => id == rimeterm_config::left_tabs_state::ANCHOR_TOP,
+        LeftGroup::Bottom => id == rimeterm_config::left_tabs_state::ANCHOR_BOTTOM,
     }
 }
 
@@ -539,7 +775,7 @@ mod tests {
 
     #[test]
     fn tab_cycle_visits_every_tab() {
-        // Agents → Viewer → Shell → Integration → Agents
+        // Agents → Viewer → Shell → Tabs → Integration → Agents
         let mut state = SettingsState::default();
         state.open = true;
         assert_eq!(state.tab, SettingsTab::Agents);
@@ -547,6 +783,8 @@ mod tests {
         assert_eq!(state.tab, SettingsTab::Viewer);
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Shell);
+        state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Tabs);
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Integration);
         state.handle_key(key(KeyCode::Tab));
@@ -654,8 +892,8 @@ mod tests {
         let mut state = SettingsState::default();
         state.open = true;
         state.set_integration_installed(Some(true));
-        state.tab = SettingsTab::Shell;
-        state.handle_key(key(KeyCode::Char('l'))); // Shell → Integration
+        state.tab = SettingsTab::Tabs;
+        state.handle_key(key(KeyCode::Char('l'))); // Tabs → Integration
         assert_eq!(state.tab, SettingsTab::Integration);
         assert_eq!(state.cursor, 1);
     }
@@ -668,5 +906,138 @@ mod tests {
         state.tab = SettingsTab::Integration;
         state.cursor = 0;
         assert_eq!(state.handle_key(key(KeyCode::Enter)), None);
+    }
+
+    /// Seed a state matching the production catalog so tests can drive
+    /// the Tabs panel with real ids without pulling in the whole App.
+    fn seed_left_tabs(state: &mut SettingsState) {
+        use rimeterm_config::left_tabs_state::{LeftTab, LeftTabsState};
+        let mut s = LeftTabsState {
+            top: vec![
+                LeftTab::new("files", true),
+                LeftTab::new("todo", true),
+                LeftTab::new("fr", true),
+            ],
+            bottom: vec![
+                LeftTab::new("git", true),
+                LeftTab::new("sysmon", true),
+                LeftTab::new("agtop", true),
+                LeftTab::new("models", true),
+                LeftTab::new("stock", true),
+            ],
+        };
+        s.normalize(
+            &["files", "todo", "fr"],
+            &["git", "sysmon", "agtop", "models", "stock"],
+        );
+        let labels = [
+            ("files", "Files"),
+            ("todo", "Todo"),
+            ("fr", "Fast Resume"),
+            ("git", "Git"),
+            ("sysmon", "Sysmon"),
+            ("agtop", "Agtop"),
+            ("models", "Models"),
+            ("stock", "Stock"),
+        ]
+        .into_iter()
+        .map(|(id, label)| (id.to_string(), label.to_string()))
+        .collect();
+        state.set_left_tabs_state(s, labels);
+    }
+
+    #[test]
+    fn tabs_panel_row_count_matches_state_sizes() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Tabs;
+        seed_left_tabs(&mut state);
+        // 3 top + 5 bottom = 8 rows.
+        assert_eq!(state.row_count(), 8);
+    }
+
+    #[test]
+    fn tabs_panel_reset_cursor_lands_on_first_non_anchor() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        seed_left_tabs(&mut state);
+        state.tab = SettingsTab::Shell;
+        state.handle_key(key(KeyCode::Char('l'))); // Shell → Tabs
+        assert_eq!(state.tab, SettingsTab::Tabs);
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn tabs_panel_space_toggles_non_anchor_row() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Tabs;
+        seed_left_tabs(&mut state);
+        state.cursor = 1; // Todo row in the top group.
+        let action = state.handle_key(key(KeyCode::Char(' ')));
+        match action {
+            Some(SettingsAction::SetLeftTabsState(s)) => {
+                let todo = s.top.iter().find(|t| t.id == "todo").unwrap();
+                assert!(!todo.visible, "Space should hide the row");
+            }
+            other => panic!("expected SetLeftTabsState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tabs_panel_space_rejects_anchor_row() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Tabs;
+        seed_left_tabs(&mut state);
+        state.cursor = 0; // Files anchor.
+        assert_eq!(state.handle_key(key(KeyCode::Char(' '))), None);
+        assert!(state.left_tabs_state.top[0].visible);
+    }
+
+    #[test]
+    fn tabs_panel_shift_down_swaps_neighbors_within_group() {
+        use crossterm::event::{KeyEventKind, KeyModifiers};
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Tabs;
+        seed_left_tabs(&mut state);
+        state.cursor = 1; // Todo row.
+        let shift_down =
+            KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::SHIFT, KeyEventKind::Press);
+        let action = state.handle_key(shift_down);
+        assert!(matches!(action, Some(SettingsAction::SetLeftTabsState(_))));
+        // Todo moved to index 2; the row cursor followed it.
+        assert_eq!(state.left_tabs_state.top[1].id, "fr");
+        assert_eq!(state.left_tabs_state.top[2].id, "todo");
+        assert_eq!(state.cursor, 2);
+    }
+
+    #[test]
+    fn tabs_panel_shift_up_refuses_to_swap_past_anchor() {
+        use crossterm::event::{KeyEventKind, KeyModifiers};
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Tabs;
+        seed_left_tabs(&mut state);
+        state.cursor = 1; // Todo — sits immediately after Files.
+        let shift_up =
+            KeyEvent::new_with_kind(KeyCode::Up, KeyModifiers::SHIFT, KeyEventKind::Press);
+        assert_eq!(state.handle_key(shift_up), None);
+        // State unchanged: anchor still at 0, Todo still at 1.
+        assert_eq!(state.left_tabs_state.top[0].id, "files");
+        assert_eq!(state.left_tabs_state.top[1].id, "todo");
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn tabs_panel_cursor_wraps_across_groups() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Tabs;
+        seed_left_tabs(&mut state);
+        state.cursor = 2; // Last row in top group (fr).
+        state.handle_key(key(KeyCode::Down));
+        assert_eq!(state.cursor, 3); // First row of bottom group (git anchor).
     }
 }

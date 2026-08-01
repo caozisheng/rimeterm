@@ -470,6 +470,42 @@ fn resolve_workspace_root(cwd: &std::path::Path) -> PathBuf {
     cwd.to_path_buf()
 }
 
+/// Catalog entry for one left-column tab candidate.
+///
+/// The Settings overlay uses these to show a toggle + reorder row per
+/// eligible tab. `id` is the stable string persisted to
+/// `left_tabs.state.toml`; `pane` is the live PaneId spawned once at
+/// startup and reused whenever the tab flips from hidden → visible so
+/// its worker / cwd context survives.
+#[derive(Clone, Debug)]
+pub struct LeftTabCatalogEntry {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub pane: PaneId,
+}
+
+impl LeftTabCatalogEntry {
+    pub fn new(id: &'static str, label: &'static str, pane: PaneId) -> Self {
+        Self { id, label, pane }
+    }
+}
+
+/// Compute the visible member list for a group given its catalog and
+/// the persisted visibility state. Order follows `state`; the anchor
+/// is guaranteed to be present (state.normalize enforces it) so the
+/// returned Vec is never empty.
+fn resolve_left_group_members(
+    catalog: &[LeftTabCatalogEntry],
+    state: &[rimeterm_config::left_tabs_state::LeftTab],
+) -> Vec<PaneId> {
+    state
+        .iter()
+        .filter(|tab| tab.visible)
+        .filter_map(|tab| catalog.iter().find(|entry| entry.id == tab.id))
+        .map(|entry| entry.pane)
+        .collect()
+}
+
 #[allow(dead_code)] // config / event_bus are wired in later milestones
 pub struct App {
     workspace_root: PathBuf,
@@ -640,6 +676,20 @@ pub struct App {
     /// / `claude` / `pi`). Populated on spawn, consumed by
     /// `persist_agents_state` to write the on-disk file.
     pane_agent_id: std::collections::HashMap<PaneId, &'static str>,
+    /// Stable id → PaneId catalog for tabs eligible in the left-top
+    /// (`files`) group. Fixed at startup; drives the Settings overlay
+    /// visibility + reorder panel and the `set_members` rewrite on
+    /// apply. Order here is canonical (used as the default when a
+    /// workspace has no persisted picks yet).
+    left_top_catalog: Vec<LeftTabCatalogEntry>,
+    /// Same as [`Self::left_top_catalog`] for the left-bottom (`git`)
+    /// group.
+    left_bottom_catalog: Vec<LeftTabCatalogEntry>,
+    /// Persisted user picks (visibility + order) for both left-column
+    /// groups. Kept in step with the live tab groups by
+    /// `apply_left_tabs_state` on every mutation and flushed to disk
+    /// via `persist_left_tabs_state`.
+    left_tabs_state: rimeterm_config::left_tabs_state::LeftTabsState,
     /// In-progress divider drag. `None` when idle.
     active_drag: Option<DragState>,
     /// Snapshot of default ratios so we can `= / 0` reset.
@@ -899,20 +949,61 @@ impl App {
             pane.set_right_click_paste(config.mouse.right_click_paste);
             pane.set_scrollback_enabled(true);
         }
-        let files = build_files_group(file_manager_pane_id, todo_pane_id, fr_pane_id);
-        shells_members.push(first_id);
+        // Build the stable left-column tab catalogs. Order here is
+        // canonical — used both as the default order in a fresh
+        // workspace and as a fallback when `LeftTabsState::normalize`
+        // needs to insert a tab id the persisted file didn't mention.
+        let left_top_catalog: Vec<LeftTabCatalogEntry> = vec![
+            LeftTabCatalogEntry::new(
+                rimeterm_config::left_tabs_state::ANCHOR_TOP,
+                "Files",
+                file_manager_pane_id,
+            ),
+            LeftTabCatalogEntry::new("todo", "Todo", todo_pane_id),
+            LeftTabCatalogEntry::new("fr", "Fast Resume", fr_pane_id),
+        ];
+        let left_bottom_catalog: Vec<LeftTabCatalogEntry> = vec![
+            LeftTabCatalogEntry::new(
+                rimeterm_config::left_tabs_state::ANCHOR_BOTTOM,
+                "Git",
+                git_pane_id,
+            ),
+            LeftTabCatalogEntry::new("sysmon", "Sysmon", sysmon_id),
+            LeftTabCatalogEntry::new("agtop", "Agtop", agtop_id),
+            LeftTabCatalogEntry::new("models", "Models", models_id),
+            LeftTabCatalogEntry::new("stock", "Stock", stock_id),
+        ];
+        let top_ids: Vec<&'static str> = left_top_catalog.iter().map(|entry| entry.id).collect();
+        let bottom_ids: Vec<&'static str> =
+            left_bottom_catalog.iter().map(|entry| entry.id).collect();
 
+        // Load user visibility + order picks (missing file → all-default).
+        let mut left_tabs_state = if let Some(path) =
+            rimeterm_config::left_tabs_state::workspace_state_file(&workspace_root)
+        {
+            match rimeterm_config::left_tabs_state::LeftTabsState::load_or_default(&path) {
+                Ok(state) => state,
+                Err(e) => {
+                    warn!(error = %e, "failed to load left-tabs state; using defaults");
+                    rimeterm_config::left_tabs_state::LeftTabsState::default()
+                }
+            }
+        } else {
+            rimeterm_config::left_tabs_state::LeftTabsState::default()
+        };
+        left_tabs_state.normalize(&top_ids, &bottom_ids);
+
+        let files_members = resolve_left_group_members(&left_top_catalog, &left_tabs_state.top);
+        let git_members = resolve_left_group_members(&left_bottom_catalog, &left_tabs_state.bottom);
+
+        let files = build_files_group(files_members);
+        shells_members.push(first_id);
         // Groups.
         // Left column: files (top) + git (bottom). Both are Fixed —
         // no × / + affordance; the viewer is now a modal overlay
         // rather than a tab (§C24), so nothing ever needs to be
         // added or closed inside these groups.
-        let git = TabGroup::new(
-            BUILTIN_GIT,
-            git_members,
-            MembersPolicy::Fixed,
-            PaneKind::Files,
-        );
+        let git = build_git_group(git_members);
         let agents = TabGroup::new(
             BUILTIN_AGENTS,
             agents_members,
@@ -1058,6 +1149,9 @@ impl App {
             last_status_bar_hits: StatusBarHits::default(),
             pending_spawn: None,
             pane_agent_id: startup_agent_ids.into_iter().collect(),
+            left_top_catalog,
+            left_bottom_catalog,
+            left_tabs_state,
             active_drag: None,
             default_ratios,
             pending_mutations,
@@ -1517,6 +1611,16 @@ impl App {
             .set_markdown_theme(self.viewer_markdown_theme);
         self.settings_state
             .set_current_shell(self.shell_choice.clone());
+        // Seed the Tabs panel with a snapshot the user can mutate;
+        // apply_settings_action swaps it back in when the user commits.
+        let labels = self
+            .left_top_catalog
+            .iter()
+            .chain(self.left_bottom_catalog.iter())
+            .map(|entry| (entry.id.to_string(), entry.label.to_string()))
+            .collect();
+        self.settings_state
+            .set_left_tabs_state(self.left_tabs_state.clone(), labels);
         let _ = self.redraw_tx.send(());
     }
 
@@ -1582,6 +1686,104 @@ impl App {
                 // the row click isn't silently dropped.
                 self.set_hint("Agent actions not wired yet (C22.6 scope)".into());
             }
+            SettingsAction::SetLeftTabsState(state) => {
+                self.apply_left_tabs_state(state);
+            }
+        }
+    }
+
+    /// Adopt a new [`LeftTabsState`] emitted by the Settings overlay:
+    /// normalize against the catalog, rewrite both left-column tab
+    /// groups' members via `TabGroup::set_members`, redirect focus if
+    /// the focused pane was just hidden, and flush the picks to disk.
+    fn apply_left_tabs_state(
+        &mut self,
+        mut state: rimeterm_config::left_tabs_state::LeftTabsState,
+    ) {
+        let top_ids: Vec<&'static str> =
+            self.left_top_catalog.iter().map(|entry| entry.id).collect();
+        let bottom_ids: Vec<&'static str> = self
+            .left_bottom_catalog
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        state.normalize(&top_ids, &bottom_ids);
+
+        let top_members = resolve_left_group_members(&self.left_top_catalog, &state.top);
+        let bottom_members = resolve_left_group_members(&self.left_bottom_catalog, &state.bottom);
+
+        let visible_top: std::collections::HashSet<PaneId> = top_members.iter().copied().collect();
+        let visible_bottom: std::collections::HashSet<PaneId> =
+            bottom_members.iter().copied().collect();
+
+        if let Some(group) = self.tree.find_tab_group_mut(BUILTIN_FILES) {
+            if let Err(e) = group.set_members(top_members, Some(0)) {
+                warn!(error = %e, "left-top set_members failed");
+                self.set_hint(format!("left-top update failed: {e}"));
+                return;
+            }
+        }
+        if let Some(group) = self.tree.find_tab_group_mut(BUILTIN_GIT) {
+            if let Err(e) = group.set_members(bottom_members, Some(0)) {
+                warn!(error = %e, "left-bottom set_members failed");
+                self.set_hint(format!("left-bottom update failed: {e}"));
+                return;
+            }
+        }
+
+        // If the focused pane just got hidden, hand focus back to the
+        // group's now-active anchor so the caret doesn't strand on an
+        // invisible pane.
+        let focused_pane = self.focus.focused_pane();
+        let focused_group = self.focus.focused_group();
+        if let (Some(pane), Some(group_id)) = (focused_pane, focused_group) {
+            let hidden = matches!(group_id, BUILTIN_FILES if !visible_top.contains(&pane))
+                || matches!(group_id, BUILTIN_GIT if !visible_bottom.contains(&pane));
+            if hidden {
+                if let Some(new_active) = self
+                    .tree
+                    .find_tab_group(group_id)
+                    .and_then(|g| g.active_pane())
+                {
+                    self.focus.set_focus(new_active, Some(group_id));
+                }
+            }
+        }
+
+        self.left_tabs_state = state;
+        // Keep the Settings overlay's copy in step so a second mutation
+        // doesn't undo the first (its cached state would otherwise be
+        // stale after normalize/anchor pinning).
+        let labels = self
+            .left_top_catalog
+            .iter()
+            .chain(self.left_bottom_catalog.iter())
+            .map(|entry| (entry.id.to_string(), entry.label.to_string()))
+            .collect();
+        self.settings_state
+            .set_left_tabs_state(self.left_tabs_state.clone(), labels);
+        self.persist_left_tabs_state();
+        self.needs_redraw = true;
+        let _ = self.redraw_tx.send(());
+    }
+
+    /// Flush the current left-tabs state to disk. Non-fatal on error —
+    /// the next launch just reverts to defaults for this workspace.
+    fn persist_left_tabs_state(&self) {
+        let Some(path) =
+            rimeterm_config::left_tabs_state::workspace_state_file(&self.workspace_root)
+        else {
+            return;
+        };
+        let top_ids: Vec<&'static str> =
+            self.left_top_catalog.iter().map(|entry| entry.id).collect();
+        let bottom_ids: Vec<&'static str> = self
+            .left_bottom_catalog
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        if let Err(e) = self.left_tabs_state.save_to(&path, &top_ids, &bottom_ids) {
+            warn!(error = %e, "failed to persist left-tabs state");
         }
     }
 
@@ -4472,17 +4674,25 @@ fn resume_spawn_spec(target: ResumeTarget) -> Result<ResumeSpawnSpec> {
     })
 }
 
-fn build_files_group(
-    file_manager_pane_id: PaneId,
-    todo_pane_id: PaneId,
-    fr_pane_id: PaneId,
-) -> TabGroup {
+fn build_files_group(members: Vec<PaneId>) -> TabGroup {
+    debug_assert!(
+        !members.is_empty(),
+        "left-top group must always have at least the anchor member",
+    );
     TabGroup::new(
         BUILTIN_FILES,
-        vec![file_manager_pane_id, todo_pane_id, fr_pane_id],
+        members,
         MembersPolicy::Fixed,
         PaneKind::Files,
     )
+}
+
+fn build_git_group(members: Vec<PaneId>) -> TabGroup {
+    debug_assert!(
+        !members.is_empty(),
+        "left-bottom group must always have at least the anchor member",
+    );
+    TabGroup::new(BUILTIN_GIT, members, MembersPolicy::Fixed, PaneKind::Files)
 }
 
 fn remove_agent_picker_placeholder(group: &mut TabGroup, panes: &mut PaneRegistry) {
@@ -6491,7 +6701,7 @@ mod tests {
         let todo_id = PaneId(42);
         let fr_id = PaneId(43);
 
-        let group = build_files_group(files_id, todo_id, fr_id);
+        let group = build_files_group(vec![files_id, todo_id, fr_id]);
 
         assert_eq!(group.members(), &[files_id, todo_id, fr_id]);
         assert_eq!(group.policy(), MembersPolicy::Fixed);

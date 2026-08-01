@@ -257,6 +257,43 @@ impl TabGroup {
         *slot = new_id;
         Ok(old)
     }
+
+    /// Replace the entire member list atomically. Admin API — bypasses
+    /// [`MembersPolicy`] because it's used by the Settings overlay to
+    /// let the user hide / reorder tabs in Fixed groups, not by the
+    /// user-facing `Ctrl+T` / `×` affordances. Preserves the currently-
+    /// active pane when it survives the rewrite; otherwise falls back
+    /// to `active` (clamped to the new length) or `0`.
+    ///
+    /// Errors:
+    /// - [`PolicyError::LastMember`] if `members` is empty — every
+    ///   group must have at least one live tab (see [`Self::new`]).
+    /// - [`PolicyError::Full`] if the group is `Open` and the new list
+    ///   exceeds its `max`.
+    pub fn set_members(
+        &mut self,
+        members: Vec<PaneId>,
+        preferred_active: Option<usize>,
+    ) -> Result<(), PolicyError> {
+        if members.is_empty() {
+            return Err(PolicyError::LastMember(self.id));
+        }
+        if let MembersPolicy::Open { max } = self.policy
+            && members.len() > max
+        {
+            return Err(PolicyError::Full {
+                group: self.id,
+                max,
+            });
+        }
+        let previously_active = self.active_pane();
+        self.members = members;
+        self.active = previously_active
+            .and_then(|id| self.members.iter().position(|m| *m == id))
+            .or_else(|| preferred_active.filter(|i| *i < self.members.len()))
+            .unwrap_or(0);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -361,5 +398,71 @@ mod tests {
         g.try_close(0, false).unwrap();
         // Removing index 0 should keep `c` (originally at 2) visible at index 1.
         assert_eq!(g.active_pane(), Some(c));
+    }
+
+    #[test]
+    fn set_members_preserves_previously_active_pane() {
+        let a = pid();
+        let b = pid();
+        let c = pid();
+        let mut g = TabGroup::new(
+            TabGroupId::from_static("files"),
+            vec![a, b, c],
+            MembersPolicy::Fixed,
+            PaneKind::Files,
+        );
+        g.goto(1).unwrap(); // active on `b`
+        // Reorder + drop `a`; `b` survives so active MUST follow it.
+        g.set_members(vec![c, b], None).unwrap();
+        assert_eq!(g.active_pane(), Some(b));
+        assert_eq!(g.active_index(), 1);
+    }
+
+    #[test]
+    fn set_members_falls_back_when_active_removed() {
+        let a = pid();
+        let b = pid();
+        let mut g = TabGroup::new(
+            TabGroupId::from_static("files"),
+            vec![a, b],
+            MembersPolicy::Fixed,
+            PaneKind::Files,
+        );
+        g.goto(1).unwrap(); // active on `b`
+        // `b` gone; preferred_active = 0 keeps us on the first survivor.
+        g.set_members(vec![a], Some(0)).unwrap();
+        assert_eq!(g.active_pane(), Some(a));
+    }
+
+    #[test]
+    fn set_members_rejects_empty_list() {
+        let a = pid();
+        let mut g = TabGroup::new(
+            TabGroupId::from_static("files"),
+            vec![a],
+            MembersPolicy::Fixed,
+            PaneKind::Files,
+        );
+        assert!(matches!(
+            g.set_members(vec![], None),
+            Err(PolicyError::LastMember(_)),
+        ));
+    }
+
+    #[test]
+    fn set_members_enforces_open_group_cap() {
+        let a = pid();
+        let b = pid();
+        let c = pid();
+        let mut g = TabGroup::new(
+            TabGroupId::from_static("shells"),
+            vec![a],
+            MembersPolicy::Open { max: 2 },
+            PaneKind::Shell,
+        );
+        assert!(matches!(
+            g.set_members(vec![a, b, c], None),
+            Err(PolicyError::Full { .. }),
+        ));
     }
 }
