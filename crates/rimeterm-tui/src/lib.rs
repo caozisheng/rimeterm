@@ -43,5 +43,6 @@ pub mod todo_pane;
 pub mod updater;
 pub mod upgrade;
 pub mod viewer;
+pub mod zones_pane;
 
 pub use app::App;

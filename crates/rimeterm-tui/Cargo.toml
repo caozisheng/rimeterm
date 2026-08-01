@@ -16,6 +16,7 @@ rimeterm-pty = { workspace = true }
 rimeterm-ipc = { workspace = true }
 fast-resume = { workspace = true }
 rimeterm-stock = { workspace = true }
+rimeterm-zones = { workspace = true }
 serde_json = "1"
 parking_lot = "0.12"
 serde = { workspace = true }

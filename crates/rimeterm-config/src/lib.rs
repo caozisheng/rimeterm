@@ -41,6 +41,7 @@ pub struct Config {
     pub mouse: MouseConfig,
     pub viewer: ViewerConfig,
     pub stock: StockConfig,
+    pub zones: ZonesConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -300,6 +301,40 @@ impl Default for StockConfig {
             closed_refresh_secs: 60,
             http_proxy: None,
             tushare_token: None,
+        }
+    }
+}
+
+/// Zones-pane knobs: home-zone override, refresh cadence, side-list toggle.
+/// Rendered by `rimeterm-tui::zones_pane` on top of the `rimeterm-zones`
+/// braille globe.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ZonesConfig {
+    /// Explicit override for the "home" zone marker. `None` (default) calls
+    /// [`iana_time_zone::get_timezone`] via `rimeterm-zones`.
+    pub home: Option<String>,
+    /// Repaint interval in seconds. The subsolar point moves ~0.25°/minute,
+    /// so faster is wasted work in a terminal pane.
+    pub refresh_secs: u32,
+    /// Show the vertical zone list next to the map when the pane is wide
+    /// enough (>= 100 cols).
+    pub show_side_list: bool,
+    /// Default work window used to colour markers Core / Shoulder / Off
+    /// when no per-zone window is configured. Format `"HH:MM-HH:MM"`.
+    pub default_window: String,
+    /// Shoulder minutes flanking the work window. `1` → one hour on each side.
+    pub shoulder_hours: u16,
+}
+
+impl Default for ZonesConfig {
+    fn default() -> Self {
+        Self {
+            home: None,
+            refresh_secs: 60,
+            show_side_list: true,
+            default_window: "09:00-17:00".to_string(),
+            shoulder_hours: 1,
         }
     }
 }

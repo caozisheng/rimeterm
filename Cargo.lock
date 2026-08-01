@@ -4994,6 +4994,7 @@ dependencies = [
  "rimeterm-models",
  "rimeterm-pty",
  "rimeterm-stock",
+ "rimeterm-zones",
  "semver",
  "serde",
  "serde_json",
@@ -5021,6 +5022,21 @@ dependencies = [
  "tuxedo",
  "unicode-width",
  "which",
+]
+
+[[package]]
+name = "rimeterm-zones"
+version = "0.2.11"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "directories",
+ "iana-time-zone",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.19",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]

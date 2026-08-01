@@ -12,6 +12,7 @@ members = [
     "crates/fast-resume",
     "crates/rimeterm-models",
     "crates/rimeterm-stock",
+    "crates/rimeterm-zones",
     "crates/tuxedo",
 ]
 
@@ -33,6 +34,7 @@ rimeterm-tui    = { path = "crates/rimeterm-tui",    version = "0.2" }
 rimeterm-markdown = { path = "crates/rimeterm-markdown", version = "0.2" }
 rimeterm-models = { path = "crates/rimeterm-models", version = "0.2" }
 rimeterm-stock  = { path = "crates/rimeterm-stock",  version = "0.2" }
+rimeterm-zones  = { path = "crates/rimeterm-zones",  version = "0.2" }
 tuxedo          = { path = "crates/tuxedo" }
 fast-resume      = { path = "crates/fast-resume" }
 

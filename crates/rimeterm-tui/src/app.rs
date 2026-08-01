@@ -923,6 +923,19 @@ impl App {
         pinned_pane_ids.insert(stock_id);
         git_members.push(stock_id);
 
+        // Left-bottom group sixth tab: Native ZonesPane — braille world map
+        // with a day/night terminator, per-configured-zone markers, and a
+        // ◉ "home" marker resolved from the OS via `iana_time_zone`. Zero
+        // network, ~60 s repaint. Data crate `rimeterm-zones` is pinned;
+        // pane state persists globally like the stock watchlist.
+        let zones_watchlist = rimeterm_config::paths::zones_file()
+            .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-zones.toml"));
+        let zones = crate::zones_pane::ZonesPane::new(config.zones.clone(), zones_watchlist);
+        let zones_id = zones.id();
+        panes.insert(Box::new(zones));
+        pinned_pane_ids.insert(zones_id);
+        git_members.push(zones_id);
+
         // Shells group: always at least one interactive shell. Bottom
         // moved to the left-bottom (git) group, so shells is single-
         // purpose now.
@@ -972,6 +985,7 @@ impl App {
             LeftTabCatalogEntry::new("agtop", "Agtop", agtop_id),
             LeftTabCatalogEntry::new("models", "Models", models_id),
             LeftTabCatalogEntry::new("stock", "Stock", stock_id),
+            LeftTabCatalogEntry::new("zones", "Zones", zones_id),
         ];
         let top_ids: Vec<&'static str> = left_top_catalog.iter().map(|entry| entry.id).collect();
         let bottom_ids: Vec<&'static str> =

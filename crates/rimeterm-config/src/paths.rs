@@ -74,6 +74,13 @@ pub fn stock_watchlist_file() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join("stock").join("watchlist.toml"))
 }
 
+/// Global zone list file used by the `ZonesPane` (world-map + timezones).
+/// It follows the user rather than the active workspace, same rationale
+/// as [`stock_watchlist_file`].
+pub fn zones_file() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("zones").join("zones.toml"))
+}
+
 /// `~/.rimeterm/bin/` — essentials binaries live here (C21.5).
 ///
 /// Populated at first launch by [`crate::essentials::materialize`] from
@@ -472,6 +479,16 @@ mod tests {
             assert_eq!(
                 stock_watchlist_file(),
                 Some(root.join("data").join("stock").join("watchlist.toml")),
+            );
+        });
+    }
+
+    #[test]
+    fn zones_file_lives_in_global_data_dir() {
+        with_rimeterm_home(|root| {
+            assert_eq!(
+                zones_file(),
+                Some(root.join("data").join("zones").join("zones.toml")),
             );
         });
     }

@@ -190,6 +190,31 @@ failing startup.
   while retaining the upstream todo.txt engine, TUI, CLI, and standalone
   `tuxedo` binary.
 
+## Timezones + world map
+
+`ZonesPane` renders a braille Web-Mercator globe with a day/night terminator
+and per-zone markers in-process. The stack:
+
+- [zonetimeline-tui](https://github.com/findyourexit/zonetimeline-tui) — MIT.
+  Upstream `zonetimeline-tui` (aka `ztl`) is a standalone TUI binary; we ported
+  the map subsystem (`canvas.rs`, `projection.rs`, `solar.rs`, `locations.rs`,
+  `core/timezones.rs` @ v0.4.0) into the `rimeterm-zones` crate so the tab
+  compiles in without a separate `cargo install ztl`. The rest of the pane
+  (small-pane layout tiers, IANA-name search modal, tick loop, watchlist
+  persistence, side zone list) is rimeterm-native. Ported files carry SPDX
+  `MIT` / `2025 Tom Larcher` headers.
+- [Natural Earth](https://www.naturalearthdata.com/) `ne_110m_coastline`
+  (`v5.1.2`) — public domain. Vendored polylines in
+  `crates/rimeterm-zones/src/coastline.rs` drive the coastline outline.
+- [IANA time zone database](https://www.iana.org/time-zones) `zone1970.tab`
+  (`eggert/tz @ 2026a`) — public domain. Vendored representative city
+  coordinates in `crates/rimeterm-zones/src/coords.rs` power the marker
+  placement and the auto-detected home marker (via
+  [iana-time-zone](https://github.com/strawlab/iana-time-zone) — MIT /
+  Apache-2.0).
+- [chrono-tz](https://github.com/chronotope/chrono-tz) — MIT / Apache-2.0.
+  DST-aware IANA zone lookups.
+
 ## Terminal / TUI design lineage
 
 - [zellij](https://github.com/zellij-org/zellij) and
