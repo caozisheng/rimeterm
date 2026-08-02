@@ -132,6 +132,27 @@ jobs:
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building version: ${VERSION}"
 
+      - name: Align workspace version to release tag
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        # env!("CARGO_PKG_VERSION") — used by the Upgrade dialog to show
+        # "Current version" and by updater::select_release_for to decide
+        # which GitHub tag is newer — is baked in from
+        # workspace.package.version at compile time. cargo-deb reads the
+        # same field for the .deb version stamp too. Without this bump,
+        # every release from v0.2.12 onward built as 0.2.11 and the
+        # upgrade modal always saw an "available" newer release. Portable
+        # `sed -i.bak` (BSD sed on macOS needs the suffix); the address
+        # range restricts the edit to the [workspace.package] section so
+        # [workspace.dependencies] version keys are untouched.
+        run: |
+          set -euo pipefail
+          sed -i.bak -E '/^\[workspace\.package\]/,/^\[/ s|^(version = )"[^"]*"|\1"'"${VERSION}"'"|' Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "workspace.package now:"
+          sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml
+
       # One cargo invocation so incremental linking + parallel codegen share
       # work across both binaries.
       - name: Cargo build --release (rimeterm + rimectl)
