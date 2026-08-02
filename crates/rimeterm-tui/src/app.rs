@@ -49,6 +49,7 @@ use rimeterm_core::tabs::{
 use rimeterm_pty::{ShellChoice, detect_default_shell};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use unicode_width::UnicodeWidthStr;
 
 use crate::file_manager_pane::FileManagerPane;
 use crate::fr_pane::{FrAction, FrPane};
@@ -610,6 +611,27 @@ pub struct App {
     upgrade_state: crate::upgrade::UpgradeState,
     upgrade_tx: mpsc::UnboundedSender<crate::upgrade::WorkerEvent>,
     upgrade_rx: mpsc::UnboundedReceiver<crate::upgrade::WorkerEvent>,
+    /// Newest release GitHub knows about, snapshotted from the most
+    /// recent successful check (silent or interactive). Populates the
+    /// red "有新版本 vX.Y.Z" chip in the hint bar's bottom-right; kept
+    /// separate from `upgrade_state` so the chip persists even after
+    /// the user closes the overlay without downloading, and gets
+    /// cleared the moment a subsequent check reports UpToDate. Only
+    /// written from [`Self::apply_upgrade_event`] under a matching
+    /// generation, so stale events can never revive a stale chip.
+    latest_available: Option<crate::updater::AvailableRelease>,
+    /// Screen rect of the hint-bar update chip from the last frame.
+    /// `None` when the chip wasn't rendered (no known update, or the
+    /// terminal was too narrow). Consumed by `on_mouse` so a left-
+    /// click on the chip triggers the same `app.upgrade` flag the
+    /// menu entry uses.
+    last_upgrade_chip_rect: Option<Rect>,
+    /// Latched to `true` the moment we spawn the first-launch silent
+    /// upgrade check; guards `run()` from firing a second probe on a
+    /// hypothetical re-entry (e.g. once we add a reconnect path). The
+    /// check itself is cheap, but hammering GitHub's public API from
+    /// a background TUI would be rude.
+    silent_upgrade_check_spawned: bool,
     #[cfg(windows)]
     pending_installer: Option<PathBuf>,
     flags: Arc<ActionFlags>,
@@ -1144,6 +1166,9 @@ impl App {
             upgrade_state: crate::upgrade::UpgradeState::default(),
             upgrade_tx,
             upgrade_rx,
+            latest_available: None,
+            last_upgrade_chip_rect: None,
+            silent_upgrade_check_spawned: false,
             #[cfg(windows)]
             pending_installer: None,
             flags,
@@ -1181,6 +1206,12 @@ impl App {
         // Spawn the local IPC server (§11). Shuts down when this handle
         // is dropped at the end of `run`.
         let ipc_shutdown = self.spawn_ipc_server().await;
+
+        // Fire a one-shot silent upgrade probe against GitHub Releases.
+        // Result lands on `upgrade_rx` and flips `latest_available` on
+        // success, which paints the red "有新版本" chip in the hint
+        // bar bottom-right. Network hiccups stay silent by design.
+        self.spawn_startup_upgrade_check();
 
         guard.terminal.draw(|f| {
             let cursor = self.draw(f.area(), f);
@@ -1562,6 +1593,26 @@ impl App {
         });
     }
 
+    /// Fire the one-shot silent upgrade probe on first boot. Bumps the
+    /// upgrade-state generation to `1` without opening the overlay,
+    /// then reuses [`Self::spawn_upgrade_check`] so the same
+    /// `WorkerEvent::CheckFinished` path handles success, error, and
+    /// stale-generation filtering as the interactive flow.
+    ///
+    /// Latched via `silent_upgrade_check_spawned` so it never fires
+    /// twice for a single App lifetime. Silent by design: network
+    /// errors just leave the chip unlit — users who want to know
+    /// what's happening open Menu → Upgrade and get the full error
+    /// text in the modal.
+    fn spawn_startup_upgrade_check(&mut self) {
+        if self.silent_upgrade_check_spawned {
+            return;
+        }
+        self.silent_upgrade_check_spawned = true;
+        let generation = self.upgrade_state.start_silent_check();
+        self.spawn_upgrade_check(generation);
+    }
+
     #[cfg(windows)]
     fn spawn_upgrade_download(&self, generation: u64, release: crate::updater::AvailableRelease) {
         let tx = self.upgrade_tx.clone();
@@ -1608,7 +1659,41 @@ impl App {
     }
 
     fn apply_upgrade_event(&mut self, event: crate::upgrade::WorkerEvent) {
+        // Capture whether this event is a CheckFinished belonging to
+        // the current generation BEFORE handing to `apply`; the
+        // upgrade state consumes `event` by value and `apply` also
+        // filters stale generations. Only in-generation
+        // CheckFinished events are allowed to touch
+        // `latest_available` — so a late silent response cannot
+        // resurrect an update badge the user just cleared by opening
+        // the modal and getting an UpToDate.
+        let check_result = match &event {
+            crate::upgrade::WorkerEvent::CheckFinished { generation, result }
+                if *generation == self.upgrade_state.generation() =>
+            {
+                Some(result.clone())
+            }
+            _ => None,
+        };
         self.upgrade_state.apply(event);
+        if let Some(result) = check_result {
+            match result {
+                Ok(Some(release)) => {
+                    self.latest_available = Some(release);
+                }
+                Ok(None) => {
+                    // Explicit "no update" — drop any cached chip.
+                    self.latest_available = None;
+                }
+                Err(_) => {
+                    // Network / GitHub API failure — leave any
+                    // previously-known available release intact.
+                    // Users still see the badge from the last
+                    // successful probe; the modal (if the user opens
+                    // it) shows the fresh failure text.
+                }
+            }
+        }
         #[cfg(windows)]
         if let Some(path) = self.upgrade_state.ready_installer_path() {
             self.pending_installer = Some(path);
@@ -2491,6 +2576,20 @@ impl App {
                     return;
                 }
             }
+            // Hint bar update chip. Lives in the bottom row rather
+            // than the top status bar, but the same "widget belongs
+            // to the shell, not a pane" logic applies: hit-test it
+            // before divider / pane routing so a stray chip click
+            // never lands in an underlying pane's mouse event
+            // stream. The flag fires the same code path Menu →
+            // Upgrade uses (`drain_flags` → `open_and_check`), so a
+            // click opens the modal with a fresh check in flight.
+            if let Some(r) = self.last_upgrade_chip_rect {
+                if point_in_rect(m.column, m.row, r) {
+                    self.flags.upgrade.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
             // 1. Divider drag — highest priority for the pane area.
             if let Some(d) = self
                 .last_dividers
@@ -3323,9 +3422,32 @@ impl App {
                 .unwrap_or_else(hint_bar_text);
             (text, Style::default().add_modifier(Modifier::DIM))
         };
+        // Upgrade nudge chip. Painted in the hint bar's right slot
+        // whenever a background / interactive check has surfaced a
+        // newer version. Bold red so it reads as urgent without
+        // colliding with the destructive-red `[×]` in the top status
+        // bar (different row, different intent). Rect cached for the
+        // mouse layer so a left-click on the chip fires the same
+        // `app.upgrade` flag as Menu → Upgrade.
+        //
+        // Layout math lives in the pure helper `upgrade_chip_layout`
+        // so the width bookkeeping (chip glyphs vs. terminal width,
+        // 1-cell gap between hint text and chip) is unit-testable
+        // without spinning up a full frame.
+        let hint_bar_rect = vertical[2];
+        let layout = upgrade_chip_layout(hint_bar_rect, self.latest_available.as_ref());
         Paragraph::new(Line::from(hint_text))
             .style(hint_style)
-            .render(vertical[2], frame.buffer_mut());
+            .render(layout.hint_rect, frame.buffer_mut());
+        self.last_upgrade_chip_rect = layout.chip.as_ref().map(|c| c.rect);
+        if let Some(chip) = layout.chip {
+            let chip_style = Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD);
+            Paragraph::new(Line::from(chip.label))
+                .style(chip_style)
+                .render(chip.rect, frame.buffer_mut());
+        }
 
         self.last_menu_popup_rect = None;
         self.last_picker_popup_rect = None;
@@ -6262,6 +6384,78 @@ fn hint_bar_text() -> String {
     "Ctrl+Q Quit · F1 / Ctrl+Shift+P Palette · Alt+1..4 Pane · Alt+[/] Tab · Ctrl+T New tab · Ctrl+W Close tab · Ctrl+= / - Zoom · F10 Menu".into()
 }
 
+/// One rendered upgrade-chip instance: the styled label the render
+/// pipeline paints and the exact `Rect` the mouse layer hit-tests
+/// against. `label` is already trimmed to the chip's visible width.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpgradeChip {
+    pub label: String,
+    pub rect: Rect,
+}
+
+/// Split a hint-bar rect between the left-aligned hint text and the
+/// right-aligned upgrade nudge chip.
+///
+/// Contract:
+/// - `release = None` → chip suppressed, `hint_rect = area`.
+/// - Chip label = `" ⚠ 有新版本 vX.Y.Z "` (leading + trailing space so
+///   the red run doesn't touch the edge cell / the hint text).
+/// - Suppress the chip entirely when the terminal can't hold at least
+///   `chip_width + 1` cells: a truncated red badge reads as a render
+///   bug, and the hint text is load-bearing.
+/// - Otherwise the chip claims the rightmost `chip_width` cells; the
+///   hint text gets the remaining cells minus a 1-cell gap.
+///
+/// Pure — no App state — so the width math is unit-testable without
+/// spinning up a full frame.
+pub(crate) fn upgrade_chip_layout(
+    area: Rect,
+    release: Option<&crate::updater::AvailableRelease>,
+) -> UpgradeChipLayout {
+    let Some(release) = release else {
+        return UpgradeChipLayout {
+            hint_rect: area,
+            chip: None,
+        };
+    };
+    let label = format!(" ⚠ 有新版本 v{} ", release.version);
+    let chip_width = UnicodeWidthStr::width(label.as_str()) as u16;
+    if chip_width == 0 || area.width < chip_width.saturating_add(1) {
+        return UpgradeChipLayout {
+            hint_rect: area,
+            chip: None,
+        };
+    }
+    let hint_rect = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width - chip_width - 1,
+        height: area.height,
+    };
+    let chip_rect = Rect {
+        x: area.x + area.width - chip_width,
+        y: area.y,
+        width: chip_width,
+        height: area.height,
+    };
+    UpgradeChipLayout {
+        hint_rect,
+        chip: Some(UpgradeChip {
+            label,
+            rect: chip_rect,
+        }),
+    }
+}
+
+/// Pair returned by [`upgrade_chip_layout`]: the reduced hint-text
+/// rect (may equal the input area when no chip is painted) and, when
+/// present, the chip's rendered label + rect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpgradeChipLayout {
+    pub hint_rect: Rect,
+    pub chip: Option<UpgradeChip>,
+}
+
 fn point_in_rect(x: u16, y: u16, r: Rect) -> bool {
     x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
 }
@@ -8181,5 +8375,74 @@ mod tests {
         let mut inputs = baseline_cursor_inputs();
         inputs.focused_cursor = None;
         assert_eq!(decide_frame_cursor(inputs), None);
+    }
+
+    fn fake_release(version: &str) -> crate::updater::AvailableRelease {
+        crate::updater::AvailableRelease {
+            version: semver::Version::parse(version).unwrap(),
+            notes: String::new(),
+            html_url: String::new(),
+            published_at: None,
+            windows_installer: None,
+        }
+    }
+
+    #[test]
+    fn upgrade_chip_layout_no_release_returns_full_hint_rect() {
+        let area = Rect::new(0, 40, 120, 1);
+        let out = upgrade_chip_layout(area, None);
+        assert_eq!(out.hint_rect, area);
+        assert!(out.chip.is_none());
+    }
+
+    #[test]
+    fn upgrade_chip_layout_reserves_right_slot_when_wide_enough() {
+        let area = Rect::new(0, 40, 120, 1);
+        let release = fake_release("0.2.17");
+        let out = upgrade_chip_layout(area, Some(&release));
+
+        let chip = out.chip.expect("chip should paint at 120 cols");
+        // Chip anchored to the right edge, exactly one cell of gap.
+        assert_eq!(chip.rect.x + chip.rect.width, area.x + area.width);
+        assert_eq!(chip.rect.y, area.y);
+        assert_eq!(chip.rect.height, area.height);
+        // Hint rect shrinks by chip width + 1-cell gap.
+        assert_eq!(out.hint_rect.width, area.width - chip.rect.width - 1);
+        assert_eq!(out.hint_rect.x, area.x);
+        // Label contains the version so the eye can spot which
+        // release the chip is nudging toward.
+        assert!(chip.label.contains("0.2.17"), "label = {:?}", chip.label);
+        // ⚠ + 有新版本 glyphs must survive verbatim — no dropped ideographs
+        // from an accidental byte-slice truncation.
+        assert!(chip.label.contains('⚠'));
+        assert!(chip.label.contains("有新版本"));
+        // Non-empty hint rect so the "F10 Menu · Ctrl+Q Quit" row can
+        // still paint next to the chip on a normal terminal.
+        assert!(out.hint_rect.width > 40);
+    }
+
+    #[test]
+    fn upgrade_chip_layout_suppresses_chip_on_narrow_terminal() {
+        // Chip label at "0.999.999" measures ~21 cells (⚠ = 1,
+        // Chinese glyphs = 2 each, ASCII = 1). Any width below
+        // `chip_width + 1` MUST suppress the chip outright rather
+        // than paint a truncated red badge.
+        let area = Rect::new(0, 40, 15, 1);
+        let release = fake_release("0.999.999");
+        let out = upgrade_chip_layout(area, Some(&release));
+        assert!(out.chip.is_none());
+        assert_eq!(out.hint_rect, area);
+    }
+
+    #[test]
+    fn upgrade_chip_layout_respects_nonzero_origin() {
+        // Reproduces the real layout: the hint bar sits on the last
+        // row, so `area.y` is non-zero. Off-by-ones in `x + width -
+        // chip_width` would shift the chip off-screen.
+        let area = Rect::new(3, 47, 100, 1);
+        let release = fake_release("0.2.17");
+        let out = upgrade_chip_layout(area, Some(&release)).chip.unwrap();
+        assert_eq!(out.rect.x + out.rect.width, 103);
+        assert_eq!(out.rect.y, 47);
     }
 }

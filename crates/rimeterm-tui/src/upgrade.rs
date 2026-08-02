@@ -111,6 +111,41 @@ impl UpgradeState {
         self.generation
     }
 
+    /// Background variant of [`start_check`]: bumps the generation and
+    /// moves to `Checking`, but leaves `open` alone so the caller can
+    /// probe GitHub Releases at startup without popping the modal in
+    /// the user's face. The generation still gates the resulting
+    /// [`WorkerEvent::CheckFinished`] through the same [`apply`]
+    /// pipeline, so if the user hits Menu → Upgrade before the
+    /// background result lands, [`open_and_check`] takes over cleanly
+    /// (its own `start_check` advances the generation past this one,
+    /// so the stale silent response gets filtered out).
+    pub fn start_silent_check(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.phase = Phase::Checking;
+        self.generation
+    }
+
+    /// Current generation counter — exposed so the App can guard its
+    /// own snapshot of the latest available release against stale
+    /// worker events (only mirror after an [`apply`] whose event
+    /// generation matches).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Latest known release when we're parked on `Phase::Available`.
+    /// Any other phase — Checking, UpToDate, Downloading,
+    /// ReadyToInstall, Failed — returns `None`. Used by the hint-bar
+    /// update chip so it can render the target version alongside the
+    /// "有新版本" glyph.
+    pub fn available_release(&self) -> Option<&AvailableRelease> {
+        match &self.phase {
+            Phase::Available(release) => Some(release),
+            _ => None,
+        }
+    }
+
     pub fn apply(&mut self, event: WorkerEvent) {
         let event_generation = match &event {
             WorkerEvent::CheckFinished { generation, .. }
@@ -468,5 +503,54 @@ mod tests {
 
         assert_eq!(state.ready_installer_path(), Some(path));
         assert!(matches!(state.phase(), UpgradePhase::ReadyToInstall));
+    }
+
+    #[test]
+    fn silent_check_does_not_open_the_overlay() {
+        let mut state = UpgradeState::default();
+
+        let generation = state.start_silent_check();
+
+        assert_eq!(generation, 1);
+        assert!(!state.open, "silent check must NOT open the overlay");
+        assert!(matches!(state.phase(), UpgradePhase::Checking));
+        assert!(state.available_release().is_none());
+    }
+
+    #[test]
+    fn silent_check_result_populates_available_release() {
+        let mut state = UpgradeState::default();
+        let generation = state.start_silent_check();
+
+        state.apply(WorkerEvent::CheckFinished {
+            generation,
+            result: Ok(Some(release())),
+        });
+
+        assert!(!state.open);
+        assert!(matches!(state.phase(), UpgradePhase::Available));
+        assert_eq!(
+            state.available_release().map(|r| r.version.to_string()),
+            Some("0.3.0".to_string())
+        );
+    }
+
+    #[test]
+    fn user_open_after_silent_available_advances_generation_past_silent() {
+        // Silent check has landed on Available; hitting Menu → Upgrade
+        // must start a fresh interactive check (users expect the
+        // overlay to reflect a live probe, not a cached result).
+        let mut state = UpgradeState::default();
+        let silent_gen = state.start_silent_check();
+        state.apply(WorkerEvent::CheckFinished {
+            generation: silent_gen,
+            result: Ok(Some(release())),
+        });
+
+        let interactive_gen = state.open_and_check();
+
+        assert!(state.open);
+        assert!(interactive_gen > silent_gen);
+        assert!(matches!(state.phase(), UpgradePhase::Checking));
     }
 }
