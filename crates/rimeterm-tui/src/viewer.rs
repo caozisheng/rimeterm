@@ -308,9 +308,15 @@ pub(crate) struct MarkdownRenderCache {
     pub(crate) generation: Generation,
     pub(crate) source_len: usize,
     pub(crate) theme: rimeterm_markdown::Theme,
+    /// Viewport content width (columns available for text after the
+    /// scrollbar strip) the cached [`Text`] was laid out for. Tables
+    /// bake themselves to this width via [`rimeterm_markdown::layout_table`],
+    /// so a resize MUST invalidate the cache — otherwise old-width table
+    /// rows get wrapped by `Paragraph::wrap` and lose column alignment.
+    pub(crate) content_width: u16,
     /// Pre-flattened Text ready to hand to `Paragraph::new`. Cloning
     /// this is O(rows) memcpy — measurably cheaper than re-running
-    /// pulldown-cmark + rimeterm-markdown's block model per frame.
+    /// pulldown-cmark + rimeterm-markdown per frame.
     pub(crate) text: Text<'static>,
     /// Cached wrapped-row count keyed by paragraph width. Cleared
     /// only when the whole cache is rebuilt.
@@ -1146,23 +1152,32 @@ fn render_markdown(
     };
 
     // P1-2 cache. Rebuild when generation bumped (fresh snapshot),
-    // source_len drifted (payload arrived at same generation), or the
-    // user flipped themes via F10 / Alt+T. On rebuild we also drop
-    // the per-width wrap-count map since its keys are only meaningful
-    // against the freshly-flattened Text.
+    // source_len drifted (payload arrived at same generation), the
+    // user flipped themes via F10 / Alt+T, OR the viewport width
+    // changed (tables are laid out to the current column budget so a
+    // resize must reflow them). On rebuild we also drop the per-width
+    // wrap-count map since its keys are only meaningful against the
+    // freshly-flattened Text.
     let source_len = state.markdown().map(|s| s.len()).unwrap_or(0);
     let generation = state.generation();
+    let text_area_width = text_area.width;
     let need_rebuild = match &state.markdown_cache {
-        Some(c) => c.generation != generation || c.source_len != source_len || c.theme != theme,
+        Some(c) => {
+            c.generation != generation
+                || c.source_len != source_len
+                || c.theme != theme
+                || c.content_width != text_area_width
+        }
         None => true,
     };
     if need_rebuild {
         let source = state.markdown().unwrap_or("").to_string();
-        let text = markdown_blocks_to_text(&source, theme);
+        let text = markdown_blocks_to_text(&source, theme, text_area_width);
         state.markdown_cache = Some(MarkdownRenderCache {
             generation,
             source_len,
             theme,
+            content_width: text_area_width,
             text,
             line_count_by_width: std::collections::HashMap::new(),
         });
@@ -1175,7 +1190,6 @@ fn render_markdown(
         .markdown_cache
         .as_mut()
         .expect("just rebuilt above if missing");
-    let text_area_width = text_area.width;
     let content_lines = *cache
         .line_count_by_width
         .entry(text_area_width)
@@ -1254,14 +1268,24 @@ fn render_markdown(
 ///   source. Text-diagram rendering (via the sibling `mermaid-text`
 ///   crate) is future work; the sentinel path is the design-doc-
 ///   documented fallback.
-/// - `DocBlock::Table` — emit a plain pipe-format representation with
-///   a divider row. `layout_table` (fair-share column widths, wide
-///   cell handling) was in the widget layer we did not vendor.
+/// - `DocBlock::Table` — laid out with box-drawing borders and
+///   fair-share column widths via [`rimeterm_markdown::layout_table`]
+///   so wide-cell content wraps inside its column instead of getting
+///   destroyed by paragraph-level word-wrap.
 ///
 /// A blank line is inserted between distinct block kinds so the
 /// visual separation matches upstream's paragraph gaps.
-fn markdown_blocks_to_text(source: &str, theme: rimeterm_markdown::Theme) -> Text<'static> {
-    use rimeterm_markdown::{DocBlock, Palette, render_markdown};
+///
+/// `content_width` is the viewport column budget (viewer inner width
+/// minus the scrollbar strip) that tables lay themselves out against.
+/// Since baked-in table geometry depends on it, callers MUST rebuild
+/// the cached `Text` whenever this value changes.
+fn markdown_blocks_to_text(
+    source: &str,
+    theme: rimeterm_markdown::Theme,
+    content_width: u16,
+) -> Text<'static> {
+    use rimeterm_markdown::{DocBlock, Palette, layout_table, render_markdown};
 
     let palette = Palette::from_theme(theme);
     let blocks = render_markdown(source, &palette, theme);
@@ -1286,44 +1310,11 @@ fn markdown_blocks_to_text(source: &str, theme: rimeterm_markdown::Theme) -> Tex
                 lines.push(Line::styled("[/mermaid]", dim));
             }
             DocBlock::Table(t) => {
-                lines.extend(table_to_lines(t));
+                lines.extend(layout_table(t, content_width));
             }
         }
     }
     Text::from(lines)
-}
-
-/// Render a `rimeterm_markdown::TableBlock` as a plain pipe-format
-/// text block. Cells are joined with `" | "` and truncated only
-/// implicitly by the outer paragraph wrap — no wide-cell modal,
-/// matching what we said we'd give up in the design doc.
-fn table_to_lines(t: &rimeterm_markdown::TableBlock) -> Vec<Line<'static>> {
-    fn render_row(cells: &[rimeterm_markdown::CellSpans]) -> Line<'static> {
-        // Interleave " | " separators between cell span groups.
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(cells.len() * 3 + 1);
-        spans.push(Span::raw("| "));
-        for (i, cell) in cells.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw(" | "));
-            }
-            spans.extend(cell.iter().cloned());
-        }
-        spans.push(Span::raw(" |"));
-        Line::from(spans)
-    }
-
-    let mut out = Vec::with_capacity(2 + t.rows.len());
-    if !t.headers.is_empty() {
-        out.push(render_row(&t.headers));
-        // Divider: `| --- | --- | ... |` matching column count.
-        let dashes: Vec<rimeterm_markdown::CellSpans> =
-            t.headers.iter().map(|_| vec![Span::raw("---")]).collect();
-        out.push(render_row(&dashes));
-    }
-    for row in &t.rows {
-        out.push(render_row(row));
-    }
-    out
 }
 
 /// Renders a Code / plain-text snapshot into `inner` with syntect
@@ -2372,7 +2363,7 @@ mod markdown_tests {
         // Regression guard: the vendored `render_markdown` on empty
         // input previously produced zero blocks in some upstream
         // versions; the wrapper must not panic.
-        let text = markdown_blocks_to_text("", rimeterm_markdown::Theme::Default);
+        let text = markdown_blocks_to_text("", rimeterm_markdown::Theme::Default, 80);
         // Empty or nearly empty is fine — just not a crash.
         assert!(text.lines.len() <= 1);
     }
@@ -2385,6 +2376,7 @@ mod markdown_tests {
         let text = markdown_blocks_to_text(
             "```rust\nfn main() {}\n```\n",
             rimeterm_markdown::Theme::Default,
+            80,
         );
         let has_style = text
             .lines
@@ -2401,6 +2393,7 @@ mod markdown_tests {
         let text = markdown_blocks_to_text(
             "prose\n\n```mermaid\ngraph LR\nA-->B\n```\n\nafter\n",
             rimeterm_markdown::Theme::Default,
+            80,
         );
         let all: String = text
             .lines
@@ -2418,14 +2411,15 @@ mod markdown_tests {
     }
 
     #[test]
-    fn markdown_blocks_to_text_pipe_formats_tables() {
-        // Tables render as GFM pipe-format (headers | divider | rows).
-        // The upstream `layout_table` fair-share widths lived in the
-        // widget layer we didn't vendor — this is the documented
-        // fallback.
+    fn markdown_blocks_to_text_box_draws_tables() {
+        // Tables render as Unicode box-drawing frames via
+        // `rimeterm_markdown::layout_table` (fair-share column widths,
+        // wide-cell wrapping). Cell content survives and column
+        // alignment is preserved by the box.
         let text = markdown_blocks_to_text(
             "| Alpha | Beta |\n|---|---|\n| one | two |\n| three | four |\n",
             rimeterm_markdown::Theme::Default,
+            80,
         );
         let all: String = text
             .lines
@@ -2434,15 +2428,35 @@ mod markdown_tests {
             .map(|s| s.content.as_ref())
             .collect::<Vec<_>>()
             .join("\n");
-        // Cells themselves survive rendering, and the pipe / divider
-        // structure is emitted around them.
-        assert!(
-            all.contains("Alpha"),
-            "missing header cell content: {all:?}"
+        // Cell content survives.
+        assert!(all.contains("Alpha"), "missing header cell: {all:?}");
+        assert!(all.contains("three"), "missing body cell: {all:?}");
+        // Box-drawing frame present.
+        assert!(all.contains('┌'), "missing top-left corner: {all:?}");
+        assert!(all.contains('┘'), "missing bottom-right corner: {all:?}");
+        assert!(all.contains('│'), "missing vertical separator: {all:?}");
+        assert!(all.contains('├'), "missing header/body divider: {all:?}");
+    }
+
+    #[test]
+    fn markdown_blocks_to_text_falls_back_to_pipe_when_too_narrow() {
+        // 4-column table needs 4*4+1 = 17 columns to box-render. 8 is
+        // well below that → pipe-format degradation.
+        let text = markdown_blocks_to_text(
+            "| A | B | C | D |\n|---|---|---|---|\n| 1 | 2 | 3 | 4 |\n",
+            rimeterm_markdown::Theme::Default,
+            8,
         );
-        assert!(all.contains("---"), "missing divider row: {all:?}");
-        assert!(all.contains("one"), "missing body cell content: {all:?}");
-        assert!(all.contains("|"), "missing pipe separator: {all:?}");
+        let all: String = text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains('|'), "pipe fallback expected: {all:?}");
+        assert!(all.contains("---"), "divider expected: {all:?}");
+        assert!(!all.contains('┌'), "boxed layout not expected: {all:?}");
     }
 
     // --- P1-2 render cache tests --------------------------------------
@@ -2536,10 +2550,14 @@ mod markdown_tests {
     }
 
     #[test]
-    fn markdown_cache_memoises_line_count_by_width() {
-        // The wrap-count map should have exactly one entry per unique
-        // paragraph width seen. Rendering twice at the same width MUST
-        // reuse the entry; a resize adds a second entry.
+    fn markdown_cache_reuses_entry_at_stable_width_and_rebuilds_on_resize() {
+        // Two renders at the same width MUST reuse the cache: same
+        // allocation address = no rebuild. A resize (width change)
+        // MUST rebuild the cache because tables are baked to the
+        // current column budget by `layout_table`, and rendering old-
+        // width tables inside a new-width Paragraph would either
+        // waste horizontal space (widened) or word-wrap the box glyphs
+        // (narrowed).
         let mut state = ViewerOverlayState::default();
         open_ready_markdown(
             &mut state,
@@ -2555,13 +2573,8 @@ mod markdown_tests {
             None,
             rimeterm_markdown::Theme::Default,
         );
-        let entries_after_first = state
-            .markdown_cache
-            .as_ref()
-            .unwrap()
-            .line_count_by_width
-            .len();
-        assert_eq!(entries_after_first, 1, "one width → one memoised entry");
+        let ptr_after_first = state.markdown_cache.as_ref().unwrap() as *const _;
+        let width_after_first = state.markdown_cache.as_ref().unwrap().content_width;
 
         render_into_pane(
             &mut state,
@@ -2570,18 +2583,14 @@ mod markdown_tests {
             None,
             rimeterm_markdown::Theme::Default,
         );
-        let entries_after_second = state
-            .markdown_cache
-            .as_ref()
-            .unwrap()
-            .line_count_by_width
-            .len();
+        let ptr_after_second = state.markdown_cache.as_ref().unwrap() as *const _;
         assert_eq!(
-            entries_after_second, 1,
-            "same width MUST NOT add a duplicate memo",
+            ptr_after_first, ptr_after_second,
+            "stable width MUST NOT rebuild the cache",
         );
 
-        // Re-render at a different width → the memo grows by one.
+        // Re-render at a different width → cache MUST rebuild against
+        // the new column budget. The stored content_width follows.
         let mut buf2 = Buffer::empty(Rect::new(0, 0, 60, 10));
         render_into_pane(
             &mut state,
@@ -2590,15 +2599,10 @@ mod markdown_tests {
             None,
             rimeterm_markdown::Theme::Default,
         );
-        let entries_after_resize = state
-            .markdown_cache
-            .as_ref()
-            .unwrap()
-            .line_count_by_width
-            .len();
-        assert_eq!(
-            entries_after_resize, 2,
-            "resize to new width MUST add one memo entry",
+        let width_after_resize = state.markdown_cache.as_ref().unwrap().content_width;
+        assert_ne!(
+            width_after_first, width_after_resize,
+            "resize MUST update the cached content_width",
         );
     }
 

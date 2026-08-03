@@ -68,6 +68,7 @@ impl View {
 pub enum Sort {
     Priority,
     Due,
+    Project,
     File,
 }
 
@@ -76,6 +77,7 @@ impl Sort {
         match self {
             Sort::Priority => "priority",
             Sort::Due => "due",
+            Sort::Project => "project",
             Sort::File => "file",
         }
     }
@@ -93,6 +95,7 @@ impl FromStr for Sort {
         match s {
             "priority" => Ok(Sort::Priority),
             "due" => Ok(Sort::Due),
+            "project" => Ok(Sort::Project),
             "file" => Ok(Sort::File),
             _ => Err(()),
         }

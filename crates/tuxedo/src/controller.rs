@@ -946,8 +946,18 @@ fn apply_action(app: &mut App, action: Action, features: ControllerFeatures) -> 
                 app.draft_clear();
             }
         }
-        Action::CycleSort if features.config => app.cycle_sort(),
-        Action::CycleSort => app.flash("sort settings unavailable when embedded"),
+        // Sort is a view preference (like cursor position) so it stays
+        // available even in the embedded pane where broader config writes
+        // are gated off. Persistence still flows through the shared XDG
+        // config when `config` is on, so standalone Tuxedo picks it up.
+        Action::CycleSort => {
+            let msg = app.prefs.cycle_sort();
+            app.flash(msg);
+            app.recompute_visible();
+            if features.config {
+                app.save_prefs();
+            }
+        }
         Action::BeginPromptProject => {
             app.mode = Mode::PromptProject;
             app.draft_clear();

@@ -80,6 +80,7 @@ pub fn sort_by_prefs(idxs: &mut [usize], tasks: &[Task], sort: Sort) {
     match sort {
         Sort::Priority => idxs.sort_by(cmp_priority(tasks)),
         Sort::Due => idxs.sort_by(cmp_due(tasks)),
+        Sort::Project => idxs.sort_by(cmp_project(tasks)),
         Sort::File => { /* preserve order */ }
     }
 }
@@ -165,6 +166,35 @@ fn cmp_due(tasks: &[Task]) -> impl Fn(&usize, &usize) -> Ordering + '_ {
             .as_deref()
             .unwrap_or("z")
             .cmp(tasks[b].due.as_deref().unwrap_or("z"))
+    }
+}
+
+/// Sort by first `+project` name (case-insensitive, `None` last), tie-broken
+/// by priority asc then due-date asc so the visual order inside a project
+/// mirrors `Sort::Priority`.
+fn cmp_project(tasks: &[Task]) -> impl Fn(&usize, &usize) -> Ordering + '_ {
+    |&a, &b| {
+        let ta = &tasks[a];
+        let tb = &tasks[b];
+        let pa = ta.projects.first().map(|s| s.to_lowercase());
+        let pb = tb.projects.first().map(|s| s.to_lowercase());
+        let cmp = match (&pa, &pb) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        cmp.then_with(|| {
+            let pra = ta.priority.unwrap_or('Z');
+            let prb = tb.priority.unwrap_or('Z');
+            pra.cmp(&prb)
+        })
+        .then_with(|| {
+            ta.due
+                .as_deref()
+                .unwrap_or("z")
+                .cmp(tb.due.as_deref().unwrap_or("z"))
+        })
     }
 }
 

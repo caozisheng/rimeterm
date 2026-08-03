@@ -100,7 +100,8 @@ impl Prefs {
     pub fn cycle_sort(&mut self) -> String {
         self.sort = match self.sort {
             Sort::Priority => Sort::Due,
-            Sort::Due => Sort::File,
+            Sort::Due => Sort::Project,
+            Sort::Project => Sort::File,
             Sort::File => Sort::Priority,
         };
         format!("sort: {}", self.sort)

@@ -292,4 +292,31 @@ mod tests {
             "task body was hidden: {text}"
         );
     }
+
+    #[test]
+    fn embedded_cycle_sort_advances_view_sort_pref() {
+        // The embedded pane omits the `config` feature by default, but sort
+        // is a view preference and MUST still cycle so hosts (like the
+        // rimeterm Todo tab) can group by project / due date on demand.
+        let (todo, done) = paths("cycle-sort");
+        std::fs::write(&todo, "live\n").expect("write todo");
+        let mut embedded = EmbeddedApp::new(todo, done, "live\n".into());
+        let start = embedded.app().sort_label();
+
+        let outcome = embedded.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+
+        assert_eq!(outcome, EmbeddedOutcome::Changed);
+        assert_ne!(
+            embedded.app().sort_label(),
+            start,
+            "S must rotate the sort even without the `config` feature"
+        );
+        assert!(
+            embedded
+                .app()
+                .flash_active()
+                .is_some_and(|msg| msg.starts_with("sort: ")),
+            "flash should announce the new sort, not the old embedded gate"
+        );
+    }
 }

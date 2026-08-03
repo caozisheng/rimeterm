@@ -36,6 +36,7 @@ pub mod theme;
 
 pub use crate::markdown::highlight::highlight_code;
 pub use crate::markdown::renderer::render_markdown;
+pub use crate::markdown::table_layout::layout_table;
 pub use crate::markdown::{
     CellSpans, DocBlock, HeadingAnchor, LinkInfo, MermaidBlockId, TableBlock, TableBlockId,
     TextBlockId, cell_to_string, heading_to_anchor,

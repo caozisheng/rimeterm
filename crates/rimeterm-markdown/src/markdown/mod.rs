@@ -1,6 +1,7 @@
 pub mod highlight;
 pub mod math;
 pub mod renderer;
+pub mod table_layout;
 
 use std::cell::Cell;
 

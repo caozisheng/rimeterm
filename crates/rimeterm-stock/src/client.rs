@@ -33,7 +33,7 @@ impl StockClient {
     }
 
     pub async fn refresh(&self, entries: &[WatchEntry], market: Market) -> Result<Snapshot> {
-        let rows = stream::iter(entries.iter().filter(|entry| entry.market == market))
+        let mut rows = stream::iter(entries.iter().filter(|entry| entry.market == market))
             .map(|entry| async move {
                 match self.quote(entry).await {
                     Ok(row) => row,
@@ -59,8 +59,16 @@ impl StockClient {
                 }
             })
             .buffer_unordered(8)
-            .collect()
+            .collect::<Vec<QuoteRow>>()
             .await;
+        // Lock display order: sort watchlist quotes by symbol (Code) so rows
+        // do not shuffle each refresh due to `buffer_unordered` completion
+        // order. Case-insensitive to keep A/H/US codes stable together.
+        rows.sort_by(|a, b| {
+            a.symbol
+                .to_ascii_uppercase()
+                .cmp(&b.symbol.to_ascii_uppercase())
+        });
         let indices = match self.indices(market).await {
             Ok(indices) => indices,
             Err(error) => {

@@ -13,8 +13,11 @@ pub enum GroupKey {
     /// `Some('A'..='Z')` for a graded priority, `None` for unprioritized.
     ListPriority(Option<char>),
     ListDue(ListDueBucket),
-    /// Completed tasks under `Sort::Priority` / `Sort::Due`. Rendered as a
-    /// COMPLETED section pinned to the bottom of the live list.
+    /// First `+project` name (case-preserved) under `Sort::Project`; `None`
+    /// covers tasks with no project tag.
+    ListProject(Option<String>),
+    /// Completed tasks under `Sort::Priority` / `Sort::Due` / `Sort::Project`.
+    /// Rendered as a COMPLETED section pinned to the bottom of the live list.
     Completed,
 }
 
@@ -101,6 +104,19 @@ impl App {
                     groups.push(GroupKey::ListDue(filter::due_bucket(
                         &tasks[i], today, week_start,
                     )));
+                    idxs.push(i);
+                }
+                for &i in &done {
+                    groups.push(GroupKey::Completed);
+                    idxs.push(i);
+                }
+                (idxs, groups)
+            }
+            Sort::Project => {
+                let mut idxs = Vec::with_capacity(pending.len() + done.len());
+                let mut groups = Vec::with_capacity(pending.len() + done.len());
+                for &i in &pending {
+                    groups.push(GroupKey::ListProject(tasks[i].projects.first().cloned()));
                     idxs.push(i);
                 }
                 for &i in &done {
@@ -347,5 +363,45 @@ mod tests {
         for g in app.visible_groups() {
             assert!(matches!(g, GroupKey::None));
         }
+    }
+
+    #[test]
+    fn project_sort_groups_by_first_project_alphabetically() {
+        // First project keys the group: `+work` before `+zeta`, unprioritized
+        // tasks with no project land under `ListProject(None)`, done tasks
+        // sink to the bottom under `Completed`.
+        let mut app = build_app(
+            "(B) alpha task +zeta\n\
+             (A) beta task +alpha\n\
+             untagged\n\
+             (A) another alpha +alpha\n\
+             x 2026-05-05 finished +alpha\n",
+        );
+        app.prefs.sort = Sort::Project;
+        app.recompute_visible();
+        let groups = app.visible_groups();
+        assert_eq!(groups.len(), 5);
+        assert_eq!(groups[0], GroupKey::ListProject(Some("alpha".into())));
+        assert_eq!(groups[1], GroupKey::ListProject(Some("alpha".into())));
+        assert_eq!(groups[2], GroupKey::ListProject(Some("zeta".into())));
+        assert_eq!(groups[3], GroupKey::ListProject(None));
+        assert_eq!(groups[4], GroupKey::Completed);
+
+        // Within the "alpha" project the priority-A row sorts above priority-B.
+        let idxs = app.visible_indices();
+        assert_eq!(app.tasks()[idxs[0]].priority, Some('A'));
+        assert_eq!(app.tasks()[idxs[1]].priority, Some('A'));
+    }
+
+    #[test]
+    fn project_sort_is_case_insensitive_but_preserves_display_case() {
+        let mut app = build_app("a +Beta\nb +alpha\nc +BETA\n");
+        app.prefs.sort = Sort::Project;
+        app.recompute_visible();
+        let groups = app.visible_groups();
+        // alpha before Beta before BETA (case-insensitive compare, first-hit wins).
+        assert_eq!(groups[0], GroupKey::ListProject(Some("alpha".into())));
+        assert_eq!(groups[1], GroupKey::ListProject(Some("Beta".into())));
+        assert_eq!(groups[2], GroupKey::ListProject(Some("BETA".into())));
     }
 }
