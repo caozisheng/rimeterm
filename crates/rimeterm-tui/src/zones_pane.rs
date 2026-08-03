@@ -478,43 +478,54 @@ struct Marker {
 }
 
 fn collect_markers(pane: &ZonesPane, cursor: DateTime<Utc>, sun: &SunPosition) -> Vec<Marker> {
-    let mut out = Vec::with_capacity(pane.list.entries.len() + 1);
+    let mut out = Vec::with_capacity(pane.list.entries.len());
+    // Dedupe by resolved handle. `local` and, say, an explicit `Asia/Shanghai`
+    // collapse to the same `Named(Tz)` on a Shanghai-local box; without this
+    // filter the map would paint the SAME cell twice, and the label pass
+    // would place its `HH:MM` badge to the RIGHT of the marker on the first
+    // draw and to the LEFT of the marker on the second — the "two times
+    // flanking the home ◉" bug. First entry wins, so its label lands on the
+    // right (label pass prefers right-of-marker); every later duplicate is
+    // dropped from the marker set. Side list still iterates
+    // `pane.list.entries` directly and is unaffected.
+    let mut seen: Vec<ZoneHandle> = Vec::new();
 
-    // Home marker (independent of the list; renders even when `local`
-    // isn't in the list — see design §15.2).
-    if let Some(handle) = &pane.home {
-        let loc = locate(handle, cursor);
-        out.push(Marker {
-            lat: loc.lat,
-            lon: loc.lon,
-            placement: loc.placement,
-            color: Color::LightMagenta,
-            night: is_night(sun, loc.lat, loc.lon),
-            time: handle.local_time(cursor).format("%H:%M").to_string(),
-            is_home: true,
-            selected: false,
-        });
-    }
-
+    // Home is drawn AS one of the list entries — the row whose zone matches
+    // `pane.home` gets promoted to the ◉ purple home marker instead of
+    // rendering a second glyph on top of the same coordinate. If no entry
+    // matches (e.g. user deleted `local`), no home marker appears.
     for (idx, entry) in pane.list.entries.iter().enumerate() {
         let Ok(handle) = parse_zone(&entry.input) else {
             continue;
         };
+        if seen.contains(&handle) {
+            continue;
+        }
+        seen.push(handle);
         let loc = locate(&handle, cursor);
-        let minute = handle.minute_of_day(cursor);
-        let avail = classify(
-            minute,
-            &pane.config.default_window,
-            pane.config.shoulder_hours,
-        );
+        let is_home = pane.home.as_ref() == Some(&handle);
+        let (color, night) = if is_home {
+            // Purple pin, ignore work-hour availability tint. `is_night` is
+            // still computed from the zone's own coord so an off-hours home
+            // still reads as "night" on the terminator.
+            (Color::LightMagenta, is_night(sun, loc.lat, loc.lon))
+        } else {
+            let minute = handle.minute_of_day(cursor);
+            let avail = classify(
+                minute,
+                &pane.config.default_window,
+                pane.config.shoulder_hours,
+            );
+            (avail.color(), is_night(sun, loc.lat, loc.lon))
+        };
         out.push(Marker {
             lat: loc.lat,
             lon: loc.lon,
             placement: loc.placement,
-            color: avail.color(),
-            night: is_night(sun, loc.lat, loc.lon),
+            color,
+            night,
             time: handle.local_time(cursor).format("%H:%M").to_string(),
-            is_home: false,
+            is_home,
             selected: idx == pane.selected,
         });
     }
@@ -1236,5 +1247,73 @@ mod tests {
         let path = dir.path().join("zones.toml");
         let pane = ZonesPane::new(ZonesConfig::default(), path);
         assert!(!pane.list.entries.is_empty());
+    }
+
+    #[test]
+    fn matching_entry_is_promoted_to_home_and_no_second_marker() {
+        // Set up a pane where the home handle is known and appears in the
+        // list. Exactly one marker MUST come back with is_home=true, and
+        // no separate home marker is pushed alongside it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zones.toml");
+        let mut pane = ZonesPane::new(ZonesConfig::default(), path);
+        // Overwrite the (possibly non-deterministic) auto-resolved home to
+        // pin the test to Asia/Shanghai. Both the handle and one entry now
+        // parse to `ZoneHandle::Named(Tz::Asia__Shanghai)`.
+        pane.home = Some(parse_zone("Asia/Shanghai").unwrap());
+        pane.list = ZoneList {
+            entries: vec![
+                ZoneEntry::new("America/New_York"),
+                ZoneEntry::new("Asia/Shanghai"),
+                ZoneEntry::new("Europe/London"),
+            ],
+        };
+        let now = Utc::now();
+        let markers = collect_markers(&pane, now, &subsolar(now));
+        assert_eq!(markers.len(), 3, "one marker per entry, no duplicate");
+        let homes: Vec<_> = markers.iter().filter(|m| m.is_home).collect();
+        assert_eq!(homes.len(), 1, "exactly one home marker");
+        assert_eq!(homes[0].color, Color::LightMagenta);
+    }
+
+    #[test]
+    fn no_home_marker_when_home_zone_not_in_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zones.toml");
+        let mut pane = ZonesPane::new(ZonesConfig::default(), path);
+        pane.home = Some(parse_zone("Antarctica/Vostok").unwrap());
+        pane.list = ZoneList {
+            entries: vec![ZoneEntry::new("America/New_York")],
+        };
+        let now = Utc::now();
+        let markers = collect_markers(&pane, now, &subsolar(now));
+        assert_eq!(markers.len(), 1);
+        assert!(!markers[0].is_home);
+    }
+
+    #[test]
+    fn duplicate_zones_collapse_to_one_marker() {
+        // The bug: on a Shanghai-local box, `parse_zone("local")` and
+        // `parse_zone("Asia/Shanghai")` both resolve to the same handle,
+        // so both plot at the same map cell. `place_label` then paints
+        // one time label to the RIGHT of ◉ and a second one to the LEFT.
+        // After dedup only the first survives.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zones.toml");
+        let mut pane = ZonesPane::new(ZonesConfig::default(), path);
+        pane.home = Some(parse_zone("Asia/Shanghai").unwrap());
+        pane.list = ZoneList {
+            entries: vec![
+                // Two DIFFERENT input strings that resolve to the same handle.
+                ZoneEntry::new("Asia/Shanghai"),
+                ZoneEntry::new("Asia/Shanghai"),
+                ZoneEntry::new("Europe/London"),
+            ],
+        };
+        let now = Utc::now();
+        let markers = collect_markers(&pane, now, &subsolar(now));
+        // 2 markers, not 3 — the duplicate Shanghai row was dropped.
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers.iter().filter(|m| m.is_home).count(), 1);
     }
 }
