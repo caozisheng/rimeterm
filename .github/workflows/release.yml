@@ -132,26 +132,51 @@ jobs:
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building version: ${VERSION}"
 
-      - name: Align workspace version to release tag
+      - name: Verify workspace version matches release tag
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.value }}
         # env!("CARGO_PKG_VERSION") — used by the Upgrade dialog to show
         # "Current version" and by updater::select_release_for to decide
-        # which GitHub tag is newer — is baked in from
+        # which GitHub tag is newer — bakes in from
         # workspace.package.version at compile time. cargo-deb reads the
-        # same field for the .deb version stamp too. Without this bump,
-        # every release from v0.2.12 onward built as 0.2.11 and the
-        # upgrade modal always saw an "available" newer release. Portable
-        # `sed -i.bak` (BSD sed on macOS needs the suffix); the address
-        # range restricts the edit to the [workspace.package] section so
-        # [workspace.dependencies] version keys are untouched.
+        # same field for the .deb version stamp too. Historical drift
+        # (0.2.11 shipped as every 0.2.12..0.2.19 tag) is prevented at
+        # the source now: `scripts/bump-version.mjs` updates workspace
+        # + Cargo.lock together and this step just refuses to build if
+        # someone tagged without running it. workflow_dispatch skips the
+        # check because dispatch builds are traceability artefacts, not
+        # user-facing releases (see `Resolve version string` above).
+        run: |
+          set -euo pipefail
+          # `tr -d '\r'` strips the CR that sneaks in when the tree is
+          # checked out with CRLF (Windows runners default to
+          # core.autocrlf=true). Without it a Windows tag build would
+          # false-positive against a perfectly aligned Cargo.toml.
+          FILE_VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/ s|^version = "\([^"]*\)"|\1|p' Cargo.toml | head -n1 | tr -d '\r')"
+          echo "tag version:       ${VERSION}"
+          echo "workspace version: ${FILE_VERSION}"
+          if [[ "${FILE_VERSION}" != "${VERSION}" ]]; then
+            echo "::error::[workspace.package].version (${FILE_VERSION}) != tag (${VERSION}). Run \`node scripts/bump-version.mjs ${VERSION}\`, commit, retag."
+            exit 1
+          fi
+      - name: Verify workspace + Cargo.lock aligned
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/bump-version.mjs --check
+      - name: Align workspace version (dispatch builds only)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        # Dispatch builds (`workflow_dispatch`) generate one-off artefacts
+        # with synthetic versions like `0.0.0-dev.<sha>`; the source tree
+        # obviously doesn't carry that. Keep the in-place rewrite here so
+        # `env!("CARGO_PKG_VERSION")` still matches the archive name.
         run: |
           set -euo pipefail
           sed -i.bak -E '/^\[workspace\.package\]/,/^\[/ s|^(version = )"[^"]*"|\1"'"${VERSION}"'"|' Cargo.toml
           rm -f Cargo.toml.bak
-          echo "workspace.package now:"
-          sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml
 
       # One cargo invocation so incremental linking + parallel codegen share
       # work across both binaries.
