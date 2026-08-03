@@ -12,15 +12,19 @@
 //! syntect-highlighted against the caller-selected [`theme::Theme`]. LaTeX
 //! math (`$…$` / `$$…$$`) is approximated to Unicode via `markdown::math`.
 //! Mermaid fences produce [`markdown::DocBlock::Mermaid`] entries carrying
-//! the raw source — text-only rendering is the caller's responsibility
-//! (invoke the sibling `mermaid-text` crate from crates.io if desired).
+//! the raw source; [`render_mermaid_to_image`] rasterises that source
+//! through `mermaid-rs-renderer` + `usvg`/`resvg`/`tiny-skia` into an
+//! [`image::DynamicImage`] ready to hand to
+//! `ratatui-image::picker::Picker`. See `src/mermaid.rs` for the pipeline
+//! and `docs/rimeterm-mermaind-design.md` for the design analysis.
 //!
 //! # What this crate does NOT do
 //!
-//! - **Mermaid image protocol** — the raster path (`mermaid-rs-renderer` +
-//!   `resvg` + Kitty/Sixel/iTerm2) is deliberately not vendored to keep
-//!   the crate free of `App` coupling. Callers that want image-protocol
-//!   Mermaid should render `DocBlock::Mermaid { source, .. }` themselves.
+//! - **Terminal image protocol** — rendering the returned
+//!   [`image::DynamicImage`] to Kitty / Sixel / iTerm2 / half-block cells
+//!   is the caller's job (rimeterm's viewer already owns a
+//!   `ratatui_image::picker::Picker` for its file-image branch and
+//!   reuses it for mermaid diagrams).
 //! - **Widget layout / scroll / selection** — no `ratatui::widgets::Widget`
 //!   impl. Consumers own the draw pass; upstream's `MarkdownViewState` +
 //!   `draw()` were tightly coupled to `crate::app::App` and were not
@@ -30,6 +34,7 @@
 
 pub mod cast;
 pub mod markdown;
+pub mod mermaid;
 pub mod section_extract;
 pub mod text_layout;
 pub mod theme;
@@ -41,4 +46,5 @@ pub use crate::markdown::{
     CellSpans, DocBlock, HeadingAnchor, LinkInfo, MermaidBlockId, TableBlock, TableBlockId,
     TextBlockId, cell_to_string, heading_to_anchor,
 };
+pub use crate::mermaid::{MermaidError, MermaidPixmap, render_mermaid_to_image};
 pub use crate::theme::{Palette, Theme};

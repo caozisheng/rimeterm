@@ -950,6 +950,7 @@ impl MdRenderer {
             source_line: self.code_block_start_line,
             source_byte_start: 0,
             source_byte_end: 0,
+            rendered: std::cell::OnceCell::new(),
         });
         // Blank line after the diagram (will open a new Text block).
         self.push_blank_line();
@@ -1991,6 +1992,7 @@ mod tests {
             source_line: 0, // fence is on line 0
             source_byte_start: 0,
             source_byte_end: 0,
+            rendered: std::cell::OnceCell::new(),
         }];
 
         let tl = std::collections::HashMap::new();

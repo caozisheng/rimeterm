@@ -148,6 +148,19 @@ pub enum DocBlock {
         source_byte_start: u32,
         /// Byte offset in the source string where this block ends (exclusive).
         source_byte_end: u32,
+        /// Lazily-rendered raster from [`crate::mermaid::render_mermaid_to_image`].
+        ///
+        /// Populated on first draw so parsing a document with no
+        /// visible mermaid diagrams pays zero raster cost, then reused
+        /// by every subsequent frame (the raster is width-independent
+        /// — width scaling happens at picker time, not here).
+        ///
+        /// [`OnceCell`] rather than [`Cell`] because we want single-
+        /// initialisation semantics; the value is not overwritten
+        /// after the first successful (or failed) render.
+        rendered: std::cell::OnceCell<
+            Result<crate::mermaid::MermaidPixmap, crate::mermaid::MermaidError>,
+        >,
     },
     /// A parsed markdown table rendered inline with fair-share column widths.
     Table(TableBlock),
@@ -1080,6 +1093,7 @@ mod tests {
             source_line: 10,
             source_byte_start: 0,
             source_byte_end: 0,
+            rendered: std::cell::OnceCell::new(),
         };
         // Source line 12 = fence + 2 → local index 2 → logical line 0 + 2 = 2.
         assert_eq!(logical_line_at_source(&[block], 12, &no_layouts), Some(2));

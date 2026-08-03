@@ -21,3 +21,16 @@ pulldown-cmark = "0.13"
 syntect        = { workspace = true }
 unicode-width  = { workspace = true }
 serde          = { workspace = true }
+# Mermaid → SVG → PNG raster pipeline for ```mermaid fenced blocks. All
+# four crates were verified to build on the workspace-pinned Rust 1.90
+# (edition-2024 floor is 1.85; mermaid-rs-renderer declares no MSRV;
+# resvg/usvg declare 1.85; tiny-skia declares none). Design reference:
+# CleverCloud/mdr v0.3.2 (MIT) `src/core/mermaid.rs` — we borrow the
+# preprocess-then-catch_unwind-then-rasterize shape but not the source.
+mermaid-rs-renderer = { version = "0.2", default-features = false }
+usvg          = "0.47"
+resvg         = "0.47"
+tiny-skia     = "0.12"
+# `image` re-uses the workspace dep so the DynamicImage type stays
+# bit-compatible with `ratatui-image` / `viewer.rs::render_image`.
+image         = { workspace = true }

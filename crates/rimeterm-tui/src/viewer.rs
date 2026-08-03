@@ -303,6 +303,14 @@ pub(crate) struct CodeHighlightCache {
 /// P1-2 whole-source Markdown parse cache. Parsing 1 MB markdown
 /// costs 2–5 ms per frame; we do it exactly once per snapshot
 /// (bumping `generation`) or per theme flip (bumping `theme_epoch`).
+///
+/// **Mermaid image invalidation**: mermaid rasters are baked into
+/// [`MermaidPlacement`] at a row height derived from the picker's
+/// current `font_size()` (see [`derive_mermaid_row_height`]). When
+/// the picker's font size changes — terminal font swap, DPI toggle,
+/// picker (re)initialisation — the derived heights drift and every
+/// placement must be re-laid-out. The cache stores the font-size
+/// tuple it was built for so the invalidation is O(1) per frame.
 #[derive(Debug)]
 pub(crate) struct MarkdownRenderCache {
     pub(crate) generation: Generation,
@@ -316,11 +324,62 @@ pub(crate) struct MarkdownRenderCache {
     pub(crate) content_width: u16,
     /// Pre-flattened Text ready to hand to `Paragraph::new`. Cloning
     /// this is O(rows) memcpy — measurably cheaper than re-running
-    /// pulldown-cmark + rimeterm-markdown per frame.
+    /// pulldown-cmark + rimeterm-markdown per frame. Mermaid blocks
+    /// occupy `N` blank rows here where `N` matches the paired
+    /// [`MermaidPlacement::row_height`] — the image is painted on top
+    /// of those blanks by the render pass, so cell-based scroll math
+    /// keeps working unchanged.
     pub(crate) text: Text<'static>,
     /// Cached wrapped-row count keyed by paragraph width. Cleared
     /// only when the whole cache is rebuilt.
     pub(crate) line_count_by_width: std::collections::HashMap<u16, u16>,
+    /// Per-mermaid raster + start-row in the flattened `text`, sorted
+    /// by ascending `start_row`. Empty when the document has no
+    /// mermaid fences, when the picker was unavailable, or when every
+    /// diagram fell back to the `[mermaid]` sentinel path.
+    pub(crate) mermaid_placements: Vec<MermaidPlacement>,
+    /// Terminal cell size (`(px_w, px_h)`) as reported by
+    /// `Picker::font_size()` at layout time. `None` means "no picker
+    /// was available" — an image-protocol change (new picker, font
+    /// switch) flips this and forces a rebuild so mermaid row heights
+    /// stay honest.
+    pub(crate) picker_font_size: Option<(u16, u16)>,
+}
+
+/// A rasterised mermaid diagram anchored to a byte position in the
+/// cached flattened [`Text`]. `start_row` is the 0-indexed row in
+/// `text.lines` where the diagram's reserved blank region begins;
+/// `row_height` is the number of blank rows the layout skipped for
+/// it. The image is painted on top of those blanks by
+/// `overlay_mermaid_diagrams` after the `Paragraph` pass.
+///
+/// **Perf note**: `protocol` is a [`ratatui_image::protocol::StatefulProtocol`],
+/// not a raw [`image::DynamicImage`]. The former OWNS the pixel
+/// buffer once and caches the resize step internally — subsequent
+/// frames at the same target rect are O(1) after the first paint.
+/// Using `Picker::new_protocol(image.clone(), ...)` per frame instead
+/// forces a full bilinear resample per placement per frame (measured
+/// at 20-80 ms per diagram on typical Windows terminals), which
+/// stalls the UI thread once a document has more than one diagram.
+/// Not [`Clone`] because `StatefulProtocol` is not `Clone`; the cache
+/// therefore hands out `&mut` references and the placements vec is
+/// borrowed rather than cloned per frame.
+pub(crate) struct MermaidPlacement {
+    pub(crate) start_row: u16,
+    pub(crate) row_height: u16,
+    pub(crate) protocol: ratatui_image::protocol::StatefulProtocol,
+}
+
+impl std::fmt::Debug for MermaidPlacement {
+    // `StatefulProtocol` is not `Debug`; project the fields that
+    // actually help debugging (position + size) and elide the raster.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MermaidPlacement")
+            .field("start_row", &self.start_row)
+            .field("row_height", &self.row_height)
+            .field("protocol", &"<StatefulProtocol>")
+            .finish()
+    }
 }
 
 /// Payload carried by worker completions. `pane_id`, `generation`, and
@@ -1043,7 +1102,7 @@ pub fn render_into_pane(
         (ViewerStatus::Loading, _) => render_message(inner, buf, "Loading…"),
         (ViewerStatus::Error(msg), _) => render_message(inner, buf, &msg),
         (ViewerStatus::Ready, Some(ViewerKind::Markdown)) => {
-            render_markdown(state, inner, buf, markdown_theme);
+            render_markdown(state, inner, buf, picker, markdown_theme);
         }
         (ViewerStatus::Ready, Some(ViewerKind::Code)) => {
             render_code(state, inner, buf);
@@ -1119,16 +1178,20 @@ fn paint_close_button(
 ///
 /// - `DocBlock::Text` → append its `text.lines` verbatim (already
 ///   syntect-styled for code blocks, LaTeX-approximated for math)
-/// - `DocBlock::Mermaid` → append the raw source lines as a fallback
-///   (proper text-diagram rendering via `mermaid-text` crate is
-///   future work — see design doc §"What we give up")
-/// - `DocBlock::Table` → append a minimal pipe-format representation
-///   (upstream `layout_table` was in the widget layer we didn't
-///   vendor; future work)
+/// - `DocBlock::Mermaid` → rasterise via
+///   `rimeterm-markdown`'s `render_mermaid_to_image` and overlay the
+///   `image::DynamicImage` with `ratatui-image` on the row range the
+///   flatten pass reserved for it. Falls back to
+///   `[mermaid]`/`[/mermaid]` sentinels around the raw source when no
+///   picker is available or the rasteriser errored — see
+///   [`markdown_blocks_to_layout`] for the full contract.
+/// - `DocBlock::Table` → laid out with box-drawing borders and
+///   fair-share column widths via [`rimeterm_markdown::layout_table`].
 fn render_markdown(
     state: &mut ViewerOverlayState,
     inner: Rect,
     buf: &mut Buffer,
+    picker: Option<&ratatui_image::picker::Picker>,
     theme: rimeterm_markdown::Theme,
 ) {
     if inner.width < 2 || inner.height == 0 {
@@ -1153,26 +1216,37 @@ fn render_markdown(
 
     // P1-2 cache. Rebuild when generation bumped (fresh snapshot),
     // source_len drifted (payload arrived at same generation), the
-    // user flipped themes via F10 / Alt+T, OR the viewport width
-    // changed (tables are laid out to the current column budget so a
-    // resize must reflow them). On rebuild we also drop the per-width
-    // wrap-count map since its keys are only meaningful against the
-    // freshly-flattened Text.
+    // user flipped themes via F10 / Alt+T, the viewport width changed
+    // (tables + mermaid heights are laid out to the current column
+    // budget), OR the picker's font size changed (mermaid raster row
+    // heights are derived from it — a font swap invalidates every
+    // placement). On rebuild we also drop the per-width wrap-count
+    // map since its keys are only meaningful against the freshly-
+    // flattened Text.
     let source_len = state.markdown().map(|s| s.len()).unwrap_or(0);
     let generation = state.generation();
     let text_area_width = text_area.width;
+    let picker_font_size = picker.map(|p| {
+        let fs = p.font_size();
+        (fs.width, fs.height)
+    });
     let need_rebuild = match &state.markdown_cache {
         Some(c) => {
             c.generation != generation
                 || c.source_len != source_len
                 || c.theme != theme
                 || c.content_width != text_area_width
+                || c.picker_font_size != picker_font_size
         }
         None => true,
     };
     if need_rebuild {
         let source = state.markdown().unwrap_or("").to_string();
-        let text = markdown_blocks_to_text(&source, theme, text_area_width);
+        // Pass the picker in directly — layout builds
+        // `StatefulProtocol`s per placement so the render pass has
+        // zero raster-clone / resize cost per frame.
+        let (text, mermaid_placements) =
+            markdown_blocks_to_layout(&source, theme, text_area_width, picker);
         state.markdown_cache = Some(MarkdownRenderCache {
             generation,
             source_len,
@@ -1180,6 +1254,8 @@ fn render_markdown(
             content_width: text_area_width,
             text,
             line_count_by_width: std::collections::HashMap::new(),
+            mermaid_placements,
+            picker_font_size,
         });
     }
 
@@ -1210,11 +1286,28 @@ fn render_markdown(
     // Text once per frame. That clone is Vec<Line<'static>> + inner
     // Cow<str, 'static> refs — measurably cheaper than re-running
     // pulldown-cmark + rimeterm-markdown for a 1 MB document.
-    let cache_ref = state.markdown_cache.as_ref().expect("cache present");
-    Paragraph::new(cache_ref.text.clone())
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0))
-        .render(text_area, buf);
+    //
+    // We paint the paragraph then the mermaid overlay in ONE borrow
+    // window on `state.markdown_cache`. The overlay needs `&mut` on
+    // the placements vec because `StatefulImage::render(..., &mut
+    // StatefulProtocol)` mutates the protocol's internal cache; the
+    // Paragraph pass only needs `&text`, which coexists with the
+    // `&mut mermaid_placements` because the two are disjoint fields.
+    if let Some(cache) = state.markdown_cache.as_mut() {
+        Paragraph::new(cache.text.clone())
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .render(text_area, buf);
+        if let Some(picker) = picker {
+            overlay_mermaid_diagrams(
+                buf,
+                text_area,
+                scroll,
+                picker,
+                &mut cache.mermaid_placements,
+            );
+        }
+    }
 
     // P1-2: only snapshot rendered rows while a selection is active.
     // The mouse-up copy path is the sole consumer; without a live
@@ -1255,19 +1348,26 @@ fn render_markdown(
     }
 }
 
-/// Render a markdown source string into a `ratatui::text::Text` via
-/// `rimeterm-markdown`'s block model, flattening every block kind into
-/// contiguous rows suitable for the existing `Paragraph`/`Scrollbar`
-/// pipeline (C22.6).
+/// Render a markdown source string into a `ratatui::text::Text` plus
+/// the list of mermaid-diagram placements the caller should overlay on
+/// top of that Text (C22.6, plus mermaid raster pipeline). Every block
+/// kind flattens into contiguous rows so the existing
+/// `Paragraph`/`Scrollbar` pipeline keeps working unchanged; mermaid
+/// diagrams reserve `N` blank rows into which
+/// [`overlay_mermaid_diagrams`] paints the rendered image after the
+/// paragraph pass.
 ///
 /// Block dispatch:
 /// - `DocBlock::Text` — append its `text.lines` verbatim (already
 ///   syntect-styled and LaTeX-approximated by the vendored crate).
-/// - `DocBlock::Mermaid` — surround the raw source with `[mermaid]`
-///   / `[/mermaid]` sentinel lines so the reader can see the diagram
-///   source. Text-diagram rendering (via the sibling `mermaid-text`
-///   crate) is future work; the sentinel path is the design-doc-
-///   documented fallback.
+/// - `DocBlock::Mermaid` — rasterise via
+///   [`rimeterm_markdown::render_mermaid_to_image`] (result cached on
+///   the block via `OnceCell`), derive a row count from
+///   [`derive_mermaid_row_height`], and reserve that many blank rows
+///   while emitting a [`MermaidPlacement`] pointing at the first row.
+///   Falls back to `[mermaid]` / `[/mermaid]` sentinel lines around
+///   the raw source when either the picker is `None` (terminal has no
+///   image protocol) or `render_mermaid_to_image` returned an error.
 /// - `DocBlock::Table` — laid out with box-drawing borders and
 ///   fair-share column widths via [`rimeterm_markdown::layout_table`]
 ///   so wide-cell content wraps inside its column instead of getting
@@ -1277,20 +1377,37 @@ fn render_markdown(
 /// visual separation matches upstream's paragraph gaps.
 ///
 /// `content_width` is the viewport column budget (viewer inner width
-/// minus the scrollbar strip) that tables lay themselves out against.
-/// Since baked-in table geometry depends on it, callers MUST rebuild
-/// the cached `Text` whenever this value changes.
-fn markdown_blocks_to_text(
+/// minus the scrollbar strip) that tables and mermaid heights lay
+/// themselves out against. Since baked-in geometry depends on it,
+/// callers MUST rebuild the cached layout whenever it changes.
+///
+/// `picker` is the terminal's [`ratatui_image::picker::Picker`], if
+/// one is available; `None` disables the mermaid raster path entirely
+/// (sentinel fallback for every mermaid block). When present, the
+/// picker's `font_size()` drives [`derive_mermaid_row_height`] AND
+/// [`Picker::new_resize_protocol`] converts each `DynamicImage` into
+/// a [`StatefulProtocol`] once at layout time; subsequent frames
+/// render through the amortising `StatefulImage` widget and never
+/// re-clone the raster.
+fn markdown_blocks_to_layout(
     source: &str,
     theme: rimeterm_markdown::Theme,
     content_width: u16,
-) -> Text<'static> {
-    use rimeterm_markdown::{DocBlock, Palette, layout_table, render_markdown};
+    picker: Option<&ratatui_image::picker::Picker>,
+) -> (Text<'static>, Vec<MermaidPlacement>) {
+    use rimeterm_markdown::{
+        DocBlock, Palette, layout_table, render_markdown, render_mermaid_to_image,
+    };
 
     let palette = Palette::from_theme(theme);
     let blocks = render_markdown(source, &palette, theme);
+    let font_size = picker.map(|p| {
+        let fs = p.font_size();
+        (fs.width, fs.height)
+    });
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut placements: Vec<MermaidPlacement> = Vec::new();
     let mut first = true;
     for block in &blocks {
         if !first {
@@ -1301,20 +1418,155 @@ fn markdown_blocks_to_text(
             DocBlock::Text { text, .. } => {
                 lines.extend(text.lines.iter().cloned());
             }
-            DocBlock::Mermaid { source, .. } => {
-                let dim = Style::default().add_modifier(Modifier::DIM);
-                lines.push(Line::styled("[mermaid]", dim));
-                for raw in source.lines() {
-                    lines.push(Line::from(raw.to_owned()));
+            DocBlock::Mermaid {
+                source, rendered, ..
+            } => {
+                // No picker OR renderer error → sentinel fallback so
+                // the reader still sees the raw diagram source.
+                let placement = picker.zip(font_size).and_then(|(picker, font_size)| {
+                    let raster = rendered.get_or_init(|| render_mermaid_to_image(source));
+                    let raster = raster.as_ref().ok()?;
+                    let rows = derive_mermaid_row_height(raster, content_width, font_size);
+                    // Clone the DynamicImage ONCE at layout time; the
+                    // resulting StatefulProtocol owns the pixels for
+                    // the lifetime of the cache and internally caches
+                    // its resized copy for `img_rect` reuse.
+                    let protocol = picker.new_resize_protocol(raster.image.clone());
+                    Some((rows, protocol))
+                });
+                if let Some((row_height, protocol)) = placement {
+                    let start_row: u16 = lines.len().try_into().unwrap_or(u16::MAX);
+                    for _ in 0..row_height {
+                        lines.push(Line::from(""));
+                    }
+                    placements.push(MermaidPlacement {
+                        start_row,
+                        row_height,
+                        protocol,
+                    });
+                } else {
+                    let dim = Style::default().add_modifier(Modifier::DIM);
+                    lines.push(Line::styled("[mermaid]", dim));
+                    for raw in source.lines() {
+                        lines.push(Line::from(raw.to_owned()));
+                    }
+                    lines.push(Line::styled("[/mermaid]", dim));
                 }
-                lines.push(Line::styled("[/mermaid]", dim));
             }
             DocBlock::Table(t) => {
                 lines.extend(layout_table(t, content_width));
             }
         }
     }
-    Text::from(lines)
+    (Text::from(lines), placements)
+}
+
+/// Derive the number of terminal rows a mermaid raster should occupy
+/// given the viewport `content_width` (in cells) and the terminal's
+/// `(cell_px_w, cell_px_h)` reported by
+/// [`ratatui_image::picker::Picker::font_size`].
+///
+/// The image is drawn to its natural pixel size when it fits inside
+/// the viewport in cell terms, otherwise scaled down uniformly to
+/// preserve aspect. Result clamped to `[3, 40]` so a giant SVG can't
+/// eat the whole overlay and a one-line-tall diagram still gets a
+/// couple of readable rows.
+fn derive_mermaid_row_height(
+    raster: &rimeterm_markdown::MermaidPixmap,
+    content_width: u16,
+    (cell_px_w, cell_px_h): (u16, u16),
+) -> u16 {
+    // Guard against a picker reporting a zero cell dimension. `1` is
+    // fine as a neutral divisor — the clamp below still bounds the
+    // final answer sensibly.
+    let cell_w = cell_px_w.max(1) as u32;
+    let cell_h = cell_px_h.max(1) as u32;
+    let avail_px_w = u32::from(content_width).saturating_mul(cell_w).max(cell_w);
+    let scale_num = avail_px_w.min(raster.width);
+    // display_px_h = raster.height * scale_num / raster.width
+    let display_px_h = (u64::from(raster.height) * u64::from(scale_num))
+        .checked_div(u64::from(raster.width.max(1)))
+        .unwrap_or(0);
+    let rows = ((display_px_h + u64::from(cell_h) - 1) / u64::from(cell_h)) as u16;
+    rows.clamp(3, 40)
+}
+
+/// Paint each [`MermaidPlacement`] on top of the just-drawn paragraph
+/// cells. Called from `render_markdown` between the `Paragraph` pass
+/// and the selection reverse-video pass.
+///
+/// # Scroll model
+///
+/// `scroll` is the current first-visible-row in the flattened Text.
+/// Each placement's `start_row` is the row in the *unscrolled* Text
+/// where the reserved blank stripe begins; the screen y-offset is
+/// therefore `start_row - scroll`, clipped to `[0, text_area.height)`.
+/// Placements fully above the viewport are skipped; placements that
+/// span the top edge are clipped from the top; placements that spill
+/// past the bottom edge get their `height` clamped to what fits.
+/// `ratatui_image::Resize::Fit` preserves aspect inside the clamped
+/// rect, so a clipped diagram degrades to "smaller but still whole"
+/// rather than "cut in half".
+///
+/// # Cost
+///
+/// Each placement carries a preloaded
+/// [`ratatui_image::protocol::StatefulProtocol`] (built once in
+/// [`markdown_blocks_to_layout`] via [`Picker::new_resize_protocol`]).
+/// Per frame we hand the protocol to [`StatefulImage`] via `&mut`;
+/// `StatefulImage::render` internally resizes the raster to fit
+/// `img_rect` on the first call and caches the resized bitmap. Frames
+/// after the first at the same rect are O(pixels-in-viewport) blits.
+/// **No** `DynamicImage::clone` and **no** resample happens per frame,
+/// which was the pathological cost the old `Picker::new_protocol`
+/// path incurred (a full bilinear resample per placement per frame,
+/// enough to stall the UI on even a two-diagram document).
+///
+/// `picker` is unused by the render call itself but kept in the
+/// signature so callers can stop passing placements downstream when
+/// the terminal loses its image capability mid-session.
+fn overlay_mermaid_diagrams(
+    buf: &mut Buffer,
+    text_area: Rect,
+    scroll: u16,
+    _picker: &ratatui_image::picker::Picker,
+    placements: &mut [MermaidPlacement],
+) {
+    use ratatui::widgets::StatefulWidget;
+    use ratatui_image::StatefulImage;
+
+    if text_area.width == 0 || text_area.height == 0 {
+        return;
+    }
+    let viewport_end = scroll.saturating_add(text_area.height);
+    for p in placements.iter_mut() {
+        let end_row = p.start_row.saturating_add(p.row_height);
+        // Fully above viewport → skip.
+        if end_row <= scroll {
+            continue;
+        }
+        // Fully below viewport → subsequent placements are also below
+        // (we emit them in source order). Bail early.
+        if p.start_row >= viewport_end {
+            break;
+        }
+        let screen_y = p.start_row.saturating_sub(scroll);
+        let remaining_rows = text_area.height.saturating_sub(screen_y);
+        // If we're clipping the top, drop those rows off `row_height`
+        // too so `Fit` scales the surviving band, not the natural size.
+        let clipped_top = scroll.saturating_sub(p.start_row);
+        let visible_height = p.row_height.saturating_sub(clipped_top).min(remaining_rows);
+        if visible_height == 0 {
+            continue;
+        }
+        let img_rect = Rect {
+            x: text_area.x,
+            y: text_area.y.saturating_add(screen_y),
+            width: text_area.width,
+            height: visible_height,
+        };
+        StatefulImage::default().render(img_rect, buf, &mut p.protocol);
+    }
 }
 
 /// Renders a Code / plain-text snapshot into `inner` with syntect
@@ -2356,24 +2608,37 @@ mod markdown_tests {
         );
     }
 
-    // --- C22.6: markdown_blocks_to_text (rimeterm-markdown wire-in) ---
+    // --- C22.6: markdown_blocks_to_layout (rimeterm-markdown wire-in) ---
+    //
+    // These tests exercise the no-picker path (`picker_font_size = None`),
+    // which returns text-only output. The `Some(...)` path is exercised
+    // by the `MermaidPlacement` / overlay tests below and by the
+    // end-to-end smoke.
 
+    /// Shorthand for the no-picker call that dominated pre-mermaid tests.
+    fn layout_text_only(
+        source: &str,
+        theme: rimeterm_markdown::Theme,
+        width: u16,
+    ) -> Text<'static> {
+        markdown_blocks_to_layout(source, theme, width, None).0
+    }
     #[test]
-    fn markdown_blocks_to_text_handles_empty_without_panic() {
+    fn layout_handles_empty_without_panic() {
         // Regression guard: the vendored `render_markdown` on empty
         // input previously produced zero blocks in some upstream
         // versions; the wrapper must not panic.
-        let text = markdown_blocks_to_text("", rimeterm_markdown::Theme::Default, 80);
+        let text = layout_text_only("", rimeterm_markdown::Theme::Default, 80);
         // Empty or nearly empty is fine — just not a crash.
         assert!(text.lines.len() <= 1);
     }
 
     #[test]
-    fn markdown_blocks_to_text_styles_code_blocks_via_syntect() {
+    fn layout_styles_code_blocks_via_syntect() {
         // rimeterm-markdown runs syntect internally against the
         // configured theme — code block contents must get non-default
         // styling on at least one span.
-        let text = markdown_blocks_to_text(
+        let text = layout_text_only(
             "```rust\nfn main() {}\n```\n",
             rimeterm_markdown::Theme::Default,
             80,
@@ -2387,13 +2652,20 @@ mod markdown_tests {
     }
 
     #[test]
-    fn markdown_blocks_to_text_marks_mermaid_blocks() {
-        // Fallback sentinel — until we wire the `mermaid-text` crate,
-        // Mermaid content is bracketed by `[mermaid]` / `[/mermaid]`.
-        let text = markdown_blocks_to_text(
+    fn layout_falls_back_to_sentinels_without_picker() {
+        // With `picker_font_size = None` we cannot rasterise, so every
+        // mermaid block MUST degrade to the `[mermaid]`/`[/mermaid]`
+        // sentinel path around the raw source. Any placement in the
+        // returned vec would be a bug (no image = nothing to paint).
+        let (text, placements) = markdown_blocks_to_layout(
             "prose\n\n```mermaid\ngraph LR\nA-->B\n```\n\nafter\n",
             rimeterm_markdown::Theme::Default,
             80,
+            None,
+        );
+        assert!(
+            placements.is_empty(),
+            "no-picker path must emit no placements"
         );
         let all: String = text
             .lines
@@ -2411,12 +2683,49 @@ mod markdown_tests {
     }
 
     #[test]
-    fn markdown_blocks_to_text_box_draws_tables() {
+    fn layout_produces_placement_with_picker() {
+        // With a picker (synthesised via `Picker::from_fontsize` for
+        // hermetic tests — a real one comes from `from_query_stdio`
+        // and needs a TTY), a supported mermaid block should surface
+        // as a `MermaidPlacement` — NOT as sentinel lines. `start_row`
+        // is anchored inside the flattened `Text`; `row_height` matches
+        // the reserved blank stripe count so scroll math stays honest.
+        let picker =
+            ratatui_image::picker::Picker::from_fontsize(ratatui_image::FontSize::new(10, 20));
+        let (text, placements) = markdown_blocks_to_layout(
+            "```mermaid\ngraph LR\nA-->B\n```\n",
+            rimeterm_markdown::Theme::Default,
+            80,
+            Some(&picker),
+        );
+        assert_eq!(placements.len(), 1, "expected one placement");
+        let p = &placements[0];
+        assert!(p.row_height >= 3, "clamp floor: {}", p.row_height);
+        assert!(p.row_height <= 40, "clamp ceiling: {}", p.row_height);
+        // The reserved region really is blank rows in the text — count
+        // them at `start_row`.
+        let reserved: Vec<&Line<'_>> = text
+            .lines
+            .iter()
+            .skip(p.start_row as usize)
+            .take(p.row_height as usize)
+            .collect();
+        assert_eq!(reserved.len(), p.row_height as usize);
+        for line in reserved {
+            assert!(
+                line.spans.iter().all(|s| s.content.as_ref().is_empty()),
+                "reserved rows should be blank, got: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_box_draws_tables() {
         // Tables render as Unicode box-drawing frames via
         // `rimeterm_markdown::layout_table` (fair-share column widths,
         // wide-cell wrapping). Cell content survives and column
         // alignment is preserved by the box.
-        let text = markdown_blocks_to_text(
+        let text = layout_text_only(
             "| Alpha | Beta |\n|---|---|\n| one | two |\n| three | four |\n",
             rimeterm_markdown::Theme::Default,
             80,
@@ -2439,10 +2748,10 @@ mod markdown_tests {
     }
 
     #[test]
-    fn markdown_blocks_to_text_falls_back_to_pipe_when_too_narrow() {
+    fn layout_table_falls_back_to_pipe_when_too_narrow() {
         // 4-column table needs 4*4+1 = 17 columns to box-render. 8 is
         // well below that → pipe-format degradation.
-        let text = markdown_blocks_to_text(
+        let text = layout_text_only(
             "| A | B | C | D |\n|---|---|---|---|\n| 1 | 2 | 3 | 4 |\n",
             rimeterm_markdown::Theme::Default,
             8,

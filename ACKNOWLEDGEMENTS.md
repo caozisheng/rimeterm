@@ -173,9 +173,21 @@ column when the user Alt+V's a file-manager selection.
   block/span translation used inside `rimeterm-markdown`.
 - [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark) — MIT.
   Zero-copy Markdown tokenizer.
+- [mermaid-rs-renderer](https://github.com/1jehuang/mermaid-rs-renderer) — MIT.
+  Pure-Rust Mermaid parser + layout that emits SVG. Wrapped by
+  [`rimeterm_markdown::render_mermaid_to_image`] to rasterise ` ```mermaid `
+  fenced blocks in the Alt+V viewer without any browser or JS runtime.
+  Design reference for the pipeline shape: [CleverCloud/mdr](https://github.com/CleverCloud/mdr) v0.3.2 (MIT) `src/core/mermaid.rs` — we borrow the
+  `catch_unwind` + preprocess-then-rasterise flow but not the source. See
+  `docs/rimeterm-mermaind-design.md` for the full evaluation.
+- [resvg](https://github.com/linebender/resvg) / [usvg](https://github.com/linebender/resvg) — MIT / Apache-2.0.
+  SVG simplification + rendering used for the mermaid raster step.
+- [tiny-skia](https://github.com/linebender/tiny-skia) — BSD-3-Clause.
+  Pixel-blitting backend that `resvg` targets; produces the raw pixmap
+  we round-trip through `image` for `ratatui-image` consumption.
 - [ratatui-image](https://github.com/benjajaja/ratatui-image) — MIT.
-  Kitty / Sixel / iTerm2 / half-block image renderer for the image
-  branch of the viewer.
+  Kitty / Sixel / iTerm2 / half-block image renderer for both the image
+  branch of the viewer and the mermaid-diagram overlay pass.
 - [image](https://github.com/image-rs/image) — MIT / Apache-2.0.
   Decoder backend for PNG / JPG / GIF / BMP / WebP.
 - [syntect](https://github.com/trishume/syntect) — MIT. Sublime Text

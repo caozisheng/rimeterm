@@ -29,6 +29,14 @@ Original MIT license retained verbatim in [`LICENSE`](./LICENSE).
   markdown_view/tests.rs`, 1163 LoC referencing `crate::app`
   fixtures) with focused unit tests under `tests/` covering the four
   invariants named in the design doc.
+- **Added** `src/mermaid.rs` — a mermaid → SVG → PNG raster pipeline
+  wrapping [`mermaid-rs-renderer`](https://github.com/1jehuang/mermaid-rs-renderer)
+  (MIT), [`usvg`](https://github.com/linebender/resvg) / [`resvg`](https://github.com/linebender/resvg) (MIT / Apache-2.0), and
+  [`tiny-skia`](https://github.com/linebender/tiny-skia) (BSD-3-Clause). Design shape (preprocess → `catch_unwind`
+  → rasterise → PNG round-trip → `image::DynamicImage`) is borrowed
+  from [CleverCloud/mdr](https://github.com/CleverCloud/mdr) v0.3.2 (MIT) `src/core/mermaid.rs`; the
+  implementation is independent. See `docs/rimeterm-mermaind-design.md`
+  for the evaluation that led here.
 
 ## Divergence policy
 
