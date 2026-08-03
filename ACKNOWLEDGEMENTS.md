@@ -54,16 +54,40 @@ ships. The stack:
 ## Native AI-agent monitor
 
 `AgtopPane` classifies AI-coding-agent processes (Claude Code, Codex,
-Aider, Cursor, Gemini, Goose, …) in-process; no external binary ships.
+Aider, Cursor, Gemini, Goose, …) in-process and enriches each row
+with model, tokens, cost, context-fill, loaded skills / plugins, and
+in-flight subagents pulled from the on-disk session transcripts. No
+external binary ships.
 
 - [agtop](https://github.com/mbrassey/agtop) — MIT. Upstream `agtop`
-  is a standalone binary; we ported the matcher table
-  (`src/matchers.rs` @ v2.4.24) into `rimeterm-tui::agtop_matchers`
-  so detection works without a separate `cargo install agtop`. The
-  rest of the pane (sysinfo-based worker, ratatui table view, filter
-  / sort / cursor UX) is rimeterm-native.
+  is a standalone binary; we ported the following pieces of v2.4.24
+  into `rimeterm-tui` so the whole thing works without a separate
+  `cargo install agtop`:
+  - `src/matchers.rs` → `agtop_matchers` (20 built-in regex matchers
+    for the known AI-coding-agent binaries + npm shims).
+  - `src/claude.rs` (session JSONL reader, cwd encoding, status
+    classification) + `src/skills.rs` (Claude Code skill discovery)
+  + `src/plugins.rs` (Claude Code plugin discovery) merged into
+    `agtop_session`.
+  - `src/pricing.rs` (cache-aware Anthropic / OpenAI / Google price
+    table with suffix-tolerant lookup) → `agtop_pricing`. We ship a
+    hand-curated ~40-entry table rather than the auto-generated
+    ~1,800-entry LiteLLM dump to keep the binary small; unknown
+    models degrade to `cost_basis: unknown` rather than shipping a
+    stale full snapshot.
+  - Detail-popup layout + column selection mirror `src/ui/popup.rs`
+    and `src/ui/agents.rs`.
+  Deliberately NOT ported: per-OS native FFI stacks
+  (`src/writing_files.rs`, `src/reading_files.rs`, `src/net_count.rs`)
+  and the WSL bridge (`src/wsl_backend.rs`) — those need libproc /
+  NtQuerySystemInformation / libprocstat work rimeterm doesn't need
+  for a coding-agent overview pane. Per-vendor enrichers other than
+  Claude (`codex.rs`, `aider.rs`, `gemini.rs`, `goose.rs`) are also
+  stubs so far — the `agtop_session` enricher pipeline is designed
+  to slot them in without touching the pane or model types.
 - Also uses [sysinfo] and [humansize] from the system-monitor stack
-  above.
+  above, plus [serde_json] for the transcript reader and [chrono] for
+  ISO-8601 timestamp parsing.
 
 ## Native AI-model catalog
 

@@ -71,12 +71,14 @@ pub fn builtin() -> Vec<Matcher> {
         m("mods", &p(&format!(r"mods{E}"))),
         m("sgpt", &p(&format!(r"sgpt{E}"))),
         m("llm", &p(&format!(r"llm{E}"))),
-        // oh-my-pi ships the bare `omp` binary as well as the scoped
-        // npm package `@oh-my-pi/pi-coding-agent`; match both so the
-        // pane shows omp sessions whether the user runs the CLI shim
-        // directly or invokes it through `node <path>/cli.js`.
+        // oh-my-pi ships the bare `omp` binary AND the scoped npm
+        // package `@oh-my-pi/pi-coding-agent`. Both surfaces classify
+        // as `omp` (same label) so a single logical session doesn't
+        // double-count in the pane when the launcher process spawns
+        // a child bun/node worker running the shim — the pane's
+        // parent/child dedupe collapses the pair to one row.
         m("omp", &p(&format!(r"omp{E}"))),
-        m("oh-my-pi", r"@oh-my-pi[/\\]"),
+        m("omp", r"@oh-my-pi[/\\]"),
         m("ollama", &p(r"ollama(\s+(run|chat|serve)|$)")),
         m("fabric", &p(&format!(r"fabric{E}"))),
         m("block-goose", &p(&format!(r"goose-server{E}"))),
@@ -171,9 +173,11 @@ mod tests {
         assert_eq!(classify("/usr/bin/bash", &b, &u), None);
     }
 
-    /// oh-my-pi is a Pi fork that ships as the bare `omp` binary plus the
-    /// scoped npm package `@oh-my-pi/pi-coding-agent`; both surfaces MUST
-    /// classify so agtop pane picks the process up on every platform.
+    /// oh-my-pi ships as the bare `omp` binary AND the scoped npm
+    /// package `@oh-my-pi/pi-coding-agent`. Both surfaces MUST
+    /// classify — and both MUST produce the SAME `omp` label so a
+    /// single logical session doesn't split into a `omp` row + an
+    /// `oh-my-pi` row when the launcher spawns a bun/node worker.
     #[test]
     fn oh_my_pi_variants() {
         let b = builtin();
@@ -185,13 +189,16 @@ mod tests {
             Some("omp")
         );
         assert_eq!(classify(r"C:\bin\omp.exe", &b, &u), Some("omp"));
+        // The scoped-npm-package shape ALSO classifies as `omp` now
+        // — this is the divergence-from-upstream fix that stops the
+        // pane double-counting a single logical session.
         assert_eq!(
             classify(
                 r"node C:\Users\jake\AppData\Roaming\npm\node_modules\@oh-my-pi\pi-coding-agent\dist\cli.js",
                 &b,
                 &u
             ),
-            Some("oh-my-pi")
+            Some("omp")
         );
         assert_eq!(
             classify(
@@ -199,7 +206,17 @@ mod tests {
                 &b,
                 &u
             ),
-            Some("oh-my-pi")
+            Some("omp")
+        );
+        // Live shape from a real bun-launched session (this is what
+        // was breaking on the user's Windows box).
+        assert_eq!(
+            classify(
+                r"bun C:\Users\jake\.bun\..\node_modules\@oh-my-pi\pi-coding-agent\dist\cli.js",
+                &b,
+                &u
+            ),
+            Some("omp")
         );
     }
 
