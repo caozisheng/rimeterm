@@ -47,13 +47,31 @@ impl ZoneList {
     /// [`crate::handle::ZoneHandle::display_label`], so no location leaks
     /// into the seed data itself.
     pub fn seeded() -> Self {
+        // Cover the globe roughly one marker per two hours of UTC offset,
+        // so a fresh watchlist shows a legible ring of dots on the map
+        // instead of clumping on the North Atlantic. Every entry below
+        // exists in `ZONE_COORDS`, so they all resolve to real markers.
         Self {
             entries: vec![
                 ZoneEntry::new("local"),
                 ZoneEntry::new("UTC"),
-                ZoneEntry::new("America/New_York"),
-                ZoneEntry::new("Europe/London"),
-                ZoneEntry::new("Asia/Tokyo"),
+                ZoneEntry::new("Pacific/Honolulu"),    // UTC−10
+                ZoneEntry::new("America/Los_Angeles"), // UTC−8/−7
+                ZoneEntry::new("America/Denver"),      // UTC−7/−6
+                ZoneEntry::new("America/Chicago"),     // UTC−6/−5
+                ZoneEntry::new("America/New_York"),    // UTC−5/−4
+                ZoneEntry::new("America/Sao_Paulo"),   // UTC−3
+                ZoneEntry::new("Europe/London"),       // UTC±0/+1
+                ZoneEntry::new("Europe/Berlin"),       // UTC+1/+2
+                ZoneEntry::new("Africa/Cairo"),        // UTC+2/+3
+                ZoneEntry::new("Europe/Moscow"),       // UTC+3
+                ZoneEntry::new("Asia/Dubai"),          // UTC+4
+                ZoneEntry::new("Asia/Kolkata"),        // UTC+5:30
+                ZoneEntry::new("Asia/Bangkok"),        // UTC+7
+                ZoneEntry::new("Asia/Shanghai"),       // UTC+8
+                ZoneEntry::new("Asia/Tokyo"),          // UTC+9
+                ZoneEntry::new("Australia/Sydney"),    // UTC+10/+11
+                ZoneEntry::new("Pacific/Auckland"),    // UTC+12/+13
             ],
         }
     }
