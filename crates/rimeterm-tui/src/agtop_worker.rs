@@ -584,47 +584,101 @@ struct RawAgent {
     ppid: u32,
 }
 
-/// Drop matched agents whose parent pid is ALSO a matched agent with
-/// the same label and cwd — those are worker processes spawned by
-/// their launcher (e.g. `omp.exe` → `bun … @oh-my-pi/pi-coding-agent`).
-/// Keeps the launcher (top of the chain) and drops the worker so the
-/// pane shows one row per logical session.
+/// Collapse launcher / worker chains to one row per logical session
+/// while preserving the descendants' resource usage.
 ///
-/// Two guards:
-/// - Same `label` required: a bash-child `claude` inside an `omp`
+/// A matched agent whose parent pid is ALSO a matched agent with the
+/// SAME label AND cwd is treated as a worker of the parent (e.g.
+/// `omp.exe` → `bun … @oh-my-pi/pi-coding-agent`). Instead of showing
+/// two rows for one session, we drop the child and roll its `cpu` +
+/// `rss` into the nearest surviving ancestor — otherwise the pane
+/// would render the (idle) launcher's 0.0% CPU and miss the bun /
+/// node worker that owns the real load.
+///
+/// Two guards on the drop:
+/// - Same `label` required: a `bash`-child `claude` inside an `omp`
 ///   subshell is a distinct logical session and MUST NOT be dropped.
 /// - Same `cwd` required: a launcher whose worker `cd`d elsewhere
 ///   still counts as a separate session because the JSONL it maps
 ///   to lives under a different encoded dir.
-fn dedupe_child_workers(raw: Vec<RawAgent>) -> Vec<RawAgent> {
+fn dedupe_child_workers(mut raw: Vec<RawAgent>) -> Vec<RawAgent> {
     if raw.len() < 2 {
         return raw;
     }
-    // Index by pid so the parent lookup is O(1) per candidate.
-    // Skip pid 0 (kernel / unresolved) so a `ppid == 0` row can't
-    // accidentally match a matched-agent-with-pid-0 (shouldn't
-    // happen in practice — no real userspace agent lives at pid 0
-    // — but defence in depth).
-    let by_pid: HashMap<u32, &RawAgent> = raw
+
+    // Snapshot label + cwd + ppid before we start mutating — the
+    // fold rewrites cpu/rss on the retained rows but we need the
+    // original relationships to decide who drops and who inherits.
+    #[derive(Clone)]
+    struct Node {
+        ppid: u32,
+        label: String,
+        cwd: String,
+    }
+    let nodes: HashMap<u32, Node> = raw
         .iter()
         .filter(|r| r.pid != 0)
-        .map(|r| (r.pid, r))
-        .collect();
-    raw.iter()
-        .filter(|r| {
-            if r.ppid == 0 {
-                return true;
-            }
-            let Some(parent) = by_pid.get(&r.ppid) else {
-                return true;
-            };
-            // Parent is a matched agent — drop THIS row only when
-            // parent+child are the same label AND cwd (i.e. a
-            // launcher/worker pair, not a nested distinct session).
-            !(parent.label == r.label && parent.cwd == r.cwd)
+        .map(|r| {
+            (
+                r.pid,
+                Node {
+                    ppid: r.ppid,
+                    label: r.label.clone(),
+                    cwd: r.cwd.clone(),
+                },
+            )
         })
-        .cloned()
-        .collect()
+        .collect();
+
+    // Resolve each pid to the pid it should FOLD INTO — walk up the
+    // ppid chain as long as parent+child share label+cwd (i.e. the
+    // parent is a worker's launcher). The terminal pid is either a
+    // matched agent whose parent is unmatched / different, or has no
+    // parent in the table. `HashMap<u32, u32>` memoises so a deep
+    // chain resolves in a single traversal.
+    let mut fold_into: HashMap<u32, u32> = HashMap::with_capacity(raw.len());
+    for r in &raw {
+        if r.pid == 0 {
+            continue;
+        }
+        let mut cur = r.pid;
+        loop {
+            let Some(node) = nodes.get(&cur) else { break };
+            let Some(parent) = nodes.get(&node.ppid) else {
+                break;
+            };
+            if parent.label != node.label || parent.cwd != node.cwd {
+                break;
+            }
+            cur = node.ppid;
+        }
+        fold_into.insert(r.pid, cur);
+    }
+
+    // Fold cpu + rss from every child into the ancestor it resolves
+    // to. Two-pass so the mutable borrow of `raw` doesn't conflict
+    // with the immutable index we needed to compute contributions.
+    let mut contrib: HashMap<u32, (f32, u64)> = HashMap::new();
+    for r in &raw {
+        let Some(&anchor) = fold_into.get(&r.pid) else {
+            continue;
+        };
+        if anchor == r.pid {
+            continue; // survivor — its own cpu/rss stay put.
+        }
+        let entry = contrib.entry(anchor).or_insert((0.0, 0));
+        entry.0 += r.cpu;
+        entry.1 = entry.1.saturating_add(r.rss);
+    }
+
+    raw.retain(|r| fold_into.get(&r.pid).copied() == Some(r.pid) || r.pid == 0);
+    for r in &mut raw {
+        if let Some((cpu_add, rss_add)) = contrib.get(&r.pid) {
+            r.cpu += *cpu_add;
+            r.rss = r.rss.saturating_add(*rss_add);
+        }
+    }
+    raw
 }
 
 fn push_ring(ring: &mut Vec<f64>, sample: f64, cap: usize) {
@@ -834,11 +888,15 @@ mod tests {
     }
 
     fn raw(pid: u32, ppid: u32, label: &str, cwd: &str) -> RawAgent {
+        raw_with_load(pid, ppid, label, cwd, 0.0, 0)
+    }
+
+    fn raw_with_load(pid: u32, ppid: u32, label: &str, cwd: &str, cpu: f32, rss: u64) -> RawAgent {
         RawAgent {
             label: label.into(),
             pid,
-            cpu: 0.0,
-            rss: 0,
+            cpu,
+            rss,
             uptime_sec: 0,
             cwd: cwd.into(),
             exe: String::new(),
@@ -859,6 +917,44 @@ mod tests {
         let out = dedupe_child_workers(vec![launcher, worker]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].pid, 30828, "the launcher should survive");
+    }
+
+    #[test]
+    fn dedupe_folds_child_load_into_launcher() {
+        // The regression: omp.exe (launcher) is idle, but bun (child)
+        // owns the real CPU + RSS. Before the fold-fix, keeping only
+        // the launcher meant the pane displayed 0.0% CPU forever
+        // even while a session was actively burning cycles.
+        let launcher = raw_with_load(30828, 26692, "omp", r"C:\p", 0.1, 12 * 1024 * 1024);
+        let worker = raw_with_load(27308, 30828, "omp", r"C:\p", 42.5, 480 * 1024 * 1024);
+        let out = dedupe_child_workers(vec![launcher, worker]);
+        assert_eq!(out.len(), 1);
+        let survivor = &out[0];
+        assert_eq!(survivor.pid, 30828);
+        assert!(
+            (survivor.cpu - 42.6).abs() < 0.001,
+            "child cpu folded into launcher: got {}",
+            survivor.cpu
+        );
+        assert_eq!(
+            survivor.rss,
+            (12 + 480) * 1024 * 1024,
+            "child rss folded into launcher"
+        );
+    }
+
+    #[test]
+    fn dedupe_folds_multi_level_chain() {
+        // launcher → middle → leaf, all same label + cwd. Every
+        // descendant folds up to the launcher; middle + leaf drop.
+        let launcher = raw_with_load(100, 1, "omp", "/p", 0.0, 0);
+        let middle = raw_with_load(200, 100, "omp", "/p", 3.0, 100);
+        let leaf = raw_with_load(300, 200, "omp", "/p", 7.0, 200);
+        let out = dedupe_child_workers(vec![launcher, middle, leaf]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pid, 100);
+        assert!((out[0].cpu - 10.0).abs() < 0.001);
+        assert_eq!(out[0].rss, 300);
     }
 
     #[test]
