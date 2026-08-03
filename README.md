@@ -8,10 +8,13 @@
 
 One screen, four zones on a 2×2 grid. Every zone is a tab strip you can reorder, hide, or hot-swap.
 
-|            | **Left**                                        | **Right** |
-| ---------- | ----------------------------------------------- | --------- |
-| **Top**    | files · todo · fr                               | agents    |
-| **Bottom** | git · sysmon · agtop · models · stock · zones   | shells    |
+```
+┌──────────────────────────────────────────────────┬──────────┐
+│  files · todo · fr                               │  agents  │
+├──────────────────────────────────────────────────┼──────────┤
+│  git · sysmon · agtop · models · stock · zones   │  shells  │
+└──────────────────────────────────────────────────┴──────────┘
+```
 
 ### Left column
 
