@@ -613,7 +613,7 @@ pub struct App {
     upgrade_rx: mpsc::UnboundedReceiver<crate::upgrade::WorkerEvent>,
     /// Newest release GitHub knows about, snapshotted from the most
     /// recent successful check (silent or interactive). Populates the
-    /// red "有新版本 vX.Y.Z" chip in the hint bar's bottom-right; kept
+    /// red "⚠ Update available vX.Y.Z" chip in the hint bar's bottom-right; kept
     /// separate from `upgrade_state` so the chip persists even after
     /// the user closes the overlay without downloading, and gets
     /// cleared the moment a subsequent check reports UpToDate. Only
@@ -1209,7 +1209,7 @@ impl App {
 
         // Fire a one-shot silent upgrade probe against GitHub Releases.
         // Result lands on `upgrade_rx` and flips `latest_available` on
-        // success, which paints the red "有新版本" chip in the hint
+        // success, which paints the red "Update available" chip in the hint
         // bar bottom-right. Network hiccups stay silent by design.
         self.spawn_startup_upgrade_check();
 
@@ -6398,8 +6398,8 @@ pub(crate) struct UpgradeChip {
 ///
 /// Contract:
 /// - `release = None` → chip suppressed, `hint_rect = area`.
-/// - Chip label = `" ⚠ 有新版本 vX.Y.Z "` (leading + trailing space so
-///   the red run doesn't touch the edge cell / the hint text).
+/// - Chip label = `" ⚠ Update available vX.Y.Z "` (leading + trailing
+///   space so the red run doesn't touch the edge cell / the hint text).
 /// - Suppress the chip entirely when the terminal can't hold at least
 ///   `chip_width + 1` cells: a truncated red badge reads as a render
 ///   bug, and the hint text is load-bearing.
@@ -6418,7 +6418,7 @@ pub(crate) fn upgrade_chip_layout(
             chip: None,
         };
     };
-    let label = format!(" ⚠ 有新版本 v{} ", release.version);
+    let label = format!(" ⚠ Update available v{} ", release.version);
     let chip_width = UnicodeWidthStr::width(label.as_str()) as u16;
     if chip_width == 0 || area.width < chip_width.saturating_add(1) {
         return UpgradeChipLayout {
@@ -8412,10 +8412,10 @@ mod tests {
         // Label contains the version so the eye can spot which
         // release the chip is nudging toward.
         assert!(chip.label.contains("0.2.17"), "label = {:?}", chip.label);
-        // ⚠ + 有新版本 glyphs must survive verbatim — no dropped ideographs
-        // from an accidental byte-slice truncation.
+        // ⚠ + "Update available" text must survive verbatim — no dropped
+        // characters from an accidental byte-slice truncation.
         assert!(chip.label.contains('⚠'));
-        assert!(chip.label.contains("有新版本"));
+        assert!(chip.label.contains("Update available"));
         // Non-empty hint rect so the "F10 Menu · Ctrl+Q Quit" row can
         // still paint next to the chip on a normal terminal.
         assert!(out.hint_rect.width > 40);

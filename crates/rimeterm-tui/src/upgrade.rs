@@ -138,7 +138,7 @@ impl UpgradeState {
     /// Any other phase — Checking, UpToDate, Downloading,
     /// ReadyToInstall, Failed — returns `None`. Used by the hint-bar
     /// update chip so it can render the target version alongside the
-    /// "有新版本" glyph.
+    /// "⚠ Update available" chip.
     pub fn available_release(&self) -> Option<&AvailableRelease> {
         match &self.phase {
             Phase::Available(release) => Some(release),
