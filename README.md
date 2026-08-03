@@ -6,26 +6,40 @@
 
 ## Layout
 
-One screen, four zones in a 2×2 grid:
+One screen, four zones on a 2×2 grid. Every zone is a tab strip you can reorder, hide, or hot-swap.
 
-|                                                                                                                                                                                                                                                                                                                            **Top-left** |                                                                                                                                                                                                             **Top-right** |
-| :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------: | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------: |
-| · **Files / todo / FR**<br/>· Native dual-pane file explorer<br/>· Embedded [Tuxedo](https://github.com/webstonehq/tuxedo) todo.txt task manager<br/>· Fast Resume session-history fuzzy search + live preview<br/>· `Ctrl+R` resumes the selected session as a new agent tab<br/>· `Alt+V` modal viewer for the cursor'd file (markdown / code / image) | **agents**<br/>· Coding-agent PTY (`omp` / `codex` / `claude` / `pi` / …)<br/>· `Ctrl+Shift+P` picker (`agents.pick.*`)<br/>· Scrollback + inline scrollbar<br/>· Mouse text selection · `Ctrl+Shift+C/V` clipboard |
+|            | **Left**                                        | **Right** |
+| ---------- | ----------------------------------------------- | --------- |
+| **Top**    | files · todo · fr                               | agents    |
+| **Bottom** | git · sysmon · agtop · models · stock · zones   | shells    |
 
-|                                                                                                                                                                                                                                                                                                                          **Bottom-left** |                                                                                                                                                                                                           **Bottom-right** |
-| :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------: | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------: |
-| · **git / sysmon / agtop / models**<br/>· Native `gix` snapshot: working-tree changes + commit graph<br/>· Tree-sitter diff highlighting<br/>· In-process **Sysmon** (CPU / memory / disks / network, optional GPU + Docker)<br/>· In-process **agtop** monitors detected agent processes<br/>· **models** browses the [models.dev](https://models.dev) catalog | **Shells**<br/>· Interactive shell PTY tabs |
+### Left column
 
-Every zone is tabbed and hot-swappable. Layout ratios and agent choice persist per workspace; Todo is global for the current user and does not change when the workspace changes.
+- **files** — native dual-pane file explorer. `Alt+V` opens the cursor'd file in a modal viewer (markdown / code / image, tree-sitter highlighted).
+- **todo** — embedded [Tuxedo](https://github.com/webstonehq/tuxedo) todo.txt manager. Global, not per-workspace — see [Global Todo](#global-todo).
+- **fr** — Fast Resume fuzzy search over coding-agent session history with live preview. `Ctrl+R` resumes the selected session in a fresh agent tab.
+- **git** — in-process `gix` snapshot: working-tree changes + serie-style commit graph, tree-sitter diff highlighting.
+- **sysmon** — CPU / memory / disks / network. Optional GPU (NVML) and Docker (bollard) behind feature flags.
+- **agtop** — process monitor for detected coding-agent CLIs; session enrichment + chip header + detail popup.
+- **models** — browses the [models.dev](https://models.dev) catalog.
+- **stock** — A-share / HK / US quote lists via [akshare](https://github.com/Cricle/akshare-rs).
+- **zones** — world map + user-curated timezone watchlist.
+
+### Right column
+
+- **agents** — PTY tabs for coding-agent CLIs (`omp` / `codex` / `claude` / `pi` / …). Auto-detected on `$PATH`; `Ctrl+Shift+P` picks one, `Ctrl+P` opens the command palette.
+- **shells** — plain interactive shell PTY tabs.
+
+Every PTY pane has scrollback + inline scrollbar, mouse text selection, and `Ctrl+Shift+C/V` clipboard. Layout ratios and agent choice persist per workspace.
 
 ## What's inside
 
-- **Agent-first** — auto-detects coding-agent CLIs on `$PATH`, picker in the app menu and command palette (`Ctrl+P`).
-- **Native files + git + sysmon + models + todo + session search** — zero external processes for the left column; the vendored Tuxedo task manager powers `todo`, and the vendored Fast Resume index/search stack powers `FR`.
+- **Zero external processes** — files, git, sysmon, agtop, models, stock, zones, todo, and session search are all in-process. Vendored [Tuxedo](https://github.com/webstonehq/tuxedo) powers `todo`; the vendored Fast Resume index/search stack powers `fr`. Retired external essentials (yazi, gitui, bottom, trippy) leave no shims behind.
 - **`rimectl` IPC** — line-delimited JSON over a named pipe (Windows) or Unix socket. Every UI command is scriptable from tests, git hooks, or *other* agents.
 - **Native mouse** — click / drag / scroll on tabs, dividers, selections, and shell prompts. Right-click is context-aware.
 - **Themes** — 8 curated palettes (`Alt+T` cycles), applied uniformly across chrome and the markdown viewer.
-- **Windows first-class** — ConPTY backend, Nerd Font fallback, MSI installer, and an Explorer right-click entry that opens the clicked folder as the workspace root.
+- **Upgrade check** — silent background probe against GitHub Releases on startup; a red `⚠ 有新版本 vX.Y.Z` chip in the hint bar's bottom-right opens the Upgrade modal on click. Silent when offline.
+- **Windows first-class** — ConPTY backend, Nerd Font fallback, MSI installer with SHA-256-verified download, and an Explorer right-click entry that opens the clicked folder as the workspace root.
 
 ## Workspace semantics
 
