@@ -78,7 +78,9 @@ struct ColumnState {
     body_rect: Rect,
     fetching: bool,
     refresh_generation: u64,
+    request_started: Instant,
     next_refresh: Instant,
+    last_update: Option<Instant>,
     last_error: Option<String>,
 }
 
@@ -93,7 +95,9 @@ impl ColumnState {
             body_rect: Rect::default(),
             fetching: false,
             refresh_generation: 0,
+            request_started: Instant::now(),
             next_refresh: Instant::now(),
+            last_update: None,
             last_error: None,
         }
     }
@@ -222,6 +226,7 @@ impl StockPane {
         self.next_generation = self.next_generation.saturating_add(1);
         column.refresh_generation = self.next_generation;
         column.fetching = true;
+        column.request_started = Instant::now();
         let market = column.market;
         let watchlist = self.watchlist.entries.clone();
         self.worker.send(StockRequest::Refresh {
@@ -435,11 +440,18 @@ impl StockPane {
                         .position(|column| column.refresh_generation == generation)
                     {
                         let market = self.columns[index].market;
-                        let next_refresh = Instant::now() + self.refresh_interval(market);
+                        let next_refresh = next_refresh_deadline(
+                            self.columns[index].request_started,
+                            self.refresh_interval(market),
+                            Instant::now(),
+                        );
                         let column = &mut self.columns[index];
                         column.fetching = false;
                         match result {
-                            Ok(snapshot) => apply_snapshot(column, snapshot),
+                            Ok(snapshot) => {
+                                apply_snapshot(column, snapshot);
+                                column.last_update = Some(Instant::now());
+                            }
                             Err(error) => column.last_error = Some(error),
                         }
                         column.next_refresh = next_refresh;
@@ -509,6 +521,11 @@ impl StockPane {
             .iter()
             .position(|column| point_in_rect(x, y, column.body_rect))
     }
+}
+
+fn next_refresh_deadline(started: Instant, interval: Duration, now: Instant) -> Instant {
+    let deadline = started + interval;
+    if deadline > now { deadline } else { now }
 }
 
 fn apply_snapshot(column: &mut ColumnState, snapshot: Snapshot) {
@@ -878,18 +895,26 @@ fn render_columns(frame: &mut Frame<'_>, area: Rect, pane: &mut StockPane) {
     }
 }
 
-/// Compute the per-column title suffix (`open · 1Hz` / `closed · 60s`).
-/// Split out so the render loop can borrow the mutable column while the
-/// pane's immutable config is read here.
+/// Compute the per-column title suffix from market state and the most recent
+/// completed refresh. This reports observed freshness instead of promising the
+/// configured request rate.
 fn column_status(pane: &StockPane, column_index: usize) -> (String, bool) {
-    let market = pane.columns[column_index].market;
-    let open = market.is_open_at(Utc::now());
-    let text = if open {
-        format!("open · {}Hz", pane.config.open_refresh_hz.max(1))
+    let column = &pane.columns[column_index];
+    let open = column.market.is_open_at(Utc::now());
+    let market_state = if open { "open" } else { "closed" };
+    let freshness = column.last_update.map_or_else(
+        || "awaiting update".to_string(),
+        |updated| format!("updated {} ago", format_update_age(updated.elapsed())),
+    );
+    (format!("{market_state} · {freshness}"), open)
+}
+
+fn format_update_age(age: Duration) -> String {
+    if age < Duration::from_secs(10) {
+        format!("{:.1}s", age.as_secs_f64())
     } else {
-        format!("closed · {}s", pane.config.closed_refresh_secs.max(1))
-    };
-    (text, open)
+        format!("{}s", age.as_secs())
+    }
 }
 
 fn render_column(
@@ -1466,6 +1491,30 @@ mod tests {
         let mut pane = pane();
         pane.visible = false;
         assert!(pane.refresh_interval(Market::AShare) >= Duration::from_secs(60));
+    }
+
+    #[test]
+    fn refresh_deadline_is_anchored_to_request_start() {
+        let request_started = Instant::now() - Duration::from_millis(750);
+        let interval = Duration::from_secs(1);
+
+        let deadline = next_refresh_deadline(request_started, interval, Instant::now());
+
+        assert!(deadline.duration_since(Instant::now()) <= Duration::from_millis(260));
+    }
+
+    #[test]
+    fn column_status_reports_observed_update_age_not_promised_rate() {
+        let mut pane = pane();
+        pane.visible = true;
+        pane.columns[2].last_update = Some(Instant::now() - Duration::from_millis(1_500));
+
+        let (status, _) = column_status(&pane, 2);
+
+        assert!(
+            status.contains("updated 1.5s ago") && !status.contains("1Hz"),
+            "{status}"
+        );
     }
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {

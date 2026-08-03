@@ -3,31 +3,53 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use rimeterm_stock::StockClient;
+use rimeterm_stock::{Market, StockClient};
 
 use crate::stock_model::{StockRequest, StockResponse};
 
 pub struct StockWorker {
-    request_tx: Sender<StockRequest>,
+    request_txs: [Sender<StockRequest>; 3],
     response_rx: Receiver<StockResponse>,
 }
 
 impl StockWorker {
     pub fn spawn(proxy: Option<String>, tushare_token: Option<String>) -> Self {
-        let (request_tx, request_rx) = mpsc::channel();
         let (response_tx, response_rx) = mpsc::channel();
+        let (request_txs, jobs): (Vec<_>, Vec<_>) = [Market::AShare, Market::HongKong, Market::Us]
+            .into_iter()
+            .map(|market| {
+                let (request_tx, request_rx) = mpsc::channel();
+                (
+                    request_tx,
+                    (
+                        market,
+                        request_rx,
+                        response_tx.clone(),
+                        proxy.clone(),
+                        tushare_token.clone(),
+                    ),
+                )
+            })
+            .unzip();
         thread::Builder::new()
-            .name("rimeterm-stock-worker".into())
-            .spawn(move || run(request_rx, response_tx, proxy, tushare_token))
-            .expect("spawn stock worker");
+            .name("rimeterm-stock-workers".into())
+            .spawn(move || {
+                run_concurrent(jobs, |(_, request_rx, response_tx, proxy, token)| {
+                    run(request_rx, response_tx, proxy, token);
+                });
+            })
+            .expect("spawn stock workers");
         Self {
-            request_tx,
+            request_txs: request_txs
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("three stock markets")),
             response_rx,
         }
     }
 
     pub fn send(&self, request: StockRequest) {
-        let _ = self.request_tx.send(request);
+        let market = request_market(&request);
+        let _ = self.request_txs[market_index(market)].send(request);
     }
 
     pub fn drain(&self) -> Vec<StockResponse> {
@@ -37,6 +59,35 @@ impl StockWorker {
         }
         responses
     }
+}
+
+fn request_market(request: &StockRequest) -> Market {
+    match request {
+        StockRequest::Refresh { market, .. } | StockRequest::Search { market, .. } => *market,
+        StockRequest::Detail { entry, .. } | StockRequest::LiveDetail { entry, .. } => entry.market,
+    }
+}
+
+const fn market_index(market: Market) -> usize {
+    match market {
+        Market::AShare => 0,
+        Market::HongKong => 1,
+        Market::Us => 2,
+    }
+}
+
+fn run_concurrent<I, F>(jobs: I, run_job: F)
+where
+    I: IntoIterator,
+    I::Item: Send,
+    F: Fn(I::Item) + Sync,
+{
+    thread::scope(|scope| {
+        for job in jobs {
+            let run_job = &run_job;
+            scope.spawn(move || run_job(job));
+        }
+    });
 }
 
 fn run(
@@ -92,5 +143,40 @@ fn run(
         if response_tx.send(response).is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use parking_lot::Mutex;
+
+    use super::run_concurrent;
+
+    #[test]
+    fn run_concurrent_overlaps_independent_jobs() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        run_concurrent(0..3, {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let completed = Arc::clone(&completed);
+            move |job| {
+                let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(concurrent, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(25));
+                active.fetch_sub(1, Ordering::SeqCst);
+                completed.lock().push(job);
+            }
+        });
+
+        assert_eq!(
+            (peak.load(Ordering::SeqCst), completed.lock().len()),
+            (3, 3)
+        );
     }
 }
