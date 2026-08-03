@@ -58,11 +58,9 @@ impl FileManagerPane {
             left_dir,
             right_dir,
             editor: Editor::None,
-            // Native FileManagerPane lives in the top-left quadrant
-            // (~35 % of a typical terminal). Horizontal hint pairs
-            // truncate at that width; stack them vertically so every
-            // key hint stays legible.
-            hint_layout: HintLayout::Vertical,
+            // Restore the 2×2 action-bar layout: `Navigate | File Ops`
+            // on row 0 and `Global | Status` on row 1, side-by-side.
+            hint_layout: HintLayout::Horizontal,
             ..AppOptions::default()
         });
         Self {
