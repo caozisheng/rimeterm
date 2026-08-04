@@ -1646,6 +1646,17 @@ impl App {
         self.upgrade_state.open = false;
     }
 
+    fn open_upgrade_overlay(&mut self) {
+        let generation = self.upgrade_state.open_and_check();
+        if matches!(
+            self.upgrade_state.phase(),
+            crate::upgrade::UpgradePhase::Checking
+        ) {
+            self.spawn_upgrade_check(generation);
+        }
+        let _ = self.redraw_tx.send(());
+    }
+
     fn spawn_upgrade_check(&self, generation: u64) {
         let tx = self.upgrade_tx.clone();
         tokio::spawn(async move {
@@ -2672,15 +2683,14 @@ impl App {
             // to the shell, not a pane" logic applies: hit-test it
             // before divider / pane routing so a stray chip click
             // never lands in an underlying pane's mouse event
-            // stream. The flag fires the same code path Menu →
-            // Upgrade uses (`drain_flags` → `open_and_check`), so a
-            // click opens the modal with a fresh check in flight.
-            if let Some(r) = self.last_upgrade_chip_rect {
-                if point_in_rect(m.column, m.row, r) {
-                    self.flags.upgrade.store(true, Ordering::Relaxed);
-                    return;
-                }
+            // stream. Open immediately rather than waiting for the next
+            // event-loop flag drain, while reusing the same overlay path
+            // as Menu → Upgrade.
+            if upgrade_chip_clicked(m.kind, m.column, m.row, self.last_upgrade_chip_rect) {
+                self.open_upgrade_overlay();
+                return;
             }
+
             // 1. Divider drag — highest priority for the pane area.
             if let Some(d) = self
                 .last_dividers
@@ -3816,15 +3826,9 @@ impl App {
             let _ = self.redraw_tx.send(());
         }
         if f.upgrade.swap(false, Ordering::Relaxed) {
-            let generation = self.upgrade_state.open_and_check();
-            if matches!(
-                self.upgrade_state.phase(),
-                crate::upgrade::UpgradePhase::Checking
-            ) {
-                self.spawn_upgrade_check(generation);
-            }
-            let _ = self.redraw_tx.send(());
+            self.open_upgrade_overlay();
         }
+
         if f.viewer_open.swap(false, Ordering::Relaxed) {
             self.open_viewer_overlay();
         }
@@ -6656,6 +6660,18 @@ fn point_in_rect(x: u16, y: u16, r: Rect) -> bool {
     x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
 }
 
+fn upgrade_chip_clicked(
+    kind: MouseEventKind,
+    column: u16,
+    row: u16,
+    chip_rect: Option<Rect>,
+) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) && chip_rect.is_some_and(|rect| point_in_rect(column, row, rect))
+}
+
 /// Return the [`HoveredDivider`] matching `(col, row)` inside `dividers`,
 /// or `None` if the cursor is off every seam. Pure — no App state — so
 /// it's cheap to call every `MouseEventKind::Moved` (fires roughly once
@@ -8674,6 +8690,30 @@ mod tests {
         let out = upgrade_chip_layout(area, Some(&release)).chip.unwrap();
         assert_eq!(out.rect.x + out.rect.width, 103);
         assert_eq!(out.rect.y, 47);
+    }
+
+    #[test]
+    fn left_click_inside_upgrade_chip_requests_dialog() {
+        let chip = Rect::new(80, 47, 23, 1);
+
+        assert!(upgrade_chip_clicked(
+            MouseEventKind::Down(MouseButton::Left),
+            90,
+            47,
+            Some(chip),
+        ));
+        assert!(!upgrade_chip_clicked(
+            MouseEventKind::Down(MouseButton::Left),
+            79,
+            47,
+            Some(chip),
+        ));
+        assert!(!upgrade_chip_clicked(
+            MouseEventKind::Down(MouseButton::Right),
+            90,
+            47,
+            Some(chip),
+        ));
     }
     #[test]
     fn restore_requested_shells_requires_first_and_degrades_afterward() {
