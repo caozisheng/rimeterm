@@ -62,14 +62,16 @@ pub fn enrich_omp(live: &[LiveAgentRef<'_>], now_ms: u64) -> HashMap<u32, Sessio
 
     // encoded-cwd → [(pid, uptime)]. Multiple live omp pids can share
     // a cwd; sort by uptime ascending so the freshest pid pairs with
-    // the freshest JSONL below.
+    // the freshest JSONL below. omp v0.74 renamed the encoding and
+    // both shapes coexist on disk, so we register EVERY variant per
+    // pid — the dir-walk loop will pick up whichever variant the
+    // running binary actually wrote.
     let mut encoded_to_pids: HashMap<String, Vec<(u32, u64)>> = HashMap::new();
     for a in live {
         if !OMP_LABELS.iter().any(|l| a.label == *l) {
             continue;
         }
-        let enc = encode_cwd(a.cwd, &home);
-        if !enc.is_empty() {
+        for enc in encode_cwd_variants(a.cwd, &home) {
             encoded_to_pids
                 .entry(enc)
                 .or_default()
@@ -243,25 +245,34 @@ fn home_dir() -> Option<PathBuf> {
     rimeterm_config::paths::user_home_dir()
 }
 
-/// Encode a live-process cwd into the shape oh-my-pi uses under
-/// `~/.omp/agent/sessions/`. Rules observed from real installs:
+/// All encoded-cwd variants the current + historical `omp` binaries
+/// use for a given live process cwd. We MUST return every variant so
+/// the enricher can pair a running pid with either an old- or
+/// new-style session directory — omp v0.74 renamed the encoding
+/// midstream and both shapes coexist in `~/.omp/agent/sessions/`.
 ///
-/// - Home-relative paths keep the trailing segments intact; only
-///   `/` and `\` become `-`. **Underscores and dots survive** — the
-///   biggest divergence from Claude Code's non-alnum-strip rule.
-///   Example: `C:\Users\me\Documents\00_code\proj` →
-///   `-Documents-00_code-proj`.
-/// - Paths outside `$HOME` on Windows: `--<drive>--<rest>--` where
-///   `<rest>` has `\` / `/` replaced with `-`. Example:
-///   `C:\Program Files\rimeterm` → `--C--Program Files-rimeterm--`.
-/// - Paths outside `$HOME` on POSIX: `--<rest>--`. Example:
-///   `/opt/proj` → `--opt-proj--`.
+/// Two variants emitted per cwd:
 ///
-/// Trailing separators are stripped first (sysinfo hands them back
-/// on Windows for many processes).
-pub(crate) fn encode_cwd(cwd: &str, home: &Path) -> String {
+/// 1. **Dash form (legacy)** — separators become `-`; underscores +
+///    dots survive. Home-relative → `-Documents-00_code-proj`;
+///    Windows non-home → `--C--Program Files-rimeterm--`; POSIX
+///    non-home → `--opt-proj--`. This is what `omp` wrote before
+///    the sha-hash migration and what still exists on disk for
+///    older sessions.
+///
+/// 2. **Sha form (current)** — `home-{basename}-{sha256(cwd)}` for
+///    home-relative paths, where the hash input has all `\` folded
+///    to `/` and any trailing separator stripped. Confirmed against
+///    real omp v0.74 sessions on Windows. Only emitted for
+///    home-relative paths — no non-home evidence in the wild yet;
+///    unmatched variants are cheap (they just miss the dir lookup).
+///
+/// The empty vec means "we can't encode this cwd" — either empty
+/// input or (defensively) an all-separator path that trims to
+/// nothing.
+pub(crate) fn encode_cwd_variants(cwd: &str, home: &Path) -> Vec<String> {
     if cwd.is_empty() {
-        return String::new();
+        return Vec::new();
     }
     let trimmed = cwd.trim_end_matches(['/', '\\']);
     let src = if trimmed.is_empty() { cwd } else { trimmed };
@@ -276,12 +287,37 @@ pub(crate) fn encode_cwd(cwd: &str, home: &Path) -> String {
     } else {
         src.starts_with(home_trimmed)
     };
+
+    let mut variants: Vec<String> = Vec::with_capacity(2);
+
     if matches_home && !home_trimmed.is_empty() {
+        // Dash form — home-relative.
         let rel = &src[home_trimmed.len()..];
-        return rel.chars().map(sep_to_dash).collect();
+        let dash: String = rel.chars().map(sep_to_dash).collect();
+        if !dash.is_empty() {
+            variants.push(dash);
+        }
+
+        // Sha form — hash the full cwd with `\` normalised to `/`
+        // (omp v0.74 hashes the forward-slash representation).
+        let for_hash: String = src
+            .chars()
+            .map(|c| if c == '\\' { '/' } else { c })
+            .collect();
+        let basename = std::path::Path::new(src)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !basename.is_empty() {
+            use sha2::{Digest, Sha256};
+            let hex = format!("{:x}", Sha256::digest(for_hash.as_bytes()));
+            variants.push(format!("home-{basename}-{hex}"));
+        }
+        return variants;
     }
 
-    // Outside home — Windows drive-letter path.
+    // Outside home — Windows drive-letter path (dash form only,
+    // no observed sha-form for non-home paths).
     if src.len() >= 2
         && src.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         && src.chars().nth(1) == Some(':')
@@ -289,12 +325,14 @@ pub(crate) fn encode_cwd(cwd: &str, home: &Path) -> String {
         let drive = src.chars().next().unwrap();
         let body: String = src[2..].chars().map(sep_to_dash).collect();
         let body = body.trim_start_matches('-');
-        return format!("--{drive}--{body}--");
+        variants.push(format!("--{drive}--{body}--"));
+        return variants;
     }
-    // POSIX outside home.
+    // POSIX outside home — dash form only.
     let body: String = src.chars().map(sep_to_dash).collect();
     let body = body.trim_start_matches('-');
-    format!("--{body}--")
+    variants.push(format!("--{body}--"));
+    variants
 }
 
 fn sep_to_dash(c: char) -> char {
@@ -634,23 +672,31 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    /// Helper: assert `expected` is one of the encoded variants for
+    /// `cwd`. Every existing dash-form test is stated as "the dash
+    /// variant must be produced" so we don't lock the SHA form into
+    /// asserting a specific hash from every fixture.
+    fn assert_variant_contains(cwd: &str, home: &Path, expected: &str) {
+        let vs = encode_cwd_variants(cwd, home);
+        assert!(
+            vs.iter().any(|v| v == expected),
+            "expected variant {expected:?} in {vs:?} for cwd {cwd:?}"
+        );
+    }
+
     #[test]
-    fn encode_cwd_windows_home_relative() {
+    fn encode_cwd_windows_home_relative_dash_form() {
         let home = PathBuf::from(r"C:\Users\zisheng");
-        assert_eq!(
-            encode_cwd(
-                r"C:\Users\zisheng\Documents\cao\00_code\github\rimeterm",
-                &home
-            ),
-            "-Documents-cao-00_code-github-rimeterm"
+        assert_variant_contains(
+            r"C:\Users\zisheng\Documents\cao\00_code\github\rimeterm",
+            &home,
+            "-Documents-cao-00_code-github-rimeterm",
         );
         // Trailing separator stripped.
-        assert_eq!(
-            encode_cwd(
-                r"C:\Users\zisheng\Documents\cao\00_code\github\rimeterm\",
-                &home
-            ),
-            "-Documents-cao-00_code-github-rimeterm"
+        assert_variant_contains(
+            r"C:\Users\zisheng\Documents\cao\00_code\github\rimeterm\",
+            &home,
+            "-Documents-cao-00_code-github-rimeterm",
         );
     }
 
@@ -658,33 +704,30 @@ mod tests {
     #[test]
     fn encode_cwd_windows_case_insensitive_home() {
         let home = PathBuf::from(r"C:\Users\zisheng");
-        assert_eq!(
-            encode_cwd(r"c:\users\ZISHENG\Documents\proj", &home),
-            "-Documents-proj"
-        );
+        assert_variant_contains(r"c:\users\ZISHENG\Documents\proj", &home, "-Documents-proj");
     }
 
     #[test]
-    fn encode_cwd_windows_outside_home() {
+    fn encode_cwd_windows_outside_home_dash_only() {
         let home = PathBuf::from(r"C:\Users\zisheng");
-        assert_eq!(
-            encode_cwd(r"C:\Program Files\rimeterm", &home),
-            "--C--Program Files-rimeterm--"
-        );
-        assert_eq!(encode_cwd(r"C:\tmp", &home), "--C--tmp--");
+        let a = encode_cwd_variants(r"C:\Program Files\rimeterm", &home);
+        assert_eq!(a, vec!["--C--Program Files-rimeterm--"]);
+        let b = encode_cwd_variants(r"C:\tmp", &home);
+        assert_eq!(b, vec!["--C--tmp--"]);
     }
 
     #[test]
-    fn encode_cwd_posix_home_relative() {
+    fn encode_cwd_posix_home_relative_dash_form() {
         let home = PathBuf::from("/home/u");
-        assert_eq!(encode_cwd("/home/u/proj", &home), "-proj");
-        assert_eq!(encode_cwd("/home/u/00_code/foo", &home), "-00_code-foo");
+        assert_variant_contains("/home/u/proj", &home, "-proj");
+        assert_variant_contains("/home/u/00_code/foo", &home, "-00_code-foo");
     }
 
     #[test]
-    fn encode_cwd_posix_outside_home() {
+    fn encode_cwd_posix_outside_home_dash_only() {
         let home = PathBuf::from("/home/u");
-        assert_eq!(encode_cwd("/opt/proj", &home), "--opt-proj--");
+        let v = encode_cwd_variants("/opt/proj", &home);
+        assert_eq!(v, vec!["--opt-proj--"]);
     }
 
     #[test]
@@ -692,13 +735,50 @@ mod tests {
         // Divergence from Claude Code — omp keeps `_` and `.` intact.
         // That's WHY we need a separate encoder.
         let home = PathBuf::from(r"C:\Users\z");
-        assert_eq!(encode_cwd(r"C:\Users\z\_download", &home), "-_download");
-        assert_eq!(encode_cwd(r"C:\Users\z\foo.bar", &home), "-foo.bar");
+        assert_variant_contains(r"C:\Users\z\_download", &home, "-_download");
+        assert_variant_contains(r"C:\Users\z\foo.bar", &home, "-foo.bar");
     }
 
     #[test]
     fn encode_cwd_empty_returns_empty() {
-        assert_eq!(encode_cwd("", &PathBuf::from("/home/u")), "");
+        assert!(encode_cwd_variants("", &PathBuf::from("/home/u")).is_empty());
+    }
+
+    /// Regression: omp v0.74 writes home-relative sessions to a
+    /// `home-{basename}-{sha256(cwd_forward_slash)}` directory. Before
+    /// we recognised this shape the pane silently rendered TOKENS as
+    /// `-` because the enricher couldn't pair any live pid with the
+    /// on-disk JSONL.
+    #[test]
+    fn encode_cwd_windows_home_relative_sha_form() {
+        let home = PathBuf::from(r"C:\Users\zisheng");
+        let cwd = r"C:\Users\zisheng\Documents\cao\00_code\github\rimeterm";
+        // Hash computed against the real omp session dir observed in
+        // the wild — locks the format so a future refactor can't
+        // silently break enrichment.
+        assert_variant_contains(
+            cwd,
+            &home,
+            "home-rimeterm-b76f888c81ade2f60d31c07f9eda21611d7164c496173f9cd647b8eb1f7b707c",
+        );
+    }
+
+    #[test]
+    fn encode_cwd_posix_home_relative_sha_form() {
+        let home = PathBuf::from("/home/u");
+        let vs = encode_cwd_variants("/home/u/proj", &home);
+        // Sha variant is `home-{basename}-<64-hex>`.
+        let sha = vs
+            .iter()
+            .find(|v| v.starts_with("home-proj-"))
+            .unwrap_or_else(|| panic!("sha variant missing from {vs:?}"));
+        assert_eq!(sha.len(), "home-proj-".len() + 64);
+        assert!(
+            sha["home-proj-".len()..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "sha suffix must be hex: {sha}"
+        );
     }
 
     #[test]
@@ -818,7 +898,13 @@ mod tests {
             let tp = dir.path().to_string_lossy().into_owned();
             format!("{tp}/Documents/00_code/proj")
         };
-        let encoded = encode_cwd(&cwd_str, dir.path());
+        // Fixture uses the dash variant so the pairing exercises the
+        // legacy-encoding branch of `encode_cwd_variants`; the sha
+        // variant is covered by dedicated encoder-level tests above.
+        let encoded = encode_cwd_variants(&cwd_str, dir.path())
+            .into_iter()
+            .next()
+            .expect("home-relative cwd must yield at least one variant");
         let proj_dir = dir
             .path()
             .join(".omp")
@@ -874,5 +960,93 @@ mod tests {
         assert_eq!(summary.tokens_cache_read, 1000);
         assert_eq!(summary.tokens_cache_write, 50);
         assert_eq!(summary.cost_provider, Some(0.42));
+    }
+
+    /// Regression: an omp v0.74 install writes home-relative sessions
+    /// to the `home-<basename>-<sha256>` directory shape. This test
+    /// stands up a fixture with ONLY the sha-form directory (no dash
+    /// dir) and confirms the enricher still pairs the live pid with
+    /// the JSONL — the very failure mode that made TOKENS render as
+    /// `-` for real omp sessions.
+    #[test]
+    fn enrich_omp_end_to_end_paired_via_sha_directory() {
+        let _guard = rimeterm_config::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = TempDir::new().unwrap();
+        let prev_home = std::env::var("RIMETERM_HOME").ok();
+        // SAFETY: serialized by ENV_LOCK and restored below.
+        unsafe {
+            std::env::set_var("RIMETERM_HOME", dir.path());
+        }
+
+        let cwd_str = if cfg!(windows) {
+            let tp = dir.path().to_string_lossy().into_owned();
+            format!(r"{tp}\Documents\proj")
+        } else {
+            let tp = dir.path().to_string_lossy().into_owned();
+            format!("{tp}/Documents/proj")
+        };
+        // Grab the SHA variant specifically — skip the dash variant so
+        // we prove the enricher can find the session using only the
+        // new-style directory name.
+        let sha_variant = encode_cwd_variants(&cwd_str, dir.path())
+            .into_iter()
+            .find(|v| v.starts_with("home-proj-"))
+            .expect("sha variant must be emitted for home-relative cwd");
+        let proj_dir = dir
+            .path()
+            .join(".omp")
+            .join("agent")
+            .join("sessions")
+            .join(&sha_variant);
+        std::fs::create_dir_all(&proj_dir).unwrap();
+
+        let jsonl_path = proj_dir.join("2026-08-04T04-00-00-000Z_xyz.jsonl");
+        let record = serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-7",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {
+                    "input": 300,
+                    "output": 40,
+                    "cacheRead": 2000,
+                    "cacheWrite": 10,
+                    "cost": {"total": 0.11}
+                }
+            }
+        });
+        std::fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let live = LiveAgentRef {
+            pid: 7373,
+            cwd: cwd_str.as_str(),
+            label: "omp",
+            uptime_sec: 12,
+        };
+        let out = enrich_omp(&[live], 0);
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("RIMETERM_HOME", v),
+                None => std::env::remove_var("RIMETERM_HOME"),
+            }
+        }
+
+        let summary = out.get(&7373).expect(
+            "enricher must pair the omp pid via the sha-encoded directory (new omp v0.74 layout)",
+        );
+        assert_eq!(summary.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(summary.tokens_input, 2310); // 300 + 2000 + 10
+        assert_eq!(summary.tokens_output, 40);
+        assert_eq!(summary.tokens_cache_read, 2000);
+        assert_eq!(summary.tokens_cache_write, 10);
+        assert_eq!(summary.cost_provider, Some(0.11));
     }
 }
