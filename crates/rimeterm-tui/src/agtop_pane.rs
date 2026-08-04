@@ -20,6 +20,7 @@
 //! | `PgUp / PgDn`   | move by 10                                |
 //! | `Home / End`    | first / last row                          |
 //! | `c m t u a p s` | sort by cpu / mem / tokens / uptime / agent / pid / status |
+//! | `$`             | sort by cost                              |
 //! | `S` (shift)     | smart sort                                |
 //! | `Tab`           | flip sort direction                       |
 //! | `/`             | enter filter mode                         |
@@ -168,6 +169,7 @@ impl AgtopPane {
             SortKey::Cpu => "cpu",
             SortKey::Memory => "memory",
             SortKey::Tokens => "tokens",
+            SortKey::Cost => "cost",
             SortKey::Pid => "pid",
             SortKey::Label => "label",
             SortKey::Uptime => "uptime",
@@ -192,6 +194,7 @@ impl AgtopPane {
             Some("cpu") => SortKey::Cpu,
             Some("memory") => SortKey::Memory,
             Some("tokens") => SortKey::Tokens,
+            Some("cost") => SortKey::Cost,
             Some("pid") => SortKey::Pid,
             Some("label") => SortKey::Label,
             Some("uptime") => SortKey::Uptime,
@@ -461,6 +464,10 @@ fn on_key_default(pane: &mut AgtopPane, key: KeyEvent) -> bool {
             pane.set_sort(SortKey::Tokens);
             true
         }
+        KeyCode::Char('$') => {
+            pane.set_sort(SortKey::Cost);
+            true
+        }
         KeyCode::Char('u') => {
             pane.set_sort(SortKey::Uptime);
             true
@@ -727,7 +734,7 @@ fn render_agent_table(frame: &mut Frame<'_>, area: Rect, view: &AgentView, curso
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "keys: j/k move  · enter details · t tokens · c cpu · m mem · / filter",
+                "keys: j/k move  · enter details  · $ cost  · t tokens  · c cpu  · m mem  · / filter",
                 Style::default().fg(Color::DarkGray),
             )),
         ]);
@@ -742,6 +749,7 @@ fn render_agent_table(frame: &mut Frame<'_>, area: Rect, view: &AgentView, curso
         cell_dim("PID"),
         cell_dim(" CPU%"),
         cell_dim("MEM"),
+        cell_dim("  COST"),
         cell_dim("TOKENS"),
         cell_dim("UPTIME"),
         cell_dim("PROJECT"),
@@ -765,6 +773,7 @@ fn render_agent_table(frame: &mut Frame<'_>, area: Rect, view: &AgentView, curso
             Constraint::Length(6),                           // pid
             Constraint::Length(5),                           // cpu%
             Constraint::Length(9),                           // mem
+            Constraint::Length(6),                           // cost (widest "<$0.01")
             Constraint::Length(7),                           // tokens
             Constraint::Length(8),                           // uptime
             Constraint::Length(project_width.max(1) as u16), // project
@@ -783,6 +792,9 @@ fn render_row(selected: bool, agent: &AgentInfo, project_width: usize) -> Row<'s
     };
     let status_style = status_color(agent.status).patch(base);
     let cpu_style = Style::default().fg(cpu_color(agent.cpu)).patch(base);
+    let cost_style = Style::default()
+        .fg(cost_color(agent.cost_basis, agent.cost_usd))
+        .patch(base);
     let danger_style = Style::default()
         .fg(Color::Rgb(240, 170, 80))
         .add_modifier(Modifier::BOLD)
@@ -799,6 +811,7 @@ fn render_row(selected: bool, agent: &AgentInfo, project_width: usize) -> Row<'s
         cell(format!("{:>6}", agent.pid), base),
         cell(format!("{:>5.1}", agent.cpu), cpu_style),
         cell(format_size(agent.rss, DECIMAL), base),
+        cell(format!("{:>6}", format_cost(agent.cost_usd)), cost_style),
         cell(format!("{:>7}", format_tokens(agent.tokens_total)), base),
         cell(format_uptime(agent.uptime_sec), base),
         cell(truncate(&project_or_task(agent), project_width), base),
@@ -1210,6 +1223,23 @@ fn cpu_color(pct: f32) -> Color {
     if pct < 5.0 {
         Color::Green
     } else if pct < 30.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+/// Per-row COST column color. Non-Api rows (Local runtime or Unknown
+/// model) render dim gray — the `—` placeholder shouldn't compete
+/// visually with real dollar figures. Api rows scale green → yellow
+/// → red as the tab burns through actual money.
+fn cost_color(basis: CostBasis, usd: f64) -> Color {
+    if !matches!(basis, CostBasis::Api) {
+        return Color::DarkGray;
+    }
+    if usd < 1.0 {
+        Color::Green
+    } else if usd < 10.0 {
         Color::Yellow
     } else {
         Color::Red
@@ -1812,6 +1842,84 @@ mod tests {
         // "tokens" appears in the TOKENS column header too, so we
         // only assert the value doesn't render (dash placeholder).
         assert!(!rendered.contains("$"), "cost value leaked: {rendered}");
+    }
+
+    #[test]
+    fn dollar_key_sorts_by_cost() {
+        let mut pane = AgtopPane::new();
+        assert!(pane.on_key(KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE)));
+        assert_eq!(pane.sort_key, SortKey::Cost);
+        assert_eq!(pane.sort_order, SortOrder::Descending);
+        // Second press flips direction (matches the c / m / t
+        // convention — no cost-specific special case).
+        assert!(pane.on_key(KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE)));
+        assert_eq!(pane.sort_order, SortOrder::Ascending);
+    }
+
+    #[test]
+    fn stable_state_round_trips_cost_sort_key() {
+        let mut source = AgtopPane::new();
+        source.sort_key = SortKey::Cost;
+        source.sort_order = SortOrder::Descending;
+        let state = source.snapshot_state();
+
+        let mut restored = AgtopPane::new();
+        restored.restore_state(&state);
+
+        assert_eq!(restored.sort_key, SortKey::Cost);
+        assert_eq!(restored.sort_order, SortOrder::Descending);
+    }
+
+    #[test]
+    fn table_renders_cost_column_for_api_agent() {
+        let mut pane = AgtopPane::new();
+        let mut a = agent("claude", 1, 0.0, 128 * 1024 * 1024, 60);
+        a.cost_usd = 4.21;
+        a.cost_basis = CostBasis::Api;
+        seed_snapshot(&mut pane, vec![a]);
+
+        // Wide enough for the whole table incl. the new COST column.
+        let mut terminal = Terminal::new(TestBackend::new(140, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                pane.render(area, frame, &ctx());
+            })
+            .unwrap();
+        let rendered = buf_string(&terminal);
+
+        assert!(
+            rendered.contains("COST"),
+            "COST column header missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("$4.21"),
+            "per-row cost cell missing: {rendered}"
+        );
+    }
+
+    #[test]
+    fn table_renders_dash_for_zero_cost_row() {
+        let mut pane = AgtopPane::new();
+        // Zero-cost agent (Unknown basis, `—` placeholder).
+        let a = agent("claude", 1, 0.0, 128 * 1024 * 1024, 60);
+        seed_snapshot(&mut pane, vec![a]);
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                pane.render(area, frame, &ctx());
+            })
+            .unwrap();
+        let rendered = buf_string(&terminal);
+
+        assert!(rendered.contains("COST"));
+        // No dollar figure — cost renders as the em-dash placeholder.
+        assert!(
+            !rendered.contains('$'),
+            "zero-cost row must not render a dollar figure: {rendered}"
+        );
     }
     #[test]
     fn stable_state_round_trips_without_cursor_or_detail() {

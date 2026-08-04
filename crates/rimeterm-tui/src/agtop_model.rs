@@ -141,6 +141,9 @@ pub enum SortKey {
     Cpu,
     Memory,
     Tokens,
+    /// Per-agent dollar cost (real Api rows sort ahead of Local /
+    /// Unknown rows, whose cost is always 0).
+    Cost,
     Pid,
     Label,
     Uptime,
@@ -155,6 +158,7 @@ impl SortKey {
             Self::Cpu => "cpu",
             Self::Memory => "mem",
             Self::Tokens => "tokens",
+            Self::Cost => "cost",
             Self::Pid => "pid",
             Self::Label => "agent",
             Self::Uptime => "uptime",
@@ -412,6 +416,11 @@ impl AgentView {
                 .then(a.pid.cmp(&b.pid)),
             SortKey::Memory => a.rss.cmp(&b.rss).then(a.pid.cmp(&b.pid)),
             SortKey::Tokens => a.tokens_total.cmp(&b.tokens_total).then(a.pid.cmp(&b.pid)),
+            SortKey::Cost => a
+                .cost_usd
+                .partial_cmp(&b.cost_usd)
+                .unwrap_or(Ordering::Equal)
+                .then(a.pid.cmp(&b.pid)),
             SortKey::Pid => a.pid.cmp(&b.pid),
             SortKey::Label => a
                 .label
