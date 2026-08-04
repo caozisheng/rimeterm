@@ -237,6 +237,11 @@ impl FileManagerPane {
     }
 
     pub(crate) fn restore_state(&mut self, state: &rimeterm_config::memory_state::PaneState) {
+        self.restore_directories(state);
+        self.restore_preferences(state);
+    }
+
+    fn restore_directories(&mut self, state: &rimeterm_config::memory_state::PaneState) {
         let value = |key| state.values.get(key).map(String::as_str);
         if let Some(path) = value("left_dir")
             .map(PathBuf::from)
@@ -250,6 +255,10 @@ impl FileManagerPane {
         {
             self.app.right.navigate_to(path);
         }
+    }
+
+    pub(crate) fn restore_preferences(&mut self, state: &rimeterm_config::memory_state::PaneState) {
+        let value = |key| state.values.get(key).map(String::as_str);
         if let Some(hidden) = value("left_hidden").and_then(parse_bool) {
             self.app.left.set_show_hidden(hidden);
         }
@@ -557,6 +566,37 @@ mod tests {
         assert_eq!(restored.app.active, Pane::Right);
         assert_eq!(restored.app.left.current_dir, left.path());
         assert_eq!(restored.app.right.current_dir, right.path());
+        assert!(restored.app.left.show_hidden);
+        assert_eq!(restored.app.right.sort_mode(), SortMode::Extension);
+        assert!(restored.app.single_pane);
+        assert!(restored.app.show_preview);
+    }
+
+    #[test]
+    fn restore_preferences_keeps_explicit_workspace_directories() {
+        let remembered_left = tempdir().unwrap();
+        let remembered_right = tempdir().unwrap();
+        let mut remembered = FileManagerPane::new(
+            remembered_left.path().into(),
+            remembered_right.path().into(),
+        );
+        remembered.app.active = Pane::Right;
+        remembered.app.left.set_show_hidden(true);
+        remembered.app.right.set_sort_mode(SortMode::Extension);
+        remembered.app.single_pane = true;
+        remembered.app.show_preview = true;
+        let state = remembered.snapshot_state();
+
+        let explicit_workspace = tempdir().unwrap();
+        let mut restored = FileManagerPane::new(
+            explicit_workspace.path().into(),
+            explicit_workspace.path().into(),
+        );
+        restored.restore_preferences(&state);
+
+        assert_eq!(restored.app.left.current_dir, explicit_workspace.path());
+        assert_eq!(restored.app.right.current_dir, explicit_workspace.path());
+        assert_eq!(restored.app.active, Pane::Right);
         assert!(restored.app.left.show_hidden);
         assert_eq!(restored.app.right.sort_mode(), SortMode::Extension);
         assert!(restored.app.single_pane);

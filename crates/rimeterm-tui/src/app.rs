@@ -838,10 +838,16 @@ fn restore_requested_shells<T, E>(
 }
 
 impl App {
+    /// Build the application for `workspace_root`.
+    ///
+    /// When `explicit_workspace` is true, the root came from a valid positional
+    /// CLI/Explorer argument. It owns the Files directories while remembered
+    /// state may still restore Files preferences.
     pub fn new(
         workspace_root: PathBuf,
         config: Config,
         mut memory: rimeterm_config::memory_state::MemoryState,
+        explicit_workspace: bool,
     ) -> Result<Self> {
         let has_global_ui_state = rimeterm_config::memory_state::default_ui_state_file()
             .is_some_and(|path| path.exists());
@@ -889,7 +895,11 @@ impl App {
             event_bus.clone(),
         );
         if let Some(state) = memory.ui.files.as_ref() {
-            file_manager_pane.restore_state(state);
+            if explicit_workspace {
+                file_manager_pane.restore_preferences(state);
+            } else {
+                file_manager_pane.restore_state(state);
+            }
         }
         let file_manager_pane_id = file_manager_pane.id();
         panes.insert(Box::new(file_manager_pane));

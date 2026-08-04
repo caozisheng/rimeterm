@@ -25,6 +25,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 # Windows-only: embed assets/rimeterm.ico into the .exe as the Win32 icon
 # resource picked up by Explorer, the taskbar, and Alt+Tab. Optional on
 # other platforms (the build script is a no-op there).

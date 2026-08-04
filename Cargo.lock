@@ -4987,6 +4987,7 @@ dependencies = [
  "rimeterm-core",
  "rimeterm-pty",
  "rimeterm-tui",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

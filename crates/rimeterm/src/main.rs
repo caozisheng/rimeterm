@@ -28,7 +28,7 @@ fn main() -> Result<()> {
     init_tracing();
 
     let memory = load_global_memory();
-    let workspace_root = resolve_workspace_root(&memory)?;
+    let (workspace_root, explicit_workspace) = resolve_workspace_root(&memory)?;
     let config = load_config(&workspace_root)?;
 
     // C21.5: materialize bundled configs (yazi bridge + all seeds) into
@@ -87,7 +87,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let app = App::new(workspace_root, config, memory)?;
+        let app = App::new(workspace_root, config, memory, explicit_workspace)?;
         app.run().await
     })
 }
@@ -112,19 +112,30 @@ fn main() -> Result<()> {
 /// Non-existent / non-directory candidates fall through to the next
 /// step, so a fat-fingered CLI arg or a since-deleted persisted path
 /// still boots cleanly.
-fn resolve_workspace_root(memory: &rimeterm_config::memory_state::MemoryState) -> Result<PathBuf> {
-    if let Some(arg) = std::env::args_os().nth(1) {
-        let candidate = PathBuf::from(&arg);
+fn resolve_workspace_root(
+    memory: &rimeterm_config::memory_state::MemoryState,
+) -> Result<(PathBuf, bool)> {
+    resolve_workspace_root_from(std::env::args_os().nth(1), memory)
+}
+
+/// Resolve the launch workspace and whether a valid positional argument chose it.
+/// The flag prevents Files memory from overwriting an Explorer right-click target.
+fn resolve_workspace_root_from(
+    launch_path: Option<std::ffi::OsString>,
+    memory: &rimeterm_config::memory_state::MemoryState,
+) -> Result<(PathBuf, bool)> {
+    if let Some(arg) = launch_path {
+        let candidate = PathBuf::from(arg);
         if candidate.is_dir() {
             // Canonicalize so downstream `.rimeterm/` lookups and the
             // status-bar `workspace:` label see an absolute path.
-            return Ok(canonicalize_workspace_root(candidate));
+            return Ok((canonicalize_workspace_root(candidate), true));
         }
     }
     if let Some(last) = &memory.ui.last_workspace
         && last.is_dir()
     {
-        return Ok(canonicalize_workspace_root(last.clone()));
+        return Ok((canonicalize_workspace_root(last.clone()), false));
     }
     // One-time compatibility for installs that predate memory.toml. Once the
     // policy file exists, disabled last-workspace memory must not be bypassed.
@@ -136,14 +147,14 @@ fn resolve_workspace_root(memory: &rimeterm_config::memory_state::MemoryState) -
         && let Some(last) = state.last_workspace
         && last.is_dir()
     {
-        return Ok(canonicalize_workspace_root(last));
+        return Ok((canonicalize_workspace_root(last), false));
     }
     if let Some(home) = rimeterm_config::paths::user_home_dir()
         && home.is_dir()
     {
-        return Ok(canonicalize_workspace_root(home));
+        return Ok((canonicalize_workspace_root(home), false));
     }
-    Ok(std::env::current_dir()?)
+    Ok((std::env::current_dir()?, false))
 }
 
 fn load_global_memory() -> rimeterm_config::memory_state::MemoryState {
@@ -167,6 +178,23 @@ fn canonicalize_workspace_root(candidate: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_launch_directory_wins_over_remembered_workspace() {
+        let explicit = tempfile::tempdir().expect("explicit workspace");
+        let remembered = tempfile::tempdir().expect("remembered workspace");
+        let mut memory = rimeterm_config::memory_state::MemoryState::default();
+        memory.ui.last_workspace = Some(remembered.path().to_path_buf());
+
+        let (workspace, is_explicit) =
+            resolve_workspace_root_from(Some(explicit.path().as_os_str().to_owned()), &memory)
+                .expect("resolve workspace");
+
+        assert_eq!(
+            workspace,
+            canonicalize_workspace_root(explicit.path().into())
+        );
+        assert!(is_explicit);
+    }
     #[cfg(windows)]
     #[test]
     fn canonicalize_workspace_root_matches_plain_canonical_path() {
