@@ -721,6 +721,16 @@ impl PaneProvider for PtyPane {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.selection.is_active() {
+                    if self.scrollback_enabled {
+                        let inner = inner_rect(outer_rect);
+                        if inner.height > 0 {
+                            if ev.row < inner.y {
+                                self.session.scroll_lines(1);
+                            } else if ev.row >= inner.y.saturating_add(inner.height) {
+                                self.session.scroll_lines(-1);
+                            }
+                        }
+                    }
                     let cell = self.selection_cell_clamped(ev.column, ev.row, outer_rect);
                     self.selection.extend(cell);
                     return true;
