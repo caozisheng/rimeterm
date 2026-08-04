@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use tui_file_explorer::{
     App, AppOptions, AppOutcome, Editor, FileMutation, FileMutationFailure, FileMutationResult,
-    HintLayout, Pane, copy_dir_all, draw_in,
+    HintLayout, Pane, SortMode, copy_dir_all, draw_in,
 };
 
 /// Which explorer column currently receives keyboard input.
@@ -196,6 +196,106 @@ impl FileManagerPane {
         thread::spawn(move || {
             let _ = tx.send(execute_mutation(mutation));
         });
+    }
+
+    pub(crate) fn snapshot_state(&self) -> rimeterm_config::memory_state::PaneState {
+        use std::collections::BTreeMap;
+        let values = BTreeMap::from([
+            (
+                "active".into(),
+                match self.app.active {
+                    Pane::Left => "left",
+                    Pane::Right => "right",
+                }
+                .into(),
+            ),
+            (
+                "left_dir".into(),
+                self.app.left.current_dir.to_string_lossy().into_owned(),
+            ),
+            (
+                "right_dir".into(),
+                self.app.right.current_dir.to_string_lossy().into_owned(),
+            ),
+            ("left_hidden".into(), self.app.left.show_hidden.to_string()),
+            (
+                "right_hidden".into(),
+                self.app.right.show_hidden.to_string(),
+            ),
+            (
+                "left_sort".into(),
+                sort_mode_key(self.app.left.sort_mode()).into(),
+            ),
+            (
+                "right_sort".into(),
+                sort_mode_key(self.app.right.sort_mode()).into(),
+            ),
+            ("single_pane".into(), self.app.single_pane.to_string()),
+            ("preview".into(), self.app.show_preview.to_string()),
+        ]);
+        rimeterm_config::memory_state::PaneState { values }
+    }
+
+    pub(crate) fn restore_state(&mut self, state: &rimeterm_config::memory_state::PaneState) {
+        let value = |key| state.values.get(key).map(String::as_str);
+        if let Some(path) = value("left_dir")
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+        {
+            self.app.left.navigate_to(path);
+        }
+        if let Some(path) = value("right_dir")
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+        {
+            self.app.right.navigate_to(path);
+        }
+        if let Some(hidden) = value("left_hidden").and_then(parse_bool) {
+            self.app.left.set_show_hidden(hidden);
+        }
+        if let Some(hidden) = value("right_hidden").and_then(parse_bool) {
+            self.app.right.set_show_hidden(hidden);
+        }
+        if let Some(mode) = value("left_sort").and_then(parse_sort_mode) {
+            self.app.left.set_sort_mode(mode);
+        }
+        if let Some(mode) = value("right_sort").and_then(parse_sort_mode) {
+            self.app.right.set_sort_mode(mode);
+        }
+        self.app.active = match value("active") {
+            Some("right") => Pane::Right,
+            _ => Pane::Left,
+        };
+        if let Some(single) = value("single_pane").and_then(parse_bool) {
+            self.app.single_pane = single;
+        }
+        if let Some(preview) = value("preview").and_then(parse_bool) {
+            self.app.show_preview = preview;
+        }
+    }
+}
+fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn sort_mode_key(mode: SortMode) -> &'static str {
+    match mode {
+        SortMode::Name => "name",
+        SortMode::SizeDesc => "size",
+        SortMode::Extension => "extension",
+    }
+}
+
+fn parse_sort_mode(value: &str) -> Option<SortMode> {
+    match value {
+        "name" => Some(SortMode::Name),
+        "size" => Some(SortMode::SizeDesc),
+        "extension" => Some(SortMode::Extension),
+        _ => None,
     }
 }
 fn execute_mutation(mutation: FileMutation) -> FileMutationResult {
@@ -437,5 +537,29 @@ mod tests {
         let dir = tempdir().unwrap();
         let pane = FileManagerPane::new(dir.path().into(), dir.path().into());
         assert!(!pane.is_editing());
+    }
+    #[test]
+    fn stable_state_round_trips_and_ignores_missing_directories() {
+        let left = tempdir().unwrap();
+        let right = tempdir().unwrap();
+        let mut source = FileManagerPane::new(left.path().into(), right.path().into());
+        source.app.active = Pane::Right;
+        source.app.left.set_show_hidden(true);
+        source.app.right.set_sort_mode(SortMode::Extension);
+        source.app.single_pane = true;
+        source.app.show_preview = true;
+        let state = source.snapshot_state();
+
+        let fallback = tempdir().unwrap();
+        let mut restored = FileManagerPane::new(fallback.path().into(), fallback.path().into());
+        restored.restore_state(&state);
+
+        assert_eq!(restored.app.active, Pane::Right);
+        assert_eq!(restored.app.left.current_dir, left.path());
+        assert_eq!(restored.app.right.current_dir, right.path());
+        assert!(restored.app.left.show_hidden);
+        assert_eq!(restored.app.right.sort_mode(), SortMode::Extension);
+        assert!(restored.app.single_pane);
+        assert!(restored.app.show_preview);
     }
 }

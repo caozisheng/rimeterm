@@ -507,10 +507,103 @@ fn resolve_left_group_members(
         .collect()
 }
 
+fn restore_named_active_tab(
+    group: &mut TabGroup,
+    stable_id: Option<&str>,
+    catalog: &[LeftTabCatalogEntry],
+) {
+    let Some(stable_id) = stable_id else {
+        return;
+    };
+    let Some(pane_id) = catalog
+        .iter()
+        .find(|entry| entry.id == stable_id)
+        .map(|entry| entry.pane)
+    else {
+        return;
+    };
+    if let Some(index) = group.members().iter().position(|member| *member == pane_id) {
+        let _ = group.goto(index);
+    }
+}
+
+fn migrate_legacy_workspace_state(
+    workspace_root: &std::path::Path,
+    memory: &mut rimeterm_config::memory_state::MemoryState,
+) {
+    if memory.policy.last_workspace
+        && memory.ui.last_workspace.is_none()
+        && let Some(path) = rimeterm_config::session_state::session_state_file()
+        && let Ok(state) = rimeterm_config::session_state::SessionState::load_or_default(&path)
+    {
+        memory.ui.last_workspace = state.last_workspace;
+    }
+    if memory.policy.pane_sizes
+        && memory.ui.pane_sizes.is_none()
+        && let Some(path) = rimeterm_config::layout_state::workspace_state_file(workspace_root)
+        && path.exists()
+        && let Ok(state) = rimeterm_config::layout_state::LayoutState::load_or_default(&path)
+    {
+        memory.ui.pane_sizes = Some(state.splits);
+    }
+    if memory.policy.tab_layout
+        && memory.ui.tab_layout.is_none()
+        && let Some(path) = rimeterm_config::left_tabs_state::workspace_state_file(workspace_root)
+        && path.exists()
+        && let Ok(state) = rimeterm_config::left_tabs_state::LeftTabsState::load_or_default(&path)
+    {
+        memory.ui.tab_layout = Some(state);
+    }
+    if memory.policy.agent_tabs
+        && memory.ui.agent_tabs.is_none()
+        && let Some(path) = rimeterm_config::agents_state::workspace_state_file(workspace_root)
+        && path.exists()
+        && let Ok(state) = rimeterm_config::agents_state::AgentsState::load_or_default(&path)
+    {
+        memory.ui.agent_tabs = Some(state.tabs);
+    }
+    if memory.policy.files
+        && memory.ui.files.is_none()
+        && let Some(path) = rimeterm_config::files_state::workspace_state_file(workspace_root)
+        && path.exists()
+        && let Ok(state) = rimeterm_config::files_state::FilesState::load_or_default(&path)
+    {
+        use rimeterm_config::files_state::FileSideState;
+        let state = state.resolve_for_workspace(workspace_root);
+        memory.ui.files = Some(rimeterm_config::memory_state::PaneState {
+            values: std::collections::BTreeMap::from([
+                (
+                    "active".into(),
+                    match state.active {
+                        FileSideState::Left => "left",
+                        FileSideState::Right => "right",
+                    }
+                    .into(),
+                ),
+                (
+                    "left_dir".into(),
+                    state.left_dir.to_string_lossy().into_owned(),
+                ),
+                (
+                    "right_dir".into(),
+                    state.right_dir.to_string_lossy().into_owned(),
+                ),
+                ("left_hidden".into(), state.show_hidden.to_string()),
+                ("right_hidden".into(), state.show_hidden.to_string()),
+                ("left_sort".into(), state.sort.clone()),
+                ("right_sort".into(), state.sort),
+                ("single_pane".into(), (!state.dual_pane).to_string()),
+            ]),
+        });
+    }
+}
+
 #[allow(dead_code)] // config / event_bus are wired in later milestones
 pub struct App {
     workspace_root: PathBuf,
     config: Config,
+    memory_policy: rimeterm_config::memory_state::MemoryPolicy,
+    remembered_ui: rimeterm_config::memory_state::UiState,
     shell_choice: ShellChoice,
     shell_short: String,
     menu: AppMenu,
@@ -674,7 +767,6 @@ pub struct App {
     /// pointer leaves any divider rect.
     ///
     /// Keyed by `(SplitPath, boundary)` — the same key that identifies
-    /// a divider in `last_dividers`. `Direction` is cached so the
     /// hint / glyph don't need a second lookup.
     hovered_divider: Option<HoveredDivider>,
     /// Non-divider interactive glyph under the mouse pointer RIGHT NOW
@@ -730,8 +822,32 @@ pub struct App {
     needs_redraw: bool,
 }
 
+fn restore_requested_shells<T, E>(
+    requested: usize,
+    mut spawn: impl FnMut(usize) -> Result<T, E>,
+) -> Result<(Vec<T>, Option<E>), E> {
+    let mut restored = Vec::with_capacity(requested);
+    for number in 1..=requested {
+        match spawn(number) {
+            Ok(shell) => restored.push(shell),
+            Err(error) if number == 1 => return Err(error),
+            Err(error) => return Ok((restored, Some(error))),
+        }
+    }
+    Ok((restored, None))
+}
+
 impl App {
-    pub fn new(workspace_root: PathBuf, config: Config) -> Result<Self> {
+    pub fn new(
+        workspace_root: PathBuf,
+        config: Config,
+        mut memory: rimeterm_config::memory_state::MemoryState,
+    ) -> Result<Self> {
+        let has_global_ui_state = rimeterm_config::memory_state::default_ui_state_file()
+            .is_some_and(|path| path.exists());
+        if !has_global_ui_state {
+            migrate_legacy_workspace_state(&workspace_root, &mut memory);
+        }
         let shell_choice = pick_shell(&config)?;
         let shell_short: String = shell_choice.short_name().into();
         info!(
@@ -767,22 +883,31 @@ impl App {
             std::collections::HashSet::new();
 
         // Files group — native explorer, global Todo, then Fast Resume.
-        let file_manager_pane = FileManagerPane::with_event_bus(
+        let mut file_manager_pane = FileManagerPane::with_event_bus(
             workspace_root.clone(),
             workspace_root.clone(),
             event_bus.clone(),
         );
+        if let Some(state) = memory.ui.files.as_ref() {
+            file_manager_pane.restore_state(state);
+        }
         let file_manager_pane_id = file_manager_pane.id();
         panes.insert(Box::new(file_manager_pane));
         pinned_pane_ids.insert(file_manager_pane_id);
         let (todo_action_tx, todo_action_rx) = mpsc::unbounded_channel();
-        let todo_pane = TodoPane::new(todo_action_tx, viewer_markdown_theme);
+        let mut todo_pane = TodoPane::new(todo_action_tx, viewer_markdown_theme);
+        if let Some(state) = memory.ui.todo.as_ref() {
+            todo_pane.restore_state(state);
+        }
         let todo_pane_id = todo_pane.id();
         panes.insert(Box::new(todo_pane));
         pinned_pane_ids.insert(todo_pane_id);
 
         let (fr_action_tx, fr_action_rx) = mpsc::unbounded_channel();
-        let fr_pane = FrPane::new(fr_action_tx);
+        let mut fr_pane = FrPane::new(fr_action_tx);
+        if let Some(state) = memory.ui.fast_resume.as_ref() {
+            fr_pane.restore_state(state);
+        }
         let fr_pane_id = fr_pane.id();
         panes.insert(Box::new(fr_pane));
         pinned_pane_ids.insert(fr_pane_id);
@@ -790,17 +915,16 @@ impl App {
         // Native Git pane — read-only workspace Git panel backed by
         // `gix`. Follows files-cwd via `SetActiveRoot` in the main loop
         // (see `handle_set_active_root`); F5 issues `workspace.pane.reload`.
-        let git_pane = crate::git_pane::GitPane::new(resolved_root.clone());
+        let mut git_pane = crate::git_pane::GitPane::new(resolved_root.clone());
+        if let Some(state) = memory.ui.git.as_ref() {
+            git_pane.restore_state(state);
+        }
         let git_pane_id = git_pane.id();
         panes.insert(Box::new(git_pane));
         pinned_pane_ids.insert(git_pane_id);
         let mut git_members = vec![git_pane_id];
 
         let mut agents_members = Vec::new();
-        // (pane_id, static registry id) for each agent tab we spawn during
-        // startup — either from config or from the persisted state file.
-        // Handed into App::pane_agent_id below so `persist_agents_state`
-        // can rebuild the on-disk list correctly across restarts.
         let mut startup_agent_ids: Vec<(PaneId, &'static str)> = Vec::new();
         for spec in &config.agents.tabs {
             let id = build_agent_pane(
@@ -811,87 +935,49 @@ impl App {
                 redraw_tx.clone(),
                 osc_tx.clone(),
             )?;
-            // §19.14.4: agents panes flip Down(Right) semantics to
-            // "copy-then-paste" (Windows Terminal / iTerm2 default).
-            // Users who want the legacy copy-only behaviour set
-            // `[mouse] right_click_paste = false`.
             if let Some(pane) = panes.get_mut(id) {
                 pane.set_right_click_paste(config.mouse.right_click_paste);
                 pane.set_scrollback_enabled(true);
             }
             agents_members.push(id);
-            // Try to map the config spec id back to a registry entry so
-            // we can persist it. Config-only specs (rare) get skipped.
-            if let Some(reg) = rimeterm_pty::agent_registry::find(&spec.id) {
-                startup_agent_ids.push((id, reg.id));
+            if let Some(registry_spec) = rimeterm_pty::agent_registry::find(&spec.id) {
+                startup_agent_ids.push((id, registry_spec.id));
             }
         }
-
-        // Persisted picks from previous sessions (see §14 / C-current).
-        // Each id is looked up in AGENT_REGISTRY; unknown / renamed ids
-        // are skipped silently rather than crashing the workspace.
         if agents_members.is_empty() {
-            if let Some(state_path) =
-                rimeterm_config::agents_state::workspace_state_file(&workspace_root)
-            {
-                match rimeterm_config::agents_state::AgentsState::load_or_default(&state_path) {
-                    Ok(state) => {
-                        for id in &state.tabs {
-                            let Some(spec) = rimeterm_pty::agent_registry::find(id) else {
-                                tracing::warn!(
-                                    agent_id = id.as_str(),
-                                    "persisted agent id no longer in registry — skipping"
-                                );
-                                continue;
-                            };
-                            let ext_spec = rimeterm_config::AgentSpec {
-                                id: spec.id.to_string(),
-                                label: spec.label.to_string(),
-                                command: spec.argv.iter().map(|s| s.to_string()).collect(),
-                                install_hint: Some(spec.install_hint.to_string()),
-                            };
-                            match build_agent_pane(
-                                &mut panes,
-                                &session_writes,
-                                &ext_spec,
-                                &workspace_root,
-                                redraw_tx.clone(),
-                                osc_tx.clone(),
-                            ) {
-                                Ok(pane_id) => {
-                                    // §19.14.4: match the config-path setup.
-                                    if let Some(pane) = panes.get_mut(pane_id) {
-                                        pane.set_right_click_paste(config.mouse.right_click_paste);
-                                        pane.set_scrollback_enabled(true);
-                                    }
-                                    agents_members.push(pane_id);
-                                    startup_agent_ids.push((pane_id, spec.id));
-                                }
-                                Err(e) => {
-                                    tracing::warn!(agent_id = id.as_str(), error = %e, "failed to restore persisted agent tab")
-                                }
-                            }
+            for id in memory.ui.agent_tabs.clone().unwrap_or_default() {
+                let Some(spec) = rimeterm_pty::agent_registry::find(&id) else {
+                    warn!(agent_id = id, "remembered agent id no longer exists");
+                    continue;
+                };
+                let external_spec = rimeterm_config::AgentSpec {
+                    id: spec.id.to_string(),
+                    label: spec.label.to_string(),
+                    command: spec.argv.iter().map(|value| value.to_string()).collect(),
+                    install_hint: Some(spec.install_hint.to_string()),
+                };
+                match build_agent_pane(
+                    &mut panes,
+                    &session_writes,
+                    &external_spec,
+                    &workspace_root,
+                    redraw_tx.clone(),
+                    osc_tx.clone(),
+                ) {
+                    Ok(pane_id) => {
+                        if let Some(pane) = panes.get_mut(pane_id) {
+                            pane.set_right_click_paste(config.mouse.right_click_paste);
+                            pane.set_scrollback_enabled(true);
                         }
-                        if !agents_members.is_empty() {
-                            tracing::info!(
-                                path = %state_path.display(),
-                                count = agents_members.len(),
-                                "restored persisted agent tabs"
-                            );
-                        }
+                        agents_members.push(pane_id);
+                        startup_agent_ids.push((pane_id, spec.id));
                     }
-                    Err(e) => {
-                        tracing::warn!(path = %state_path.display(), error = %e, "failed to load agents state")
+                    Err(error) => {
+                        warn!(agent_id = id, %error, "failed to restore agent tab");
                     }
                 }
             }
         }
-
-        // §14 C14: agents group starts with a picker placeholder when
-        // no config tabs and no persisted state produced a real member.
-        // TabGroup::new asserts non-empty on construction; the
-        // placeholder is auto-closed the first time a real agent lands
-        // (see `new_agent_tab_in`).
         if agents_members.is_empty() {
             let hint = format_agent_picker_hint();
             let picker = PlaceholderPane::new(AGENT_PICKER_TITLE, hint, "🤖", Color::LightMagenta);
@@ -900,89 +986,83 @@ impl App {
             agents_members.push(id);
         }
 
-        // Left-bottom (git) group second tab: Native SysmonPane (C25).
-        // Replaces the previous `bottom` PTY. Pinned so `×` never
-        // appears; future read-only plugins land here alongside it.
-        let sysmon = crate::sysmon_pane::SysmonPane::new();
+        let mut sysmon = crate::sysmon_pane::SysmonPane::new();
+        if let Some(state) = memory.ui.sysmon.as_ref() {
+            sysmon.restore_state(state);
+        }
         let sysmon_id = sysmon.id();
         panes.insert(Box::new(sysmon));
         pinned_pane_ids.insert(sysmon_id);
         git_members.push(sysmon_id);
 
-        // Left-bottom (git) group third tab: Native AgtopPane — a
-        // top-like status view for AI coding agents (Claude Code,
-        // Codex, Aider, Cursor, Gemini, Goose, …). In-process, no
-        // PTY: we spun off from the upstream `agtop` binary (see
-        // `agtop_matchers` for attribution) so users don't need a
-        // separate `cargo install agtop`. Pinned so `×` never
-        // appears — this is a permanent left-column tab.
-        let agtop = crate::agtop_pane::AgtopPane::new();
+        let mut agtop = crate::agtop_pane::AgtopPane::new();
+        if let Some(state) = memory.ui.agtop.as_ref() {
+            agtop.restore_state(state);
+        }
         let agtop_id = agtop.id();
         panes.insert(Box::new(agtop));
         pinned_pane_ids.insert(agtop_id);
         git_members.push(agtop_id);
 
-        // Left-bottom (git) group fourth tab: Native ModelsPane — a
-        // catalog browser for models.dev showing every provider's
-        // model list with context window and $/1M-tokens pricing.
-        // In-process, no PTY: data types + fetch layer live in the
-        // `rimeterm-models` crate (ported from MIT `reyamira/models`
-        // v0.14.0) so users don't need a separate `cargo install
-        // modelsdev`. Pinned so `×` never appears.
-        let models = crate::models_pane::ModelsPane::new();
+        let mut models = crate::models_pane::ModelsPane::new();
+        if let Some(state) = memory.ui.models.as_ref() {
+            models.restore_state(state);
+        }
         let models_id = models.id();
         panes.insert(Box::new(models));
         pinned_pane_ids.insert(models_id);
         git_members.push(models_id);
 
-        // Left-bottom group fifth tab: Native stock watchlist and market view.
-        // Data access stays in rimeterm-stock; this pane remains pinned.
         let stock_watchlist = rimeterm_config::paths::stock_watchlist_file()
             .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-stock-watchlist.toml"));
-        let stock = crate::stock_pane::StockPane::new(config.stock.clone(), stock_watchlist);
+        let mut stock = crate::stock_pane::StockPane::new(config.stock.clone(), stock_watchlist);
+        if let Some(state) = memory.ui.stock.as_ref() {
+            stock.restore_state(state);
+        }
         let stock_id = stock.id();
         panes.insert(Box::new(stock));
         pinned_pane_ids.insert(stock_id);
         git_members.push(stock_id);
 
-        // Left-bottom group sixth tab: Native ZonesPane — braille world map
-        // with a day/night terminator, per-configured-zone markers, and a
-        // ◉ "home" marker resolved from the OS via `iana_time_zone`. Zero
-        // network, ~60 s repaint. Data crate `rimeterm-zones` is pinned;
-        // pane state persists globally like the stock watchlist.
         let zones_watchlist = rimeterm_config::paths::zones_file()
             .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-zones.toml"));
-        let zones = crate::zones_pane::ZonesPane::new(config.zones.clone(), zones_watchlist);
+        let mut zones = crate::zones_pane::ZonesPane::new(config.zones.clone(), zones_watchlist);
+        if let Some(state) = memory.ui.zones.as_ref() {
+            zones.restore_state(state);
+        }
         let zones_id = zones.id();
         panes.insert(Box::new(zones));
         pinned_pane_ids.insert(zones_id);
         git_members.push(zones_id);
 
-        // Shells group: always at least one interactive shell. Bottom
-        // moved to the left-bottom (git) group, so shells is single-
-        // purpose now.
-        let mut shells_members = Vec::new();
-
-        // 2. Add the first shell tab
-        let first = spawn_shell(
-            &shell_choice,
-            workspace_root.clone(),
-            "shell-1".into(),
-            80,
-            24,
-            redraw_tx.clone(),
-            osc_tx.clone(),
-        )?;
-        let first_id = first.pane.id();
-        session_writes
-            .lock()
-            .insert(first_id, first.pane.session().clone());
-        panes.insert(Box::new(first.pane));
-        // §19.14.4: shell-1 gets right-click-paste like every other
-        // shells-group tab.
-        if let Some(pane) = panes.get_mut(first_id) {
-            pane.set_right_click_paste(config.mouse.right_click_paste);
-            pane.set_scrollback_enabled(true);
+        let shell_count = memory.ui.shell_tabs.unwrap_or(1).clamp(1, 16);
+        let (shell_spawns, restore_error) = restore_requested_shells(shell_count, |number| {
+            spawn_shell(
+                &shell_choice,
+                workspace_root.clone(),
+                format!("shell-{number}"),
+                80,
+                24,
+                redraw_tx.clone(),
+                osc_tx.clone(),
+            )
+        })?;
+        if let Some(error) = restore_error {
+            warn!(error = %error, restored = shell_spawns.len(), requested = shell_count,
+                "stopped restoring additional shell tabs");
+        }
+        let mut shells_members = Vec::with_capacity(shell_spawns.len());
+        for spawn in shell_spawns {
+            let pane_id = spawn.pane.id();
+            session_writes
+                .lock()
+                .insert(pane_id, spawn.pane.session().clone());
+            panes.insert(Box::new(spawn.pane));
+            if let Some(pane) = panes.get_mut(pane_id) {
+                pane.set_right_click_paste(config.mouse.right_click_paste);
+                pane.set_scrollback_enabled(true);
+            }
+            shells_members.push(pane_id);
         }
         // Build the stable left-column tab catalogs. Order here is
         // canonical — used both as the default order in a fresh
@@ -1013,45 +1093,32 @@ impl App {
         let bottom_ids: Vec<&'static str> =
             left_bottom_catalog.iter().map(|entry| entry.id).collect();
 
-        // Load user visibility + order picks (missing file → all-default).
-        let mut left_tabs_state = if let Some(path) =
-            rimeterm_config::left_tabs_state::workspace_state_file(&workspace_root)
-        {
-            match rimeterm_config::left_tabs_state::LeftTabsState::load_or_default(&path) {
-                Ok(state) => state,
-                Err(e) => {
-                    warn!(error = %e, "failed to load left-tabs state; using defaults");
-                    rimeterm_config::left_tabs_state::LeftTabsState::default()
-                }
-            }
-        } else {
-            rimeterm_config::left_tabs_state::LeftTabsState::default()
-        };
+        let mut left_tabs_state = memory.ui.tab_layout.clone().unwrap_or_default();
         left_tabs_state.normalize(&top_ids, &bottom_ids);
 
         let files_members = resolve_left_group_members(&left_top_catalog, &left_tabs_state.top);
         let git_members = resolve_left_group_members(&left_bottom_catalog, &left_tabs_state.bottom);
 
-        let files = build_files_group(files_members);
-        shells_members.push(first_id);
-        // Groups.
-        // Left column: files (top) + git (bottom). Both are Fixed —
-        // no × / + affordance; the viewer is now a modal overlay
-        // rather than a tab (§C24), so nothing ever needs to be
-        // added or closed inside these groups.
-        let git = build_git_group(git_members);
-        let agents = TabGroup::new(
+        let mut files = build_files_group(files_members);
+        let mut git = build_git_group(git_members);
+        let mut agents = TabGroup::new(
             BUILTIN_AGENTS,
             agents_members,
             MembersPolicy::Open { max: 16 },
             PaneKind::AgentChat,
         );
-        let shells = TabGroup::new(
+        let mut shells = TabGroup::new(
             BUILTIN_SHELLS,
             shells_members,
             MembersPolicy::Open { max: 16 },
             PaneKind::Shell,
         );
+        if let Some(active) = memory.ui.active_tabs.as_ref() {
+            restore_named_active_tab(&mut files, active.files.as_deref(), &left_top_catalog);
+            restore_named_active_tab(&mut git, active.git.as_deref(), &left_bottom_catalog);
+            let _ = agents.goto(active.agents.min(agents.len().saturating_sub(1)));
+            let _ = shells.goto(active.shells.min(shells.len().saturating_sub(1)));
+        }
 
         // Layout (§C24 4-zone): root Horizontal split, each column
         // Vertical. Left column stacks files (top) over git (bottom);
@@ -1078,31 +1145,19 @@ impl App {
         let mut tree = LayoutTree::new(root).map_err(|e| anyhow!("layout tree: {e}"))?;
         let default_ratios = snapshot_all_ratios(&tree);
 
-        // Restore any previously persisted ratios for this workspace.
-        if let Some(state_path) =
-            rimeterm_config::layout_state::workspace_state_file(&workspace_root)
-        {
-            match rimeterm_config::layout_state::LayoutState::load_or_default(&state_path) {
-                Ok(state) if !state.is_empty() => {
-                    apply_persisted_state(&mut tree, &state);
-                    info!(
-                        path = %state_path.display(),
-                        splits = state.splits.len(),
-                        "restored persisted layout state",
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(error = %e, "failed to load layout state; using defaults");
-                }
-            }
+        if let Some(splits) = memory.ui.pane_sizes.clone() {
+            apply_persisted_state(
+                &mut tree,
+                &rimeterm_config::layout_state::LayoutState { splits },
+            );
         }
 
         let mut focus = FocusManager::new(event_bus.clone());
-        // Default focus lands on the native file manager so the launch
-        // state matches the pre-launch expectation ("open rimeterm → I
-        // can navigate files immediately").
-        focus.set_focus(file_manager_pane_id, Some(BUILTIN_FILES));
+        let initial_pane = tree
+            .find_tab_group(BUILTIN_FILES)
+            .and_then(TabGroup::active_pane)
+            .unwrap_or(file_manager_pane_id);
+        focus.set_focus(initial_pane, Some(BUILTIN_FILES));
 
         let flags = Arc::new(ActionFlags::default());
         let snapshot = Arc::new(parking_lot::RwLock::new(WorkspaceSnapshot::default()));
@@ -1131,6 +1186,8 @@ impl App {
             last_file_manager_cwd: Some(workspace_root.clone()),
             workspace_root,
             config,
+            memory_policy: memory.policy,
+            remembered_ui: memory.ui,
             shell_choice,
             shell_short,
             menu: AppMenu::v0_1_default(),
@@ -1720,6 +1777,8 @@ impl App {
             .collect();
         self.settings_state
             .set_left_tabs_state(self.left_tabs_state.clone(), labels);
+        self.settings_state
+            .set_memory_policy(self.memory_policy.clone());
         let _ = self.redraw_tx.send(());
     }
 
@@ -1787,6 +1846,18 @@ impl App {
             }
             SettingsAction::SetLeftTabsState(state) => {
                 self.apply_left_tabs_state(state);
+            }
+            SettingsAction::SetMemoryPolicy(policy) => {
+                self.memory_policy = policy.clone();
+                self.settings_state.set_memory_policy(policy.clone());
+                if let Some(path) = rimeterm_config::memory_state::default_memory_policy_file()
+                    && let Err(error) = policy.save_to(&path)
+                {
+                    warn!(error = %error, "failed to persist memory policy");
+                    self.set_hint(format!("memory settings save failed: {error}"));
+                }
+                self.persist_ui_state();
+                let _ = self.redraw_tx.send(());
             }
         }
     }
@@ -1868,22 +1939,32 @@ impl App {
 
     /// Flush the current left-tabs state to disk. Non-fatal on error —
     /// the next launch just reverts to defaults for this workspace.
-    fn persist_left_tabs_state(&self) {
-        let Some(path) =
-            rimeterm_config::left_tabs_state::workspace_state_file(&self.workspace_root)
-        else {
-            return;
-        };
-        let top_ids: Vec<&'static str> =
-            self.left_top_catalog.iter().map(|entry| entry.id).collect();
-        let bottom_ids: Vec<&'static str> = self
-            .left_bottom_catalog
-            .iter()
-            .map(|entry| entry.id)
-            .collect();
-        if let Err(e) = self.left_tabs_state.save_to(&path, &top_ids, &bottom_ids) {
-            warn!(error = %e, "failed to persist left-tabs state");
-        }
+    fn persist_left_tabs_state(&mut self) {
+        self.remembered_ui.tab_layout = self
+            .memory_policy
+            .tab_layout
+            .then(|| self.left_tabs_state.clone());
+        self.save_remembered_ui();
+    }
+
+    /// Refresh the remembered active-tab snapshot without blocking the event
+    /// loop on disk I/O. Structural mutations and shutdown flush the complete
+    /// UI state atomically.
+    fn persist_active_tabs(&mut self) {
+        self.remembered_ui.active_tabs = self.memory_policy.active_tabs.then(|| {
+            rimeterm_config::memory_state::ActiveTabsState {
+                files: self.active_left_tab_id(BUILTIN_FILES, &self.left_top_catalog),
+                git: self.active_left_tab_id(BUILTIN_GIT, &self.left_bottom_catalog),
+                agents: self
+                    .tree
+                    .find_tab_group(BUILTIN_AGENTS)
+                    .map_or(0, TabGroup::active_index),
+                shells: self
+                    .tree
+                    .find_tab_group(BUILTIN_SHELLS)
+                    .map_or(0, TabGroup::active_index),
+            }
+        });
     }
 
     /// Apply a new app-wide theme (§C v0.1: the same
@@ -2856,6 +2937,7 @@ impl App {
         if let Some(pane_id) = pane_id {
             self.focus.set_focus(pane_id, Some(gid));
         }
+        self.persist_active_tabs();
     }
 
     /// Dispatch the `[+]` affordance for `gid`. shells → spawn a new shell
@@ -3782,6 +3864,7 @@ impl App {
                 self.focus.set_focus(id, Some(gid));
             }
         }
+        self.persist_active_tabs();
     }
 
     fn tab_goto(&mut self, idx: usize) {
@@ -3797,6 +3880,7 @@ impl App {
                 self.set_hint(format!("no tab {} in {}", idx + 1, gid));
             }
         }
+        self.persist_active_tabs();
     }
 
     fn focus_direction(&mut self, dir: usize) {
@@ -3986,6 +4070,7 @@ impl App {
             .try_add(new_id, PaneKind::Shell)
             .map_err(|e| anyhow!("policy rejected new tab: {e}"))?;
         self.focus.set_focus(new_id, Some(gid));
+        self.persist_ui_state();
         Ok(new_id)
     }
 
@@ -4161,6 +4246,8 @@ impl App {
         }
         if was_agent || gid == BUILTIN_AGENTS {
             self.persist_agents_state();
+        } else {
+            self.persist_ui_state();
         }
         Ok(())
     }
@@ -4200,6 +4287,7 @@ impl App {
             group.goto(idx).map_err(|error| anyhow!("{error}"))?;
         }
         self.focus.set_focus(pane_id, Some(gid));
+        self.persist_active_tabs();
         Ok(())
     }
 
@@ -4536,13 +4624,7 @@ impl App {
             .flat_map(|g| g.members().iter().copied())
             .collect();
 
-        // Persist current ratios (§19.12.9). Silent on error — persistence
-        // is a nice-to-have; we should never block shutdown on it.
-        self.persist_layout();
-        // Remember the last active workspace root so the next launch
-        // (without an explicit CLI arg) resumes here instead of the
-        // install directory / process CWD. Also silent on error.
-        self.persist_session_state();
+        self.persist_ui_state();
         for id in all {
             self.drop_pane_and_session(id);
         }
@@ -4555,32 +4637,14 @@ impl App {
     /// tree are indistinguishable at load time, which is exactly what
     /// we want (no stale ratios lingering after the code-side default
     /// changes).
-    fn persist_layout(&self) {
-        let Some(path) = rimeterm_config::layout_state::workspace_state_file(&self.workspace_root)
-        else {
-            return;
-        };
-        let state = snapshot_persisted_state(&self.tree, &self.default_ratios);
-        if state.is_empty() {
-            // Delete-on-empty: `remove_file` errors are non-fatal (file
-            // might already be gone). Log the successful delete so the
-            // startup log shows the "back to defaults" event.
-            match std::fs::remove_file(&path) {
-                Ok(()) => info!(path = %path.display(), "layout state empty; removed file"),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => warn!(error = %e, "failed to remove empty layout state"),
-            }
-            return;
-        }
-        if let Err(e) = state.save_to(&path) {
-            warn!(error = %e, "failed to persist layout state");
+    fn persist_layout(&mut self) {
+        if self.memory_policy.pane_sizes {
+            self.remembered_ui.pane_sizes =
+                Some(snapshot_persisted_state(&self.tree, &self.default_ratios).splits);
         } else {
-            info!(
-                path = %path.display(),
-                diffs = state.splits.len(),
-                "persisted layout state (diff)"
-            );
+            self.remembered_ui.pane_sizes = None;
         }
+        self.save_remembered_ui();
     }
 
     /// Write the active workspace root to `${data_dir}/session.state.toml`
@@ -4588,59 +4652,189 @@ impl App {
     /// resumes in the directory the user was last browsing rather than
     /// the install directory / process CWD. Silent on error; the next
     /// launch just falls back to the user home.
-    fn persist_session_state(&self) {
-        let Some(path) = rimeterm_config::session_state::session_state_file() else {
-            return;
-        };
-        let state = rimeterm_config::session_state::SessionState {
-            last_workspace: Some(self.active_root.clone()),
-        };
-        if let Err(e) = state.save_to(&path) {
-            warn!(error = %e, "failed to persist session state");
-        } else {
-            info!(
-                path = %path.display(),
-                last_workspace = %self.active_root.display(),
-                "persisted session state"
-            );
-        }
+    fn persist_session_state(&mut self) {
+        self.remembered_ui.last_workspace = self
+            .memory_policy
+            .last_workspace
+            .then(|| self.active_root.clone());
+        self.save_remembered_ui();
     }
 
     /// Write the current agents-quadrant tab list to
     /// `${data_dir}/workspaces/<hash>/agents.state.toml`. Silent on
     /// error — the next launch just won't restore, no user harm.
-    fn persist_agents_state(&self) {
-        let Some(path) = rimeterm_config::agents_state::workspace_state_file(&self.workspace_root)
-        else {
+    fn persist_agents_state(&mut self) {
+        self.remembered_ui.agent_tabs = self.memory_policy.agent_tabs.then(|| {
+            self.tree
+                .find_tab_group(BUILTIN_AGENTS)
+                .map(|group| {
+                    group
+                        .members()
+                        .iter()
+                        .filter_map(|pane| self.pane_agent_id.get(pane).map(|id| id.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        self.save_remembered_ui();
+    }
+
+    fn persist_ui_state(&mut self) {
+        self.remembered_ui.last_workspace = self
+            .memory_policy
+            .last_workspace
+            .then(|| self.active_root.clone());
+        self.remembered_ui.pane_sizes = self
+            .memory_policy
+            .pane_sizes
+            .then(|| snapshot_persisted_state(&self.tree, &self.default_ratios).splits);
+        self.remembered_ui.tab_layout = self
+            .memory_policy
+            .tab_layout
+            .then(|| self.left_tabs_state.clone());
+        self.remembered_ui.active_tabs = self.memory_policy.active_tabs.then(|| {
+            rimeterm_config::memory_state::ActiveTabsState {
+                files: self.active_left_tab_id(BUILTIN_FILES, &self.left_top_catalog),
+                git: self.active_left_tab_id(BUILTIN_GIT, &self.left_bottom_catalog),
+                agents: self
+                    .tree
+                    .find_tab_group(BUILTIN_AGENTS)
+                    .map_or(0, TabGroup::active_index),
+                shells: self
+                    .tree
+                    .find_tab_group(BUILTIN_SHELLS)
+                    .map_or(0, TabGroup::active_index),
+            }
+        });
+        self.remembered_ui.agent_tabs = self.memory_policy.agent_tabs.then(|| {
+            self.tree
+                .find_tab_group(BUILTIN_AGENTS)
+                .map(|group| {
+                    group
+                        .members()
+                        .iter()
+                        .filter_map(|pane| self.pane_agent_id.get(pane).map(|id| id.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        self.remembered_ui.shell_tabs = self.memory_policy.shell_tabs.then(|| {
+            self.tree
+                .find_tab_group(BUILTIN_SHELLS)
+                .map_or(1, TabGroup::len)
+        });
+        self.remembered_ui.files = self
+            .memory_policy
+            .files
+            .then(|| {
+                self.file_manager_pane_id.and_then(|id| {
+                    self.pane_snapshot::<FileManagerPane>(id, FileManagerPane::snapshot_state)
+                })
+            })
+            .flatten();
+        self.remembered_ui.git = self
+            .memory_policy
+            .git
+            .then(|| {
+                self.git_pane_id.and_then(|id| {
+                    self.pane_snapshot::<crate::git_pane::GitPane>(
+                        id,
+                        crate::git_pane::GitPane::snapshot_state,
+                    )
+                })
+            })
+            .flatten();
+        self.remembered_ui.todo =
+            self.snapshot_catalog_pane("todo", self.memory_policy.todo, TodoPane::snapshot_state);
+        self.remembered_ui.fast_resume = self.snapshot_catalog_pane(
+            "fr",
+            self.memory_policy.fast_resume,
+            FrPane::snapshot_state,
+        );
+        self.remembered_ui.sysmon = self.snapshot_catalog_pane(
+            "sysmon",
+            self.memory_policy.sysmon,
+            crate::sysmon_pane::SysmonPane::snapshot_state,
+        );
+        self.remembered_ui.agtop = self.snapshot_catalog_pane(
+            "agtop",
+            self.memory_policy.agtop,
+            crate::agtop_pane::AgtopPane::snapshot_state,
+        );
+        self.remembered_ui.models = self.snapshot_catalog_pane(
+            "models",
+            self.memory_policy.models,
+            crate::models_pane::ModelsPane::snapshot_state,
+        );
+        self.remembered_ui.stock = self.snapshot_catalog_pane(
+            "stock",
+            self.memory_policy.stock,
+            crate::stock_pane::StockPane::snapshot_state,
+        );
+        self.remembered_ui.zones = self.snapshot_catalog_pane(
+            "zones",
+            self.memory_policy.zones,
+            crate::zones_pane::ZonesPane::snapshot_state,
+        );
+        self.save_remembered_ui();
+    }
+
+    fn active_left_tab_id(
+        &self,
+        group_id: TabGroupId,
+        catalog: &[LeftTabCatalogEntry],
+    ) -> Option<String> {
+        let active = self.tree.find_tab_group(group_id)?.active_pane()?;
+        catalog
+            .iter()
+            .find(|entry| entry.pane == active)
+            .map(|entry| entry.id.to_string())
+    }
+
+    fn pane_snapshot<T: 'static>(
+        &self,
+        pane_id: PaneId,
+        snapshot: fn(&T) -> rimeterm_config::memory_state::PaneState,
+    ) -> Option<rimeterm_config::memory_state::PaneState> {
+        self.panes
+            .get(pane_id)?
+            .as_any()?
+            .downcast_ref::<T>()
+            .map(snapshot)
+    }
+
+    fn snapshot_catalog_pane<T: 'static>(
+        &self,
+        stable_id: &str,
+        enabled: bool,
+        snapshot: fn(&T) -> rimeterm_config::memory_state::PaneState,
+    ) -> Option<rimeterm_config::memory_state::PaneState> {
+        enabled
+            .then(|| self.catalog_pane_id(stable_id))
+            .flatten()
+            .and_then(|pane_id| self.pane_snapshot(pane_id, snapshot))
+    }
+
+    fn catalog_pane_id(&self, stable_id: &str) -> Option<PaneId> {
+        self.left_top_catalog
+            .iter()
+            .chain(self.left_bottom_catalog.iter())
+            .find(|entry| entry.id == stable_id)
+            .map(|entry| entry.pane)
+    }
+
+    fn save_remembered_ui(&self) {
+        let Some(path) = rimeterm_config::memory_state::default_ui_state_file() else {
             return;
         };
-        // Walk the agents group in tab order so on-disk order matches
-        // on-screen order. Placeholder panes (no entry in pane_agent_id)
-        // are skipped — persisting the picker itself would defeat the
-        // whole restore contract.
-        let tabs: Vec<String> = self
-            .tree
-            .find_tab_group(BUILTIN_AGENTS)
-            .map(|g| {
-                g.members()
-                    .iter()
-                    .filter_map(|pid| self.pane_agent_id.get(pid).map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let state = rimeterm_config::agents_state::AgentsState { tabs };
-        if let Err(e) = state.save_to(&path) {
-            warn!(error = %e, "failed to persist agents state");
-        } else {
-            info!(path = %path.display(), count = state.tabs.len(), "persisted agents state");
+        if let Err(error) = self.remembered_ui.save_to(&path) {
+            warn!(error = %error, "failed to persist global UI state");
         }
     }
 
-    /// Reset every split ratio to defaults and delete the persisted state
-    /// file. Signal-only entrypoint used by the `flags.layout_reset`
-    /// drain — kept for keymap + palette compatibility. `rimectl` and
-    /// context-menu callers should go through
-    /// [`Self::reset_layout_scope`] to get an ack.
+    /// Reset every split ratio to defaults and refresh global remembered state.
+    /// Signal-only entrypoint used by the `flags.layout_reset` drain; `rimectl`
+    /// and context-menu callers use [`Self::reset_layout_scope`] for an ack.
     fn reset_layout(&mut self) {
         let _ = self.reset_layout_scope(None);
     }
@@ -4651,12 +4845,8 @@ impl App {
     /// success (`"all"` or the group id) so IPC callers can echo it back
     /// to shell scripts.
     ///
-    /// Persist side-effect:
-    /// - `None` → delete the state file (matches pre-C18-B semantics).
-    /// - `Some(gid)` → re-persist a fresh snapshot so other groups'
-    ///   overrides survive. Combined with C18-C's diff-storage, an
-    ///   all-defaults tree yields an empty file (or none if we later
-    ///   delete-on-empty).
+    /// Persist side-effect: full reset stores the now-default layout; scoped
+    /// reset snapshots the whole tree so unrelated overrides survive.
     fn reset_layout_scope(
         &mut self,
         group: Option<rimeterm_core::TabGroupId>,
@@ -4666,12 +4856,8 @@ impl App {
                 for (path, ratios) in self.default_ratios.clone() {
                     let _ = self.tree.set_ratios(&path, ratios);
                 }
-                if let Some(path) =
-                    rimeterm_config::layout_state::workspace_state_file(&self.workspace_root)
-                {
-                    let _ = std::fs::remove_file(&path);
-                }
-                self.set_hint("layout reset to defaults (persisted state cleared)".into());
+                self.persist_layout();
+                self.set_hint("layout reset to defaults (global state updated)".into());
                 Ok("all".to_string())
             }
             Some(gid) => {
@@ -6916,6 +7102,40 @@ mod tests {
     }
 
     #[test]
+    fn restore_named_active_tab_uses_stable_id_and_ignores_unknown() {
+        let files = PaneId(51);
+        let todo = PaneId(52);
+        let fr = PaneId(53);
+        let catalog = vec![
+            LeftTabCatalogEntry::new("files", "Files", files),
+            LeftTabCatalogEntry::new("todo", "Todo", todo),
+            LeftTabCatalogEntry::new("fr", "Fast Resume", fr),
+        ];
+        let mut group = build_files_group(vec![files, todo, fr]);
+
+        restore_named_active_tab(&mut group, Some("fr"), &catalog);
+        assert_eq!(group.active_pane(), Some(fr));
+
+        restore_named_active_tab(&mut group, Some("removed-pane"), &catalog);
+        assert_eq!(group.active_pane(), Some(fr));
+    }
+
+    #[test]
+    fn restore_named_active_tab_ignores_hidden_catalog_member() {
+        let files = PaneId(61);
+        let hidden = PaneId(62);
+        let catalog = vec![
+            LeftTabCatalogEntry::new("files", "Files", files),
+            LeftTabCatalogEntry::new("hidden", "Hidden", hidden),
+        ];
+        let mut group = build_files_group(vec![files]);
+
+        restore_named_active_tab(&mut group, Some("hidden"), &catalog);
+
+        assert_eq!(group.active_pane(), Some(files));
+    }
+
+    #[test]
     fn resolve_workspace_root_returns_cwd_when_no_git_up_the_chain() {
         let dir = tempfile::tempdir().unwrap();
         // No `.git` anywhere in the ancestor chain.
@@ -8444,5 +8664,22 @@ mod tests {
         let out = upgrade_chip_layout(area, Some(&release)).chip.unwrap();
         assert_eq!(out.rect.x + out.rect.width, 103);
         assert_eq!(out.rect.y, 47);
+    }
+    #[test]
+    fn restore_requested_shells_requires_first_and_degrades_afterward() {
+        let first = restore_requested_shells(3, |_| Err::<(), _>("first"));
+        assert_eq!(first, Err("first"));
+
+        let mut attempts = Vec::new();
+        let restored = restore_requested_shells(4, |number| {
+            attempts.push(number);
+            if number == 3 {
+                Err("later")
+            } else {
+                Ok(number)
+            }
+        });
+        assert_eq!(restored, Ok((vec![1, 2], Some("later"))));
+        assert_eq!(attempts, vec![1, 2, 3]);
     }
 }

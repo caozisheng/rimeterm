@@ -168,6 +168,51 @@ impl ModelsPane {
         let next = (self.cursor as i32).saturating_add(delta).max(0) as usize;
         self.cursor = next.min(max);
     }
+
+    pub(crate) fn snapshot_state(&self) -> rimeterm_config::memory_state::PaneState {
+        let sort = match self.sort_key {
+            SortKey::Provider => "provider",
+            SortKey::Name => "name",
+            SortKey::Context => "context",
+            SortKey::InputCost => "input_cost",
+            SortKey::OutputCost => "output_cost",
+            SortKey::Release => "release",
+        };
+        let order = match self.sort_order {
+            SortOrder::Ascending => "ascending",
+            SortOrder::Descending => "descending",
+        };
+        let mut values = std::collections::BTreeMap::from([
+            ("sort".into(), sort.into()),
+            ("order".into(), order.into()),
+        ]);
+        if let Some(filter) = &self.filter {
+            values.insert("filter".into(), filter.clone());
+        }
+        rimeterm_config::memory_state::PaneState { values }
+    }
+
+    pub(crate) fn restore_state(&mut self, state: &rimeterm_config::memory_state::PaneState) {
+        self.sort_key = match state.values.get("sort").map(String::as_str) {
+            Some("name") => SortKey::Name,
+            Some("context") => SortKey::Context,
+            Some("input_cost") => SortKey::InputCost,
+            Some("output_cost") => SortKey::OutputCost,
+            Some("release") => SortKey::Release,
+            _ => SortKey::Provider,
+        };
+        self.sort_order = match state.values.get("order").map(String::as_str) {
+            Some("descending") => SortOrder::Descending,
+            _ => SortOrder::Ascending,
+        };
+        self.filter = state
+            .values
+            .get("filter")
+            .filter(|value| !value.is_empty())
+            .cloned();
+        self.cursor = 0;
+        self.modal = Modal::None;
+    }
 }
 
 impl Default for ModelsPane {
@@ -1009,5 +1054,23 @@ mod tests {
         // We still need a worker because it owns channels the pane
         // holds. The thread parks on recv immediately so this is cheap.
         ModelsPane::new()
+    }
+    #[test]
+    fn stable_state_round_trips_without_cursor_or_modal() {
+        let mut source = build_test_pane();
+        source.sort_key = SortKey::Context;
+        source.sort_order = SortOrder::Descending;
+        source.filter = Some("open".into());
+        source.cursor = 7;
+        let state = source.snapshot_state();
+
+        let mut restored = build_test_pane();
+        restored.restore_state(&state);
+
+        assert_eq!(restored.sort_key, SortKey::Context);
+        assert_eq!(restored.sort_order, SortOrder::Descending);
+        assert_eq!(restored.filter.as_deref(), Some("open"));
+        assert_eq!(restored.cursor, 0);
+        assert_eq!(restored.modal, Modal::None);
     }
 }

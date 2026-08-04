@@ -75,6 +75,51 @@ impl TodoPane {
     fn paths(&self) -> (&Path, &Path) {
         (&self.todo_path, &self.archive_path)
     }
+
+    pub(crate) fn snapshot_state(&self) -> rimeterm_config::memory_state::PaneState {
+        let mut values = std::collections::BTreeMap::new();
+        if let TodoState::Ready(app) = &self.state {
+            let inner = app.app();
+            values.insert(
+                "view".into(),
+                match inner.view() {
+                    tuxedo::app::View::List => "list",
+                    tuxedo::app::View::Archive => "archive",
+                }
+                .into(),
+            );
+            values.insert("sort".into(), inner.sort_label().into());
+            values.insert("search".into(), inner.filter().search.clone());
+            if let Some(project) = &inner.filter().project {
+                values.insert("project".into(), project.clone());
+            }
+            if let Some(context) = &inner.filter().context {
+                values.insert("context".into(), context.clone());
+            }
+        }
+        rimeterm_config::memory_state::PaneState { values }
+    }
+
+    pub(crate) fn restore_state(&mut self, state: &rimeterm_config::memory_state::PaneState) {
+        let TodoState::Ready(app) = &mut self.state else {
+            return;
+        };
+        let inner = app.app_mut();
+        inner.set_view(match state.values.get("view").map(String::as_str) {
+            Some("archive") => tuxedo::app::View::Archive,
+            _ => tuxedo::app::View::List,
+        });
+        if let Some(sort) = state
+            .values
+            .get("sort")
+            .and_then(|value| value.parse().ok())
+        {
+            inner.prefs.sort = sort;
+        }
+        inner.set_search(state.values.get("search").cloned().unwrap_or_default());
+        inner.set_project_filter(state.values.get("project").cloned());
+        inner.set_context_filter(state.values.get("context").cloned());
+    }
 }
 
 fn load_embedded(todo_path: &Path, archive_path: &Path) -> TodoState {
@@ -272,5 +317,31 @@ mod tests {
 
         assert!(matches!(pane.state, TodoState::Ready(_)));
         assert!(!todo.exists());
+    }
+    #[test]
+    fn stable_state_round_trips_view_sort_and_filters() {
+        let (todo, done) = fixture("memory-source");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut source =
+            TodoPane::with_paths(tx.clone(), rimeterm_markdown::Theme::Default, todo, done);
+        let TodoState::Ready(app) = &mut source.state else {
+            panic!("ready");
+        };
+        app.app_mut().set_view(tuxedo::app::View::Archive);
+        app.app_mut().prefs.sort = tuxedo::app::Sort::Due;
+        app.app_mut().set_search("urgent".into());
+        app.app_mut().set_project_filter(Some("work".into()));
+        let state = source.snapshot_state();
+
+        let (todo, done) = fixture("memory-restored");
+        let mut restored = TodoPane::with_paths(tx, rimeterm_markdown::Theme::Default, todo, done);
+        restored.restore_state(&state);
+        let TodoState::Ready(app) = &restored.state else {
+            panic!("ready");
+        };
+        assert_eq!(app.app().view(), tuxedo::app::View::Archive);
+        assert_eq!(app.app().sort_label(), "due");
+        assert_eq!(app.app().filter().search, "urgent");
+        assert_eq!(app.app().filter().project.as_deref(), Some("work"));
     }
 }

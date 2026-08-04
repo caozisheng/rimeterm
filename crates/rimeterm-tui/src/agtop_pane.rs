@@ -161,6 +161,55 @@ impl AgtopPane {
             };
         }
     }
+
+    pub(crate) fn snapshot_state(&self) -> rimeterm_config::memory_state::PaneState {
+        let sort = match self.sort_key {
+            SortKey::Smart => "smart",
+            SortKey::Cpu => "cpu",
+            SortKey::Memory => "memory",
+            SortKey::Tokens => "tokens",
+            SortKey::Pid => "pid",
+            SortKey::Label => "label",
+            SortKey::Uptime => "uptime",
+            SortKey::Status => "status",
+        };
+        let order = match self.sort_order {
+            SortOrder::Ascending => "ascending",
+            SortOrder::Descending => "descending",
+        };
+        let mut values = std::collections::BTreeMap::from([
+            ("sort".into(), sort.into()),
+            ("order".into(), order.into()),
+        ]);
+        if let Some(filter) = &self.filter {
+            values.insert("filter".into(), filter.clone());
+        }
+        rimeterm_config::memory_state::PaneState { values }
+    }
+
+    pub(crate) fn restore_state(&mut self, state: &rimeterm_config::memory_state::PaneState) {
+        self.sort_key = match state.values.get("sort").map(String::as_str) {
+            Some("cpu") => SortKey::Cpu,
+            Some("memory") => SortKey::Memory,
+            Some("tokens") => SortKey::Tokens,
+            Some("pid") => SortKey::Pid,
+            Some("label") => SortKey::Label,
+            Some("uptime") => SortKey::Uptime,
+            Some("status") => SortKey::Status,
+            _ => SortKey::Smart,
+        };
+        self.sort_order = match state.values.get("order").map(String::as_str) {
+            Some("ascending") => SortOrder::Ascending,
+            _ => SortOrder::Descending,
+        };
+        self.filter = state
+            .values
+            .get("filter")
+            .filter(|value| !value.is_empty())
+            .cloned();
+        self.cursor = 0;
+        self.modal = Modal::None;
+    }
 }
 
 impl Default for AgtopPane {
@@ -1763,5 +1812,23 @@ mod tests {
         // "tokens" appears in the TOKENS column header too, so we
         // only assert the value doesn't render (dash placeholder).
         assert!(!rendered.contains("$"), "cost value leaked: {rendered}");
+    }
+    #[test]
+    fn stable_state_round_trips_without_cursor_or_detail() {
+        let mut source = AgtopPane::new();
+        source.sort_key = SortKey::Tokens;
+        source.sort_order = SortOrder::Ascending;
+        source.filter = Some("claude".into());
+        source.cursor = 4;
+        let state = source.snapshot_state();
+
+        let mut restored = AgtopPane::new();
+        restored.restore_state(&state);
+
+        assert_eq!(restored.sort_key, SortKey::Tokens);
+        assert_eq!(restored.sort_order, SortOrder::Ascending);
+        assert_eq!(restored.filter.as_deref(), Some("claude"));
+        assert_eq!(restored.cursor, 0);
+        assert_eq!(restored.modal, Modal::None);
     }
 }

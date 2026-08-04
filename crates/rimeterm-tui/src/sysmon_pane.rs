@@ -156,6 +156,56 @@ impl SysmonPane {
     fn set_hint<S: Into<String>>(&mut self, text: S) {
         self.hint = Some(text.into());
     }
+
+    pub(crate) fn snapshot_state(&self) -> rimeterm_config::memory_state::PaneState {
+        let view = match self.view {
+            SysmonView::Overview => "overview",
+            SysmonView::Processes => "processes",
+        };
+        let sort = match self.sort_key {
+            SortKey::Cpu => "cpu",
+            SortKey::Memory => "memory",
+            SortKey::Pid => "pid",
+            SortKey::Name => "name",
+        };
+        let order = match self.sort_order {
+            SortOrder::Ascending => "ascending",
+            SortOrder::Descending => "descending",
+        };
+        let mut values = std::collections::BTreeMap::from([
+            ("view".into(), view.into()),
+            ("sort".into(), sort.into()),
+            ("order".into(), order.into()),
+        ]);
+        if let Some(filter) = &self.filter {
+            values.insert("filter".into(), filter.clone());
+        }
+        rimeterm_config::memory_state::PaneState { values }
+    }
+
+    pub(crate) fn restore_state(&mut self, state: &rimeterm_config::memory_state::PaneState) {
+        self.view = match state.values.get("view").map(String::as_str) {
+            Some("processes") => SysmonView::Processes,
+            _ => SysmonView::Overview,
+        };
+        self.sort_key = match state.values.get("sort").map(String::as_str) {
+            Some("memory") => SortKey::Memory,
+            Some("pid") => SortKey::Pid,
+            Some("name") => SortKey::Name,
+            _ => SortKey::Cpu,
+        };
+        self.sort_order = match state.values.get("order").map(String::as_str) {
+            Some("ascending") => SortOrder::Ascending,
+            _ => SortOrder::Descending,
+        };
+        self.filter = state
+            .values
+            .get("filter")
+            .filter(|value| !value.is_empty())
+            .cloned();
+        self.process_cursor = 0;
+        self.modal = Modal::None;
+    }
 }
 
 impl Default for SysmonPane {
@@ -1535,5 +1585,25 @@ mod tests {
             pane.render(f.area(), f, &ctx());
         })
         .expect("processes view must not panic");
+    }
+    #[test]
+    fn stable_state_round_trips_without_process_cursor_or_modal() {
+        let mut source = SysmonPane::new();
+        source.view = SysmonView::Processes;
+        source.sort_key = SortKey::Name;
+        source.sort_order = SortOrder::Ascending;
+        source.filter = Some("cargo".into());
+        source.process_cursor = 9;
+        let state = source.snapshot_state();
+
+        let mut restored = SysmonPane::new();
+        restored.restore_state(&state);
+
+        assert_eq!(restored.view, SysmonView::Processes);
+        assert_eq!(restored.sort_key, SortKey::Name);
+        assert_eq!(restored.sort_order, SortOrder::Ascending);
+        assert_eq!(restored.filter.as_deref(), Some("cargo"));
+        assert_eq!(restored.process_cursor, 0);
+        assert_eq!(restored.modal, Modal::None);
     }
 }

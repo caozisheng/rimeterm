@@ -35,6 +35,8 @@ pub enum SettingsTab {
     /// entries — no admin needed); other platforms render a
     /// "not supported" notice.
     Integration,
+    /// Global remembered-state categories shared by every workspace.
+    Memory,
 }
 
 impl Default for SettingsTab {
@@ -78,6 +80,7 @@ pub enum SettingsAction {
     /// avoids re-implementing normalize / anchor rules on the App
     /// side.
     SetLeftTabsState(rimeterm_config::left_tabs_state::LeftTabsState),
+    SetMemoryPolicy(rimeterm_config::memory_state::MemoryPolicy),
     Refresh,
     Close,
 }
@@ -119,6 +122,8 @@ pub struct SettingsState {
     /// (harmless fallback, but should not happen — App seeds every
     /// catalog entry).
     pub left_tab_labels: std::collections::HashMap<String, String>,
+    /// Live copy of the global remembered-state policy.
+    pub memory_policy: rimeterm_config::memory_state::MemoryPolicy,
 }
 
 impl Default for SettingsState {
@@ -135,6 +140,7 @@ impl Default for SettingsState {
             integration_installed: None,
             left_tabs_state: rimeterm_config::left_tabs_state::LeftTabsState::default(),
             left_tab_labels: std::collections::HashMap::new(),
+            memory_policy: rimeterm_config::memory_state::MemoryPolicy::default(),
         }
     }
 }
@@ -202,6 +208,10 @@ impl SettingsState {
         self.left_tab_labels = labels;
     }
 
+    pub fn set_memory_policy(&mut self, policy: rimeterm_config::memory_state::MemoryPolicy) {
+        self.memory_policy = policy;
+    }
+
     fn row_count(&self) -> usize {
         match self.tab {
             SettingsTab::Agents => self.agents.len(),
@@ -218,6 +228,7 @@ impl SettingsState {
                     0
                 }
             }
+            SettingsTab::Memory => MEMORY_LABELS.len(),
         }
     }
 
@@ -314,6 +325,11 @@ impl SettingsState {
         }
     }
 
+    fn toggle_memory_at_cursor(&mut self) -> Option<SettingsAction> {
+        toggle_memory_policy(&mut self.memory_policy, self.cursor)?;
+        Some(SettingsAction::SetMemoryPolicy(self.memory_policy.clone()))
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<SettingsAction> {
         use crossterm::event::KeyModifiers;
         if !self.open {
@@ -337,27 +353,32 @@ impl SettingsState {
                 _ => {}
             }
         }
+        if self.tab == SettingsTab::Memory && key.code == KeyCode::Char(' ') {
+            return self.toggle_memory_at_cursor();
+        }
         match key.code {
             KeyCode::Esc => Some(SettingsAction::Close),
             KeyCode::Tab => {
-                // Cycle Agents → Viewer → Shell → Tabs → Integration → Agents.
+                // Cycle through every Settings section.
                 self.tab = match self.tab {
                     SettingsTab::Agents => SettingsTab::Viewer,
                     SettingsTab::Viewer => SettingsTab::Shell,
                     SettingsTab::Shell => SettingsTab::Tabs,
                     SettingsTab::Tabs => SettingsTab::Integration,
-                    SettingsTab::Integration => SettingsTab::Agents,
+                    SettingsTab::Integration => SettingsTab::Memory,
+                    SettingsTab::Memory => SettingsTab::Agents,
                 };
                 self.reset_cursor_for_tab();
                 None
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.tab = match self.tab {
-                    SettingsTab::Agents => SettingsTab::Integration,
+                    SettingsTab::Agents => SettingsTab::Memory,
                     SettingsTab::Viewer => SettingsTab::Agents,
                     SettingsTab::Shell => SettingsTab::Viewer,
                     SettingsTab::Tabs => SettingsTab::Shell,
                     SettingsTab::Integration => SettingsTab::Tabs,
+                    SettingsTab::Memory => SettingsTab::Integration,
                 };
                 self.reset_cursor_for_tab();
                 None
@@ -368,7 +389,8 @@ impl SettingsState {
                     SettingsTab::Viewer => SettingsTab::Shell,
                     SettingsTab::Shell => SettingsTab::Tabs,
                     SettingsTab::Tabs => SettingsTab::Integration,
-                    SettingsTab::Integration => SettingsTab::Agents,
+                    SettingsTab::Integration => SettingsTab::Memory,
+                    SettingsTab::Memory => SettingsTab::Agents,
                 };
                 self.reset_cursor_for_tab();
                 None
@@ -420,6 +442,7 @@ impl SettingsState {
                     _ => None,
                 }
             }
+            SettingsTab::Memory => self.toggle_memory_at_cursor(),
         }
     }
 
@@ -461,6 +484,7 @@ impl SettingsState {
                     0
                 }
             }
+            SettingsTab::Memory => 0,
         };
     }
 
@@ -495,9 +519,7 @@ impl SettingsState {
             height,
         };
         Clear.render(popup, buf);
-        let block = Block::default()
-            .title(" Settings · Agents / Viewer / Shell / Tabs / Integration ")
-            .borders(Borders::ALL);
+        let block = Block::default().title(" Settings ").borders(Borders::ALL);
         let inner = block.inner(popup);
         block.render(popup, buf);
 
@@ -521,8 +543,13 @@ impl SettingsState {
                 " Integration ",
                 tab_style(self.tab == SettingsTab::Integration, accent),
             ),
+            Span::raw("  "),
             Span::styled(
-                "   [Tab] switch · [r] refresh",
+                " Memory ",
+                tab_style(self.tab == SettingsTab::Memory, accent),
+            ),
+            Span::styled(
+                "   [Tab] switch",
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ]);
@@ -665,6 +692,23 @@ impl SettingsState {
                     ));
                 }
             }
+            SettingsTab::Memory => {
+                lines.push(Line::styled(
+                    " ↑/↓ select · [Space/Enter] remember on next launch",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                for (idx, label) in MEMORY_LABELS.iter().enumerate() {
+                    let checkbox = if memory_policy_value(&self.memory_policy, idx) {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    };
+                    lines.push(Line::styled(
+                        format!("  {checkbox} {label}"),
+                        row_style(idx == self.cursor),
+                    ));
+                }
+            }
         }
         if let Some(busy) = &self.busy {
             lines.push(Line::styled(
@@ -708,6 +752,71 @@ impl SettingsState {
             lines.push(Line::styled(text, row_style(offset + idx == self.cursor)));
         }
     }
+}
+
+const MEMORY_LABELS: [&str; 15] = [
+    "Last workspace directory",
+    "Pane sizes",
+    "Tab visibility and order",
+    "Active tab in each group",
+    "Agent tabs",
+    "Shell tabs",
+    "Files settings",
+    "Git settings",
+    "Todo settings",
+    "Fast Resume settings",
+    "Sysmon settings",
+    "Agtop settings",
+    "Models settings",
+    "Stock settings",
+    "Zones settings",
+];
+
+fn memory_policy_value(policy: &rimeterm_config::memory_state::MemoryPolicy, index: usize) -> bool {
+    match index {
+        0 => policy.last_workspace,
+        1 => policy.pane_sizes,
+        2 => policy.tab_layout,
+        3 => policy.active_tabs,
+        4 => policy.agent_tabs,
+        5 => policy.shell_tabs,
+        6 => policy.files,
+        7 => policy.git,
+        8 => policy.todo,
+        9 => policy.fast_resume,
+        10 => policy.sysmon,
+        11 => policy.agtop,
+        12 => policy.models,
+        13 => policy.stock,
+        14 => policy.zones,
+        _ => false,
+    }
+}
+
+fn toggle_memory_policy(
+    policy: &mut rimeterm_config::memory_state::MemoryPolicy,
+    index: usize,
+) -> Option<()> {
+    let value = match index {
+        0 => &mut policy.last_workspace,
+        1 => &mut policy.pane_sizes,
+        2 => &mut policy.tab_layout,
+        3 => &mut policy.active_tabs,
+        4 => &mut policy.agent_tabs,
+        5 => &mut policy.shell_tabs,
+        6 => &mut policy.files,
+        7 => &mut policy.git,
+        8 => &mut policy.todo,
+        9 => &mut policy.fast_resume,
+        10 => &mut policy.sysmon,
+        11 => &mut policy.agtop,
+        12 => &mut policy.models,
+        13 => &mut policy.stock,
+        14 => &mut policy.zones,
+        _ => return None,
+    };
+    *value = !*value;
+    Some(())
 }
 
 fn is_anchor(group: LeftGroup, id: &str) -> bool {
@@ -775,7 +884,7 @@ mod tests {
 
     #[test]
     fn tab_cycle_visits_every_tab() {
-        // Agents → Viewer → Shell → Tabs → Integration → Agents
+        // Agents → Viewer → Shell → Tabs → Integration → Memory → Agents
         let mut state = SettingsState::default();
         state.open = true;
         assert_eq!(state.tab, SettingsTab::Agents);
@@ -788,16 +897,18 @@ mod tests {
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Integration);
         state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Memory);
+        state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Agents);
     }
 
     #[test]
-    fn left_arrow_wraps_from_agents_to_integration() {
+    fn left_arrow_wraps_from_agents_to_memory() {
         let mut state = SettingsState::default();
         state.open = true;
         assert_eq!(state.tab, SettingsTab::Agents);
         state.handle_key(key(KeyCode::Char('h')));
-        assert_eq!(state.tab, SettingsTab::Integration);
+        assert_eq!(state.tab, SettingsTab::Memory);
     }
 
     #[test]
@@ -1039,5 +1150,84 @@ mod tests {
         state.cursor = 2; // Last row in top group (fr).
         state.handle_key(key(KeyCode::Down));
         assert_eq!(state.cursor, 3); // First row of bottom group (git anchor).
+    }
+    #[test]
+    fn memory_tab_participates_in_navigation_cycle() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Integration;
+
+        state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Memory);
+        state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Agents);
+    }
+
+    #[test]
+    fn memory_panel_has_one_row_per_policy_category() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Memory;
+
+        assert_eq!(state.row_count(), 15);
+    }
+
+    #[test]
+    fn memory_panel_space_toggles_selected_category() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Memory;
+        state.cursor = 1;
+
+        let action = state.handle_key(key(KeyCode::Char(' ')));
+
+        match action {
+            Some(SettingsAction::SetMemoryPolicy(policy)) => {
+                assert!(!policy.pane_sizes);
+                assert!(policy.last_workspace);
+            }
+            other => panic!("expected SetMemoryPolicy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_panel_enter_toggles_selected_category() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Memory;
+        state.cursor = 14;
+
+        let action = state.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            Some(SettingsAction::SetMemoryPolicy(policy)) if !policy.zones
+        ));
+    }
+    #[test]
+    fn memory_panel_renders_all_categories_in_normal_popup() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Memory;
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buffer = Buffer::empty(area);
+
+        state.render(area, &mut buffer);
+
+        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("Last workspace directory"));
+        assert!(rendered.contains("Zones settings"));
+        assert!(rendered.contains("Memory"));
+    }
+
+    #[test]
+    fn memory_panel_small_terminal_does_not_panic() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Memory;
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buffer = Buffer::empty(area);
+
+        state.render(area, &mut buffer);
     }
 }

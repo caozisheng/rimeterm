@@ -334,6 +334,28 @@ impl StockPane {
         )
     }
 
+    pub(crate) fn snapshot_state(&self) -> rimeterm_config::memory_state::PaneState {
+        let market = match self.focused_market() {
+            Market::AShare => "a_share",
+            Market::HongKong => "hong_kong",
+            Market::Us => "us",
+        };
+        rimeterm_config::memory_state::PaneState {
+            values: std::collections::BTreeMap::from([("market".into(), market.into())]),
+        }
+    }
+
+    pub(crate) fn restore_state(&mut self, state: &rimeterm_config::memory_state::PaneState) {
+        let market = match state.values.get("market").map(String::as_str) {
+            Some("hong_kong") => Market::HongKong,
+            Some("us") => Market::Us,
+            _ => Market::AShare,
+        };
+        self.focus_market(market);
+        self.view = View::List;
+        self.modal = Modal::None;
+    }
+
     fn on_search_key(&mut self, key: KeyEvent) -> bool {
         let mut query = None;
         let mut add = None;
@@ -1517,6 +1539,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stable_state_restores_market_by_id_not_cursor() {
+        let mut source = pane();
+        source.focused = 2;
+        let state = source.snapshot_state();
+
+        let mut restored = pane();
+        restored.restore_state(&state);
+
+        assert_eq!(restored.focused_market(), Market::Us);
+        assert!(matches!(restored.view, View::List));
+        assert!(matches!(restored.modal, Modal::None));
+    }
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
         buffer
             .content()

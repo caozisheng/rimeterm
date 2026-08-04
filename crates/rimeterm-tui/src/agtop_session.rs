@@ -1217,13 +1217,16 @@ mod tests {
     /// session show up as `tokens: —` on Windows.
     #[test]
     fn enrich_claude_end_to_end_populates_tokens_and_model() {
+        let _guard = rimeterm_config::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = TempDir::new().unwrap();
         // `user_home_dir()` respects `RIMETERM_HOME` via
         // `rimeterm-config::paths` — we shadow $HOME for the test so
         // the enricher scans our fixture tree instead of the real
         // one.
         let prev_home = std::env::var("RIMETERM_HOME").ok();
-        // SAFETY: single-threaded test; we restore below.
+        // SAFETY: serialized by ENV_LOCK and restored below.
         unsafe {
             std::env::set_var("RIMETERM_HOME", dir.path());
         }

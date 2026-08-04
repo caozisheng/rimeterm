@@ -484,6 +484,27 @@ impl FrPane {
             blit_buffer(&cache.buf, frame.buffer_mut(), (area.x, area.y));
         }
     }
+
+    pub(crate) fn snapshot_state(&self) -> rimeterm_config::memory_state::PaneState {
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("query".into(), self.state.query.clone());
+        if let Some(agent) = &self.state.agent_filter {
+            values.insert("agent".into(), agent.clone());
+        }
+        rimeterm_config::memory_state::PaneState { values }
+    }
+
+    pub(crate) fn restore_state(&mut self, state: &rimeterm_config::memory_state::PaneState) {
+        self.state.query = state.values.get("query").cloned().unwrap_or_default();
+        self.state.cursor = self.state.query.chars().count();
+        self.state.agent_filter = state
+            .values
+            .get("agent")
+            .filter(|agent| AGENT_ORDER.contains(&agent.as_str()))
+            .cloned();
+        self.state.request_search();
+        self.send_search();
+    }
 }
 
 impl PaneProvider for FrPane {
@@ -497,6 +518,14 @@ impl PaneProvider for FrPane {
 
     fn caps(&self) -> PaneCaps {
         PaneCaps::default()
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 
     fn render(
@@ -1077,5 +1106,20 @@ mod tests {
     #[test]
     fn wide_pane_places_results_beside_preview() {
         assert_eq!(FrState::split_axis(100), SplitAxis::Horizontal);
+    }
+    #[test]
+    fn stable_state_restores_query_and_agent_filter() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut source = FrPane::new(tx.clone());
+        source.state.query = "resume work".into();
+        source.state.agent_filter = Some(AGENT_ORDER[0].into());
+        let state = source.snapshot_state();
+
+        let mut restored = FrPane::new(tx);
+        restored.restore_state(&state);
+
+        assert_eq!(restored.state.query, "resume work");
+        assert_eq!(restored.state.agent_filter.as_deref(), Some(AGENT_ORDER[0]));
+        assert_eq!(restored.state.cursor, "resume work".chars().count());
     }
 }

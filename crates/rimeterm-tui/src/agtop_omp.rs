@@ -799,9 +799,12 @@ mod tests {
     /// tokens/cost show as `—` for real omp sessions.
     #[test]
     fn enrich_omp_end_to_end_populates_tokens_model_and_cost() {
+        let _guard = rimeterm_config::test_util::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = TempDir::new().unwrap();
         let prev_home = std::env::var("RIMETERM_HOME").ok();
-        // SAFETY: single-threaded test; restored below.
+        // SAFETY: serialized by ENV_LOCK and restored below.
         unsafe {
             std::env::set_var("RIMETERM_HOME", dir.path());
         }

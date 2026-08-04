@@ -92,6 +92,11 @@ impl EmbeddedApp {
         &self.app
     }
 
+    /// Mutable access for host-owned state restoration.
+    pub fn app_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
+
     /// Explicit archive path supplied at construction.
     pub fn archive_path(&self) -> &Path {
         &self.archive_path

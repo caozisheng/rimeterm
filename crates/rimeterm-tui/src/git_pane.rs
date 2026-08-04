@@ -307,6 +307,25 @@ impl GitPane {
             Focus::Detail => self.scroll_detail(down),
         }
     }
+
+    pub(crate) fn snapshot_state(&self) -> rimeterm_config::memory_state::PaneState {
+        let focus = match self.focus {
+            Focus::Commits | Focus::Detail => "commits",
+            Focus::Changes | Focus::Diff => "changes",
+        };
+        rimeterm_config::memory_state::PaneState {
+            values: std::collections::BTreeMap::from([("focus".into(), focus.into())]),
+        }
+    }
+
+    pub(crate) fn restore_state(&mut self, state: &rimeterm_config::memory_state::PaneState) {
+        self.focus = match state.values.get("focus").map(String::as_str) {
+            Some("commits") => Focus::Commits,
+            _ => Focus::Changes,
+        };
+        self.diff = None;
+        self.detail = None;
+    }
 }
 
 impl PaneProvider for GitPane {
@@ -1506,5 +1525,18 @@ mod tests {
         })
         .unwrap();
         assert_eq!(pane.commits_list_state.selected(), Some(30));
+    }
+    #[test]
+    fn stable_state_restores_list_focus_without_overlay() {
+        let mut source = seeded_pane();
+        source.focus = Focus::Detail;
+        let state = source.snapshot_state();
+
+        let mut restored = seeded_pane();
+        restored.restore_state(&state);
+
+        assert_eq!(restored.focus, Focus::Commits);
+        assert!(restored.detail.is_none());
+        assert!(restored.diff.is_none());
     }
 }

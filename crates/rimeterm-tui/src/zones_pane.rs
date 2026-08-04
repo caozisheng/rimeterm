@@ -267,6 +267,27 @@ impl ZonesPane {
         }
         true
     }
+
+    pub(crate) fn snapshot_state(&self) -> rimeterm_config::memory_state::PaneState {
+        let mut values = std::collections::BTreeMap::new();
+        if let Some(entry) = self.list.entries.get(self.selected) {
+            values.insert("selected_zone".into(), entry.input.clone());
+        }
+        rimeterm_config::memory_state::PaneState { values }
+    }
+
+    pub(crate) fn restore_state(&mut self, state: &rimeterm_config::memory_state::PaneState) {
+        if let Some(input) = state.values.get("selected_zone")
+            && let Some(index) = self
+                .list
+                .entries
+                .iter()
+                .position(|entry| &entry.input == input)
+        {
+            self.selected = index;
+        }
+        self.modal = Modal::None;
+    }
 }
 
 impl PaneProvider for ZonesPane {
@@ -1315,5 +1336,27 @@ mod tests {
         // 2 markers, not 3 — the duplicate Shanghai row was dropped.
         assert_eq!(markers.len(), 2);
         assert_eq!(markers.iter().filter(|m| m.is_home).count(), 1);
+    }
+    #[test]
+    fn stable_state_restores_zone_by_input_not_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = ZonesPane::new(ZonesConfig::default(), dir.path().join("source.toml"));
+        source.list = ZoneList {
+            entries: vec![ZoneEntry::new("UTC"), ZoneEntry::new("Europe/London")],
+        };
+        source.selected = 1;
+        let state = source.snapshot_state();
+
+        let mut restored = ZonesPane::new(ZonesConfig::default(), dir.path().join("restored.toml"));
+        restored.list = ZoneList {
+            entries: vec![ZoneEntry::new("Europe/London"), ZoneEntry::new("UTC")],
+        };
+        restored.restore_state(&state);
+
+        assert_eq!(restored.selected, 0);
+        assert_eq!(
+            restored.list.entries[restored.selected].input,
+            "Europe/London"
+        );
     }
 }

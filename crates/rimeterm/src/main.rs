@@ -27,7 +27,8 @@ use tracing_subscriber::EnvFilter;
 fn main() -> Result<()> {
     init_tracing();
 
-    let workspace_root = resolve_workspace_root()?;
+    let memory = load_global_memory();
+    let workspace_root = resolve_workspace_root(&memory)?;
     let config = load_config(&workspace_root)?;
 
     // C21.5: materialize bundled configs (yazi bridge + all seeds) into
@@ -86,7 +87,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let app = App::new(workspace_root, config)?;
+        let app = App::new(workspace_root, config, memory)?;
         app.run().await
     })
 }
@@ -99,8 +100,8 @@ fn main() -> Result<()> {
 ///    when Explorer spawns the process with a CWD elsewhere (the
 ///    `Directory` verb runs from `%SystemRoot%\System32`). Kept
 ///    explicit and first so right-click launches always win.
-/// 2. `last_workspace` persisted in `~/.rimeterm/data/session.state.toml`
-///    from the previous shutdown, when the directory still exists.
+/// 2. `last_workspace` enabled in `~/.rimeterm/data/memory.toml` and stored
+///    in the shared `~/.rimeterm/data/ui.state.toml`.
 /// 3. The user home directory (`~`). Installed-binary launches
 ///    (Start Menu / Spotlight / Dock) inherit the install directory
 ///    as CWD, which is useless — home is a saner "first launch"
@@ -111,7 +112,7 @@ fn main() -> Result<()> {
 /// Non-existent / non-directory candidates fall through to the next
 /// step, so a fat-fingered CLI arg or a since-deleted persisted path
 /// still boots cleanly.
-fn resolve_workspace_root() -> Result<PathBuf> {
+fn resolve_workspace_root(memory: &rimeterm_config::memory_state::MemoryState) -> Result<PathBuf> {
     if let Some(arg) = std::env::args_os().nth(1) {
         let candidate = PathBuf::from(&arg);
         if candidate.is_dir() {
@@ -120,17 +121,22 @@ fn resolve_workspace_root() -> Result<PathBuf> {
             return Ok(canonicalize_workspace_root(candidate));
         }
     }
-    if let Some(path) = rimeterm_config::session_state::session_state_file() {
-        match rimeterm_config::session_state::SessionState::load_or_default(&path) {
-            Ok(state) => {
-                if let Some(last) = state.last_workspace
-                    && last.is_dir()
-                {
-                    return Ok(canonicalize_workspace_root(last));
-                }
-            }
-            Err(err) => tracing::warn!(error = %err, "failed to load session state"),
-        }
+    if let Some(last) = &memory.ui.last_workspace
+        && last.is_dir()
+    {
+        return Ok(canonicalize_workspace_root(last.clone()));
+    }
+    // One-time compatibility for installs that predate memory.toml. Once the
+    // policy file exists, disabled last-workspace memory must not be bypassed.
+    let has_policy = rimeterm_config::memory_state::default_memory_policy_file()
+        .is_some_and(|path| path.exists());
+    if !has_policy
+        && let Some(path) = rimeterm_config::session_state::session_state_file()
+        && let Ok(state) = rimeterm_config::session_state::SessionState::load_or_default(&path)
+        && let Some(last) = state.last_workspace
+        && last.is_dir()
+    {
+        return Ok(canonicalize_workspace_root(last));
     }
     if let Some(home) = rimeterm_config::paths::user_home_dir()
         && home.is_dir()
@@ -138,6 +144,16 @@ fn resolve_workspace_root() -> Result<PathBuf> {
         return Ok(canonicalize_workspace_root(home));
     }
     Ok(std::env::current_dir()?)
+}
+
+fn load_global_memory() -> rimeterm_config::memory_state::MemoryState {
+    match rimeterm_config::memory_state::MemoryState::load() {
+        Ok(memory) => memory,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to load global UI memory; using defaults");
+            rimeterm_config::memory_state::MemoryState::default()
+        }
+    }
 }
 
 fn canonicalize_workspace_root(candidate: PathBuf) -> PathBuf {
