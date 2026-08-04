@@ -59,6 +59,8 @@ use crate::agtop_worker::AgtopWorker;
 /// Poll cadence. 1500 ms matches upstream `agtop`'s default
 /// `--interval`.
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(1500);
+const KEY_HINTS: &str =
+    " j/k move · Enter details · / filter · c/m/t/$ sort · Tab order · r refresh ";
 
 /// Modal state — either nothing, a live filter-entry, or the detail
 /// popup pinned to a pid. Kill is deliberately absent (agents are
@@ -261,6 +263,7 @@ impl PaneProvider for AgtopPane {
         let title = format_title(&self.snapshot, self.sort_key, self.sort_order);
         let block = Block::default()
             .title(title)
+            .title_bottom(Line::styled(KEY_HINTS, border_style))
             .borders(Borders::ALL)
             .border_style(border_style);
         let inner = block.inner(area);
@@ -1481,6 +1484,27 @@ mod tests {
     }
 
     #[test]
+    fn render_shows_primary_key_hints_on_bottom_border() {
+        let mut pane = AgtopPane::new();
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                pane.render(area, frame, &ctx());
+            })
+            .unwrap();
+
+        let rendered = buf_string(&terminal);
+        let bottom_border = rendered.lines().last().unwrap();
+        assert!(bottom_border.contains("j/k move"), "{bottom_border}");
+        assert!(bottom_border.contains("Enter details"), "{bottom_border}");
+        assert!(bottom_border.contains("/ filter"), "{bottom_border}");
+        assert!(bottom_border.contains("c/m/t/$ sort"), "{bottom_border}");
+        assert!(bottom_border.contains("Tab order"), "{bottom_border}");
+        assert!(bottom_border.contains("r refresh"), "{bottom_border}");
+    }
+
+    #[test]
     fn render_with_agents_shows_labels_and_tokens() {
         let mut pane = AgtopPane::new();
         let mut a = agent("claude", 111, 25.0, 128 * 1024 * 1024, 3660);
@@ -1841,7 +1865,10 @@ mod tests {
         assert!(!rendered.contains("cost"), "cost chip leaked: {rendered}");
         // "tokens" appears in the TOKENS column header too, so we
         // only assert the value doesn't render (dash placeholder).
-        assert!(!rendered.contains("$"), "cost value leaked: {rendered}");
+        let content = rendered
+            .rsplit_once('\n')
+            .map_or(rendered.as_str(), |(body, _)| body);
+        assert!(!content.contains('$'), "cost value leaked: {rendered}");
     }
 
     #[test]
@@ -1916,8 +1943,11 @@ mod tests {
 
         assert!(rendered.contains("COST"));
         // No dollar figure — cost renders as the em-dash placeholder.
+        let content = rendered
+            .rsplit_once('\n')
+            .map_or(rendered.as_str(), |(body, _)| body);
         assert!(
-            !rendered.contains('$'),
+            !content.contains('$'),
             "zero-cost row must not render a dollar figure: {rendered}"
         );
     }
