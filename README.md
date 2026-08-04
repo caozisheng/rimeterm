@@ -70,7 +70,7 @@ external-edit detection, completion, filtering, recurrence, and archival.
 
 ## Install
 
-Grab the archive for your platform from the [latest release] — MSI on Windows, `.deb` on Debian/Ubuntu, `.pkg` on macOS, or a plain `.tar.gz`/`.zip` extractable anywhere. Nothing else ships alongside — a single `rimeterm` + `rimectl` binary is the entire payload.
+Grab the installer for your platform from the [latest release] — MSI on Windows, `.deb` on Debian/Ubuntu, or a `.dmg` on macOS (Apple Silicon). Nothing else ships alongside — a single `rimeterm` + `rimectl` binary is the entire payload.
 
 From source:
 
