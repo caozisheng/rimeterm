@@ -299,15 +299,18 @@ pub(crate) fn encode_cwd_variants(cwd: &str, home: &Path) -> Vec<String> {
         }
 
         // Sha form — hash the full cwd with `\` normalised to `/`
-        // (omp v0.74 hashes the forward-slash representation).
+        // (omp v0.74 hashes the forward-slash representation). We
+        // MUST derive the basename from this same forward-slash form:
+        // `std::path::Path::file_name` uses the host OS separator,
+        // so on POSIX a Windows-style `C:\…\rimeterm` would look
+        // like a single component and the basename would round-trip
+        // as the whole path. Trailing separators were already
+        // stripped by the `trim_end_matches` at the top of the fn.
         let for_hash: String = src
             .chars()
             .map(|c| if c == '\\' { '/' } else { c })
             .collect();
-        let basename = std::path::Path::new(src)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let basename: String = for_hash.rsplit('/').next().unwrap_or("").to_string();
         if !basename.is_empty() {
             use sha2::{Digest, Sha256};
             let hex = format!("{:x}", Sha256::digest(for_hash.as_bytes()));
