@@ -41,14 +41,20 @@ pub fn build_line<'a>(task: &'a Task, opts: RowOpts<'a>, theme: &Theme) -> Line<
     }
 
     // status glyph + priority box
-    let glyph = if task.done {
-        "✓ "
-    } else if opts.cursor {
+    let glyph = if opts.cursor {
         "▸ "
+    } else if task.done {
+        "✓ "
     } else {
         "  "
     };
-    let glyph_color = if task.done { theme.done } else { theme.accent };
+    let glyph_color = if opts.cursor {
+        theme.accent
+    } else if task.done {
+        theme.done
+    } else {
+        theme.accent
+    };
     let mut glyph_style = Style::default().fg(glyph_color);
     if opts.cursor {
         glyph_style = glyph_style.add_modifier(Modifier::BOLD);
@@ -474,6 +480,25 @@ mod tests {
             body_text("Call dentist uid:abc @phone +health", &[]),
             "Call dentist uid:abc @phone +health",
         );
+    }
+    #[test]
+    fn completed_task_under_cursor_keeps_cursor_arrow() {
+        let task = parse_line("x completed task").unwrap();
+        let opts = RowOpts {
+            idx_label: 0,
+            cursor: true,
+            multi_mode: false,
+            multi_checked: false,
+            selected: false,
+            show_line_num: false,
+            match_term: None,
+            today: "2026-05-06",
+            hidden_keys: &[],
+        };
+
+        let line = build_line(&task, opts, &MUTED);
+
+        assert_eq!(line.spans[0].content.as_ref(), "▸ ");
     }
 
     #[test]
