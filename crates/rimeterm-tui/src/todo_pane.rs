@@ -1,16 +1,15 @@
 //! Native adapter for the embedded Tuxedo todo.txt application.
 
+use crossterm::event::{KeyEvent, MouseEvent};
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
 use std::any::Any;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-use crossterm::event::KeyEvent;
-use ratatui::Frame;
-use ratatui::layout::Rect;
-use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
 use tokio::sync::mpsc;
-use tuxedo::embed::{EmbeddedApp, EmbeddedOutcome};
+use tuxedo::embed::{EmbeddedApp, EmbeddedFeatures, EmbeddedOutcome};
 use tuxedo::theme::Theme as TuxedoTheme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +65,6 @@ impl TodoPane {
     pub fn set_theme(&mut self, theme: rimeterm_markdown::Theme) {
         self.theme = theme;
     }
-
     fn retry_load(&mut self) {
         self.state = load_embedded(&self.todo_path, &self.archive_path);
     }
@@ -130,10 +128,14 @@ fn load_embedded(todo_path: &Path, archive_path: &Path) -> TodoState {
             return TodoState::Error(format!("failed to read {}: {error}", todo_path.display()));
         }
     };
-    TodoState::Ready(EmbeddedApp::new(
+    TodoState::Ready(EmbeddedApp::with_features(
         todo_path.to_path_buf(),
         archive_path.to_path_buf(),
         body,
+        EmbeddedFeatures {
+            clipboard: true,
+            ..EmbeddedFeatures::default()
+        },
     ))
 }
 
@@ -232,6 +234,21 @@ impl PaneProvider for TodoPane {
             let _ = self.action_tx.send(TodoAction::ExitRequested);
         }
         true
+    }
+
+    fn on_mouse(&mut self, event: MouseEvent, outer: Rect) -> bool {
+        let TodoState::Ready(app) = &mut self.state else {
+            return false;
+        };
+        app.on_mouse(event, outer)
+    }
+
+    fn scrollbar_dragging(&self) -> bool {
+        matches!(&self.state, TodoState::Ready(app) if app.scrollbar_dragging())
+    }
+
+    fn wants_mouse_priority(&self, _shift_held: bool) -> bool {
+        matches!(&self.state, TodoState::Ready(_))
     }
     fn poll_background(&mut self) -> bool {
         if Instant::now() < self.next_poll {

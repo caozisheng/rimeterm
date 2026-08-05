@@ -106,7 +106,6 @@ pub fn draw_in(frame: &mut Frame, area: Rect, app: &mut App, theme: &crate::them
     if let Some(ra) = right_area {
         detail::render(frame, ra, app);
     }
-
     if app.prefs.layout.status_bar {
         if app.mode == Mode::Search {
             status::render_command_line(frame, bottom_area, app);
@@ -240,6 +239,21 @@ pub(crate) fn keep_cursor_visible(
     new.min(max_offset).min(usize::from(u16::MAX)) as u16
 }
 
+pub(crate) fn scroll_offset_for_drag(
+    track_len: u16,
+    content_len: usize,
+    viewport_len: u16,
+    track_position: u16,
+) -> u16 {
+    let max_offset = content_len.saturating_sub(usize::from(viewport_len));
+    if max_offset == 0 || track_len == 0 {
+        return 0;
+    }
+    let position = usize::from(track_position.min(track_len.saturating_sub(1)));
+    ((position * max_offset) / usize::from(track_len.saturating_sub(1))).min(usize::from(u16::MAX))
+        as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::keep_cursor_visible;
@@ -278,5 +292,18 @@ mod tests {
     fn handles_degenerate_inputs() {
         assert_eq!(keep_cursor_visible(0, None, 0, 100), 0);
         assert_eq!(keep_cursor_visible(0, Some(0), 5, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use super::scroll_offset_for_drag;
+
+    #[test]
+    fn scrollbar_drag_maps_track_position_to_clamped_offset() {
+        assert_eq!(scroll_offset_for_drag(9, 20, 5, 0), 0);
+        assert_eq!(scroll_offset_for_drag(9, 20, 5, 4), 7);
+        assert_eq!(scroll_offset_for_drag(9, 20, 5, 8), 15);
+        assert_eq!(scroll_offset_for_drag(9, 20, 5, 99), 15);
     }
 }

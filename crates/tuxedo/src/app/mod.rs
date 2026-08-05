@@ -11,6 +11,7 @@ use crate::note;
 use crate::serve::{self, ShareInfo};
 use crate::theme::{self, Theme};
 use crate::todo::Task;
+use ratatui::layout::Rect;
 
 mod autocomplete;
 mod bulk;
@@ -44,7 +45,7 @@ pub use draft_overlay::{
 pub use flash::Flash;
 pub use palette::CommandPaletteState;
 pub use prefs::{Layout, Prefs};
-pub use selection::Selection;
+pub use selection::{Selection, TextPoint, TextSelection};
 pub use types::{
     AUTOCOMPLETE_CAP, AddOutcome, Density, FLASH_TTL, Filter, LEADER_WINDOW, Mode, SavedFilter,
     Sort, UNDO_LIMIT, View,
@@ -146,6 +147,11 @@ pub struct App {
     /// view, keyed by `View::idx()`. Updated at render time via `Cell` so the
     /// renderer can keep the cursor row visible without taking `&mut self`.
     pub(crate) view_scroll: [Cell<u16>; 2],
+    pub(crate) text_selection: Option<crate::app::selection::TextSelection>,
+    pub(crate) text_body: Rect,
+    pub(crate) text_lines: Vec<String>,
+    pub(crate) text_scrollbar: Option<Rect>,
+    pub(crate) scrollbar_dragging: bool,
     /// Handle to the in-TUI capture server. `None` until the first time
     /// the user presses `s` (or invokes "show capture QR" from the
     /// palette). Once bound, the entry stays for the rest of the
@@ -205,6 +211,11 @@ impl App {
             filter: Filter::default(),
             draft: DraftState::default(),
             selection: Selection::default(),
+            text_selection: None,
+            text_body: Rect::default(),
+            text_lines: Vec::new(),
+            text_scrollbar: None,
+            scrollbar_dragging: false,
             flash_state: Flash::default(),
             chord: Chord::default(),
             file_path,
@@ -645,7 +656,6 @@ impl App {
     /// Apply a freshly loaded [`Config`] at runtime — used by the hot-reload
     /// watcher. Rebuilds `prefs` and `saved_filters` from the new config
     /// values, then refreshes the visible task cache so theme/density/sort/
-    /// layout changes take effect immediately.
     pub fn reload_config(&mut self, new_cfg: Config) {
         self.prefs = Prefs::from_config(new_cfg.clone());
         self.saved_filters = new_cfg
@@ -659,6 +669,7 @@ impl App {
         self.week_start = new_cfg.week_start.unwrap_or(WeekStart::Sunday);
         self.recompute_visible();
     }
+
     /// Poll todo.txt and the inbox, returning whether visible state or a flash changed.
     pub fn poll_external_changes(&mut self) -> bool {
         let reconcile = self.store.reconcile();
@@ -685,5 +696,106 @@ impl App {
         let report = self.store.drain_inbox();
         self.apply_drain(report);
         matches!(reconcile, Reconcile::Unchanged)
+    }
+}
+impl App {
+    pub(crate) fn set_text_layout(
+        &mut self,
+        body: Rect,
+        lines: Vec<String>,
+        scrollbar: Option<Rect>,
+    ) {
+        self.text_body = body;
+        self.text_lines = lines;
+        self.text_scrollbar = scrollbar;
+    }
+
+    pub(crate) fn text_point_at(&self, x: u16, y: u16) -> Option<crate::app::selection::TextPoint> {
+        if !self.text_body.contains((x, y).into()) {
+            return None;
+        }
+        Some(crate::app::selection::TextPoint {
+            line: usize::from(y.saturating_sub(self.text_body.y))
+                + usize::from(self.view_scroll[self.view.idx()].get()),
+            column: usize::from(x.saturating_sub(self.text_body.x)),
+        })
+    }
+
+    pub(crate) fn begin_text_selection(&mut self, x: u16, y: u16) -> bool {
+        let Some(point) = self.text_point_at(x, y) else {
+            return false;
+        };
+        self.text_selection = Some(crate::app::selection::TextSelection::begin(point));
+        true
+    }
+
+    pub(crate) fn update_text_selection(&mut self, x: u16, y: u16) -> bool {
+        let Some(point) = self.text_point_at(x, y) else {
+            return self
+                .text_selection
+                .is_some_and(|selection| selection.is_dragging());
+        };
+        if let Some(selection) = &mut self.text_selection {
+            selection.update(point);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn finish_text_selection(&mut self) -> bool {
+        if let Some(selection) = &mut self.text_selection {
+            selection.finish();
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn set_scroll_offset(&mut self, offset: u16) {
+        self.view_scroll[self.view.idx()].set(offset);
+    }
+
+    pub(crate) fn text_scrollbar(&self) -> Option<Rect> {
+        self.text_scrollbar
+    }
+    pub(crate) fn scrollbar_dragging(&self) -> bool {
+        self.scrollbar_dragging
+    }
+
+    pub(crate) fn text_selection_active(&self) -> bool {
+        self.text_selection
+            .is_some_and(|selection| !selection.is_empty())
+    }
+
+    pub(crate) fn text_selection_copy(&self) -> Option<String> {
+        self.text_selection
+            .filter(|selection| !selection.is_empty())
+            .map(|selection| selection.extract(&self.text_lines))
+            .filter(|text| !text.is_empty())
+    }
+    pub(crate) fn text_selection_dragging(&self) -> bool {
+        self.text_selection
+            .is_some_and(|selection| selection.is_dragging())
+    }
+    pub(crate) fn text_selection_contains(&self, point: crate::app::selection::TextPoint) -> bool {
+        self.text_selection
+            .is_some_and(|selection| selection.contains(point))
+    }
+
+    pub(crate) fn scroll_by(&mut self, delta: i16) {
+        let max_offset = self
+            .text_lines
+            .len()
+            .saturating_sub(usize::from(self.text_body.height))
+            .min(usize::from(u16::MAX)) as u16;
+        let current = self.view_scroll[self.view.idx()].get();
+        let next = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as u16)
+        };
+        self.view_scroll[self.view.idx()].set(next.min(max_offset));
+    }
+    pub(crate) fn set_scrollbar_dragging(&mut self, dragging: bool) {
+        self.scrollbar_dragging = dragging;
     }
 }

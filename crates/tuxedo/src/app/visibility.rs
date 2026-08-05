@@ -37,6 +37,7 @@ impl App {
     /// Recompute the cached visible-index list and parallel group keys. Call
     /// after any mutation that affects filter/sort/view/tasks/archive.
     pub fn recompute_visible(&mut self) {
+        self.text_selection = None;
         match self.view {
             View::List => self.rebuild_list_cache(),
             View::Archive => self.rebuild_archive_cache(),

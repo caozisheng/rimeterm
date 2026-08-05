@@ -5,9 +5,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+
+use crate::clipboard;
 
 use crate::app::App;
 use crate::config::Config;
@@ -102,8 +104,14 @@ impl EmbeddedApp {
         &self.archive_path
     }
 
-    /// Handle one key without reading terminal events or launching an editor.
     pub fn handle_key(&mut self, key: KeyEvent) -> EmbeddedOutcome {
+        if key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.app.text_selection_active()
+        {
+            self.copy_text_selection();
+            return EmbeddedOutcome::Changed;
+        }
         let features = ControllerFeatures {
             share: self.features.share,
             notes: self.features.notes,
@@ -114,6 +122,85 @@ impl EmbeddedApp {
         match controller::handle_key(&mut self.app, key, &self.keybinds, features) {
             ControllerOutcome::Handled => EmbeddedOutcome::Changed,
             ControllerOutcome::ExitRequested => EmbeddedOutcome::ExitRequested,
+        }
+    }
+
+    pub fn on_mouse(&mut self, event: MouseEvent, _area: Rect) -> bool {
+        let inside = |rect: Rect| rect.contains((event.column, event.row).into());
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(scrollbar) = self.app.text_scrollbar()
+                    && inside(scrollbar)
+                {
+                    self.app.set_scrollbar_dragging(true);
+                    self.update_scrollbar(event.row);
+                    return true;
+                }
+                self.app.begin_text_selection(event.column, event.row)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.app.scrollbar_dragging() {
+                    self.update_scrollbar(event.row);
+                    true
+                } else {
+                    self.app.update_text_selection(event.column, event.row)
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.app.scrollbar_dragging() {
+                    self.app.set_scrollbar_dragging(false);
+                    true
+                } else {
+                    self.app.finish_text_selection()
+                }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                if inside(self.app.text_body) || self.app.text_scrollbar().is_some_and(inside) =>
+            {
+                let delta = if matches!(event.kind, MouseEventKind::ScrollDown) {
+                    3
+                } else {
+                    -3
+                };
+                self.app.scroll_by(delta);
+                true
+            }
+            MouseEventKind::Down(MouseButton::Right)
+                if self.features.clipboard && self.app.text_selection_active() =>
+            {
+                self.copy_text_selection();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn scrollbar_dragging(&self) -> bool {
+        self.app.scrollbar_dragging() || self.app.text_selection_dragging()
+    }
+
+    fn update_scrollbar(&mut self, row: u16) {
+        let Some(scrollbar) = self.app.text_scrollbar() else {
+            return;
+        };
+        let position = row.saturating_sub(scrollbar.y);
+        let total = self.app.text_lines.len();
+        let viewport = self.app.text_body.height;
+        let offset = crate::ui::scroll_offset_for_drag(scrollbar.height, total, viewport, position);
+        self.app.set_scroll_offset(offset);
+    }
+
+    fn copy_text_selection(&mut self) {
+        let Some(text) = self.app.text_selection_copy() else {
+            return;
+        };
+        if !self.features.clipboard {
+            self.app.flash("clipboard unavailable when embedded");
+            return;
+        }
+        match clipboard::copy(&text) {
+            Ok(()) => self.app.flash("copied"),
+            Err(error) => self.app.flash(format!("copy failed: {error}")),
         }
     }
 
@@ -159,7 +246,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
@@ -323,5 +412,129 @@ mod tests {
                 .is_some_and(|msg| msg.starts_with("sort: ")),
             "flash should announce the new sort, not the old embedded gate"
         );
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_drag_selects_rendered_todo_text() {
+        let (todo, done) = paths("mouse-selection");
+        let mut embedded = EmbeddedApp::new(todo, done, "alpha beta\n".into());
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("terminal");
+        terminal
+            .draw(|frame| embedded.render(frame, frame.area(), &theme::MUTED))
+            .expect("render");
+        let body = embedded.app().text_body;
+        assert!(embedded.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), body.x, body.y + 1),
+            body
+        ));
+        assert!(embedded.on_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                body.x + 16,
+                body.y + 1
+            ),
+            body
+        ));
+        assert!(embedded.on_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                body.x + 16,
+                body.y + 1
+            ),
+            body
+        ));
+        assert!(
+            embedded
+                .app()
+                .text_selection_copy()
+                .is_some_and(|text| text.contains("alpha"))
+        );
+    }
+
+    #[test]
+    fn ctrl_c_copies_active_text_selection_before_task_bindings() {
+        let (todo, done) = paths("ctrl-c-selection");
+        std::fs::write(&todo, "alpha beta\n").expect("write todo");
+        let mut embedded = EmbeddedApp::with_features(
+            todo,
+            done,
+            "alpha beta\n".into(),
+            super::EmbeddedFeatures {
+                clipboard: true,
+                ..super::EmbeddedFeatures::default()
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("terminal");
+        terminal
+            .draw(|frame| embedded.render(frame, frame.area(), &theme::MUTED))
+            .expect("render");
+        let body = embedded.app().text_body;
+        embedded.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), body.x, body.y),
+            body,
+        );
+        embedded.on_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), body.x + 16, body.y),
+            body,
+        );
+        embedded.on_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), body.x + 16, body.y),
+            body,
+        );
+        assert!(embedded.app().text_selection_active());
+        let outcome = embedded.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(outcome, EmbeddedOutcome::Changed);
+        assert_eq!(embedded.app().flash_active(), Some("copied"));
+    }
+
+    #[test]
+    fn mouse_dragging_scrollbar_changes_scroll_offset() {
+        let (todo, done) = paths("mouse-scrollbar");
+        let body = (0..40)
+            .map(|i| format!("task-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut embedded = EmbeddedApp::new(todo, done, body);
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("terminal");
+        terminal
+            .draw(|frame| embedded.render(frame, frame.area(), &theme::MUTED))
+            .expect("render");
+        let scrollbar = embedded.app().text_scrollbar().expect("scrollbar");
+        assert!(embedded.on_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                scrollbar.x,
+                scrollbar.bottom() - 1
+            ),
+            scrollbar
+        ));
+        assert!(embedded.scrollbar_dragging());
+        assert!(embedded.on_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                scrollbar.x,
+                scrollbar.bottom() - 1
+            ),
+            scrollbar
+        ));
+        assert!(embedded.on_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                scrollbar.x,
+                scrollbar.bottom() - 1
+            ),
+            scrollbar
+        ));
+        assert!(!embedded.scrollbar_dragging());
+        assert!(embedded.app().view_scroll[embedded.app().view.idx()].get() > 0);
     }
 }
