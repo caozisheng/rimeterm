@@ -2565,6 +2565,14 @@ impl App {
                     .close_button_rect()
                     .is_some_and(|r| point_in_rect(m.column, m.row, r));
             if in_content || sticky || on_close_button {
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                    && should_restore_viewer_focus(self.focus.focused_group())
+                {
+                    // The overlay spans both left groups. Focus the pane below
+                    // the click so live group ownership matches what the user
+                    // clicked, regardless of where Alt+V originally opened it.
+                    self.focus_pane_at(m.column, m.row);
+                }
                 let _ = self.viewer.on_mouse(m);
                 if self.viewer.take_close_request() {
                     self.close_viewer_overlay();
@@ -3411,9 +3419,7 @@ impl App {
         // §C24: the viewer overlay covers the ENTIRE left column
         // (files+git stacked). We paint it AFTER the group loop so
         // it lands on top of yazi and gitui with edges aligned to
-        // the outer left column rect. `render_into_pane` calls
-        // `Clear.render(pane_rect, buf)` first, so any leftover
-        // yazi/gitui glyphs underneath are wiped in the same pass.
+        // the outer left column rect.
         if self.viewer.is_open() {
             let left_col_rect = split_parent_rect(
                 &self.tree,
@@ -3421,16 +3427,17 @@ impl App {
                 &rimeterm_core::layout::SplitPath::root().push(0),
             );
             if let Some(rect) = left_col_rect {
+                let viewer_focused = self.viewer_owns_caret();
                 viewer::render_into_pane(
                     &mut self.viewer,
                     rect,
                     frame.buffer_mut(),
                     self.viewer_picker.as_ref(),
                     self.viewer_markdown_theme,
+                    viewer_focused,
                 );
-                // The pane below the border is what mouse events
-                // route to. Match `render_into_pane`'s inner rect:
-                // one cell inset all around for the border.
+                // The pane below the border is what mouse events route to.
+                // Match render_into_pane's inner rect: one cell inset all around.
                 if rect.width >= 2 && rect.height >= 2 {
                     self.last_viewer_rect = Some(Rect {
                         x: rect.x + 1,
@@ -7056,29 +7063,25 @@ fn should_hijack_right_for_viewer_with_editing(
     selection.is_some()
 }
 
-/// Decide whether an incoming key should dismiss the currently-open
-/// viewer overlay.
-///
-/// Rule: bare `←` and `Esc` close the overlay UNLESS the focused pane
-/// is a PTY that would consume the key for its own line editing —
-/// i.e. focus is on the agents or shells group. When focus is on the
-/// files/git column, on no pane at all, or anywhere else, the overlay
-/// is the natural target for the dismiss chord and should close.
-///
-/// Mirrors the `→ = open` gate in
-/// [`should_hijack_right_for_viewer_with_editing`]: `→` is the
-/// symmetric "open" affordance from the file manager, `←`/`Esc` is the
-/// symmetric "close" affordance from anywhere that isn't actively
-/// swallowing the key. Global dismissals also stay available via
-/// `Alt+V`, the `[×]` mouse affordance, and the `viewer.close`
-/// command.
-///
-/// Any modifier (`Ctrl` / `Alt` / `Shift`) falls through so global
-/// chords such as `Alt+HJKL` and `Ctrl+Q` still work; the modifier
-/// filter matches the sibling right-arrow rule.
-///
-/// Pure — no `App` / focus / filesystem access, so the routing logic
-/// is unit-testable without spinning up a live App.
+/// Whether a viewer click must reclaim focus from the right column.
+/// Files and git already confer viewer ownership; every other focus state
+/// needs a pane hit-test before the viewer handles the click.
+fn should_restore_viewer_focus(focused_group: Option<TabGroupId>) -> bool {
+    !matches!(focused_group, Some(g) if g == BUILTIN_FILES || g == BUILTIN_GIT)
+}
+fn should_route_pane_mouse(kind: MouseEventKind, hit: PaneId, focused: Option<PaneId>) -> bool {
+    !matches!(
+        kind,
+        MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+    ) || focused == Some(hit)
+}
+/// Decide whether an incoming key should dismiss the currently-open viewer.
+/// Bare `Left` and `Esc` close it unless an agents/shells PTY owns the key.
+/// Modified keys always fall through to global bindings or the focused pane.
+
 fn should_dismiss_viewer_overlay(
     key: KeyEvent,
     overlay_open: bool,
@@ -7100,19 +7103,21 @@ fn should_dismiss_viewer_overlay(
     !matches!(focused_group, Some(g) if g == BUILTIN_AGENTS || g == BUILTIN_SHELLS)
 }
 
-fn should_route_pane_mouse(kind: MouseEventKind, hit: PaneId, focused: Option<PaneId>) -> bool {
-    !matches!(
-        kind,
-        MouseEventKind::ScrollUp
-            | MouseEventKind::ScrollDown
-            | MouseEventKind::ScrollLeft
-            | MouseEventKind::ScrollRight
-    ) || focused == Some(hit)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clicking_viewer_restores_left_column_ownership_after_right_pane_focus() {
+        // The overlay is drawn over the left column, so clicking it must
+        // reclaim viewer ownership from the right-side pane. Otherwise the
+        // PTY keeps consuming bare Left while the viewer border looks active.
+        assert!(should_restore_viewer_focus(Some(BUILTIN_SHELLS)));
+        assert!(should_restore_viewer_focus(Some(BUILTIN_AGENTS)));
+        assert!(!should_restore_viewer_focus(Some(BUILTIN_FILES)));
+        assert!(!should_restore_viewer_focus(Some(BUILTIN_GIT)));
+        assert!(should_restore_viewer_focus(None));
+    }
     use crossterm::event::MouseButton;
 
     #[test]

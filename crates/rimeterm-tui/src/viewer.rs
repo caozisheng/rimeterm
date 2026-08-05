@@ -1059,20 +1059,25 @@ pub fn render_into_pane(
     buf: &mut Buffer,
     picker: Option<&ratatui_image::picker::Picker>,
     markdown_theme: rimeterm_markdown::Theme,
+    focused: bool,
 ) {
     if !state.is_open() {
         return;
     }
     let title = build_title(state);
-    // §C v0.1: viewer chrome tint follows the app-wide theme (same
-    // enum that drives markdown rendering). One `Palette::from_theme`
-    // call per frame; `border_focused` is the state.focus slot which
-    // differs meaningfully across every curated theme.
-    let accent = rimeterm_markdown::Palette::from_theme(markdown_theme).border_focused;
+    // Focus tint follows the same live focus bit used by App's caret
+    // decision. A visible overlay can be passive while the right column owns
+    // input, so its border must not claim focus in that state.
+    let palette = rimeterm_markdown::Palette::from_theme(markdown_theme);
+    let border = if focused {
+        palette.border_focused
+    } else {
+        palette.border
+    };
     let block = Block::default()
-        .title(Line::styled(title, Style::default().fg(accent)))
+        .title(Line::styled(title, Style::default().fg(border)))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent));
+        .border_style(Style::default().fg(border));
     let inner = block.inner(pane_rect);
     // Clear pane cells so any previously-rendered yazi glyphs don't
     // bleed through where the block skips characters (e.g. gaps
@@ -1086,7 +1091,7 @@ pub fn render_into_pane(
     // so `on_mouse` can act on Down(Left) hits. Falls back to
     // `None` when the pane is too narrow to fit the 3-cell
     // affordance without overlapping the title.
-    state.close_button_rect = paint_close_button(pane_rect, buf, accent);
+    state.close_button_rect = paint_close_button(pane_rect, buf, border);
 
     // Reset frame-scoped state before deciding how to fill inner.
     state.text_area = None;
@@ -1115,9 +1120,7 @@ pub fn render_into_pane(
     }
 }
 
-/// Legacy name kept as a thin wrapper so external callers (currently
-/// none outside app.rs — but tests reference it) compile against the
-/// new signature during the transition.
+/// Legacy convenience wrapper using the default theme and focused chrome.
 pub fn render_overlay(
     state: &mut ViewerOverlayState,
     bounds: Rect,
@@ -1130,6 +1133,7 @@ pub fn render_overlay(
         buf,
         picker,
         rimeterm_markdown::Theme::Default,
+        true,
     );
 }
 
@@ -2573,6 +2577,41 @@ mod markdown_tests {
         // Top-left corner of the block border is `┌`.
         assert_eq!(buf[(0, 0)].symbol(), "┌");
     }
+    #[test]
+    fn render_into_pane_uses_live_focus_for_border_color() {
+        let mut state = ViewerOverlayState::default();
+        state.open_snapshot(
+            ViewerSource {
+                path: PathBuf::from("notes.md"),
+                kind: ViewerKind::Markdown,
+            },
+            None,
+        );
+        let bounds = Rect::new(0, 0, 60, 20);
+        let palette = rimeterm_markdown::Palette::from_theme(rimeterm_markdown::Theme::Default);
+
+        let mut passive = Buffer::empty(bounds);
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut passive,
+            None,
+            rimeterm_markdown::Theme::Default,
+            false,
+        );
+        assert_eq!(passive[(0, 0)].fg, palette.border);
+
+        let mut focused = Buffer::empty(bounds);
+        render_into_pane(
+            &mut state,
+            bounds,
+            &mut focused,
+            None,
+            rimeterm_markdown::Theme::Default,
+            true,
+        );
+        assert_eq!(focused[(0, 0)].fg, palette.border_focused);
+    }
 
     #[test]
     fn render_into_pane_draws_close_button_and_reports_rect() {
@@ -2595,6 +2634,7 @@ mod markdown_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
 
         // Expected `[×]` sits one cell inside the top-right corner.
@@ -2805,6 +2845,7 @@ mod markdown_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
         let ptr_first = state.markdown_cache.as_ref().unwrap() as *const _;
 
@@ -2814,6 +2855,7 @@ mod markdown_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
         let ptr_second = state.markdown_cache.as_ref().unwrap() as *const _;
 
@@ -2843,13 +2885,14 @@ mod markdown_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
         let theme_seen_before = state.markdown_cache.as_ref().unwrap().theme;
 
         // Any theme != Default forces the cache guard to fire.
         let other = rimeterm_markdown::Theme::Dracula;
         assert_ne!(theme_seen_before, other, "test needs distinct themes");
-        render_into_pane(&mut state, bounds, &mut buf, None, other);
+        render_into_pane(&mut state, bounds, &mut buf, None, other, true);
         let theme_seen_after = state.markdown_cache.as_ref().unwrap().theme;
 
         assert_eq!(
@@ -2881,6 +2924,7 @@ mod markdown_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
         let ptr_after_first = state.markdown_cache.as_ref().unwrap() as *const _;
         let width_after_first = state.markdown_cache.as_ref().unwrap().content_width;
@@ -2891,6 +2935,7 @@ mod markdown_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
         let ptr_after_second = state.markdown_cache.as_ref().unwrap() as *const _;
         assert_eq!(
@@ -2907,6 +2952,7 @@ mod markdown_tests {
             &mut buf2,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
         let width_after_resize = state.markdown_cache.as_ref().unwrap().content_width;
         assert_ne!(
@@ -2931,6 +2977,7 @@ mod markdown_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
 
         assert!(
@@ -3091,6 +3138,7 @@ mod code_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
 
         // Border corner visible at (0,0).
@@ -3137,6 +3185,7 @@ mod code_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
         let generation_after_first = state.code_hl_cache.as_ref().map(|c| c.generation);
         assert!(state.code_hl_cache.is_some(), "cache built on first render");
@@ -3148,6 +3197,7 @@ mod code_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
         let ptr_second = state.code_hl_cache.as_ref().unwrap() as *const _;
         let generation_after_second = state.code_hl_cache.as_ref().map(|c| c.generation);
@@ -3190,6 +3240,7 @@ mod code_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
         let gen_seen_a = state
             .code_hl_cache
@@ -3221,6 +3272,7 @@ mod code_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
         let gen_seen_b = state
             .code_hl_cache
@@ -3267,6 +3319,7 @@ mod code_tests {
             &mut buf,
             None,
             rimeterm_markdown::Theme::Default,
+            true,
         );
 
         let cp_len = state.code_hl_cache.as_ref().unwrap().checkpoints.len();
