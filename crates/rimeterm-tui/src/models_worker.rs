@@ -102,7 +102,12 @@ pub(crate) fn format_fetch_error(e: &FetchError) -> String {
             502 | 503 | 504 => format!("HTTP {status} — models.dev is down"),
             other => format!("HTTP {other} from models.dev"),
         },
-        FetchError::Parse(_) => "models.dev returned malformed JSON".to_owned(),
+        FetchError::UnexpectedContent { preview } => {
+            format!("models.dev returned non-JSON: {}", truncate(preview, 30))
+        }
+        FetchError::Parse { line, column, .. } => {
+            format!("models.dev JSON mismatch at {line}:{column}")
+        }
     }
 }
 
@@ -249,6 +254,19 @@ mod tests {
             })
             .contains("is down")
         );
+    }
+
+    #[test]
+    fn response_errors_explain_content_or_json_location() {
+        let html = format_fetch_error(&FetchError::UnexpectedContent {
+            preview: "<!doctype html>".into(),
+        });
+        let json = format_fetch_error(&FetchError::Parse {
+            line: 7,
+            column: 19,
+            message: "invalid type".into(),
+        });
+        assert!(html.contains("non-JSON") && json.contains("7:19"));
     }
 
     #[test]

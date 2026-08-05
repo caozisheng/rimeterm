@@ -51,8 +51,14 @@ pub enum FetchError {
     Network(#[source] reqwest::Error),
     #[error("HTTP {status}: {body}")]
     Status { status: u16, body: String },
-    #[error("failed to parse models.dev response: {0}")]
-    Parse(#[source] reqwest::Error),
+    #[error("models.dev returned non-JSON content: {preview}")]
+    UnexpectedContent { preview: String },
+    #[error("failed to parse models.dev response at {line}:{column}: {message}")]
+    Parse {
+        line: usize,
+        column: usize,
+        message: String,
+    },
 }
 
 /// Fetch the full `models.dev` catalog. Blocking — expected to be
@@ -92,5 +98,46 @@ pub fn fetch_providers_from(url: &str) -> Result<ProvidersMap, FetchError> {
         });
     }
 
-    response.json::<ProvidersMap>().map_err(FetchError::Parse)
+    let body = response.bytes().map_err(FetchError::Network)?;
+    parse_response(&body)
+}
+
+fn parse_response(body: &[u8]) -> Result<ProvidersMap, FetchError> {
+    let first = body
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace());
+    if first != Some(b'{') {
+        let preview = String::from_utf8_lossy(body)
+            .chars()
+            .take(80)
+            .collect::<String>()
+            .replace(['\r', '\n'], " ");
+        return Err(FetchError::UnexpectedContent { preview });
+    }
+    serde_json::from_slice(body).map_err(|error| FetchError::Parse {
+        line: error.line(),
+        column: error.column(),
+        message: error.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_response_rejects_html_as_non_json() {
+        let error = parse_response(b"<!doctype html><title>Cloudflare</title>").unwrap_err();
+        assert!(matches!(error, FetchError::UnexpectedContent { .. }));
+    }
+
+    #[test]
+    fn parse_response_reports_json_location() {
+        let error = parse_response(br#"{"openai":{"id":"openai","name":17}}"#).unwrap_err();
+        let FetchError::Parse { line, column, .. } = error else {
+            panic!("expected schema parse error");
+        };
+        assert!(line > 0 && column > 0);
+    }
 }

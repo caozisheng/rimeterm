@@ -22,4 +22,6 @@ pub mod data;
 pub mod format;
 
 pub use api::{FetchError, fetch_providers, fetch_providers_from};
-pub use data::{Cost, Limits, Modalities, Model, Provider, ProvidersMap};
+pub use data::{
+    Cost, CostTier, Limits, Modalities, Model, Provider, ProvidersMap, ReasoningOption, TierSpec,
+};

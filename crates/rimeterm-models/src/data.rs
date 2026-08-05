@@ -1,19 +1,15 @@
 //! Owned data model for `https://models.dev/api.json`.
 //!
-//! Port of upstream `modelsdev::data` (MIT, v0.14.0). Trimmed to only
-//! the fields the ModelsPane actually renders — dropped `ReasoningOption`,
-//! `CostTier`, `TierSpec`, `Modalities` maps beyond `input`/`output`, the
-//! open-weights toggle, and the tui-piechart adornments. Re-syncing with
-//! upstream stays trivial: field names are unchanged and `serde(default)`
-//! everywhere absorbs whatever the API adds next.
+//! Port of the permissive subset used by `reyamira/models` v0.14.0. Optional
+//! fields preserve distinctions between absent and explicitly reported values.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Top-level API shape: `{ "<provider_id>": Provider, … }`.
+/// Top-level API shape: `{ "<provider_id>": Provider, ... }`.
 pub type ProvidersMap = HashMap<String, Provider>;
 
-/// One provider (openai, anthropic, xai, groq, …) plus its models.
+/// One provider plus its models.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Provider {
     pub id: String,
@@ -28,7 +24,7 @@ pub struct Provider {
     pub models: HashMap<String, Model>,
 }
 
-/// One model entry. Only fields the pane currently reads.
+/// One model entry from models.dev.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -42,6 +38,8 @@ pub struct Model {
     #[serde(default)]
     pub attachment: bool,
     #[serde(default)]
+    pub temperature: bool,
+    #[serde(default)]
     pub modalities: Option<Modalities>,
     #[serde(default)]
     pub cost: Option<Cost>,
@@ -52,7 +50,17 @@ pub struct Model {
     #[serde(default)]
     pub last_updated: Option<String>,
     #[serde(default)]
+    pub knowledge: Option<String>,
+    #[serde(default)]
     pub open_weights: bool,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub structured_output: Option<bool>,
+    #[serde(default)]
+    pub reasoning_options: Vec<ReasoningOption>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +73,46 @@ pub struct Cost {
     pub cache_read: Option<f64>,
     #[serde(default)]
     pub cache_write: Option<f64>,
+    #[serde(default)]
+    pub reasoning: Option<f64>,
+    #[serde(default)]
+    pub input_audio: Option<f64>,
+    #[serde(default)]
+    pub output_audio: Option<f64>,
+    #[serde(default)]
+    pub tiers: Vec<CostTier>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReasoningOption {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<Option<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CostTier {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<TierSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TierSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,8 +134,6 @@ pub struct Modalities {
 }
 
 impl Model {
-    /// True when the model emits text (or when no modalities are declared —
-    /// upstream default). Image-only / embedding-only models return false.
     pub fn is_text_model(&self) -> bool {
         match &self.modalities {
             Some(m) => m.output.iter().any(|o| o == "text"),
@@ -109,6 +155,12 @@ impl Model {
 
     pub fn output_cost(&self) -> Option<f64> {
         self.cost.as_ref().and_then(|c| c.output)
+    }
+
+    pub fn is_free(&self) -> bool {
+        self.cost
+            .as_ref()
+            .is_none_or(|c| c.input.unwrap_or(0.0) == 0.0 && c.output.unwrap_or(0.0) == 0.0)
     }
 }
 
@@ -162,5 +214,49 @@ mod tests {
         assert_eq!(m.input_cost(), None);
         assert!(!m.reasoning);
         assert!(m.is_text_model(), "no modalities → treated as text");
+    }
+
+    #[test]
+    fn deserialize_rich_model_fields_permissively() {
+        let json = r#"{
+            "openai": {"id":"openai","name":"OpenAI","models":{
+                "o3": {
+                    "id":"o3","name":"o3","description":"Reasoning model",
+                    "temperature":true,"structured_output":true,"status":"deprecated",
+                    "knowledge":"2025-06","reasoning_options":[
+                        {"type":"effort","values":["low",null,"high"]}
+                    ],
+                    "cost": {
+                        "input":2.0,"output":8.0,"reasoning":9.0,
+                        "input_audio":1.0,"output_audio":2.0,
+                        "tiers":[{"input":4.0,"output":12.0,"tier":{"type":"context","size":200000}}]
+                    }
+                }
+            }}
+        }"#;
+        let map: ProvidersMap = serde_json::from_str(json).expect("parse rich model");
+        let model = &map["openai"].models["o3"];
+        assert_eq!(model.description.as_deref(), Some("Reasoning model"));
+        assert!(model.temperature);
+        assert_eq!(model.structured_output, Some(true));
+        assert_eq!(model.status.as_deref(), Some("deprecated"));
+        assert_eq!(model.knowledge.as_deref(), Some("2025-06"));
+        assert_eq!(model.reasoning_options.len(), 1);
+        let cost = model.cost.as_ref().unwrap();
+        assert_eq!(cost.reasoning, Some(9.0));
+        assert_eq!(cost.input_audio, Some(1.0));
+        assert_eq!(cost.output_audio, Some(2.0));
+        assert_eq!(cost.tiers[0].tier.as_ref().unwrap().size, Some(200_000));
+    }
+
+    #[test]
+    fn parse_current_sdk_shape_with_context_tier_and_interleaved_fields() {
+        let json = r#"{
+          "anthropic":{"id":"anthropic","name":"Anthropic","env":[],"models":{
+            "claude-sonnet":{"id":"claude-sonnet","name":"Claude Sonnet","description":"Model","attachment":true,"reasoning":true,"reasoning_options":[{"type":"toggle"},{"type":"effort","values":["low","max"]}],"tool_call":true,"interleaved":{"field":"reasoning_content"},"structured_output":true,"temperature":true,"release_date":"2026-02-17","last_updated":"2026-03-13","modalities":{"input":["text","image","pdf"],"output":["text"]},"open_weights":false,"limit":{"context":1000000,"output":64000},"cost":{"input":3,"output":15,"tiers":[{"input":6,"output":22.5,"tier":{"type":"context","size":200000}}],"context_over_200k":{"input":6,"output":22.5}}}
+          }}
+        }"#;
+        let providers: ProvidersMap = serde_json::from_str(json).expect("current SDK shape");
+        assert_eq!(providers["anthropic"].models.len(), 1);
     }
 }

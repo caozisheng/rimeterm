@@ -21,12 +21,8 @@ pub fn format_tokens(n: u64) -> String {
             format!("{millions:.1}M")
         }
     } else if n >= 1_000 {
-        let k = n as f64 / 1_000.0;
-        if k >= 100.0 {
-            format!("{k:.0}K")
-        } else {
-            format!("{k:.0}K")
-        }
+        let thousands = n as f64 / 1_000.0;
+        format!("{thousands:.0}K")
     } else {
         format!("{n}")
     }

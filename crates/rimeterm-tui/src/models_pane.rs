@@ -1,128 +1,135 @@
-//! Native AI-model catalog pane — a compact flat table showing every
-//! model exposed via [`https://models.dev/api.json`](https://models.dev/api.json)
-//! with provider, context window, and $/1M-tokens pricing.
-//!
-//! Modelled on [`crate::agtop_pane::AgtopPane`]: the pane owns a
-//! [`ModelsWorker`] on a background OS thread that hits the models.dev
-//! API; the pane pulls the resulting [`Snapshot`] and renders a filtered
-//! / sorted view. Keybindings mirror the sysmon / agtop process tables
-//! so muscle memory carries over:
-//!
-//! | Key             | Action                                            |
-//! |-----------------|---------------------------------------------------|
-//! | `j / k / ↓ ↑`   | move cursor                                       |
-//! | `p n c i o d`   | sort by provider / name / context / input / output / date |
-//! | `Tab`           | flip sort direction                               |
-//! | `/`             | enter filter mode (matches id/name/provider)      |
-//! | `Enter`         | commit filter                                     |
-//! | `Esc`           | dismiss filter                                    |
-//! | `r` / `F5`      | force a refetch from models.dev                   |
-//!
-//! Attribution: the fetched schema + row shape are a direct port of
-//! MIT-licensed `reyamira/models` (`modelsdev` v0.14.0). See
-//! [`rimeterm_models`] for details.
-//!
-//! [`ModelsWorker`]: crate::models_worker::ModelsWorker
-//! [`Snapshot`]: crate::models_model::Snapshot
+//! Three-column models.dev browser adapted from `reyamira/models` v0.14.0.
 
 use std::any::Any;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        StatefulWidget, Table, Widget,
-    },
+    widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
-
-use rimeterm_models::format::{format_context, format_cost_short};
+use rimeterm_models::format::{EM_DASH, format_context, format_cost_short};
+use rimeterm_models::{Model, Provider};
 
 use crate::models_model::{
-    ModelRow, ModelView, ModelsRequest, ModelsResponse, Snapshot, SortKey, SortOrder,
+    CatalogProjection, Filters, ModelEntry, ModelsRequest, ModelsResponse, ProviderCategory,
+    ProviderListItem, Snapshot, SortKey, SortOrder, provider_category,
 };
-
 use crate::models_worker::ModelsWorker;
 
-/// Rows the scroll wheel advances per notch. Matches `pty_pane`'s
-/// three-line convention so the "one notch = a chunk" muscle memory
-/// stays consistent across every rimeterm pane that scrolls.
-const WHEEL_STEP: i32 = 3;
+const PAGE_SIZE: usize = 10;
 
-/// Modal state — only filter entry uses one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Focus {
+    #[default]
+    Providers,
+    Models,
+    Details,
+}
+
+impl Focus {
+    fn left(self) -> Self {
+        match self {
+            Self::Providers => Self::Details,
+            Self::Models => Self::Providers,
+            Self::Details => Self::Models,
+        }
+    }
+
+    fn right(self) -> Self {
+        match self {
+            Self::Providers => Self::Models,
+            Self::Models => Self::Details,
+            Self::Details => Self::Providers,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Providers => "providers",
+            Self::Models => "models",
+            Self::Details => "details",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 enum Modal {
     #[default]
     None,
-    Filter {
+    Search {
         input: String,
     },
 }
 
-/// Native `ModelsPane` provider — the models.dev browser for rimeterm.
 pub struct ModelsPane {
     id: PaneId,
     title: String,
     worker: ModelsWorker,
     snapshot: Snapshot,
-    /// Monotonic counter; bumped before every `Fetch` request so late
-    /// replies land harmlessly when they overlap a fresher one.
     requested_generation: u64,
     applied_generation: u64,
     sort_key: SortKey,
     sort_order: SortOrder,
-    filter: Option<String>,
-    cursor: usize,
+    filters: Filters,
+    category_filter: ProviderCategory,
+    group_by_category: bool,
+    search_query: String,
+    selected_provider_id: Option<String>,
+    selected_model_provider_id: Option<String>,
+    selected_model_id: Option<String>,
+    provider_cursor: usize,
+    model_cursor: usize,
+    focus: Focus,
+    detail_scroll: u16,
     modal: Modal,
-    /// True while a fetch is in flight — drives the "loading" hint.
     fetching: bool,
-    /// Transient status text rendered on the footer row. Cleared after
-    /// the next render pass consumes it.
     hint: Option<String>,
-    /// Rect of the table body captured on the last render — used by
-    /// [`Self::on_mouse`] to hit-test scroll-wheel events without
-    /// depending on the App's outer rect (which includes the border
-    /// row that the child shouldn't scroll through).
-    body_rect: Rect,
 }
 
 impl ModelsPane {
     pub fn new() -> Self {
         let worker = ModelsWorker::spawn();
-        // Prime the counter with a first fetch immediately so the
-        // pane doesn't render an empty "no data" state on startup.
-        let requested_generation = 1;
-        worker.send(ModelsRequest::Fetch {
-            generation: requested_generation,
-        });
+        worker.send(ModelsRequest::Fetch { generation: 1 });
         Self {
             id: PaneId::next(),
             title: "models".to_owned(),
             worker,
             snapshot: Snapshot::empty(),
-            requested_generation,
+            requested_generation: 1,
             applied_generation: 0,
-            sort_key: SortKey::Provider,
-            sort_order: SortOrder::Ascending,
-            filter: None,
-            cursor: 0,
+            sort_key: SortKey::Release,
+            sort_order: SortOrder::Descending,
+            filters: Filters::default(),
+            category_filter: ProviderCategory::All,
+            group_by_category: false,
+            search_query: String::new(),
+            selected_provider_id: None,
+            selected_model_provider_id: None,
+            selected_model_id: None,
+            provider_cursor: 0,
+            model_cursor: 0,
+            focus: Focus::Providers,
+            detail_scroll: 0,
             modal: Modal::None,
             fetching: true,
             hint: None,
-            body_rect: Rect::default(),
         }
     }
 
-    fn model_view(&self) -> ModelView {
-        ModelView::from_snapshot(
+    fn projection(&self) -> CatalogProjection {
+        CatalogProjection::build(
             &self.snapshot,
+            self.selected_provider_id.as_deref(),
+            self.filters,
+            self.category_filter,
+            self.group_by_category,
+            &self.search_query,
             self.sort_key,
             self.sort_order,
-            self.filter.as_deref(),
         )
     }
 
@@ -134,84 +141,194 @@ impl ModelsPane {
         self.fetching = true;
     }
 
-    fn set_sort(&mut self, key: SortKey) {
-        if self.sort_key == key {
-            self.sort_order = self.sort_order.flip();
-        } else {
-            self.sort_key = key;
-            // Provider / Name default to ascending (A→Z); numeric
-            // columns default to descending (big first) — matches
-            // what a user reaching for `c` (context) or `i` (cost)
-            // typically wants: "show me the biggest / cheapest first".
-            self.sort_order = match key {
-                SortKey::Provider | SortKey::Name => SortOrder::Ascending,
-                _ => SortOrder::Descending,
-            };
-        }
-        self.cursor = 0;
-    }
-
-    fn set_hint<S: Into<String>>(&mut self, text: S) {
+    fn set_hint(&mut self, text: impl Into<String>) {
         self.hint = Some(text.into());
     }
 
-    /// Move the cursor by a signed row delta, clamping into
-    /// `[0, view.rows.len())`. Shared by keyboard PageUp/PageDown
-    /// and the mouse-wheel handler so both paths behave identically.
-    fn move_cursor(&mut self, delta: i32) {
-        let view = self.model_view();
-        if view.rows.is_empty() {
-            self.cursor = 0;
+    fn sync_selection(&mut self) {
+        let projection = self.projection();
+        if let Some(id) = self.selected_provider_id.as_deref() {
+            if let Some(index) = projection.provider_items.iter().position(
+                |item| matches!(item, ProviderListItem::Provider { id: current, .. } if current == id),
+            ) {
+                self.provider_cursor = index;
+            } else {
+                self.selected_provider_id = None;
+                self.provider_cursor = 0;
+            }
+        } else {
+            self.provider_cursor = 0;
+        }
+        let projection = self.projection();
+        let selected_index = self
+            .selected_model_provider_id
+            .as_deref()
+            .zip(self.selected_model_id.as_deref())
+            .and_then(|(provider_id, model_id)| {
+                projection.models.iter().position(|entry| {
+                    entry.provider_id == provider_id && entry.model.id == model_id
+                })
+            });
+        self.model_cursor = selected_index.unwrap_or(0);
+        if let Some(entry) = projection.models.get(self.model_cursor) {
+            self.selected_model_provider_id = Some(entry.provider_id.clone());
+            self.selected_model_id = Some(entry.model.id.clone());
+        } else {
+            self.selected_model_provider_id = None;
+            self.selected_model_id = None;
+        }
+        self.detail_scroll = 0;
+    }
+
+    fn choose_provider(&mut self, index: usize, projection: &CatalogProjection) {
+        self.provider_cursor = projection.selectable_provider_index(index, true);
+        self.selected_provider_id = match projection.provider_items.get(self.provider_cursor) {
+            Some(ProviderListItem::Provider { id, .. }) => Some(id.clone()),
+            _ => None,
+        };
+        self.model_cursor = 0;
+        self.selected_model_provider_id = None;
+        self.selected_model_id = None;
+        self.sync_selection();
+    }
+
+    fn move_provider(&mut self, delta: isize) {
+        let projection = self.projection();
+        if projection.provider_items.is_empty() {
             return;
         }
-        let max = view.rows.len() - 1;
-        let next = (self.cursor as i32).saturating_add(delta).max(0) as usize;
-        self.cursor = next.min(max);
+        let max = projection.provider_items.len() - 1;
+        let mut next = self.provider_cursor.saturating_add_signed(delta).min(max);
+        next = projection.selectable_provider_index(next, delta >= 0);
+        self.choose_provider(next, &projection);
+    }
+
+    fn move_model(&mut self, delta: isize) {
+        let projection = self.projection();
+        if projection.models.is_empty() {
+            self.model_cursor = 0;
+            self.selected_model_provider_id = None;
+            self.selected_model_id = None;
+            return;
+        }
+        self.model_cursor = self
+            .model_cursor
+            .saturating_add_signed(delta)
+            .min(projection.models.len() - 1);
+        let entry = &projection.models[self.model_cursor];
+        self.selected_model_provider_id = Some(entry.provider_id.clone());
+        self.selected_model_id = Some(entry.model.id.clone());
+        self.detail_scroll = 0;
+    }
+
+    fn jump_start(&mut self) {
+        match self.focus {
+            Focus::Providers => self.move_provider(-(self.provider_cursor as isize)),
+            Focus::Models => self.move_model(-(self.model_cursor as isize)),
+            Focus::Details => self.detail_scroll = 0,
+        }
+    }
+
+    fn jump_end(&mut self) {
+        match self.focus {
+            Focus::Providers => {
+                let len = self.projection().provider_items.len();
+                if len > 0 {
+                    self.move_provider((len - 1) as isize);
+                }
+            }
+            Focus::Models => {
+                let len = self.projection().models.len();
+                if len > 0 {
+                    self.move_model((len - 1) as isize);
+                }
+            }
+            Focus::Details => self.detail_scroll = u16::MAX,
+        }
+    }
+
+    fn toggle_filter(&mut self, key: char) {
+        match key {
+            '1' => self.filters.reasoning = !self.filters.reasoning,
+            '2' => self.filters.tools = !self.filters.tools,
+            '3' => self.filters.open_weights = !self.filters.open_weights,
+            '4' => self.filters.free = !self.filters.free,
+            '5' => self.category_filter = self.category_filter.next(),
+            '6' => self.group_by_category = !self.group_by_category,
+            _ => return,
+        }
+        self.sync_selection();
+    }
+
+    fn current_model<'a>(&self, projection: &'a CatalogProjection) -> Option<&'a ModelEntry> {
+        projection.models.get(self.model_cursor)
     }
 
     pub(crate) fn snapshot_state(&self) -> rimeterm_config::memory_state::PaneState {
-        let sort = match self.sort_key {
-            SortKey::Provider => "provider",
-            SortKey::Name => "name",
-            SortKey::Context => "context",
-            SortKey::InputCost => "input_cost",
-            SortKey::OutputCost => "output_cost",
-            SortKey::Release => "release",
-        };
-        let order = match self.sort_order {
-            SortOrder::Ascending => "ascending",
-            SortOrder::Descending => "descending",
-        };
         let mut values = std::collections::BTreeMap::from([
-            ("sort".into(), sort.into()),
-            ("order".into(), order.into()),
+            ("sort".into(), self.sort_key.label().into()),
+            (
+                "order".into(),
+                match self.sort_order {
+                    SortOrder::Ascending => "ascending",
+                    SortOrder::Descending => "descending",
+                }
+                .into(),
+            ),
+            ("focus".into(), self.focus.key().into()),
+            ("reasoning".into(), self.filters.reasoning.to_string()),
+            ("tools".into(), self.filters.tools.to_string()),
+            ("open_weights".into(), self.filters.open_weights.to_string()),
+            ("free".into(), self.filters.free.to_string()),
+            ("category".into(), category_key(self.category_filter).into()),
+            ("group".into(), self.group_by_category.to_string()),
         ]);
-        if let Some(filter) = &self.filter {
-            values.insert("filter".into(), filter.clone());
+        if !self.search_query.is_empty() {
+            values.insert("search".into(), self.search_query.clone());
+        }
+        if let Some(id) = &self.selected_provider_id {
+            values.insert("provider".into(), id.clone());
+        }
+        if let Some(id) = &self.selected_model_provider_id {
+            values.insert("model_provider".into(), id.clone());
+        }
+        if let Some(id) = &self.selected_model_id {
+            values.insert("model".into(), id.clone());
         }
         rimeterm_config::memory_state::PaneState { values }
     }
 
     pub(crate) fn restore_state(&mut self, state: &rimeterm_config::memory_state::PaneState) {
-        self.sort_key = match state.values.get("sort").map(String::as_str) {
+        let value = |key| state.values.get(key).map(String::as_str);
+        self.sort_key = match value("sort") {
             Some("name") => SortKey::Name,
-            Some("context") => SortKey::Context,
-            Some("input_cost") => SortKey::InputCost,
-            Some("output_cost") => SortKey::OutputCost,
-            Some("release") => SortKey::Release,
-            _ => SortKey::Provider,
+            Some("cost") => SortKey::Cost,
+            Some("ctx") => SortKey::Context,
+            _ => SortKey::Release,
         };
-        self.sort_order = match state.values.get("order").map(String::as_str) {
-            Some("descending") => SortOrder::Descending,
-            _ => SortOrder::Ascending,
+        self.sort_order = match value("order") {
+            Some("ascending") => SortOrder::Ascending,
+            _ => SortOrder::Descending,
         };
-        self.filter = state
-            .values
-            .get("filter")
-            .filter(|value| !value.is_empty())
-            .cloned();
-        self.cursor = 0;
+        self.focus = match value("focus") {
+            Some("models") => Focus::Models,
+            Some("details") => Focus::Details,
+            _ => Focus::Providers,
+        };
+        self.filters = Filters {
+            reasoning: value("reasoning") == Some("true"),
+            tools: value("tools") == Some("true"),
+            open_weights: value("open_weights") == Some("true"),
+            free: value("free") == Some("true"),
+        };
+        self.category_filter = parse_category(value("category"));
+        self.group_by_category = value("group") == Some("true");
+        self.search_query = value("search").unwrap_or_default().to_owned();
+        self.selected_provider_id = value("provider").map(str::to_owned);
+        self.selected_model_provider_id = value("model_provider").map(str::to_owned);
+        self.selected_model_id = value("model").map(str::to_owned);
         self.modal = Modal::None;
+        self.sync_selection();
     }
 }
 
@@ -251,76 +368,42 @@ impl PaneProvider for ModelsPane {
         frame: &mut Frame<'_>,
         ctx: &PaneRenderCtx<'_>,
     ) -> RenderOutcome {
-        let border_style = if ctx.focused {
+        let outer_style = if ctx.focused {
             Style::default().fg(ctx.focus_color)
         } else {
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM)
+            Style::default().fg(Color::DarkGray)
         };
-        let title = format_title(
-            &self.snapshot,
-            self.sort_key,
-            self.sort_order,
-            self.fetching,
-        );
+        let loading = if self.fetching { " · loading" } else { "" };
         let block = Block::default()
-            .title(title)
+            .title(format!(
+                " models · {} providers · {} models{} ",
+                self.snapshot.provider_count, self.snapshot.model_count, loading
+            ))
             .borders(Borders::ALL)
-            .border_style(border_style);
+            .border_style(outer_style);
         let inner = block.inner(area);
         block.render(area, frame.buffer_mut());
-        if inner.height == 0 || inner.width == 0 {
+        if inner.width == 0 || inner.height == 0 {
             return RenderOutcome::default();
         }
-
-        // Bottom row: filter footer / hint / selected-model detail
-        // whenever there's something to show. Rest of the inner rect
-        // goes to the table.
-        let footer_active = self.hint.is_some()
-            || !matches!(self.modal, Modal::None)
-            || self.snapshot.last_error.is_some()
-            || !self.snapshot.rows.is_empty();
-        let (body_rect, footer_rect) = if footer_active && inner.height >= 2 {
-            let split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(1)])
-                .split(inner);
-            (split[0], Some(split[1]))
-        } else {
-            (inner, None)
-        };
-
-        let view = self.model_view();
-        // Cache the body rect so on_mouse can hit-test wheel events
-        // against the scrollable region only (not the border, not the
-        // footer). Empty-state paints in the same rect and doesn't
-        // scroll, but caching it uniformly keeps the pane's mouse
-        // ownership shape simple.
-        self.body_rect = body_rect;
-        render_models_table(
-            frame,
-            body_rect,
-            &view,
-            self.cursor,
-            self.fetching,
-            self.snapshot.last_error.as_deref(),
-        );
-
-        if let Some(rect) = footer_rect {
-            let selected = view.rows.get(self.cursor);
-            render_footer(
-                frame,
-                rect,
-                &self.modal,
-                self.hint.as_deref(),
-                self.snapshot.last_error.as_deref(),
-                selected,
-            );
-        }
-        // One-shot hints clear after the frame that displayed them.
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(20),
+                Constraint::Percentage(45),
+                Constraint::Percentage(35),
+            ])
+            .split(vertical[0]);
+        let projection = self.projection();
+        render_providers(frame, columns[0], self, &projection);
+        render_models(frame, columns[1], self, &projection);
+        render_right(frame, columns[2], self, &projection);
+        render_footer(frame, vertical[1], self);
         self.hint = None;
-
         RenderOutcome::default()
     }
 
@@ -331,9 +414,8 @@ impl PaneProvider for ModelsPane {
         {
             return false;
         }
-
-        match &mut self.modal {
-            Modal::Filter { input } => match key.code {
+        if let Modal::Search { input } = &mut self.modal {
+            return match key.code {
                 KeyCode::Char(c) => {
                     input.push(c);
                     true
@@ -343,82 +425,94 @@ impl PaneProvider for ModelsPane {
                     true
                 }
                 KeyCode::Enter => {
-                    self.filter = if input.is_empty() {
-                        None
-                    } else {
-                        Some(input.clone())
-                    };
-                    self.cursor = 0;
+                    self.search_query = input.trim().to_owned();
                     self.modal = Modal::None;
+                    self.sync_selection();
                     true
                 }
                 KeyCode::Esc => {
                     self.modal = Modal::None;
                     true
                 }
-                _ => false,
-            },
-            Modal::None => on_key_default(self, key),
+                _ => true,
+            };
         }
+        match key.code {
+            KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.left(),
+            KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.right(),
+            KeyCode::Char('j') | KeyCode::Down => match self.focus {
+                Focus::Providers => self.move_provider(1),
+                Focus::Models => self.move_model(1),
+                Focus::Details => self.detail_scroll = self.detail_scroll.saturating_add(1),
+            },
+            KeyCode::Char('k') | KeyCode::Up => match self.focus {
+                Focus::Providers => self.move_provider(-1),
+                Focus::Models => self.move_model(-1),
+                Focus::Details => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+            },
+            KeyCode::PageDown => match self.focus {
+                Focus::Providers => self.move_provider(PAGE_SIZE as isize),
+                Focus::Models => self.move_model(PAGE_SIZE as isize),
+                Focus::Details => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(PAGE_SIZE as u16)
+                }
+            },
+            KeyCode::PageUp => match self.focus {
+                Focus::Providers => self.move_provider(-(PAGE_SIZE as isize)),
+                Focus::Models => self.move_model(-(PAGE_SIZE as isize)),
+                Focus::Details => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(PAGE_SIZE as u16)
+                }
+            },
+            KeyCode::Home | KeyCode::Char('g') => self.jump_start(),
+            KeyCode::End | KeyCode::Char('G') => self.jump_end(),
+            KeyCode::Char(c @ '1'..='6') => self.toggle_filter(c),
+            KeyCode::Char('/') => {
+                self.modal = Modal::Search {
+                    input: self.search_query.clone(),
+                }
+            }
+            KeyCode::Char('s') => {
+                self.sort_key = self.sort_key.next();
+                self.sync_selection();
+            }
+            KeyCode::Char('S') => {
+                self.sort_order = self.sort_order.flip();
+                self.sync_selection();
+            }
+            KeyCode::Char('r') | KeyCode::F(5) => {
+                self.request_fetch();
+                self.set_hint("refreshing models.dev");
+            }
+            _ => return false,
+        }
+        true
     }
 
-    fn on_mouse(&mut self, ev: MouseEvent, _outer_rect: Rect) -> bool {
-        // Route wheel events through cursor-motion (which the
-        // window_around() logic reflects in the visible viewport)
-        // rather than a separate scroll offset — one source of
-        // truth means the highlight and the scrollbar thumb can
-        // never drift out of sync. Same shape as `fr_pane` and
-        // `agtop_pane`'s wheel handling.
-        if !point_in_rect(ev.column, ev.row, self.body_rect) {
-            return false;
-        }
-        match ev.kind {
-            MouseEventKind::ScrollDown => {
-                self.move_cursor(WHEEL_STEP);
-                true
-            }
-            MouseEventKind::ScrollUp => {
-                self.move_cursor(-WHEEL_STEP);
-                true
-            }
-            _ => false,
-        }
+    fn on_mouse(&mut self, _event: MouseEvent, _outer_rect: Rect) -> bool {
+        false
     }
 
     fn reload(&mut self) {
         self.request_fetch();
-        self.set_hint("↻ refreshing");
+        self.set_hint("refreshing models.dev");
     }
 
     fn poll_background(&mut self) -> bool {
         let mut changed = false;
-
         for response in self.worker.drain() {
             let ModelsResponse::Fetch { generation, result } = response;
             if generation < self.applied_generation {
-                // Stale — a fresher snapshot has already been applied.
                 continue;
             }
             self.applied_generation = generation;
             self.fetching = false;
             match result {
-                Ok(mut snapshot) => {
-                    // Preserve last_error only if the new snapshot is
-                    // empty (transient blip) — a good refetch clears it.
-                    snapshot.last_error = None;
+                Ok(snapshot) => {
                     self.snapshot = snapshot;
+                    self.sync_selection();
                 }
-                Err(msg) => {
-                    // Keep any previously-fetched rows on screen;
-                    // just tag the snapshot with the error so the
-                    // footer shows what went wrong.
-                    self.snapshot.last_error = Some(msg);
-                }
-            }
-            // Clamp cursor in case the row count shrank.
-            let view = self.model_view();
-            if self.cursor >= view.rows.len() {
-                self.cursor = view.rows.len().saturating_sub(1);
+                Err(error) => self.snapshot.last_error = Some(error),
             }
             changed = true;
         }
@@ -426,651 +520,761 @@ impl PaneProvider for ModelsPane {
     }
 }
 
-fn on_key_default(pane: &mut ModelsPane, key: KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Char('j') | KeyCode::Down => {
-            let view = pane.model_view();
-            if !view.rows.is_empty() {
-                pane.cursor = (pane.cursor + 1).min(view.rows.len() - 1);
-            }
-            true
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            pane.cursor = pane.cursor.saturating_sub(1);
-            true
-        }
-        KeyCode::PageDown => {
-            let view = pane.model_view();
-            if !view.rows.is_empty() {
-                pane.cursor = (pane.cursor + 10).min(view.rows.len() - 1);
-            }
-            true
-        }
-        KeyCode::PageUp => {
-            pane.cursor = pane.cursor.saturating_sub(10);
-            true
-        }
-        KeyCode::Home | KeyCode::Char('g') => {
-            pane.cursor = 0;
-            true
-        }
-        KeyCode::End | KeyCode::Char('G') => {
-            let view = pane.model_view();
-            if !view.rows.is_empty() {
-                pane.cursor = view.rows.len() - 1;
-            }
-            true
-        }
-        KeyCode::Tab => {
-            pane.sort_order = pane.sort_order.flip();
-            true
-        }
-        KeyCode::Char('p') => {
-            pane.set_sort(SortKey::Provider);
-            true
-        }
-        KeyCode::Char('n') => {
-            pane.set_sort(SortKey::Name);
-            true
-        }
-        KeyCode::Char('c') => {
-            pane.set_sort(SortKey::Context);
-            true
-        }
-        KeyCode::Char('i') => {
-            pane.set_sort(SortKey::InputCost);
-            true
-        }
-        KeyCode::Char('o') => {
-            pane.set_sort(SortKey::OutputCost);
-            true
-        }
-        KeyCode::Char('d') => {
-            pane.set_sort(SortKey::Release);
-            true
-        }
-        KeyCode::Char('/') => {
-            pane.modal = Modal::Filter {
-                input: pane.filter.clone().unwrap_or_default(),
-            };
-            true
-        }
-        KeyCode::Char('r') | KeyCode::F(5) => {
-            pane.request_fetch();
-            pane.set_hint("↻ refetching from models.dev");
-            true
-        }
-        _ => false,
+fn focus_border(focused: bool) -> Style {
+    Style::default().fg(if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    })
+}
+
+fn category_color(category: ProviderCategory) -> Color {
+    match category {
+        ProviderCategory::All => Color::White,
+        ProviderCategory::Origin => Color::Magenta,
+        ProviderCategory::Cloud => Color::Blue,
+        ProviderCategory::Inference => Color::Green,
+        ProviderCategory::Gateway => Color::Yellow,
+        ProviderCategory::Tool => Color::Cyan,
     }
 }
 
-/// Compose the tab-title-plus-summary shown in the border. Kept short
-/// so it doesn't push the sort indicator past the border on a narrow pane.
-fn format_title(snapshot: &Snapshot, key: SortKey, order: SortOrder, fetching: bool) -> String {
-    let arrow = match order {
-        SortOrder::Ascending => "↑",
-        SortOrder::Descending => "↓",
-    };
-    let key_name = match key {
-        SortKey::Provider => "prov",
-        SortKey::Name => "name",
-        SortKey::Context => "ctx",
-        SortKey::InputCost => "in$",
-        SortKey::OutputCost => "out$",
-        SortKey::Release => "date",
-    };
-    let loading = if fetching { " · loading" } else { "" };
-    format!(
-        " models · {} providers · {} models · sort:{}{}{} ",
-        snapshot.provider_count,
-        snapshot.rows.len(),
-        key_name,
-        arrow,
-        loading,
-    )
-}
-
-/// Draw the models table with a highlighted cursor row, a right-edge
-/// scrollbar when there's more content than the viewport can show,
-/// and an empty-state hint when nothing matches.
-fn render_models_table(
+fn render_providers(
     frame: &mut Frame<'_>,
     area: Rect,
-    view: &ModelView,
-    cursor: usize,
-    fetching: bool,
-    last_error: Option<&str>,
+    pane: &ModelsPane,
+    projection: &CatalogProjection,
 ) {
-    if view.rows.is_empty() {
-        // Precedence: user filter (typed intent) > fetch error (real
-        // failure) > fetching (progress) > default. Showing the
-        // filter miss over an error is correct — the user just
-        // typed the filter, they know what they asked for.
-        let (msg, msg_style, footer) = match view.filter.as_deref() {
-            Some(f) if !f.is_empty() => (
-                format!("no models match `{f}`"),
-                Style::default().fg(Color::DarkGray),
-                "sort: p·n·c·i·o·d   filter: /   refetch: r",
-            ),
-            _ if last_error.is_some() => (
-                format!("⚠ {}", last_error.unwrap()),
-                Style::default().fg(Color::Red),
-                "set HTTPS_PROXY or RIMETERM_MODELS_URL, then press r",
-            ),
-            _ if fetching => (
-                "fetching https://models.dev/api.json…".to_owned(),
-                Style::default().fg(Color::DarkGray),
-                "sort: p·n·c·i·o·d   filter: /   refetch: r",
-            ),
-            _ => (
-                "no models loaded".to_owned(),
-                Style::default().fg(Color::DarkGray),
-                "sort: p·n·c·i·o·d   filter: /   refetch: r",
-            ),
-        };
-        let hint = Paragraph::new(vec![
-            Line::from(Span::styled(msg, msg_style)),
-            Line::from(""),
-            Line::from(Span::styled(
-                footer,
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            )),
-        ])
-        .wrap(ratatui::widgets::Wrap { trim: true });
-        hint.render(area, frame.buffer_mut());
+    let block = Block::default()
+        .title(" Providers ")
+        .borders(Borders::ALL)
+        .border_style(focus_border(pane.focus == Focus::Providers));
+    let inner = block.inner(area);
+    block.render(area, frame.buffer_mut());
+    if inner.width == 0 || inner.height == 0 {
         return;
     }
-
-    // Reserve the rightmost column for the scrollbar when it would
-    // actually do something (row count exceeds the body rows). The
-    // scrollbar renders over the same column ratatui would use for
-    // the last content cell, so we shave 1 col off `table_area` up
-    // front rather than letting the scrollbar clobber cell text.
-    let viewport_rows = area.height.saturating_sub(1) as usize; // -1 for header
-    let needs_scrollbar = view.rows.len() > viewport_rows && area.width >= 2;
-    let (table_area, scrollbar_area) = if needs_scrollbar {
-        let split = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
-            .split(area);
-        (split[0], Some(split[1]))
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+    let cat_color = if pane.category_filter == ProviderCategory::All {
+        Color::DarkGray
     } else {
-        (area, None)
+        category_color(pane.category_filter)
     };
-
-    let header = Row::new(vec![
-        cell_dim("PROVIDER"),
-        cell_dim("MODEL"),
-        cell_dim("CTX"),
-        cell_dim(" IN$"),
-        cell_dim("OUT$"),
-        cell_dim("R"),
-    ]);
-
-    // Compute a viewport window so the cursor stays visible even
-    // with 4k rows — ratatui's Table has no built-in scroll.
-    let (start, end) = window_around(cursor, view.rows.len(), viewport_rows);
-
-    let (provider_w, model_w) = column_widths(table_area.width);
-
-    let rows: Vec<Row> = view.rows[start..end]
-        .iter()
-        .enumerate()
-        .map(|(local_idx, row)| {
-            let abs_idx = start + local_idx;
-            let selected = abs_idx == cursor;
-            let base = if selected {
-                Style::default().add_modifier(Modifier::REVERSED)
+    Paragraph::new(Line::from(vec![
+        Span::styled("[5]", Style::default().fg(cat_color)),
+        Span::raw(format!(" {}  ", pane.category_filter.short_label())),
+        Span::styled(
+            "[6]",
+            Style::default().fg(if pane.group_by_category {
+                Color::Green
             } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::raw(" Grp"),
+    ]))
+    .render(split[0], frame.buffer_mut());
+
+    let viewport = split[1].height as usize;
+    let (start, end) = window_around(
+        pane.provider_cursor,
+        projection.provider_items.len(),
+        viewport,
+    );
+    let mut lines = Vec::with_capacity(end.saturating_sub(start));
+    for (offset, item) in projection.provider_items[start..end].iter().enumerate() {
+        let index = start + offset;
+        let selected = index == pane.provider_cursor && pane.focus == Focus::Providers;
+        let caret = if selected { "> " } else { "  " };
+        let line = match item {
+            ProviderListItem::All { count } => Line::from(vec![
+                Span::styled(caret, Style::default().fg(Color::Cyan)),
+                Span::styled(format!("All ({count})"), Style::default().fg(Color::Green)),
+            ]),
+            ProviderListItem::CategoryHeader(category) => Line::from(Span::styled(
+                truncate(
+                    &format!("── {} ─────────────────", category.label()),
+                    inner.width as usize,
+                ),
                 Style::default()
-            };
-            Row::new(vec![
-                cell(truncate(&row.provider_name, provider_w), base),
-                cell(truncate(&row.model_name, model_w), base),
-                cell(format_context(row.context), base),
-                cell(
-                    format!("{:>5}", format_cost_short(row.input_cost)),
-                    cost_style(row.input_cost).patch(base),
-                ),
-                cell(
-                    format!("{:>5}", format_cost_short(row.output_cost)),
-                    cost_style(row.output_cost).patch(base),
-                ),
-                cell(
-                    reasoning_glyph(row.reasoning),
-                    reasoning_style(row.reasoning).patch(base),
-                ),
-            ])
-        })
-        .collect();
+                    .fg(category_color(*category))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            ProviderListItem::Provider { id, count } => {
+                let category = provider_category(id);
+                Line::from(vec![
+                    Span::styled(caret, Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!("{} ", category.initial()),
+                        Style::default().fg(category_color(category)),
+                    ),
+                    Span::raw(truncate(id, inner.width.saturating_sub(9) as usize)),
+                    Span::styled(format!(" ({count})"), Style::default().fg(Color::Gray)),
+                ])
+            }
+        };
+        lines.push(line);
+    }
+    Paragraph::new(lines).render(split[1], frame.buffer_mut());
+}
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(provider_w.max(1) as u16),
-            Constraint::Length(model_w.max(1) as u16),
-            Constraint::Length(5), // ctx, e.g. "128K"
-            Constraint::Length(5), // in$
-            Constraint::Length(5), // out$
-            Constraint::Length(1), // reasoning glyph
-        ],
-    )
-    .header(header)
-    .column_spacing(1);
-    ratatui::widgets::Widget::render(table, table_area, frame.buffer_mut());
+fn render_models(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    pane: &ModelsPane,
+    projection: &CatalogProjection,
+) {
+    let provider_name = pane
+        .selected_provider_id
+        .as_deref()
+        .and_then(|id| pane.snapshot.provider(id))
+        .map_or("Models", |entry| entry.provider.name.as_str());
+    let mut title = format!(" {provider_name} ({})", projection.models.len());
+    if !pane.search_query.is_empty() {
+        title.push_str(&format!(" [/{}]", pane.search_query));
+    }
+    let filters = pane.filters.labels();
+    if !filters.is_empty() {
+        title.push_str(&format!(" [{}]", filters.join(" ")));
+    }
+    title.push_str(&format!(
+        " {}{} ",
+        pane.sort_order.arrow(),
+        pane.sort_key.label()
+    ));
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(focus_border(pane.focus == Focus::Models));
+    let inner = block.inner(area);
+    block.render(area, frame.buffer_mut());
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if projection.models.is_empty() {
+        let message = if pane.fetching && pane.snapshot.provider_count == 0 {
+            "fetching models.dev..."
+        } else {
+            "no matching models"
+        };
+        Paragraph::new(Span::styled(message, Style::default().fg(Color::DarkGray)))
+            .render(inner, frame.buffer_mut());
+        return;
+    }
+    let model_width = inner.width.saturating_sub(31).max(8) as usize;
+    let header = Line::from(vec![
+        Span::styled(
+            "  RTFO ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:<model_width$}", "Model"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " Input  Output Context",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let viewport = inner.height.saturating_sub(1) as usize;
+    let (start, end) = window_around(pane.model_cursor, projection.models.len(), viewport);
+    let mut lines = Vec::with_capacity(end.saturating_sub(start) + 1);
+    lines.push(header);
+    for (offset, entry) in projection.models[start..end].iter().enumerate() {
+        let index = start + offset;
+        let selected = index == pane.model_cursor;
+        let caret = if selected && pane.focus == Focus::Models {
+            "> "
+        } else {
+            "  "
+        };
+        let model_style = if selected {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(caret, Style::default().fg(Color::Cyan)),
+            capability(entry.model.reasoning, "R", Color::Cyan, "·"),
+            capability(entry.model.tool_call, "T", Color::Yellow, "·"),
+            capability(entry.model.attachment, "F", Color::Magenta, "·"),
+            capability(entry.model.open_weights, "O", Color::Green, "C"),
+            Span::raw(" "),
+            Span::styled(
+                format!("{:<model_width$}", truncate(&entry.model.name, model_width)),
+                model_style,
+            ),
+            Span::styled(
+                format!(" {:>6}", format_cost_short(entry.model.input_cost())),
+                cost_style(entry.model.input_cost()),
+            ),
+            Span::styled(
+                format!(" {:>7}", format_cost_short(entry.model.output_cost())),
+                cost_style(entry.model.output_cost()),
+            ),
+            Span::raw(format!(
+                " {:>7}",
+                format_context(entry.model.context_tokens())
+            )),
+        ]));
+    }
+    Paragraph::new(lines).render(inner, frame.buffer_mut());
+}
 
-    // Scrollbar. `viewport_content_length` scales the thumb size so
-    // it accurately reflects the fraction of rows currently visible;
-    // `position` uses the cursor row (not `start`) so grabbing the
-    // thumb visually matches where the highlight lives.
-    if let Some(sb_area) = scrollbar_area {
-        let mut sb_state = ScrollbarState::new(view.rows.len())
-            .position(cursor)
-            .viewport_content_length(viewport_rows);
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .render(sb_area, frame.buffer_mut(), &mut sb_state);
+fn capability(active: bool, yes: &'static str, color: Color, no: &'static str) -> Span<'static> {
+    if active {
+        Span::styled(yes, Style::default().fg(color))
+    } else {
+        Span::styled(no, Style::default().fg(Color::DarkGray))
     }
 }
 
-fn render_footer(
+fn render_right(
     frame: &mut Frame<'_>,
     area: Rect,
-    modal: &Modal,
-    hint: Option<&str>,
-    error: Option<&str>,
-    selected: Option<&ModelRow>,
+    pane: &ModelsPane,
+    projection: &CatalogProjection,
 ) {
-    let (text, style) = match modal {
-        Modal::Filter { input } => (format!("/ {input}_"), Style::default().fg(Color::Cyan)),
-        Modal::None => {
-            // Priority: user-set one-shot hint > fetch error > selected-row detail.
-            if let Some(h) = hint {
-                (h.to_string(), Style::default().fg(Color::Yellow))
-            } else if let Some(e) = error {
-                (format!("⚠ {e}"), Style::default().fg(Color::Red))
-            } else if let Some(row) = selected {
-                (
-                    format_detail_line(row),
-                    Style::default().fg(Color::DarkGray),
-                )
+    let selected = pane.current_model(projection);
+    let provider = selected
+        .and_then(|entry| pane.snapshot.provider(&entry.provider_id))
+        .or_else(|| {
+            pane.selected_provider_id
+                .as_deref()
+                .and_then(|id| pane.snapshot.provider(id))
+        });
+    let provider_height = provider.map_or(4, |entry| {
+        let width = area.width.saturating_sub(2).max(1) as usize;
+        let text = format!(
+            "{}\nCategory: {}\nDocs: {}\nAPI: {}\nEnv: {}",
+            entry.provider.name,
+            provider_category(&entry.id).label(),
+            entry.provider.doc.as_deref().unwrap_or(EM_DASH),
+            entry.provider.api.as_deref().unwrap_or(EM_DASH),
+            if entry.provider.env.is_empty() {
+                EM_DASH.to_owned()
             } else {
-                (String::new(), Style::default())
+                entry.provider.env.join(", ")
+            },
+        );
+        text.lines()
+            .map(|line| line.chars().count().div_ceil(width).max(1))
+            .sum::<usize>()
+            .saturating_add(2)
+            .min(area.height.saturating_sub(3) as usize)
+            .max(4) as u16
+    });
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(provider_height), Constraint::Min(3)])
+        .split(area);
+    render_provider_card(frame, split[0], provider);
+    render_model_detail(frame, split[1], pane, selected);
+}
+
+fn render_provider_card(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    entry: Option<&crate::models_model::ProviderEntry>,
+) {
+    let block = Block::default()
+        .title(" Provider ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    block.render(area, frame.buffer_mut());
+    let lines = match entry {
+        Some(entry) => provider_lines(&entry.id, &entry.provider),
+        None => vec![Line::from(Span::styled(
+            "No provider selected",
+            Style::default().fg(Color::DarkGray),
+        ))],
+    };
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .render(inner, frame.buffer_mut());
+}
+
+fn provider_lines(id: &str, provider: &Provider) -> Vec<Line<'static>> {
+    let category = provider_category(id);
+    vec![
+        Line::from(Span::styled(
+            provider.name.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        label_value("Category: ", category.label(), category_color(category)),
+        label_value(
+            "Docs: ",
+            provider.doc.as_deref().unwrap_or(EM_DASH),
+            Color::White,
+        ),
+        label_value(
+            "API:  ",
+            provider.api.as_deref().unwrap_or(EM_DASH),
+            Color::White,
+        ),
+        label_value(
+            "Env:  ",
+            &if provider.env.is_empty() {
+                EM_DASH.to_owned()
+            } else {
+                provider.env.join(", ")
+            },
+            Color::White,
+        ),
+    ]
+}
+
+fn render_model_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    pane: &ModelsPane,
+    entry: Option<&ModelEntry>,
+) {
+    let block = Block::default()
+        .title(" Details ")
+        .borders(Borders::ALL)
+        .border_style(focus_border(pane.focus == Focus::Details));
+    let inner = block.inner(area);
+    block.render(area, frame.buffer_mut());
+    let lines = entry.map_or_else(
+        || {
+            vec![Line::from(Span::styled(
+                "No model selected",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        },
+        |entry| model_detail_lines(&entry.model, inner.width),
+    );
+    let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
+    let scroll = pane.detail_scroll.min(max_scroll);
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .scroll((scroll, 0))
+        .render(inner, frame.buffer_mut());
+}
+
+fn model_detail_lines(model: &Model, width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            model.name.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            model.id.clone(),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(vec![
+            Span::styled("Family: ", Style::default().fg(Color::Gray)),
+            Span::raw(model.family.clone().unwrap_or_else(|| EM_DASH.into())),
+            Span::raw("  "),
+            Span::styled("Status: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                model.status.clone().unwrap_or_else(|| "active".into()),
+                Style::default().fg(if model.status.as_deref() == Some("deprecated") {
+                    Color::Red
+                } else {
+                    Color::Green
+                }),
+            ),
+        ]),
+    ];
+    if let Some(description) = model.description.as_deref().filter(|text| !text.is_empty()) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            description.to_owned(),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    lines.push(section_header(width, "Capabilities"));
+    lines.push(two_pair(
+        "Reasoning",
+        yes_no(model.reasoning),
+        "Tools",
+        yes_no(model.tool_call),
+    ));
+    lines.push(two_pair(
+        "Source",
+        if model.open_weights { "Open" } else { "Closed" },
+        "Files",
+        yes_no(model.attachment),
+    ));
+    lines.push(two_pair(
+        "Temp",
+        yes_no(model.temperature),
+        "Structured",
+        optional_yes_no(model.structured_output),
+    ));
+    for option in &model.reasoning_options {
+        let label = option.r#type.as_deref().unwrap_or("reasoning");
+        let value = if !option.values.is_empty() {
+            option
+                .values
+                .iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else if option.min.is_some() || option.max.is_some() {
+            format!(
+                "{}–{}",
+                option
+                    .min
+                    .map_or_else(|| EM_DASH.into(), |v| format_context(Some(v as u64))),
+                option
+                    .max
+                    .map_or_else(|| EM_DASH.into(), |v| format_context(Some(v as u64)))
+            )
+        } else {
+            "Yes".into()
+        };
+        lines.push(label_value(
+            &format!("{}: ", title_case(label)),
+            &value,
+            Color::LightGreen,
+        ));
+    }
+    lines.push(section_header(width, "Pricing"));
+    if let Some(cost) = &model.cost {
+        lines.push(two_pair(
+            "Input",
+            &price(cost.input),
+            "Output",
+            &price(cost.output),
+        ));
+        lines.push(two_pair(
+            "Cache Read",
+            &price(cost.cache_read),
+            "Cache Write",
+            &price(cost.cache_write),
+        ));
+        if cost.reasoning.is_some() {
+            lines.push(label_value(
+                "Thinking: ",
+                &price(cost.reasoning),
+                Color::White,
+            ));
+        }
+        if cost.input_audio.is_some() || cost.output_audio.is_some() {
+            lines.push(two_pair(
+                "Audio In",
+                &price(cost.input_audio),
+                "Audio Out",
+                &price(cost.output_audio),
+            ));
+        }
+        for tier in &cost.tiers {
+            let label = tier.tier.as_ref().and_then(|spec| spec.size).map_or_else(
+                || "Tier".into(),
+                |size| format!("Over {}", format_context(Some(size))),
+            );
+            lines.push(label_value(
+                &format!("{label}: "),
+                &format!("{} / {}", price(tier.input), price(tier.output)),
+                Color::White,
+            ));
+        }
+    } else {
+        lines.push(Line::from(EM_DASH));
+    }
+    lines.push(section_header(width, "Limits"));
+    let limits = model.limit.as_ref();
+    lines.push(Line::from(format!(
+        "Context: {}   Input: {}   Output: {}",
+        format_context(limits.and_then(|limit| limit.context)),
+        format_context(limits.and_then(|limit| limit.input)),
+        format_context(limits.and_then(|limit| limit.output)),
+    )));
+    lines.push(section_header(width, "Modalities"));
+    if let Some(modalities) = &model.modalities {
+        lines.push(label_value(
+            "Input:  ",
+            &list_or_dash(&modalities.input),
+            Color::White,
+        ));
+        lines.push(label_value(
+            "Output: ",
+            &list_or_dash(&modalities.output),
+            Color::White,
+        ));
+    } else {
+        lines.push(Line::from("Input: text   Output: text"));
+    }
+    lines.push(section_header(width, "Dates"));
+    lines.push(two_pair(
+        "Released",
+        model.release_date.as_deref().unwrap_or(EM_DASH),
+        "Knowledge",
+        model.knowledge.as_deref().unwrap_or(EM_DASH),
+    ));
+    if model.last_updated.is_some() {
+        lines.push(label_value(
+            "Updated: ",
+            model.last_updated.as_deref().unwrap_or(EM_DASH),
+            Color::White,
+        ));
+    }
+    lines
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect, pane: &ModelsPane) {
+    let (text, color) = match &pane.modal {
+        Modal::Search { input } => (format!("/ {input}_"), Color::Cyan),
+        Modal::None => {
+            if let Some(hint) = &pane.hint {
+                (hint.clone(), Color::Yellow)
+            } else if let Some(error) = &pane.snapshot.last_error {
+                (format!("error: {error}"), Color::Red)
+            } else {
+                (
+                    "h/l focus  j/k nav  / search  s/S sort  1-6 filter  r refresh".into(),
+                    Color::DarkGray,
+                )
             }
         }
     };
-    Paragraph::new(Line::styled(text, style)).render(area, frame.buffer_mut());
+    Paragraph::new(Line::styled(text, Style::default().fg(color))).render(area, frame.buffer_mut());
 }
 
-/// Compact single-line detail for the currently-selected row.
-/// `openai/gpt-4o · 128K ctx · $2.5/$10.0 · text · 2024-05-13`
-fn format_detail_line(row: &ModelRow) -> String {
-    let ctx = format_context(row.context);
-    let cost = format!(
-        "{}/{}",
-        format_cost_short(row.input_cost),
-        format_cost_short(row.output_cost),
-    );
-    let mut parts = vec![
-        format!("{}/{}", row.provider_id, row.model_id),
-        format!("{ctx} ctx"),
-        cost,
-    ];
-    let mut caps = Vec::new();
-    if row.reasoning {
-        caps.push("reasoning");
-    }
-    if row.tool_call {
-        caps.push("tools");
-    }
-    if row.attachment {
-        caps.push("files");
-    }
-    if row.open_weights {
-        caps.push("open");
-    }
-    if !caps.is_empty() {
-        parts.push(caps.join("·"));
-    }
-    if let Some(date) = row.release_date.as_deref() {
-        parts.push(date.to_owned());
-    }
-    parts.join(" · ")
+fn label_value(label: &str, value: &str, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(label.to_owned(), Style::default().fg(Color::Gray)),
+        Span::styled(value.to_owned(), Style::default().fg(color)),
+    ])
 }
 
-/// Center a `viewport`-sized window around `cursor` in `total`. Falls
-/// back to `[0, total)` when the viewport is at least as tall as the
-/// data.
+fn two_pair(left_label: &str, left: &str, right_label: &str, right: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{left_label}: "), Style::default().fg(Color::Gray)),
+        Span::raw(format!("{left:<10}")),
+        Span::styled(format!("{right_label}: "), Style::default().fg(Color::Gray)),
+        Span::raw(right.to_owned()),
+    ])
+}
+
+fn section_header(width: u16, title: &str) -> Line<'static> {
+    let prefix = format!("── {title} ");
+    let fill = "─".repeat((width as usize).saturating_sub(prefix.chars().count()));
+    Line::from(Span::styled(
+        format!("\n{prefix}{fill}"),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "Yes" } else { "No" }
+}
+
+fn optional_yes_no(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "Yes",
+        Some(false) => "No",
+        None => EM_DASH,
+    }
+}
+
+fn price(value: Option<f64>) -> String {
+    value.map_or_else(
+        || EM_DASH.into(),
+        |value| format!("{}/M", format_cost_short(Some(value))),
+    )
+}
+
+fn list_or_dash(values: &[String]) -> String {
+    if values.is_empty() {
+        EM_DASH.into()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn title_case(value: &str) -> String {
+    value
+        .split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().collect::<String>() + chars.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn cost_style(cost: Option<f64>) -> Style {
+    match cost {
+        Some(0.0) => Style::default().fg(Color::Green),
+        Some(value) if value < 10.0 => Style::default().fg(Color::White),
+        Some(_) => Style::default().fg(Color::Yellow),
+        None => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let mut output: String = value.chars().take(width - 1).collect();
+    output.push('…');
+    output
+}
+
 fn window_around(cursor: usize, total: usize, viewport: usize) -> (usize, usize) {
-    if viewport == 0 || total == 0 {
+    if total == 0 || viewport == 0 {
         return (0, 0);
     }
     if total <= viewport {
         return (0, total);
     }
-    let half = viewport / 2;
-    let start = cursor.saturating_sub(half);
-    let end = (start + viewport).min(total);
-    // If we bumped against the end, shift start left so the viewport
-    // stays full.
-    let start = end.saturating_sub(viewport);
-    (start, end)
+    let end = (cursor.saturating_sub(viewport / 2) + viewport).min(total);
+    (end.saturating_sub(viewport), end)
 }
 
-/// Split the row's leftover width between PROVIDER and MODEL columns.
-/// Fixed columns consume: 5 (ctx) + 5 (in$) + 5 (out$) + 1 (R) + 5
-/// separators = 21 cells. Remainder gets split 40/60 provider/model
-/// with a minimum of 6 for each so a tiny pane still renders both.
-fn column_widths(inner_width: u16) -> (usize, usize) {
-    const FIXED: u16 = 21;
-    let remaining = inner_width.saturating_sub(FIXED) as usize;
-    let provider = (remaining * 40 / 100).max(6);
-    let model = remaining.saturating_sub(provider).max(6);
-    (provider, model)
-}
-
-fn cell<S: Into<String>>(text: S, style: Style) -> ratatui::widgets::Cell<'static> {
-    ratatui::widgets::Cell::from(Line::styled(text.into(), style))
-}
-
-fn cell_dim(text: &'static str) -> ratatui::widgets::Cell<'static> {
-    cell(
-        text,
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
-fn cost_style(cost: Option<f64>) -> Style {
-    // Cheap models green, mid yellow, expensive red — matches the
-    // sysmon/agtop color language for "cost/danger" scaled quantities.
-    match cost {
-        Some(v) if v < 1.0 => Style::default().fg(Color::Green),
-        Some(v) if v < 10.0 => Style::default().fg(Color::Yellow),
-        Some(_) => Style::default().fg(Color::Red),
-        None => Style::default().fg(Color::DarkGray),
+fn category_key(category: ProviderCategory) -> &'static str {
+    match category {
+        ProviderCategory::All => "all",
+        ProviderCategory::Origin => "origin",
+        ProviderCategory::Cloud => "cloud",
+        ProviderCategory::Inference => "inference",
+        ProviderCategory::Gateway => "gateway",
+        ProviderCategory::Tool => "tool",
     }
 }
 
-fn reasoning_glyph(on: bool) -> &'static str {
-    if on { "★" } else { " " }
-}
-
-fn reasoning_style(on: bool) -> Style {
-    if on {
-        Style::default().fg(Color::Magenta)
-    } else {
-        Style::default()
+fn parse_category(value: Option<&str>) -> ProviderCategory {
+    match value {
+        Some("origin") => ProviderCategory::Origin,
+        Some("cloud") => ProviderCategory::Cloud,
+        Some("inference") => ProviderCategory::Inference,
+        Some("gateway") => ProviderCategory::Gateway,
+        Some("tool") => ProviderCategory::Tool,
+        _ => ProviderCategory::All,
     }
-}
-
-/// Left-truncate `s` to `max` chars (not bytes) with a trailing ellipsis.
-fn truncate(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if s.chars().count() <= max {
-        return s.to_owned();
-    }
-    if max <= 1 {
-        return "…".to_owned();
-    }
-    let mut out: String = s.chars().take(max - 1).collect();
-    out.push('…');
-    out
-}
-
-/// Absolute cell hit-test. Kept local (rather than shared with the
-/// nearly-identical helper in `app.rs`) so this pane pulls in one
-/// less cross-module dependency for four lines of code.
-fn point_in_rect(col: u16, row: u16, r: Rect) -> bool {
-    r.width > 0
-        && r.height > 0
-        && col >= r.x
-        && col < r.x.saturating_add(r.width)
-        && row >= r.y
-        && row < r.y.saturating_add(r.height)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn window_smaller_than_total_centers_cursor() {
-        // 100 rows, 10-row viewport, cursor at 50 → window ~[45, 55).
-        let (s, e) = window_around(50, 100, 10);
-        assert_eq!(e - s, 10);
-        assert!(s <= 50 && 50 < e);
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     #[test]
-    fn window_at_end_clamps_to_last_row() {
-        let (s, e) = window_around(99, 100, 10);
-        assert_eq!(e, 100);
-        assert_eq!(s, 90);
-    }
-
-    #[test]
-    fn window_when_data_fits_shows_all() {
-        assert_eq!(window_around(3, 8, 10), (0, 8));
-    }
-
-    #[test]
-    fn window_empty_returns_empty() {
-        assert_eq!(window_around(0, 0, 10), (0, 0));
-        assert_eq!(window_around(5, 100, 0), (0, 0));
-    }
-
-    #[test]
-    fn column_widths_split_remaining_between_provider_and_model() {
-        let (p, m) = column_widths(80);
-        assert!(p >= 6);
-        assert!(m >= 6);
-        assert!(p + m + 21 >= 80 - 2, "sum roughly fills the inner width");
-    }
-
-    #[test]
-    fn column_widths_hit_min_on_narrow_pane() {
-        let (p, m) = column_widths(30);
-        assert_eq!(p, 6);
-        assert!(m >= 6);
-    }
-
-    #[test]
-    fn column_widths_clamp_on_tiny_pane() {
-        let (p, m) = column_widths(10);
-        assert_eq!(p, 6);
-        assert_eq!(m, 6);
-    }
-
-    #[test]
-    fn truncate_at_ascii_boundary() {
-        assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("helloworld", 5), "hell…");
-        assert_eq!(truncate("x", 1), "x");
-        assert_eq!(truncate("abc", 0), "");
-    }
-
-    #[test]
-    fn format_title_stays_terse_on_narrow_pane() {
-        let s = Snapshot {
-            rows: vec![],
-            provider_count: 87,
-            last_error: None,
-        };
-        let t = format_title(&s, SortKey::InputCost, SortOrder::Descending, false);
-        // Title fits inside a 60-col pane (models pane rarely gets more).
-        assert!(t.chars().count() <= 60, "{t:?}");
-        assert!(t.contains("sort:in$↓"));
-        assert!(t.contains("87 providers"));
-    }
-
-    #[test]
-    fn format_detail_line_includes_capabilities() {
-        let row = ModelRow {
-            provider_id: "openai".into(),
-            provider_name: "OpenAI".into(),
-            model_id: "gpt-4o".into(),
-            model_name: "GPT-4o".into(),
-            context: Some(128_000),
-            output_limit: Some(16_384),
-            input_cost: Some(2.5),
-            output_cost: Some(10.0),
-            reasoning: false,
-            tool_call: true,
-            attachment: true,
-            family: None,
-            release_date: Some("2024-05-13".into()),
-            last_updated: None,
-            is_text: true,
-            open_weights: false,
-        };
-        let line = format_detail_line(&row);
-        assert!(line.contains("openai/gpt-4o"));
-        assert!(line.contains("128K ctx"));
-        assert!(line.contains("$2.5/$10.0"));
-        assert!(line.contains("tools"));
-        assert!(line.contains("files"));
-        assert!(line.contains("2024-05-13"));
-    }
-
-    #[test]
-    fn cost_style_scales_by_price() {
-        // Free tier / very cheap → green.
-        assert_eq!(cost_style(Some(0.5)).fg, Some(Color::Green));
-        // Mid → yellow.
-        assert_eq!(cost_style(Some(5.0)).fg, Some(Color::Yellow));
-        // Frontier → red.
-        assert_eq!(cost_style(Some(75.0)).fg, Some(Color::Red));
-        // Missing → dark grey.
-        assert_eq!(cost_style(None).fg, Some(Color::DarkGray));
-    }
-
-    #[test]
-    fn set_sort_flips_order_on_same_key() {
-        let mut pane = build_test_pane();
-        pane.sort_key = SortKey::Provider;
-        pane.sort_order = SortOrder::Ascending;
-        pane.set_sort(SortKey::Provider);
-        assert_eq!(pane.sort_order, SortOrder::Descending);
-    }
-
-    #[test]
-    fn set_sort_defaults_numeric_columns_descending() {
-        let mut pane = build_test_pane();
-        pane.set_sort(SortKey::Context);
-        // Big-context first is what users want when they reach for `c`.
-        assert_eq!(pane.sort_order, SortOrder::Descending);
-    }
-
-    #[test]
-    fn set_sort_defaults_text_columns_ascending() {
-        let mut pane = build_test_pane();
-        pane.set_sort(SortKey::Name);
+    fn keymap_cycles_focus_filters_and_sort() {
+        let mut pane = ModelsPane::new();
+        assert!(pane.on_key(key(KeyCode::Char('l'))));
+        assert_eq!(pane.focus, Focus::Models);
+        assert!(pane.on_key(key(KeyCode::Char('1'))));
+        assert!(pane.filters.reasoning);
+        let previous = pane.sort_key;
+        assert!(pane.on_key(key(KeyCode::Char('s'))));
+        assert_ne!(pane.sort_key, previous);
+        assert!(pane.on_key(key(KeyCode::Char('S'))));
         assert_eq!(pane.sort_order, SortOrder::Ascending);
     }
 
     #[test]
-    fn point_in_rect_matches_only_inside_cells() {
-        let r = Rect::new(2, 3, 10, 5); // [2..12) × [3..8)
-        assert!(point_in_rect(2, 3, r), "top-left corner is inside");
-        assert!(point_in_rect(11, 7, r), "bottom-right cell is inside");
-        assert!(!point_in_rect(12, 5, r), "just past right edge");
-        assert!(!point_in_rect(5, 8, r), "just past bottom edge");
-        assert!(!point_in_rect(1, 5, r), "left of the rect");
-        assert!(!point_in_rect(5, 2, r), "above the rect");
+    fn search_commits_only_on_enter() {
+        let mut pane = ModelsPane::new();
+        pane.on_key(key(KeyCode::Char('/')));
+        pane.on_key(key(KeyCode::Char('g')));
+        pane.on_key(key(KeyCode::Char('p')));
+        assert!(pane.search_query.is_empty());
+        pane.on_key(key(KeyCode::Enter));
+        assert_eq!(pane.search_query, "gp");
     }
 
     #[test]
-    fn point_in_rect_rejects_zero_sized() {
-        // Empty rect (before first render) must never hit — otherwise
-        // a stray click at (0,0) with `body_rect` = default would
-        // hijack the wheel before the first paint captured a real rect.
-        assert!(!point_in_rect(0, 0, Rect::default()));
-    }
-
-    #[test]
-    fn move_cursor_clamps_to_row_range() {
-        let mut pane = build_test_pane();
-        // Seed a snapshot big enough to bump against; skip the worker.
-        pane.snapshot = Snapshot {
-            rows: (0..5)
-                .map(|i| ModelRow {
-                    provider_id: "p".into(),
-                    provider_name: "P".into(),
-                    model_id: format!("m{i}"),
-                    model_name: format!("M{i}"),
-                    context: None,
-                    output_limit: None,
-                    input_cost: None,
-                    output_cost: None,
-                    reasoning: false,
-                    tool_call: false,
-                    attachment: false,
-                    family: None,
-                    release_date: None,
-                    last_updated: None,
-                    is_text: true,
-                    open_weights: false,
-                })
-                .collect(),
-            provider_count: 1,
-            last_error: None,
-        };
-        pane.move_cursor(100);
-        assert_eq!(pane.cursor, 4, "clamped to last row");
-        pane.move_cursor(-100);
-        assert_eq!(pane.cursor, 0, "clamped to first row");
-        pane.move_cursor(3);
-        assert_eq!(pane.cursor, 3);
-    }
-
-    #[test]
-    fn move_cursor_stays_zero_when_empty() {
-        let mut pane = build_test_pane();
-        // Default snapshot has zero rows — the wheel handler must
-        // not underflow / panic.
-        pane.move_cursor(WHEEL_STEP);
-        assert_eq!(pane.cursor, 0);
-        pane.move_cursor(-WHEEL_STEP);
-        assert_eq!(pane.cursor, 0);
-    }
-
-    #[test]
-    fn wheel_step_matches_pty_convention() {
-        // pty_pane / fr_pane / agtop all use 3 rows-per-notch. Keep
-        // the muscle memory identical.
-        assert_eq!(WHEEL_STEP, 3);
-    }
-
-    /// Build a pane WITHOUT spawning the worker thread — direct field
-    /// init since ModelsPane::new() hits the OS to spawn.
-    fn build_test_pane() -> ModelsPane {
-        // We still need a worker because it owns channels the pane
-        // holds. The thread parks on recv immediately so this is cheap.
-        ModelsPane::new()
-    }
-    #[test]
-    fn stable_state_round_trips_without_cursor_or_modal() {
-        let mut source = build_test_pane();
-        source.sort_key = SortKey::Context;
-        source.sort_order = SortOrder::Descending;
-        source.filter = Some("open".into());
-        source.cursor = 7;
-        let state = source.snapshot_state();
-
-        let mut restored = build_test_pane();
+    fn stable_state_round_trips_browsing_preferences() {
+        let mut pane = ModelsPane::new();
+        pane.focus = Focus::Details;
+        pane.filters.reasoning = true;
+        pane.category_filter = ProviderCategory::Cloud;
+        pane.group_by_category = true;
+        pane.search_query = "claude".into();
+        pane.sort_key = SortKey::Context;
+        pane.sort_order = SortOrder::Ascending;
+        let state = pane.snapshot_state();
+        let mut restored = ModelsPane::new();
         restored.restore_state(&state);
-
+        assert_eq!(restored.focus, Focus::Details);
+        assert!(restored.filters.reasoning);
+        assert_eq!(restored.category_filter, ProviderCategory::Cloud);
+        assert!(restored.group_by_category);
+        assert_eq!(restored.search_query, "claude");
         assert_eq!(restored.sort_key, SortKey::Context);
-        assert_eq!(restored.sort_order, SortOrder::Descending);
-        assert_eq!(restored.filter.as_deref(), Some("open"));
-        assert_eq!(restored.cursor, 0);
-        assert_eq!(restored.modal, Modal::None);
+        assert_eq!(restored.sort_order, SortOrder::Ascending);
+    }
+
+    #[test]
+    fn narrow_helpers_never_underflow() {
+        assert_eq!(window_around(0, 0, 0), (0, 0));
+        assert_eq!(truncate("abc", 0), "");
+        let lines = model_detail_lines(
+            &serde_json::from_str::<Model>(r#"{"id":"m","name":"M"}"#).unwrap(),
+            0,
+        );
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn render_exposes_three_columns_and_core_hints() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let json = r#"{
+          "openai":{"id":"openai","name":"OpenAI","doc":"https://docs.example","api":"https://api.example","env":["OPENAI_API_KEY"],"models":{
+            "gpt":{"id":"gpt","name":"GPT","tool_call":true,"attachment":true,"description":"A capable model","cost":{"input":2,"output":8},"limit":{"context":128000}}
+          }}
+        }"#;
+        let mut pane = ModelsPane::new();
+        pane.snapshot = Snapshot::from_providers(&serde_json::from_str(json).unwrap());
+        pane.sync_selection();
+        let backend = TestBackend::new(160, 44);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                pane.render(
+                    frame.area(),
+                    frame,
+                    &PaneRenderCtx {
+                        focused: true,
+                        title_override: None,
+                        focus_color: Color::Cyan,
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Providers"), "{text}");
+        assert!(text.contains("RTFO"), "{text}");
+        assert!(text.contains("Provider"), "{text}");
+        assert!(text.contains("Capabilities"), "{text}");
+        assert!(text.contains("h/l focus"), "{text}");
     }
 }
