@@ -6,11 +6,10 @@ use ratatui::{
 };
 
 use super::diff::centered_rect_min;
-use crate::config::THEME;
 
 /// Create a standard modal block with double border.
-pub(crate) fn modal_block(title: &str) -> Block<'static> {
-    let theme = THEME.read().unwrap();
+pub(crate) fn modal_block(title: &str, theme: &crate::config::Theme) -> Block<'static> {
+    let theme = theme;
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
@@ -26,12 +25,9 @@ pub(crate) fn modal_block(title: &str) -> Block<'static> {
 
 /// Clear an overlay area, repainting it with the theme background so overlays keep the
 /// theme bg instead of falling back to the terminal default background.
-pub(crate) fn clear_area(f: &mut Frame, area: Rect) {
+pub(crate) fn clear_area(f: &mut Frame, area: Rect, theme: &crate::config::Theme) {
     f.render_widget(Clear, area);
-    f.render_widget(
-        Block::default().style(Style::default().bg(THEME.read().unwrap().bg)),
-        area,
-    );
+    f.render_widget(Block::default().style(Style::default().bg(theme.bg)), area);
 }
 
 /// Clear, size, and render a modal frame. Returns (inner_area, outer_area) for body content.
@@ -43,10 +39,11 @@ pub(crate) fn modal_area(
     min_w: u16,
     min_h: u16,
     size: Rect,
+    theme: &crate::config::Theme,
 ) -> (Rect, Rect) {
     let area = centered_rect_min(percent_x, percent_y, min_w, min_h, size);
-    clear_area(f, area);
-    let block = modal_block(title);
+    clear_area(f, area, theme);
+    let block = modal_block(title, theme);
     let inner = block.inner(area);
     f.render_widget(block, area);
     (inner, area)

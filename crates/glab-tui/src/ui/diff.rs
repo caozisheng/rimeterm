@@ -1,4 +1,3 @@
-use crate::config::THEME;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -14,6 +13,7 @@ pub(crate) fn format_comment_with_suggestions(
     all_lines: &[crate::app::DiffLine],
     prefix: &str,
     prefix_style: Style,
+    theme: &crate::config::Theme,
 ) -> Vec<(String, Style, Vec<(Style, String)>)> {
     let mut result_lines = Vec::new();
     let mut in_suggestion = false;
@@ -75,7 +75,7 @@ pub(crate) fn format_comment_with_suggestions(
                 prefix_style,
                 vec![(
                     Style::default()
-                        .fg(THEME.read().unwrap().green)
+                        .fg(theme.green)
                         .add_modifier(Modifier::BOLD),
                     "┌─── Code Suggestion ───".to_string(),
                 )],
@@ -83,7 +83,7 @@ pub(crate) fn format_comment_with_suggestions(
 
             // Print original code as DELETIONS (red)
             for orig in &original_lines {
-                let theme = THEME.read().unwrap();
+                let theme = theme;
                 let code_fg = theme.diff_deletion_fg;
                 let code_bg = theme.diff_deletion_bg;
                 let prefix_fg = theme.red;
@@ -128,14 +128,14 @@ pub(crate) fn format_comment_with_suggestions(
                 prefix_style,
                 vec![(
                     Style::default()
-                        .fg(THEME.read().unwrap().green)
+                        .fg(theme.green)
                         .add_modifier(Modifier::BOLD),
                     "└─── End of Suggestion ───".to_string(),
                 )],
             ));
         } else if in_suggestion {
             // Print suggested code as ADDITIONS (green)
-            let theme = THEME.read().unwrap();
+            let theme = theme;
             let code_fg = theme.diff_addition_fg;
             let code_bg = theme.diff_addition_bg;
             let prefix_fg = theme.green;
@@ -169,7 +169,7 @@ pub(crate) fn format_comment_with_suggestions(
                 current_prefix,
                 prefix_style,
                 vec![(
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(theme.text_normal),
                     body_line.to_string(),
                 )],
             ));
@@ -180,10 +180,7 @@ pub(crate) fn format_comment_with_suggestions(
         result_lines.push((
             prefix.to_string(),
             prefix_style,
-            vec![(
-                Style::default().fg(THEME.read().unwrap().text_normal),
-                String::new(),
-            )],
+            vec![(Style::default().fg(theme.text_normal), String::new())],
         ));
     }
 
@@ -364,9 +361,10 @@ mod tests {
     #[test]
     fn test_get_label_color() {
         let colors = std::collections::HashMap::new();
-        let color1 = get_label_color("bug", &colors);
-        let _color2 = get_label_color("feature", &colors);
-        let color3 = get_label_color("bug", &colors);
+        let theme = crate::config::Theme::default();
+        let color1 = get_label_color("bug", &colors, &theme);
+        let _color2 = get_label_color("feature", &colors, &theme);
+        let color3 = get_label_color("bug", &colors, &theme);
 
         assert_eq!(color1, color3);
         match color1 {
@@ -379,11 +377,27 @@ mod tests {
     fn test_render_labels_cell() {
         let labels = vec!["bug".to_string(), "backend".to_string()];
         let colors = std::collections::HashMap::new();
-        let cell_empty = render_labels_cell(&[], &colors, "", false, false, 24);
+        let cell_empty = render_labels_cell(
+            &[],
+            &colors,
+            "",
+            false,
+            false,
+            24,
+            &crate::config::Theme::default(),
+        );
         let cell_str_empty = format!("{:?}", cell_empty);
         assert!(cell_str_empty.contains("—"));
 
-        let cell_normal = render_labels_cell(&labels, &colors, "", false, false, 24);
+        let cell_normal = render_labels_cell(
+            &labels,
+            &colors,
+            "",
+            false,
+            false,
+            24,
+            &crate::config::Theme::default(),
+        );
         let cell_str = format!("{:?}", cell_normal);
         assert!(cell_str.contains("bug"));
         assert!(cell_str.contains("backend"));
@@ -415,6 +429,7 @@ mod tests {
             &all_lines,
             prefix,
             prefix_style,
+            &crate::config::Theme::default(),
         );
 
         assert_eq!(formatted.len(), 6);

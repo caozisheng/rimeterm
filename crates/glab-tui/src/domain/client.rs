@@ -590,7 +590,7 @@ impl GitlabClient {
 
 impl Clone for GitlabClient {
     fn clone(&self) -> Self {
-        let mut backend = crate::backend::create_backend(self.is_github);
+        let mut backend = self.backend.clone_box();
         if let Some(ref tx) = self.tx {
             backend.set_tx(tx.clone());
         }

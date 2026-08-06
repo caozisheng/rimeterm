@@ -3,7 +3,6 @@ use super::helpers::{get_label_color, highlight_fuzzy_match};
 use super::modal::{clear_area, modal_area};
 use crate::app::SaveMenu;
 use crate::app::{App, Tab};
-use crate::config::{ICONS, THEME};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -14,10 +13,11 @@ use ratatui::{
 
 pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
     app.overlay_stack.clear();
-    let icons = ICONS.read().unwrap();
+    let icons = &app.resources.icons;
     if let Some(menu) = &mut app.edit_menu {
         let is_new_entity = menu.is_new();
-        let (body, edit_menu_area) = modal_area(f, &menu.title, 52, 48, 42, 8, size);
+        let (body, edit_menu_area) =
+            modal_area(f, &menu.title, 52, 48, 42, 8, size, &app.resources.theme);
         app.overlay_stack
             .push((crate::app::OverlayKind::EditMenu, edit_menu_area));
 
@@ -36,30 +36,30 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             .map(|(i, (label, val))| {
                 let is_selected = i == menu.selected_idx;
                 let item_bg = if is_selected {
-                    THEME.read().unwrap().highlight_bg
+                    app.resources.theme.highlight_bg
                 } else {
-                    THEME.read().unwrap().bg
+                    app.resources.theme.bg
                 };
 
                 let label_style = if is_selected {
                     Style::default()
-                        .fg(THEME.read().unwrap().text_normal)
+                        .fg(app.resources.theme.text_normal)
                         .bg(item_bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .fg(THEME.read().unwrap().text_muted)
+                        .fg(app.resources.theme.text_muted)
                         .bg(item_bg)
                 };
 
                 let sep_style = if is_selected {
                     Style::default()
-                        .fg(THEME.read().unwrap().text_normal)
+                        .fg(app.resources.theme.text_normal)
                         .bg(item_bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
-                        .fg(THEME.read().unwrap().text_muted)
+                        .fg(app.resources.theme.text_muted)
                         .bg(item_bg)
                 };
 
@@ -80,12 +80,16 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                                     val_spans.push(Span::styled(
                                         ", ",
                                         Style::default()
-                                            .fg(THEME.read().unwrap().text_normal)
+                                            .fg(app.resources.theme.text_normal)
                                             .bg(item_bg),
                                     ));
                                 }
                                 let trimmed = part.trim();
-                                let label_color = get_label_color(trimmed, &app.label_colors);
+                                let label_color = get_label_color(
+                                    trimmed,
+                                    &app.label_colors,
+                                    &app.resources.theme,
+                                );
                                 let mut style = Style::default()
                                     .fg(label_color)
                                     .bg(item_bg)
@@ -103,13 +107,13 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                                     val_spans.push(Span::styled(
                                         ", ",
                                         Style::default()
-                                            .fg(THEME.read().unwrap().text_normal)
+                                            .fg(app.resources.theme.text_normal)
                                             .bg(item_bg),
                                     ));
                                 }
                                 let trimmed = part.trim();
                                 let mut style =
-                                    Style::default().fg(THEME.read().unwrap().blue).bg(item_bg);
+                                    Style::default().fg(app.resources.theme.blue).bg(item_bg);
                                 if is_selected {
                                     style = style.add_modifier(Modifier::BOLD);
                                 }
@@ -118,19 +122,19 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                         }
                         _ => {
                             let val_fg = match label.as_str() {
-                                "Milestone" => THEME.read().unwrap().purple,
-                                "Due Date" => THEME.read().unwrap().yellow,
+                                "Milestone" => app.resources.theme.purple,
+                                "Due Date" => app.resources.theme.yellow,
                                 "Status (Draft/Ready)" | "Source Branch" | "Target Branch" => {
-                                    THEME.read().unwrap().purple
+                                    app.resources.theme.purple
                                 }
                                 "Confidential" => {
                                     if val.to_lowercase() == "yes" {
-                                        THEME.read().unwrap().red
+                                        app.resources.theme.red
                                     } else {
-                                        THEME.read().unwrap().green
+                                        app.resources.theme.green
                                     }
                                 }
-                                _ => THEME.read().unwrap().text_normal,
+                                _ => app.resources.theme.text_normal,
                             };
                             let mut style = Style::default().fg(val_fg).bg(item_bg);
                             if is_selected {
@@ -159,14 +163,14 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
         let all_items: Vec<ListItem> = if is_new_entity {
             let is_submit_selected = menu.selected_idx == submit_idx;
             let submit_bg = if is_submit_selected {
-                THEME.read().unwrap().border_focused
+                app.resources.theme.border_focused
             } else {
-                THEME.read().unwrap().bg
+                app.resources.theme.bg
             };
             let submit_fg = if is_submit_selected {
-                THEME.read().unwrap().bg
+                app.resources.theme.bg
             } else {
-                THEME.read().unwrap().border_focused
+                app.resources.theme.border_focused
             };
             let submit_line = Line::from(vec![Span::styled(
                 "          [ Submit ]          ",
@@ -177,7 +181,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             )]);
             let mut v = items;
             v.push(ListItem::new(
-                Line::from("").style(Style::default().bg(THEME.read().unwrap().bg)),
+                Line::from("").style(Style::default().bg(app.resources.theme.bg)),
             ));
             v.push(ListItem::new(submit_line));
             v
@@ -185,7 +189,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             items
         };
 
-        let list = List::new(all_items).style(Style::default().bg(THEME.read().unwrap().bg));
+        let list = List::new(all_items).style(Style::default().bg(app.resources.theme.bg));
         let mut state = menu.state.clone();
         f.render_stateful_widget(list, body, &mut state);
         menu.state = state;
@@ -193,7 +197,16 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
 
     if app.column_filter_context.is_none() {
         if let Some(selector) = &mut app.selector {
-            let (body, selector_area) = modal_area(f, &selector.title, 50, 60, 34, 6, size);
+            let (body, selector_area) = modal_area(
+                f,
+                &selector.title,
+                50,
+                60,
+                34,
+                6,
+                size,
+                &app.resources.theme,
+            );
             app.overlay_stack
                 .push((crate::app::OverlayKind::Selector, selector_area));
 
@@ -224,16 +237,16 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             };
 
             let border_color_search = if selector.is_filtering {
-                THEME.read().unwrap().border_focused
+                app.resources.theme.border_focused
             } else {
-                THEME.read().unwrap().border
+                app.resources.theme.border
             };
             let search_block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(
                     Style::default()
                         .fg(border_color_search)
-                        .bg(THEME.read().unwrap().bg),
+                        .bg(app.resources.theme.bg),
                 )
                 .title(" Filter (press 'f' or '/' to focus) ");
 
@@ -247,13 +260,13 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
 
             let search_style = if selector.search_query.is_empty() && !selector.is_filtering {
                 Style::default()
-                    .fg(THEME.read().unwrap().text_muted)
-                    .bg(THEME.read().unwrap().bg)
+                    .fg(app.resources.theme.text_muted)
+                    .bg(app.resources.theme.bg)
                     .add_modifier(Modifier::ITALIC)
             } else {
                 Style::default()
-                    .fg(THEME.read().unwrap().text_normal)
-                    .bg(THEME.read().unwrap().bg)
+                    .fg(app.resources.theme.text_normal)
+                    .bg(app.resources.theme.bg)
             };
 
             let search_p = Paragraph::new(search_text)
@@ -269,8 +282,8 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                 let p = Paragraph::new("\n  Loading options from GitLab...")
                     .style(
                         Style::default()
-                            .fg(THEME.read().unwrap().text_muted)
-                            .bg(THEME.read().unwrap().bg)
+                            .fg(app.resources.theme.text_muted)
+                            .bg(app.resources.theme.bg)
                             .add_modifier(Modifier::ITALIC),
                     )
                     .wrap(ratatui::widgets::Wrap { trim: true });
@@ -281,8 +294,8 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                     let p = Paragraph::new("\n  No matching options found.")
                         .style(
                             Style::default()
-                                .fg(THEME.read().unwrap().text_muted)
-                                .bg(THEME.read().unwrap().bg)
+                                .fg(app.resources.theme.text_muted)
+                                .bg(app.resources.theme.bg)
                                 .add_modifier(Modifier::ITALIC),
                         )
                         .wrap(ratatui::widgets::Wrap { trim: true });
@@ -305,36 +318,36 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                                 format!(" {} ", icons.check_off)
                             };
                             let marker_color = if is_selected {
-                                THEME.read().unwrap().green
+                                app.resources.theme.green
                             } else {
-                                THEME.read().unwrap().text_muted
+                                app.resources.theme.text_muted
                             };
 
                             let item_bg = if i == selector.cursor_idx {
-                                THEME.read().unwrap().highlight_bg
+                                app.resources.theme.highlight_bg
                             } else {
-                                THEME.read().unwrap().bg
+                                app.resources.theme.bg
                             };
 
                             let style = if i == selector.cursor_idx {
                                 Style::default()
                                     .bg(item_bg)
-                                    .fg(THEME.read().unwrap().text_normal)
+                                    .fg(app.resources.theme.text_normal)
                                     .add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default()
-                                    .fg(THEME.read().unwrap().text_normal)
+                                    .fg(app.resources.theme.text_normal)
                                     .bg(item_bg)
                             };
 
                             let highlight_style = if i == selector.cursor_idx {
                                 Style::default()
                                     .bg(item_bg)
-                                    .fg(THEME.read().unwrap().yellow)
+                                    .fg(app.resources.theme.yellow)
                                     .add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default()
-                                    .fg(THEME.read().unwrap().yellow)
+                                    .fg(app.resources.theme.yellow)
                                     .bg(item_bg)
                                     .add_modifier(Modifier::BOLD)
                             };
@@ -363,8 +376,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                         })
                         .collect();
 
-                    let list =
-                        List::new(items).style(Style::default().bg(THEME.read().unwrap().bg));
+                    let list = List::new(items).style(Style::default().bg(app.resources.theme.bg));
                     let mut state = selector.state.clone();
                     f.render_stateful_widget(list, list_chunk, &mut state);
                     selector.state = state;
@@ -378,15 +390,15 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             .title(format!(" {} ", text_input.title))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().header_fg)
+                    .fg(app.resources.theme.header_fg)
                     .add_modifier(Modifier::BOLD),
             )
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(THEME.read().unwrap().border_focused))
-            .style(Style::default().bg(THEME.read().unwrap().bg));
+            .border_style(Style::default().fg(app.resources.theme.border_focused))
+            .style(Style::default().bg(app.resources.theme.bg));
 
         let area = centered_rect_min(60, 60, 28, 4, size);
-        clear_area(f, area);
+        clear_area(f, area, &app.resources.theme);
         f.render_widget(block, area);
 
         let chunks = Layout::default()
@@ -410,8 +422,8 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
         let value_p = Paragraph::new(display_val)
             .style(
                 Style::default()
-                    .fg(THEME.read().unwrap().text_normal)
-                    .bg(THEME.read().unwrap().bg),
+                    .fg(app.resources.theme.text_normal)
+                    .bg(app.resources.theme.bg),
             )
             .wrap(ratatui::widgets::Wrap { trim: true });
 
@@ -423,12 +435,12 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             .title(format!(" {} ", date_picker.title))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().header_fg)
+                    .fg(app.resources.theme.header_fg)
                     .add_modifier(Modifier::BOLD),
             )
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(THEME.read().unwrap().border_focused))
-            .style(Style::default().bg(THEME.read().unwrap().bg));
+            .border_style(Style::default().fg(app.resources.theme.border_focused))
+            .style(Style::default().bg(app.resources.theme.bg));
 
         // 36 columns wide, 11 rows high
         let area = centered_rect_fixed(36, 11, size);
@@ -467,7 +479,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             .alignment(Alignment::Center)
             .style(
                 Style::default()
-                    .fg(THEME.read().unwrap().header_fg)
+                    .fg(app.resources.theme.header_fg)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -477,7 +489,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             .into_iter()
             .map(|h| Cell::from(Line::from(h).alignment(Alignment::Center)));
         let table_header =
-            Row::new(col_headers).style(Style::default().fg(THEME.read().unwrap().text_muted));
+            Row::new(col_headers).style(Style::default().fg(app.resources.theme.text_muted));
 
         // Calculate days grid
         let first_date =
@@ -496,11 +508,11 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                     let is_selected = day_num as u32 == date_picker.day;
                     let style = if is_selected {
                         Style::default()
-                            .bg(THEME.read().unwrap().highlight_bg)
-                            .fg(THEME.read().unwrap().header_fg)
+                            .bg(app.resources.theme.highlight_bg)
+                            .fg(app.resources.theme.header_fg)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(THEME.read().unwrap().text_normal)
+                        Style::default().fg(app.resources.theme.text_normal)
                     };
                     row_cells.push(Cell::from(
                         Line::from(day_num.to_string())
@@ -528,7 +540,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             .header(table_header)
             .column_spacing(1);
 
-        clear_area(f, area);
+        clear_area(f, area, &app.resources.theme);
         f.render_widget(block, area);
         f.render_widget(header_p, chunks[0]);
         f.render_widget(table, chunks[1]);
@@ -1106,13 +1118,13 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             .title(format!(" {} Keyboard Shortcuts ", icons.label_keyboard))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().header_fg)
+                    .fg(app.resources.theme.header_fg)
                     .add_modifier(Modifier::BOLD),
             )
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(THEME.read().unwrap().border_focused))
+            .border_style(Style::default().fg(app.resources.theme.border_focused))
             .border_type(BorderType::Double)
-            .style(Style::default().bg(THEME.read().unwrap().bg));
+            .style(Style::default().bg(app.resources.theme.bg));
 
         let area = centered_rect_fixed(72, 30, size);
         app.overlay_stack
@@ -1131,9 +1143,9 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             .split(area);
 
         let border_color = if app.help_search_query.is_empty() {
-            THEME.read().unwrap().border
+            app.resources.theme.border
         } else {
-            THEME.read().unwrap().border_focused
+            app.resources.theme.border_focused
         };
         let search_block = Block::default()
             .borders(Borders::ALL)
@@ -1141,7 +1153,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             .title(" Filter Shortcuts (Type to filter, Esc/Enter to exit) ")
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().text_muted)
+                    .fg(app.resources.theme.text_muted)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -1153,10 +1165,10 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
 
         let search_style = if app.help_search_query.is_empty() {
             Style::default()
-                .fg(THEME.read().unwrap().text_muted)
+                .fg(app.resources.theme.text_muted)
                 .add_modifier(Modifier::ITALIC)
         } else {
-            Style::default().fg(THEME.read().unwrap().text_normal)
+            Style::default().fg(app.resources.theme.text_normal)
         };
 
         let search_p = Paragraph::new(search_text)
@@ -1180,18 +1192,18 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                         Cell::from(Span::styled(
                             s.category,
                             Style::default()
-                                .fg(THEME.read().unwrap().purple)
+                                .fg(app.resources.theme.purple)
                                 .add_modifier(Modifier::BOLD),
                         )),
                         Cell::from(Span::styled(
                             s.key.clone(),
                             Style::default()
-                                .fg(THEME.read().unwrap().text_normal)
+                                .fg(app.resources.theme.text_normal)
                                 .add_modifier(Modifier::BOLD),
                         )),
                         Cell::from(Span::styled(
                             s.action,
-                            Style::default().fg(THEME.read().unwrap().text_normal),
+                            Style::default().fg(app.resources.theme.text_normal),
                         )),
                     ]));
                     last_category = s.category;
@@ -1201,12 +1213,12 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                         Cell::from(Span::styled(
                             s.key.clone(),
                             Style::default()
-                                .fg(THEME.read().unwrap().text_normal)
+                                .fg(app.resources.theme.text_normal)
                                 .add_modifier(Modifier::BOLD),
                         )),
                         Cell::from(Span::styled(
                             s.action,
-                            Style::default().fg(THEME.read().unwrap().text_normal),
+                            Style::default().fg(app.resources.theme.text_normal),
                         )),
                     ]));
                 }
@@ -1226,18 +1238,18 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                         Cell::from(Span::styled(
                             s.category,
                             Style::default()
-                                .fg(THEME.read().unwrap().purple)
+                                .fg(app.resources.theme.purple)
                                 .add_modifier(Modifier::BOLD),
                         )),
                         Cell::from(Span::styled(
                             s.key.clone(),
                             Style::default()
-                                .fg(THEME.read().unwrap().text_normal)
+                                .fg(app.resources.theme.text_normal)
                                 .add_modifier(Modifier::BOLD),
                         )),
                         Cell::from(Span::styled(
                             s.action,
-                            Style::default().fg(THEME.read().unwrap().text_normal),
+                            Style::default().fg(app.resources.theme.text_normal),
                         )),
                     ])
                 })
@@ -1251,7 +1263,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
         ];
 
         let header_style = Style::default()
-            .fg(THEME.read().unwrap().header_fg)
+            .fg(app.resources.theme.header_fg)
             .add_modifier(Modifier::BOLD);
         let table = Table::new(rows, widths)
             .header(
@@ -1266,7 +1278,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             .row_highlight_style(Style::default())
             .column_spacing(2);
 
-        clear_area(f, area);
+        clear_area(f, area, &app.resources.theme);
         f.render_widget(search_p, help_chunks[0]);
         f.render_widget(table, help_chunks[1]);
     }
@@ -1295,24 +1307,24 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
 
         let checklist_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(THEME.read().unwrap().border_focused))
-            .style(Style::default().bg(THEME.read().unwrap().bg))
+            .border_style(Style::default().fg(app.resources.theme.border_focused))
+            .style(Style::default().bg(app.resources.theme.bg))
             .title(format!(
                 " {} Configure View: {} ",
                 icons.label_configure,
-                tab.title(kind)
+                tab.title(kind, &app.resources.icons)
             ))
             .title_bottom(Span::styled(
                 " Space: toggle · Enter: filter/set · J/K: jump · Esc: close ",
-                Style::default().fg(THEME.read().unwrap().text_muted),
+                Style::default().fg(app.resources.theme.text_muted),
             ))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().border_focused)
+                    .fg(app.resources.theme.border_focused)
                     .add_modifier(Modifier::BOLD),
             );
 
-        clear_area(f, area);
+        clear_area(f, area, &app.resources.theme);
         f.render_widget(checklist_block.clone(), area);
 
         let inner_area = checklist_block.inner(area);
@@ -1351,7 +1363,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
 
         let columns_header = Paragraph::new(format!("  {} COLUMNS", icons.label_columns)).style(
             Style::default()
-                .fg(THEME.read().unwrap().header_fg)
+                .fg(app.resources.theme.header_fg)
                 .add_modifier(Modifier::BOLD),
         );
         f.render_widget(columns_header, popup_layout[chunk_idx]);
@@ -1378,13 +1390,13 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                 let is_active = orig_idx == active_idx;
                 let style = if is_active {
                     Style::default()
-                        .fg(THEME.read().unwrap().bg)
-                        .bg(THEME.read().unwrap().border_focused)
+                        .fg(app.resources.theme.bg)
+                        .bg(app.resources.theme.border_focused)
                         .add_modifier(Modifier::BOLD)
                 } else if checked {
-                    Style::default().fg(THEME.read().unwrap().text_normal)
+                    Style::default().fg(app.resources.theme.text_normal)
                 } else {
-                    Style::default().fg(THEME.read().unwrap().text_muted)
+                    Style::default().fg(app.resources.theme.text_muted)
                 };
                 ListItem::new(text).style(style)
             })
@@ -1396,7 +1408,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
 
         let group_header = Paragraph::new(format!("  {} GROUP BY", icons.label_group)).style(
             Style::default()
-                .fg(THEME.read().unwrap().green)
+                .fg(app.resources.theme.green)
                 .add_modifier(Modifier::BOLD),
         );
         f.render_widget(group_header, popup_layout[chunk_idx]);
@@ -1421,13 +1433,13 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                 let is_active = flat_idx == active_idx;
                 let style = if is_active {
                     Style::default()
-                        .fg(THEME.read().unwrap().bg)
-                        .bg(THEME.read().unwrap().border_focused)
+                        .fg(app.resources.theme.bg)
+                        .bg(app.resources.theme.border_focused)
                         .add_modifier(Modifier::BOLD)
                 } else if is_selected {
-                    Style::default().fg(THEME.read().unwrap().green)
+                    Style::default().fg(app.resources.theme.green)
                 } else {
-                    Style::default().fg(THEME.read().unwrap().text_normal)
+                    Style::default().fg(app.resources.theme.text_normal)
                 };
                 ListItem::new(text).style(style)
             })
@@ -1439,7 +1451,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
 
         let order_header = Paragraph::new(format!("  {} ORDER", icons.label_order)).style(
             Style::default()
-                .fg(THEME.read().unwrap().yellow)
+                .fg(app.resources.theme.yellow)
                 .add_modifier(Modifier::BOLD),
         );
         f.render_widget(order_header, popup_layout[chunk_idx]);
@@ -1464,13 +1476,13 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                 let is_active = flat_idx == active_idx;
                 let style = if is_active {
                     Style::default()
-                        .fg(THEME.read().unwrap().bg)
-                        .bg(THEME.read().unwrap().border_focused)
+                        .fg(app.resources.theme.bg)
+                        .bg(app.resources.theme.border_focused)
                         .add_modifier(Modifier::BOLD)
                 } else if is_selected {
-                    Style::default().fg(THEME.read().unwrap().yellow)
+                    Style::default().fg(app.resources.theme.yellow)
                 } else {
-                    Style::default().fg(THEME.read().unwrap().text_normal)
+                    Style::default().fg(app.resources.theme.text_normal)
                 };
                 ListItem::new(text).style(style)
             })
@@ -1484,7 +1496,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
         let page_size_header = Paragraph::new(format!(" {} PAGE SIZE", icons.label_page_size))
             .style(
                 Style::default()
-                    .fg(THEME.read().unwrap().header_fg)
+                    .fg(app.resources.theme.header_fg)
                     .add_modifier(Modifier::BOLD),
             );
         f.render_widget(page_size_header, popup_layout[chunk_idx]);
@@ -1500,16 +1512,16 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
         };
         let page_size_style = if app.editing_page_size {
             Style::default()
-                .fg(THEME.read().unwrap().bg)
-                .bg(THEME.read().unwrap().green)
+                .fg(app.resources.theme.bg)
+                .bg(app.resources.theme.green)
                 .add_modifier(Modifier::BOLD)
         } else if is_page_size_active {
             Style::default()
-                .fg(THEME.read().unwrap().bg)
-                .bg(THEME.read().unwrap().border_focused)
+                .fg(app.resources.theme.bg)
+                .bg(app.resources.theme.border_focused)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(THEME.read().unwrap().text_normal)
+            Style::default().fg(app.resources.theme.text_normal)
         };
         let page_size_paragraph = Paragraph::new(page_size_text)
             .style(page_size_style)
@@ -1521,7 +1533,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
 
         let theme_header = Paragraph::new(format!("  {} THEME", icons.label_theme)).style(
             Style::default()
-                .fg(THEME.read().unwrap().purple)
+                .fg(app.resources.theme.purple)
                 .add_modifier(Modifier::BOLD),
         );
         f.render_widget(theme_header, popup_layout[chunk_idx]);
@@ -1545,13 +1557,13 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                 let is_active = flat_idx == active_idx;
                 let style = if is_active {
                     Style::default()
-                        .fg(THEME.read().unwrap().bg)
-                        .bg(THEME.read().unwrap().border_focused)
+                        .fg(app.resources.theme.bg)
+                        .bg(app.resources.theme.border_focused)
                         .add_modifier(Modifier::BOLD)
                 } else if is_selected {
-                    Style::default().fg(THEME.read().unwrap().purple)
+                    Style::default().fg(app.resources.theme.purple)
                 } else {
-                    Style::default().fg(THEME.read().unwrap().text_normal)
+                    Style::default().fg(app.resources.theme.text_normal)
                 };
                 ListItem::new(text).style(style)
             })
@@ -1564,7 +1576,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
         // Save button
         let save_header = Paragraph::new(" SAVE").style(
             Style::default()
-                .fg(THEME.read().unwrap().header_fg)
+                .fg(app.resources.theme.header_fg)
                 .add_modifier(Modifier::BOLD),
         );
         f.render_widget(save_header, popup_layout[chunk_idx]);
@@ -1578,11 +1590,11 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
         };
         let save_button_style = if is_save_selected {
             Style::default()
-                .fg(THEME.read().unwrap().bg)
-                .bg(THEME.read().unwrap().border_focused)
+                .fg(app.resources.theme.bg)
+                .bg(app.resources.theme.border_focused)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(THEME.read().unwrap().text_normal)
+            Style::default().fg(app.resources.theme.text_normal)
         };
         let save_button = Paragraph::new(save_button_text)
             .style(save_button_style)
@@ -1598,14 +1610,14 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                 .push((crate::app::OverlayKind::SaveMenu, submenu_area));
             let submenu_block = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(THEME.read().unwrap().border_focused))
+                .border_style(Style::default().fg(app.resources.theme.border_focused))
                 .title(format!(" {} Save to Config ", icons.label_save))
                 .title_style(
                     Style::default()
-                        .fg(THEME.read().unwrap().border_focused)
+                        .fg(app.resources.theme.border_focused)
                         .add_modifier(Modifier::BOLD),
                 );
-            clear_area(f, submenu_area);
+            clear_area(f, submenu_area, &app.resources.theme);
             f.render_widget(submenu_block.clone(), submenu_area);
             let submenu_inner = submenu_block.inner(submenu_area);
 
@@ -1622,11 +1634,11 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                     };
                     let style = if is_active {
                         Style::default()
-                            .fg(THEME.read().unwrap().bg)
-                            .bg(THEME.read().unwrap().border_focused)
+                            .fg(app.resources.theme.bg)
+                            .bg(app.resources.theme.border_focused)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(THEME.read().unwrap().text_normal)
+                        Style::default().fg(app.resources.theme.text_normal)
                     };
                     ListItem::new(label).style(style)
                 })
@@ -1656,12 +1668,12 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                 .title(format!(" {} ", selector.title))
                 .title_style(
                     Style::default()
-                        .fg(THEME.read().unwrap().header_fg)
+                        .fg(app.resources.theme.header_fg)
                         .add_modifier(Modifier::BOLD),
                 )
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(THEME.read().unwrap().border_focused))
-                .style(Style::default().bg(THEME.read().unwrap().bg));
+                .border_style(Style::default().fg(app.resources.theme.border_focused))
+                .style(Style::default().bg(app.resources.theme.bg));
 
             let area = centered_rect_fixed(44, 44, size);
             app.overlay_stack
@@ -1681,16 +1693,16 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             let (search_chunk, list_chunk) = (chunks[0], chunks[1]);
 
             let border_color_search = if selector.is_filtering {
-                THEME.read().unwrap().border_focused
+                app.resources.theme.border_focused
             } else {
-                THEME.read().unwrap().border
+                app.resources.theme.border
             };
             let search_block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(
                     Style::default()
                         .fg(border_color_search)
-                        .bg(THEME.read().unwrap().bg),
+                        .bg(app.resources.theme.bg),
                 )
                 .title(" Filter (press 'f' or '/' to focus) ");
 
@@ -1703,9 +1715,9 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             };
             let search_p = Paragraph::new(search_text)
                 .block(search_block)
-                .style(Style::default().fg(THEME.read().unwrap().text_normal));
+                .style(Style::default().fg(app.resources.theme.text_normal));
 
-            clear_area(f, area);
+            clear_area(f, area, &app.resources.theme);
             f.render_widget(block, area);
             f.render_widget(search_p, search_chunk);
 
@@ -1723,36 +1735,36 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                         format!(" {} ", icons.check_off)
                     };
                     let marker_color = if is_selected {
-                        THEME.read().unwrap().green
+                        app.resources.theme.green
                     } else {
-                        THEME.read().unwrap().text_muted
+                        app.resources.theme.text_muted
                     };
 
                     let item_bg = if i == selector.cursor_idx {
-                        THEME.read().unwrap().highlight_bg
+                        app.resources.theme.highlight_bg
                     } else {
-                        THEME.read().unwrap().bg
+                        app.resources.theme.bg
                     };
 
                     let style = if i == selector.cursor_idx {
                         Style::default()
                             .bg(item_bg)
-                            .fg(THEME.read().unwrap().text_normal)
+                            .fg(app.resources.theme.text_normal)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
-                            .fg(THEME.read().unwrap().text_normal)
+                            .fg(app.resources.theme.text_normal)
                             .bg(item_bg)
                     };
 
                     let highlight_style = if i == selector.cursor_idx {
                         Style::default()
                             .bg(item_bg)
-                            .fg(THEME.read().unwrap().yellow)
+                            .fg(app.resources.theme.yellow)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
-                            .fg(THEME.read().unwrap().yellow)
+                            .fg(app.resources.theme.yellow)
                             .bg(item_bg)
                             .add_modifier(Modifier::BOLD)
                     };
@@ -1780,7 +1792,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                 })
                 .collect();
 
-            let list = List::new(items).style(Style::default().bg(THEME.read().unwrap().bg));
+            let list = List::new(items).style(Style::default().bg(app.resources.theme.bg));
             let mut state = selector.state.clone();
             f.render_stateful_widget(list, list_chunk, &mut state);
             selector.state = state;
@@ -1875,13 +1887,13 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
             .title(title)
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().header_fg)
+                    .fg(app.resources.theme.header_fg)
                     .add_modifier(Modifier::BOLD),
             )
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(THEME.read().unwrap().border_focused))
+            .border_style(Style::default().fg(app.resources.theme.border_focused))
             .border_type(BorderType::Double)
-            .style(Style::default().bg(THEME.read().unwrap().bg));
+            .style(Style::default().bg(app.resources.theme.bg));
 
         let area = centered_rect_fixed(60, 9, size);
         app.overlay_stack
@@ -1898,7 +1910,7 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
 
         let message_p = Paragraph::new(vec![Line::from(""), Line::from(message)])
             .alignment(Alignment::Center)
-            .style(Style::default().fg(THEME.read().unwrap().text_normal))
+            .style(Style::default().fg(app.resources.theme.text_normal))
             .wrap(ratatui::widgets::Wrap { trim: true });
 
         let footer_p = Paragraph::new(Line::from(vec![
@@ -1906,14 +1918,14 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                 "     [ YES ]     ",
                 Style::default()
                     .fg(if app.confirm_popup_selected_yes {
-                        THEME.read().unwrap().bg
+                        app.resources.theme.bg
                     } else {
-                        THEME.read().unwrap().border_focused
+                        app.resources.theme.border_focused
                     })
                     .bg(if app.confirm_popup_selected_yes {
-                        THEME.read().unwrap().border_focused
+                        app.resources.theme.border_focused
                     } else {
-                        THEME.read().unwrap().bg
+                        app.resources.theme.bg
                     })
                     .add_modifier(Modifier::BOLD),
             ),
@@ -1922,21 +1934,21 @@ pub(crate) fn render_overlays(f: &mut Frame, app: &mut App, size: Rect) {
                 "     [ NO ]     ",
                 Style::default()
                     .fg(if !app.confirm_popup_selected_yes {
-                        THEME.read().unwrap().bg
+                        app.resources.theme.bg
                     } else {
-                        THEME.read().unwrap().border_focused
+                        app.resources.theme.border_focused
                     })
                     .bg(if !app.confirm_popup_selected_yes {
-                        THEME.read().unwrap().border_focused
+                        app.resources.theme.border_focused
                     } else {
-                        THEME.read().unwrap().bg
+                        app.resources.theme.bg
                     })
                     .add_modifier(Modifier::BOLD),
             ),
         ]))
         .alignment(Alignment::Center);
 
-        clear_area(f, area);
+        clear_area(f, area, &app.resources.theme);
         f.render_widget(block, area);
         f.render_widget(message_p, chunks[0]);
         f.render_widget(footer_p, chunks[1]);

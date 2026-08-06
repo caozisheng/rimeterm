@@ -389,6 +389,7 @@ fn merge_tolerating_partial_failure(
     Ok(merged)
 }
 
+#[derive(Clone)]
 pub struct GlabBackend {
     tx: Option<UnboundedSender<Event>>,
 }
@@ -448,6 +449,9 @@ impl GlabBackend {
 
 #[async_trait]
 impl Backend for GlabBackend {
+    fn clone_box(&self) -> Box<dyn Backend> {
+        Box::new(self.clone())
+    }
     fn kind(&self) -> super::BackendKind {
         super::BackendKind::GitLab
     }

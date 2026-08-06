@@ -127,7 +127,7 @@ pub fn gh_state_from_fields(
     (Some(approval), Some(mergeability))
 }
 
-/// The authenticated GitHub login, resolved at most once per process.
+/// The authenticated GitHub login, resolved once per backend instance chain.
 ///
 /// Process-global rather than a field on `GhBackend`: `GitlabClient::clone`
 /// rebuilds the backend from scratch (`create_backend`, see
@@ -139,25 +139,27 @@ pub fn gh_state_from_fields(
 /// too — `get_or_try_init` leaves the cell uninitialised on error and would
 /// retry on every refresh, which is the per-refresh request the design
 /// forbids.
-static GH_CURRENT_USER: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
-
+#[derive(Clone)]
 pub struct GhBackend {
     tx: Option<UnboundedSender<Event>>,
+    current_user: std::sync::Arc<tokio::sync::OnceCell<Option<String>>>,
 }
 
 impl GhBackend {
     pub fn new() -> Self {
-        Self { tx: None }
+        Self {
+            tx: None,
+            current_user: std::sync::Arc::new(tokio::sync::OnceCell::const_new()),
+        }
     }
 
     /// `None` if the lookup fails — an unknown user must yield an unknown
     /// workflow status, never a wrong one. The failure itself is cached
     /// alongside a success, so this never re-issues the `gh api user` call
-    /// after the first attempt, whatever the outcome — and because the cache
-    /// is the process-global `GH_CURRENT_USER`, that holds across cloned
-    /// clients too, not just repeated calls on one instance.
+    /// after the first attempt, whatever the outcome. Backend clones share
+    /// this cache, while independently constructed backends stay isolated.
     async fn current_user(&self) -> Option<&str> {
-        GH_CURRENT_USER
+        self.current_user
             .get_or_init(|| async {
                 let raw = self
                     .run_gh(&["api", "user", "--jq", ".login"], "FETCHING GH USER")
@@ -206,6 +208,9 @@ impl GhBackend {
 
 #[async_trait]
 impl Backend for GhBackend {
+    fn clone_box(&self) -> Box<dyn Backend> {
+        Box::new(self.clone())
+    }
     fn kind(&self) -> super::BackendKind {
         super::BackendKind::GitHub
     }
@@ -2487,42 +2492,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_user_cache_is_shared_across_cloned_backend_instances() {
-        // Regression guard for the bug this cache exists to avoid: an earlier
-        // version cached in a `OnceCell` field *on* `GhBackend`. But
-        // `GitlabClient::clone` rebuilds the backend from scratch
-        // (`create_backend`), and every refresh clones the client
-        // (`spawn_refresh_active_tab`), so a per-instance cell would start
-        // empty on every refresh and never see a second call — zero cache
-        // hits, ever. A test that only builds one `OnceCell` locally (as the
-        // previous version of this test did) cannot see that bug: it passes
-        // identically whether the cache is shared, per-instance, or absent.
-        //
-        // This test instead exercises the actual static, `GH_CURRENT_USER`,
-        // through what stand in for two independently-cloned backends —
-        // there is nothing left to construct per-instance, which is exactly
-        // the fix: the cache no longer lives on the struct at all.
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    async fn current_user_cache_is_shared_only_by_backend_clones() {
+        let backend = GhBackend::new();
+        let clone = backend.clone();
+        let separate = GhBackend::new();
 
-        static CALLS: AtomicUsize = AtomicUsize::new(0);
-        async fn init() -> Option<String> {
-            CALLS.fetch_add(1, Ordering::SeqCst);
-            Some("cached-user".to_string())
-        }
-
-        let _first_backend = GhBackend::new();
-        let _second_backend = GhBackend::new();
-
-        let a = GH_CURRENT_USER.get_or_init(init).await.clone();
-        let b = GH_CURRENT_USER.get_or_init(init).await.clone();
-
-        assert_eq!(a, Some("cached-user".to_string()));
-        assert_eq!(a, b);
-        assert_eq!(
-            CALLS.load(Ordering::SeqCst),
-            1,
-            "the initializer must run once total, not once per backend instance"
-        );
+        assert!(std::sync::Arc::ptr_eq(
+            &backend.current_user,
+            &clone.current_user
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &backend.current_user,
+            &separate.current_user
+        ));
     }
 
     #[test]

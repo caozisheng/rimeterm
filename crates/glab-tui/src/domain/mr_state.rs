@@ -97,8 +97,10 @@ pub fn workflow_sort_key(s: Option<WorkflowStatus>) -> u8 {
 /// `NotYours` returns `None`: it has no glyph or word of its own (both
 /// callers render it as blank, not through this match), which is why it is
 /// excluded here rather than given an empty pair.
-fn workflow_icon_and_word(s: WorkflowStatus) -> Option<(String, &'static str)> {
-    let icons = crate::config::ICONS.read().unwrap();
+fn workflow_icon_and_word(
+    s: WorkflowStatus,
+    icons: &crate::config::Icons,
+) -> Option<(String, &'static str)> {
     Some(match s {
         WorkflowStatus::ReturnedToYou => (icons.workflow_returned.clone(), "Returned"),
         WorkflowStatus::ReviewRequested => (icons.workflow_review.clone(), "Review req"),
@@ -112,13 +114,13 @@ fn workflow_icon_and_word(s: WorkflowStatus) -> Option<(String, &'static str)> {
 
 /// Abbreviated cell text. Full wording lives in the Details pane, because
 /// "Returned to you" is 16 chars and the column clamps to 10 below 90 columns.
-pub fn workflow_cell(s: Option<WorkflowStatus>) -> String {
+pub fn workflow_cell(s: Option<WorkflowStatus>, icons: &crate::config::Icons) -> String {
     match s {
         // Known "not yours" renders blank so the 24-of-33 common case stays quiet.
         Some(WorkflowStatus::NotYours) => String::new(),
         // Unknown is visibly distinct from blank.
         None => "—".to_string(),
-        Some(status) => match workflow_icon_and_word(status) {
+        Some(status) => match workflow_icon_and_word(status, icons) {
             Some((icon, word)) => format!("{icon} {word}"),
             None => String::new(),
         },
@@ -130,9 +132,9 @@ pub fn workflow_cell(s: Option<WorkflowStatus>) -> String {
 /// icon and text together like the table column does. Reads from the same
 /// `workflow_icon_and_word` match as `workflow_cell` so the two can never
 /// disagree on which glyph a status gets.
-pub fn workflow_icon(s: Option<WorkflowStatus>) -> String {
+pub fn workflow_icon(s: Option<WorkflowStatus>, icons: &crate::config::Icons) -> String {
     match s {
-        Some(status) => workflow_icon_and_word(status)
+        Some(status) => workflow_icon_and_word(status, icons)
             .map(|(icon, _)| icon)
             .unwrap_or_default(),
         None => String::new(),
@@ -156,9 +158,12 @@ pub fn workflow_label(s: Option<WorkflowStatus>) -> Option<&'static str> {
 /// The abbreviated word shown in the Workflow table cell (e.g. "Returned",
 /// "Review req"). Used as the column-filter picker value so it matches
 /// exactly what the user sees. `None` for statuses that render blank.
-pub fn workflow_cell_word(s: Option<WorkflowStatus>) -> Option<&'static str> {
+pub fn workflow_cell_word(
+    s: Option<WorkflowStatus>,
+    icons: &crate::config::Icons,
+) -> Option<&'static str> {
     match s {
-        Some(status) => workflow_icon_and_word(status).map(|(_, word)| word),
+        Some(status) => workflow_icon_and_word(status, icons).map(|(_, word)| word),
         None => None,
     }
 }
@@ -271,8 +276,11 @@ fn pending_icons(s: &ApprovalState, icon: &str) -> String {
 }
 
 /// First-match-wins cascade. See the precedence flowchart in the design spec.
-pub fn approval_cell(state: Option<&ApprovalState>, is_github: bool) -> (String, ApprovalTone) {
-    let icons = crate::config::ICONS.read().unwrap();
+pub fn approval_cell(
+    state: Option<&ApprovalState>,
+    is_github: bool,
+    icons: &crate::config::Icons,
+) -> (String, ApprovalTone) {
     let Some(s) = state else {
         return ("—".to_string(), ApprovalTone::Unknown);
     };
@@ -325,8 +333,10 @@ pub fn approval_cell(state: Option<&ApprovalState>, is_github: bool) -> (String,
 /// First-match-wins cascade. Conflict outranks rebase because it is the more
 /// blocking state and the only one the user cannot fix from the TUI. Known
 /// state outranks `computing`.
-pub fn mergeable_cell(state: Option<&MergeabilityState>) -> (String, MergeTone) {
-    let icons = crate::config::ICONS.read().unwrap();
+pub fn mergeable_cell(
+    state: Option<&MergeabilityState>,
+    icons: &crate::config::Icons,
+) -> (String, MergeTone) {
     let Some(s) = state else {
         return ("—".to_string(), MergeTone::Unknown);
     };
@@ -349,8 +359,8 @@ pub fn mergeable_cell(state: Option<&MergeabilityState>) -> (String, MergeTone) 
 /// stringifies this via `.to_string()` before handing it to the table's sort
 /// comparator, whose `u64` fast path then orders rows by state rather than
 /// alphabetically by label.
-pub fn approval_sort_key(state: Option<&ApprovalState>) -> u8 {
-    match approval_cell(state, false).1 {
+pub fn approval_sort_key(state: Option<&ApprovalState>, icons: &crate::config::Icons) -> u8 {
+    match approval_cell(state, false, icons).1 {
         ApprovalTone::ChangesRequested => 0,
         ApprovalTone::Pending => 1,
         ApprovalTone::AwaitingYou => 2,
@@ -378,8 +388,8 @@ pub fn rebase_gate(state: Option<&MergeabilityState>) -> RebaseGate {
     }
 }
 
-pub fn mergeable_sort_key(state: Option<&MergeabilityState>) -> u8 {
-    match mergeable_cell(state).1 {
+pub fn mergeable_sort_key(state: Option<&MergeabilityState>, icons: &crate::config::Icons) -> u8 {
+    match mergeable_cell(state, icons).1 {
         MergeTone::Conflict => 0,
         MergeTone::Rebase => 1,
         MergeTone::Computing => 2,
@@ -443,11 +453,13 @@ pub fn threads_line_text(
 /// Each flag occupies its own slot, so `DRAFT` and the flag never displace one
 /// another. Flags append in a fixed order so the cell is stable across
 /// refreshes; later flags must be added to the end, not interleaved.
-pub fn status_flags(blocking_discussions_resolved: Option<bool>) -> String {
+pub fn status_flags(
+    blocking_discussions_resolved: Option<bool>,
+    icons: &crate::config::Icons,
+) -> String {
     let mut out = String::new();
     // Only Some(false) is a problem. Some(true) and None render nothing.
     if blocking_discussions_resolved == Some(false) {
-        let icons = crate::config::ICONS.read().unwrap();
         out.push(' ');
         out.push_str(&icons.flag_unresolved);
     }
@@ -523,23 +535,23 @@ mod tests {
     // Build expected strings from the same `ICONS` source the render code reads,
     // rather than duplicating glyph literals here.
     fn expect_chg() -> String {
-        let icons = crate::config::ICONS.read().unwrap();
+        let icons = crate::config::Icons::default();
         format!("{} CHG", icons.approval_changes)
     }
 
     fn expect_approved(counts: &str) -> String {
-        let icons = crate::config::ICONS.read().unwrap();
+        let icons = crate::config::Icons::default();
         format!("{} {}", icons.approval_approved, counts)
     }
 
     fn expect_github_approved() -> String {
-        let icons = crate::config::ICONS.read().unwrap();
+        let icons = crate::config::Icons::default();
         format!("{} APPROVED", icons.approval_approved)
     }
 
     /// Builds the expected awaiting-you string: n icons + " AWAITING".
     fn expect_awaiting_you(approvals_left: u32) -> String {
-        let icons = crate::config::ICONS.read().unwrap();
+        let icons = crate::config::Icons::default();
         let n = approvals_left.min(5).max(1) as usize;
         let dots = std::iter::repeat(icons.approval_pending.as_str())
             .take(n)
@@ -550,7 +562,7 @@ mod tests {
 
     /// Builds the expected pending string: n icons + " " + counts.
     fn expect_pending(approvals_left: u32, counts: &str) -> String {
-        let icons = crate::config::ICONS.read().unwrap();
+        let icons = crate::config::Icons::default();
         let n = approvals_left.min(5).max(1) as usize;
         let dots = std::iter::repeat(icons.approval_pending.as_str())
             .take(n)
@@ -560,26 +572,26 @@ mod tests {
     }
 
     fn expect_github_pending() -> String {
-        let icons = crate::config::ICONS.read().unwrap();
+        let icons = crate::config::Icons::default();
         format!("{} REVIEW REQ", icons.approval_pending)
     }
 
     fn expect_conflict() -> String {
-        let icons = crate::config::ICONS.read().unwrap();
+        let icons = crate::config::Icons::default();
         format!("{} CONFLICT", icons.merge_conflict)
     }
 
     fn expect_rebase() -> String {
-        let icons = crate::config::ICONS.read().unwrap();
+        let icons = crate::config::Icons::default();
         format!("{} REBASE", icons.merge_rebase)
     }
 
     fn expect_computing() -> String {
-        crate::config::ICONS.read().unwrap().merge_checking.clone()
+        crate::config::Icons::default().merge_checking
     }
 
     fn expect_clean() -> String {
-        let icons = crate::config::ICONS.read().unwrap();
+        let icons = crate::config::Icons::default();
         format!("{} CLEAN", icons.merge_clean)
     }
 
@@ -620,7 +632,7 @@ mod tests {
 
     #[test]
     fn approval_cell_unknown_renders_dash() {
-        let (text, tone) = approval_cell(None, false);
+        let (text, tone) = approval_cell(None, false, &icons());
         assert_eq!(text, "—");
         assert_eq!(tone, ApprovalTone::Unknown);
     }
@@ -637,7 +649,7 @@ mod tests {
             awaiting_you: false,
             ..Default::default()
         };
-        let (text, tone) = approval_cell(Some(&s), false);
+        let (text, tone) = approval_cell(Some(&s), false, &icons());
         assert_eq!(text, expect_chg());
         assert_eq!(tone, ApprovalTone::ChangesRequested);
     }
@@ -655,7 +667,7 @@ mod tests {
             awaiting_you: false,
             ..Default::default()
         };
-        let (text, _) = approval_cell(Some(&s), false);
+        let (text, _) = approval_cell(Some(&s), false, &icons());
         assert_eq!(text, expect_approved("2/1"));
     }
 
@@ -672,7 +684,7 @@ mod tests {
             awaiting_you: false,
             ..Default::default()
         };
-        let (text, _) = approval_cell(Some(&s), false);
+        let (text, _) = approval_cell(Some(&s), false, &icons());
         assert_eq!(text, expect_approved("1"));
     }
 
@@ -689,7 +701,7 @@ mod tests {
             awaiting_you: false,
             ..Default::default()
         };
-        let (text, tone) = approval_cell(Some(&s), false);
+        let (text, tone) = approval_cell(Some(&s), false, &icons());
         assert_ne!(tone, ApprovalTone::Approved);
         assert_eq!(text, expect_pending(0, "0"));
     }
@@ -707,7 +719,7 @@ mod tests {
             awaiting_you: true,
             ..Default::default()
         };
-        let (text, tone) = approval_cell(Some(&s), false);
+        let (text, tone) = approval_cell(Some(&s), false, &icons());
         assert_eq!(text, expect_awaiting_you(1));
         assert_eq!(tone, ApprovalTone::AwaitingYou);
     }
@@ -724,7 +736,7 @@ mod tests {
             awaiting_you: false,
             ..Default::default()
         };
-        let (text, tone) = approval_cell(Some(&s), false);
+        let (text, tone) = approval_cell(Some(&s), false, &icons());
         assert_eq!(text, expect_pending(1, "1/2"));
         assert_eq!(tone, ApprovalTone::Pending);
     }
@@ -741,7 +753,7 @@ mod tests {
             awaiting_you: false,
             ..Default::default()
         };
-        let (text, _) = approval_cell(Some(&s), true);
+        let (text, _) = approval_cell(Some(&s), true, &icons());
         assert_eq!(text, expect_github_approved());
     }
 
@@ -757,7 +769,7 @@ mod tests {
             awaiting_you: false,
             ..Default::default()
         };
-        let (text, _) = approval_cell(Some(&s), true);
+        let (text, _) = approval_cell(Some(&s), true, &icons());
         assert_eq!(text, expect_github_pending());
     }
 
@@ -765,7 +777,7 @@ mod tests {
 
     #[test]
     fn mergeable_cell_unknown_renders_dash() {
-        let (text, tone) = mergeable_cell(None);
+        let (text, tone) = mergeable_cell(None, &icons());
         assert_eq!(text, "—");
         assert_eq!(tone, MergeTone::Unknown);
     }
@@ -777,7 +789,7 @@ mod tests {
             needs_rebase: true,
             computing: true,
         };
-        let (text, tone) = mergeable_cell(Some(&s));
+        let (text, tone) = mergeable_cell(Some(&s), &icons());
         assert_eq!(text, expect_conflict());
         assert_eq!(tone, MergeTone::Conflict);
     }
@@ -790,7 +802,7 @@ mod tests {
             needs_rebase: true,
             computing: true,
         };
-        let (text, tone) = mergeable_cell(Some(&s));
+        let (text, tone) = mergeable_cell(Some(&s), &icons());
         assert_eq!(text, expect_rebase());
         assert_eq!(tone, MergeTone::Rebase);
     }
@@ -802,7 +814,7 @@ mod tests {
             needs_rebase: false,
             computing: true,
         };
-        let (text, tone) = mergeable_cell(Some(&s));
+        let (text, tone) = mergeable_cell(Some(&s), &icons());
         assert_eq!(text, expect_computing());
         assert_eq!(tone, MergeTone::Computing);
     }
@@ -814,7 +826,7 @@ mod tests {
             needs_rebase: false,
             computing: false,
         };
-        let (text, tone) = mergeable_cell(Some(&s));
+        let (text, tone) = mergeable_cell(Some(&s), &icons());
         assert_eq!(text, expect_clean());
         assert_eq!(tone, MergeTone::Clean);
     }
@@ -868,8 +880,11 @@ mod tests {
             awaiting_you: false,
             ..Default::default()
         };
-        assert!(approval_sort_key(Some(&changes)) < approval_sort_key(Some(&approved)));
-        assert!(approval_sort_key(Some(&approved)) < approval_sort_key(None));
+        assert!(
+            approval_sort_key(Some(&changes), &icons())
+                < approval_sort_key(Some(&approved), &icons())
+        );
+        assert!(approval_sort_key(Some(&approved), &icons()) < approval_sort_key(None, &icons()));
     }
 
     #[test]
@@ -884,28 +899,33 @@ mod tests {
             needs_rebase: false,
             computing: false,
         };
-        assert!(mergeable_sort_key(Some(&conflict)) < mergeable_sort_key(Some(&clean)));
-        assert!(mergeable_sort_key(Some(&clean)) < mergeable_sort_key(None));
+        assert!(
+            mergeable_sort_key(Some(&conflict), &icons())
+                < mergeable_sort_key(Some(&clean), &icons())
+        );
+        assert!(mergeable_sort_key(Some(&clean), &icons()) < mergeable_sort_key(None, &icons()));
     }
 
     // ── status flag strip ──
 
     #[test]
     fn unresolved_discussions_produces_a_flag() {
-        assert!(!status_flags(Some(false)).is_empty());
+        let icons = icons();
+        assert!(!status_flags(Some(false), &icons).is_empty());
     }
 
     #[test]
     fn resolved_discussions_produce_no_flag() {
-        assert_eq!(status_flags(Some(true)), "");
+        let icons = icons();
+        assert_eq!(status_flags(Some(true), &icons), "");
     }
 
     #[test]
     fn unknown_discussions_produce_no_flag() {
+        let icons = icons();
         // An unknown must not look like a problem.
-        assert_eq!(status_flags(None), "");
+        assert_eq!(status_flags(None, &icons), "");
     }
-
     #[test]
     fn status_filter_values_include_base_word_only_when_resolved() {
         assert_eq!(
@@ -1133,11 +1153,11 @@ mod tests {
 
     #[test]
     fn not_yours_renders_blank_and_unknown_renders_dash() {
-        assert_eq!(workflow_cell(Some(WorkflowStatus::NotYours)), "");
-        assert_eq!(workflow_cell(None), "—");
+        assert_eq!(workflow_cell(Some(WorkflowStatus::NotYours), &icons()), "");
+        assert_eq!(workflow_cell(None, &icons()), "—");
         assert_ne!(
-            workflow_cell(Some(WorkflowStatus::NotYours)),
-            workflow_cell(None),
+            workflow_cell(Some(WorkflowStatus::NotYours), &icons()),
+            workflow_cell(None, &icons()),
             "blank and unknown must be distinguishable"
         );
     }
@@ -1168,19 +1188,19 @@ mod tests {
             Inactive,
         ] {
             assert!(
-                !workflow_icon(Some(status)).is_empty(),
+                !workflow_icon(Some(status), &icons()).is_empty(),
                 "{status:?} must have a glyph"
             );
         }
-        assert_eq!(workflow_icon(Some(NotYours)), "");
-        assert_eq!(workflow_icon(None), "");
+        assert_eq!(workflow_icon(Some(NotYours), &icons()), "");
+        assert_eq!(workflow_icon(None, &icons()), "");
     }
 
     #[test]
     fn approved_by_others_has_its_own_icon() {
-        let by_others = workflow_cell(Some(WorkflowStatus::ApprovedByOthers));
-        let inactive = workflow_cell(Some(WorkflowStatus::Inactive));
-        let mine = workflow_cell(Some(WorkflowStatus::ApprovedByYou));
+        let by_others = workflow_cell(Some(WorkflowStatus::ApprovedByOthers), &icons());
+        let inactive = workflow_cell(Some(WorkflowStatus::Inactive), &icons());
+        let mine = workflow_cell(Some(WorkflowStatus::ApprovedByYou), &icons());
         assert_ne!(
             by_others, inactive,
             "ApprovedByOthers must not share Inactive's icon"
@@ -1194,7 +1214,7 @@ mod tests {
     // ── threads line (Details pane matrix) ──
 
     fn icons() -> crate::config::Icons {
-        crate::config::ICONS.read().unwrap().clone()
+        crate::config::Icons::default()
     }
 
     #[test]

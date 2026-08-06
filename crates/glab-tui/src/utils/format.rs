@@ -2,8 +2,6 @@ use chrono::{DateTime, Utc};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::config::THEME;
-
 pub fn truncate(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {
         None => String::from(s),
@@ -132,8 +130,7 @@ pub fn parse_mr_title_prefix(title: &str) -> (String, String) {
     (String::new(), extract_quotes(title_trimmed))
 }
 
-pub fn render_markdown(markdown: &str) -> Vec<Line<'static>> {
-    let theme = THEME.read().unwrap();
+pub fn render_markdown(markdown: &str, theme: &crate::config::Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for line in markdown.lines() {
         let trimmed = line.trim();
@@ -706,7 +703,8 @@ mod tests {
     #[test]
     fn test_render_markdown() {
         let md = "# Header1\n## Header2\n- Bullet `code` item\nNormal line with **bold** text";
-        let lines = render_markdown(md);
+        let theme = crate::config::Theme::default();
+        let lines = render_markdown(md, &theme);
         assert_eq!(lines.len(), 4);
     }
 

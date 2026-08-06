@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::backend::BackendKind;
-use crate::config::Config;
+use crate::config::{Config, Icons, Theme};
 use crate::domain::workflow_inputs::WorkflowInput;
 use crate::utils::ui::StatefulTable;
 use fuzzy_matcher::FuzzyMatcher;
@@ -176,8 +176,7 @@ impl Tab {
         }
     }
 
-    pub fn title(&self, kind: BackendKind) -> String {
-        let icons = crate::config::ICONS.read().unwrap();
+    pub fn title(&self, kind: BackendKind, icons: &Icons) -> String {
         match self {
             Tab::Issues => format!("{} Issues", icons.tab_issue),
             Tab::MergeRequests => {
@@ -1793,8 +1792,24 @@ pub enum ConfirmAction {
     SubmitReview(u64),     // mr iid
 }
 
+#[derive(Clone, Debug)]
+pub struct AppResources {
+    pub theme: Theme,
+    pub icons: Icons,
+}
+
+impl AppResources {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            theme: config.resolve_theme(),
+            icons: Icons::default(),
+        }
+    }
+}
+
 pub struct App {
     pub config: Config,
+    pub resources: AppResources,
     pub active_tab: Tab,
     pub running: bool,
     pub project_context: String,
@@ -1892,6 +1907,7 @@ impl Default for App {
         let config = Config::load();
         Self {
             config: config.clone(),
+            resources: AppResources::from_config(&config),
             active_tab: Tab::default(),
             running: true,
             project_context: "group/repository".to_string(),
@@ -2056,7 +2072,11 @@ impl App {
             .copied()
             .collect();
         if let Some(disabled) = &self.config.disabled_tabs {
-            tabs.retain(|t| !disabled.iter().any(|d| d == &t.title(kind)));
+            tabs.retain(|t| {
+                !disabled
+                    .iter()
+                    .any(|d| d == &t.title(kind, &self.resources.icons))
+            });
         }
         tabs
     }
@@ -2096,17 +2116,27 @@ impl App {
     }
 
     pub fn new() -> Self {
+        let config = Config::load();
+        let resources = AppResources::from_config(&config);
+        Self::with_config_and_resources(config, resources)
+    }
+
+    pub fn with_config_and_resources(config: Config, resources: AppResources) -> Self {
         let mut app = Self::default();
-        if let Some(ref active_tab_str) = app.config.active_tab {
+        app.config = config;
+        app.page_size = app.config.page_size;
+        if let Some(active_tab_str) = &app.config.active_tab {
             if let Some(tab) = Tab::from_str(active_tab_str) {
                 app.active_tab = tab;
             }
         }
         app.apply_config();
+        app.resources = resources;
         app
     }
 
     pub fn apply_config(&mut self) {
+        self.resources.theme = self.config.resolve_theme();
         for tab in Tab::ALL {
             let pane = match tab {
                 Tab::Issues => &self.config.issues,
@@ -2398,6 +2428,7 @@ impl App {
         items: &'a [crate::domain::mr::MergeRequest],
         query: &str,
         enabled_cols: &std::collections::HashSet<String>,
+        icons: &crate::config::Icons,
     ) -> Vec<&'a crate::domain::mr::MergeRequest> {
         if query.trim().is_empty() {
             return items.iter().collect();
@@ -2468,17 +2499,17 @@ impl App {
                 }
             }
             if enabled_cols.contains("Approval") {
-                for value in Self::mr_filter_values(item, "Approval") {
+                for value in Self::mr_filter_values(item, "Approval", icons) {
                     check_match(&value);
                 }
             }
             if enabled_cols.contains("Mergeable") {
-                for value in Self::mr_filter_values(item, "Mergeable") {
+                for value in Self::mr_filter_values(item, "Mergeable", icons) {
                     check_match(&value);
                 }
             }
             if enabled_cols.contains("Workflow") {
-                for v in Self::mr_filter_values(item, "Workflow") {
+                for v in Self::mr_filter_values(item, "Workflow", icons) {
                     check_match(&v);
                 }
             }
@@ -2498,7 +2529,11 @@ impl App {
     /// was duplicated across `val_a` and `val_b`, so every new column had to be
     /// added twice. Values are strings because the comparator falls back to
     /// numeric ordering when both sides parse as `u64`.
-    fn mr_sort_value(m: &crate::domain::mr::MergeRequest, col: &str) -> String {
+    fn mr_sort_value(
+        m: &crate::domain::mr::MergeRequest,
+        col: &str,
+        icons: &crate::config::Icons,
+    ) -> String {
         match col {
             "State" => m.state.clone(),
             "Author" => m.author.username.clone(),
@@ -2528,10 +2563,11 @@ impl App {
             "ID" => m.iid.to_string(),
             "Title" => m.title.clone(),
             "Approval" => {
-                crate::domain::mr_state::approval_sort_key(m.approval.as_ref()).to_string()
+                crate::domain::mr_state::approval_sort_key(m.approval.as_ref(), icons).to_string()
             }
             "Mergeable" => {
-                crate::domain::mr_state::mergeable_sort_key(m.mergeability.as_ref()).to_string()
+                crate::domain::mr_state::mergeable_sort_key(m.mergeability.as_ref(), icons)
+                    .to_string()
             }
             "Workflow" => crate::domain::mr_state::workflow_sort_key(m.workflow).to_string(),
             _ => String::new(),
@@ -2548,7 +2584,11 @@ impl App {
     /// whether an MR matches an active filter) and `collect_unique_column_values`
     /// (which populates the picker's selectable options). They previously drifted,
     /// leaving values that matched but could never be selected.
-    fn mr_filter_values(m: &crate::domain::mr::MergeRequest, col: &str) -> Vec<String> {
+    fn mr_filter_values(
+        m: &crate::domain::mr::MergeRequest,
+        col: &str,
+        icons: &crate::config::Icons,
+    ) -> Vec<String> {
         match col {
             "Labels" => m.labels.clone(),
             "Assignees" => m.assignees.iter().map(|a| a.username.clone()).collect(),
@@ -2575,7 +2615,9 @@ impl App {
             "Title" => vec![m.title.clone()],
             "Approval" => {
                 vec![
-                    match crate::domain::mr_state::approval_cell(m.approval.as_ref(), false).1 {
+                    match crate::domain::mr_state::approval_cell(m.approval.as_ref(), false, icons)
+                        .1
+                    {
                         crate::domain::mr_state::ApprovalTone::Unknown => "—",
                         crate::domain::mr_state::ApprovalTone::ChangesRequested => "CHG",
                         crate::domain::mr_state::ApprovalTone::AwaitingYou => "AWAITING",
@@ -2587,7 +2629,8 @@ impl App {
             }
             "Mergeable" => {
                 vec![
-                    match crate::domain::mr_state::mergeable_cell(m.mergeability.as_ref()).1 {
+                    match crate::domain::mr_state::mergeable_cell(m.mergeability.as_ref(), icons).1
+                    {
                         crate::domain::mr_state::MergeTone::Unknown => "—",
                         crate::domain::mr_state::MergeTone::Conflict => "CONFLICT",
                         crate::domain::mr_state::MergeTone::Rebase => "REBASE",
@@ -2597,7 +2640,7 @@ impl App {
                     .to_string(),
                 ]
             }
-            "Workflow" => crate::domain::mr_state::workflow_cell_word(m.workflow)
+            "Workflow" => crate::domain::mr_state::workflow_cell_word(m.workflow, icons)
                 .map(|w| vec![w.to_string()])
                 .unwrap_or_default(),
             _ => vec![],
@@ -2610,16 +2653,17 @@ impl App {
         enabled_columns: &std::collections::HashMap<Tab, std::collections::HashSet<String>>,
         ascending: bool,
         group_by_column: &Option<String>,
+        icons: &crate::config::Icons,
     ) -> Vec<&'a crate::domain::mr::MergeRequest> {
         let default_set = std::collections::HashSet::new();
         let enabled_cols = enabled_columns
             .get(&Tab::MergeRequests)
             .unwrap_or(&default_set);
-        let mut list = Self::filter_mrs_list(items, query, enabled_cols);
+        let mut list = Self::filter_mrs_list(items, query, enabled_cols, icons);
         if let Some(col) = group_by_column {
             list.sort_by(|a, b| {
-                let val_a = Self::mr_sort_value(a, col.as_str());
-                let val_b = Self::mr_sort_value(b, col.as_str());
+                let val_a = Self::mr_sort_value(a, col.as_str(), icons);
+                let val_b = Self::mr_sort_value(b, col.as_str(), icons);
                 let cmp = match (val_a.parse::<u64>(), val_b.parse::<u64>()) {
                     (Ok(a), Ok(b)) => a.cmp(&b),
                     _ => val_a.cmp(&val_b),
@@ -2642,12 +2686,13 @@ impl App {
             self.group_by_column
                 .get(&Tab::MergeRequests)
                 .unwrap_or(&None),
+            &self.resources.icons,
         );
         Self::apply_column_filters(
             &mut list,
             &self.column_filters,
             Tab::MergeRequests,
-            |item, col| Self::mr_filter_values(item, col),
+            |item, col| Self::mr_filter_values(item, col, &self.resources.icons),
         );
         list
     }
@@ -3599,7 +3644,7 @@ impl App {
             }
             Tab::MergeRequests => {
                 for item in &self.mrs.items {
-                    for v in Self::mr_filter_values(item, col) {
+                    for v in Self::mr_filter_values(item, col, &self.resources.icons) {
                         values.insert(v);
                     }
                 }
@@ -4308,6 +4353,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn app_resources_are_isolated_between_instances() {
+        let first = AppResources {
+            theme: crate::config::Theme::default(),
+            icons: crate::config::Icons::default(),
+        };
+        let mut second = first.clone();
+        second.theme.border_focused = ratatui::style::Color::Magenta;
+        second.icons.tab_issue = "second".to_string();
+
+        let first_app = App::with_config_and_resources(Config::default(), first);
+        let second_app = App::with_config_and_resources(Config::default(), second);
+
+        assert_ne!(
+            first_app.resources.theme.border_focused,
+            second_app.resources.theme.border_focused
+        );
+        assert_ne!(
+            first_app.resources.icons.tab_issue,
+            second_app.resources.icons.tab_issue
+        );
+    }
+
+    #[test]
     fn test_date_picker_navigation() {
         let mut dp = DatePicker::new(
             "Select Date".to_string(),
@@ -4448,18 +4516,33 @@ mod tests {
             .collect();
 
         // Filter by "DRAFT"
-        let filtered_draft = App::filter_mrs_list(&items, "DRAFT", &enabled_cols);
+        let filtered_draft = App::filter_mrs_list(
+            &items,
+            "DRAFT",
+            &enabled_cols,
+            &crate::config::Icons::default(),
+        );
         assert_eq!(filtered_draft.len(), 2);
         assert_eq!(filtered_draft[0].iid, 1);
         assert_eq!(filtered_draft[1].iid, 2);
 
         // Filter by "READY"
-        let filtered_ready = App::filter_mrs_list(&items, "READY", &enabled_cols);
+        let filtered_ready = App::filter_mrs_list(
+            &items,
+            "READY",
+            &enabled_cols,
+            &crate::config::Icons::default(),
+        );
         assert_eq!(filtered_ready.len(), 1);
         assert_eq!(filtered_ready[0].iid, 3);
 
         // Filter by state "OPEN"
-        let filtered_open = App::filter_mrs_list(&items, "OPEN", &enabled_cols);
+        let filtered_open = App::filter_mrs_list(
+            &items,
+            "OPEN",
+            &enabled_cols,
+            &crate::config::Icons::default(),
+        );
         assert_eq!(filtered_open.len(), 3);
         assert_eq!(filtered_open[0].iid, 1);
         assert_eq!(filtered_open[1].iid, 2);
@@ -4480,7 +4563,12 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let matched = App::filter_mrs_list(&items, "conflict", &with_mergeable);
+        let matched = App::filter_mrs_list(
+            &items,
+            "conflict",
+            &with_mergeable,
+            &crate::config::Icons::default(),
+        );
         assert_eq!(
             matched.len(),
             1,
@@ -4489,7 +4577,12 @@ mod tests {
 
         let without_mergeable: std::collections::HashSet<String> =
             ["ID", "Title"].iter().map(|s| s.to_string()).collect();
-        let unmatched = App::filter_mrs_list(&items, "conflict", &without_mergeable);
+        let unmatched = App::filter_mrs_list(
+            &items,
+            "conflict",
+            &without_mergeable,
+            &crate::config::Icons::default(),
+        );
         assert!(
             unmatched.is_empty(),
             "the column gate should suppress the match when Mergeable is disabled"
@@ -5201,10 +5294,17 @@ index 123456..789012 100644
         ascending: bool,
     ) -> Vec<u64> {
         let cols = mr_enabled_cols(&["ID", "State", "Author", "Status", "Title"]);
-        App::filtered_mrs_list(items, "", &cols, ascending, &Some(col.to_string()))
-            .iter()
-            .map(|m| m.iid)
-            .collect()
+        App::filtered_mrs_list(
+            items,
+            "",
+            &cols,
+            ascending,
+            &Some(col.to_string()),
+            &crate::config::Icons::default(),
+        )
+        .iter()
+        .map(|m| m.iid)
+        .collect()
     }
 
     #[test]
@@ -5404,7 +5504,7 @@ index 123456..789012 100644
 
         for col in ["Status", "Approval", "Mergeable", "Workflow"] {
             let offered = app.collect_unique_column_values(Tab::MergeRequests, col);
-            let expected = App::mr_filter_values(&app.mrs.items[0], col);
+            let expected = App::mr_filter_values(&app.mrs.items[0], col, &app.resources.icons);
             for v in expected {
                 assert!(
                     offered.contains(&v),
@@ -5579,7 +5679,7 @@ index 123456..789012 100644
         let mut mr = mr_fixture(1, "opened", "a", false, "x");
         mr.workflow = Some(WorkflowStatus::ReturnedToYou);
         assert_eq!(
-            App::mr_filter_values(&mr, "Workflow"),
+            App::mr_filter_values(&mr, "Workflow", &crate::config::Icons::default()),
             vec!["Returned".to_string()]
         );
     }
@@ -5594,7 +5694,13 @@ index 123456..789012 100644
         let cols_with: std::collections::HashSet<String> =
             with.get(&Tab::MergeRequests).unwrap().clone();
         assert_eq!(
-            App::filter_mrs_list(&items, "returned", &cols_with).len(),
+            App::filter_mrs_list(
+                &items,
+                "returned",
+                &cols_with,
+                &crate::config::Icons::default()
+            )
+            .len(),
             1,
             "search must match the Workflow label when the column is enabled"
         );
@@ -5602,7 +5708,13 @@ index 123456..789012 100644
         let cols_without: std::collections::HashSet<String> =
             without.get(&Tab::MergeRequests).unwrap().clone();
         assert_eq!(
-            App::filter_mrs_list(&items, "returned", &cols_without).len(),
+            App::filter_mrs_list(
+                &items,
+                "returned",
+                &cols_without,
+                &crate::config::Icons::default()
+            )
+            .len(),
             0,
             "the column gate must still apply"
         );

@@ -19,7 +19,6 @@ use self::helpers::{build_log_line, highlight_fuzzy_match};
 use self::modal::clear_area;
 use self::overlays::render_overlays;
 use crate::app::{App, DiffLine, Tab};
-use crate::config::{ICONS, THEME};
 use crate::utils::format::truncate;
 use std::collections::HashSet;
 
@@ -138,7 +137,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     // Paint full canvas with theme background so theme renders consistently regardless of terminal emulator defaults
     f.render_widget(
-        Block::default().style(Style::default().bg(THEME.read().unwrap().bg)),
+        Block::default().style(Style::default().bg(app.resources.theme.bg)),
         size,
     );
 
@@ -148,7 +147,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(
             Paragraph::new(msg)
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(THEME.read().unwrap().red)),
+                .style(Style::default().fg(app.resources.theme.red)),
             size,
         );
         return;
@@ -165,8 +164,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     let title_area = chunks[0];
 
-    // Top: Title & Context
-    let icons = crate::config::ICONS.read().unwrap();
+    // Own the small icon bundle so tab renderers can mutably update App.
+    let icons = app.resources.icons.clone();
+    let terminal_label = icons.label_terminal.clone();
     let header_icon = if app.is_github() {
         &icons.header_github
     } else {
@@ -176,18 +176,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
         Span::styled(
             format!(" {} GLAB-TUI ", header_icon),
             Style::default()
-                .bg(THEME.read().unwrap().border_focused)
-                .fg(THEME.read().unwrap().bg)
+                .bg(app.resources.theme.border_focused)
+                .fg(app.resources.theme.bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(
-                " {} {} ",
-                &crate::config::ICONS.read().unwrap().separator,
-                app.project_context
-            ),
+            format!(" {} {} ", icons.separator, app.project_context),
             Style::default()
-                .fg(THEME.read().unwrap().text_normal)
+                .fg(app.resources.theme.text_normal)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
@@ -195,34 +191,34 @@ pub fn render(f: &mut Frame, app: &mut App) {
         title_spans.push(Span::styled(
             format!(" {} SEARCHING ", icons.label_searching),
             Style::default()
-                .bg(THEME.read().unwrap().yellow)
-                .fg(THEME.read().unwrap().bg)
+                .bg(app.resources.theme.yellow)
+                .fg(app.resources.theme.bg)
                 .add_modifier(Modifier::BOLD),
         ));
         title_spans.push(Span::styled(
             format!(" {}_ ", app.search_query),
-            Style::default().fg(THEME.read().unwrap().yellow),
+            Style::default().fg(app.resources.theme.yellow),
         ));
     } else if !app.search_query.is_empty() {
         title_spans.push(Span::styled(
             format!(" {} FILTERED ", icons.label_filtered),
             Style::default()
-                .bg(THEME.read().unwrap().yellow)
-                .fg(THEME.read().unwrap().bg)
+                .bg(app.resources.theme.yellow)
+                .fg(app.resources.theme.bg)
                 .add_modifier(Modifier::BOLD),
         ));
         title_spans.push(Span::styled(
             format!(" {} ", app.search_query),
-            Style::default().fg(THEME.read().unwrap().yellow),
+            Style::default().fg(app.resources.theme.yellow),
         ));
     }
 
     let title = Paragraph::new(Line::from(title_spans))
-        .style(Style::default().bg(THEME.read().unwrap().bg))
+        .style(Style::default().bg(app.resources.theme.bg))
         .block(
             Block::default()
                 .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                .border_style(Style::default().fg(app.resources.theme.border)),
         );
     f.render_widget(title, title_area);
 
@@ -307,16 +303,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .available_tabs()
         .iter()
         .map(|t| {
-            let title = format!(" {} ", t.title(kind).to_uppercase());
+            let title = format!(" {} ", t.title(kind, &app.resources.icons).to_uppercase());
             if *t == app.active_tab {
                 ListItem::new(title).style(
                     Style::default()
-                        .bg(THEME.read().unwrap().border_focused)
-                        .fg(THEME.read().unwrap().bg)
+                        .bg(app.resources.theme.border_focused)
+                        .fg(app.resources.theme.bg)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                ListItem::new(title).style(Style::default().fg(THEME.read().unwrap().text_muted))
+                ListItem::new(title).style(Style::default().fg(app.resources.theme.text_muted))
             }
         })
         .collect();
@@ -324,35 +320,35 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let sidebar = List::new(sidebar_items).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(THEME.read().unwrap().border))
+            .border_style(Style::default().fg(app.resources.theme.border))
             .title(format!(" {} Navigation ", icons.label_navigation))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().text_muted)
+                    .fg(app.resources.theme.text_muted)
                     .add_modifier(Modifier::BOLD),
             ),
     );
     f.render_widget(sidebar, sidebar_rect);
 
     // Main Area Title
-    let tab_title = format!(" {} ", app.active_tab.title(kind));
+    let tab_title = format!(" {} ", app.active_tab.title(kind, &app.resources.icons));
     let main_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if app.focus_column_checklist {
-            THEME.read().unwrap().border
+            app.resources.theme.border
         } else {
-            THEME.read().unwrap().border_focused
+            app.resources.theme.border_focused
         }))
         .title(tab_title)
         .title_style(
             Style::default()
-                .fg(THEME.read().unwrap().header_fg)
+                .fg(app.resources.theme.header_fg)
                 .add_modifier(Modifier::BOLD),
         );
 
-    let highlight_style = Style::default().bg(THEME.read().unwrap().highlight_bg);
+    let highlight_style = Style::default().bg(app.resources.theme.highlight_bg);
     let header_style = Style::default()
-        .fg(THEME.read().unwrap().text_normal)
+        .fg(app.resources.theme.text_normal)
         .add_modifier(Modifier::BOLD);
 
     match app.active_tab {
@@ -461,11 +457,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if term_area.height > 0 {
         let bottom_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(THEME.read().unwrap().border))
-            .title(format!(" {} Terminal ", icons.label_terminal))
+            .border_style(Style::default().fg(app.resources.theme.border))
+            .title(format!(" {} Terminal ", terminal_label))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().purple)
+                    .fg(app.resources.theme.purple)
                     .add_modifier(Modifier::BOLD),
             );
         f.render_widget(bottom_block.clone(), term_area);
@@ -487,7 +483,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
             for i in start_idx..num_cmds {
                 if let Some(cmd) = app.terminal_commands.get(i) {
-                    log_lines.push(build_log_line(cmd, bottom_inner.width as usize));
+                    log_lines.push(build_log_line(
+                        cmd,
+                        bottom_inner.width as usize,
+                        &app.resources.theme,
+                        &app.resources.icons,
+                    ));
                 }
             }
 
@@ -501,12 +502,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .title(format!(" {} Fetching Diff ", icons.label_fetching))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().header_fg)
+                    .fg(app.resources.theme.header_fg)
                     .add_modifier(Modifier::BOLD),
             )
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(THEME.read().unwrap().border_focused))
-            .style(Style::default().bg(THEME.read().unwrap().bg));
+            .border_style(Style::default().fg(app.resources.theme.border_focused))
+            .style(Style::default().bg(app.resources.theme.bg));
 
         let pr_label = if app.is_github() {
             "Pull Request"
@@ -517,11 +518,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Line::from(""),
             Line::from(Span::styled(
                 format!("   Fetching {pr_label} Diff..."),
-                Style::default().fg(THEME.read().unwrap().text_normal),
+                Style::default().fg(app.resources.theme.text_normal),
             )),
             Line::from(Span::styled(
                 "   Please wait, running CLI tool in background...",
-                Style::default().fg(THEME.read().unwrap().text_muted),
+                Style::default().fg(app.resources.theme.text_muted),
             )),
             Line::from(""),
         ];
@@ -531,7 +532,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .alignment(Alignment::Left)
             .wrap(ratatui::widgets::Wrap { trim: true });
 
-        clear_area(f, area);
+        clear_area(f, area, &app.resources.theme);
         f.render_widget(paragraph, area);
     }
 
@@ -542,8 +543,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let unresolved_suffix = if unresolved_count > 0 {
             format!(
                 " [{} Unresolved Threads: {}] ",
-                &ICONS.read().unwrap().thread_unresolved,
-                unresolved_count
+                &app.resources.icons.thread_unresolved, unresolved_count
             )
         } else {
             String::new()
@@ -565,29 +565,29 @@ pub fn render(f: &mut Frame, app: &mut App) {
             Span::styled(
                 format!(" {} Diff #{} ", pr_label, diff_view.mr_iid),
                 Style::default()
-                    .fg(THEME.read().unwrap().header_fg)
+                    .fg(app.resources.theme.header_fg)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 unresolved_suffix,
-                Style::default().fg(THEME.read().unwrap().header_fg),
+                Style::default().fg(app.resources.theme.header_fg),
             ),
             Span::styled(
                 title_suffix,
-                Style::default().fg(THEME.read().unwrap().header_fg),
+                Style::default().fg(app.resources.theme.header_fg),
             ),
         ];
         if diff_view.search_active {
             title_spans.push(Span::styled(
-                format!(" {} SEARCHING ", &ICONS.read().unwrap().label_searching),
+                format!(" {} SEARCHING ", &app.resources.icons.label_searching),
                 Style::default()
-                    .bg(THEME.read().unwrap().yellow)
-                    .fg(THEME.read().unwrap().bg)
+                    .bg(app.resources.theme.yellow)
+                    .fg(app.resources.theme.bg)
                     .add_modifier(Modifier::BOLD),
             ));
             title_spans.push(Span::styled(
                 format!(" {}_ ", diff_view.search_query),
-                Style::default().fg(THEME.read().unwrap().yellow),
+                Style::default().fg(app.resources.theme.yellow),
             ));
         } else if !diff_view.search_query.is_empty() {
             let match_info = format!(
@@ -600,23 +600,23 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 diff_view.search_matches.len()
             );
             title_spans.push(Span::styled(
-                format!(" {} FILTERED ", &ICONS.read().unwrap().label_filtered),
+                format!(" {} FILTERED ", &app.resources.icons.label_filtered),
                 Style::default()
-                    .bg(THEME.read().unwrap().yellow)
-                    .fg(THEME.read().unwrap().bg)
+                    .bg(app.resources.theme.yellow)
+                    .fg(app.resources.theme.bg)
                     .add_modifier(Modifier::BOLD),
             ));
             title_spans.push(Span::styled(
                 format!(" {}{} ", diff_view.search_query, match_info),
-                Style::default().fg(THEME.read().unwrap().yellow),
+                Style::default().fg(app.resources.theme.yellow),
             ));
         }
 
         let outer_block = Block::default()
             .title(Line::from(title_spans))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(THEME.read().unwrap().border))
-            .style(Style::default().bg(THEME.read().unwrap().bg));
+            .border_style(Style::default().fg(app.resources.theme.border))
+            .style(Style::default().bg(app.resources.theme.bg));
 
         let inner_area = outer_block.inner(area);
 
@@ -671,9 +671,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .title(format!(" {} ", icons.label_files))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(if diff_view.focus_on_files {
-                    THEME.read().unwrap().border_focused
+                    app.resources.theme.border_focused
                 } else {
-                    THEME.read().unwrap().border
+                    app.resources.theme.border
                 }));
 
             let mut file_items = Vec::new();
@@ -686,9 +686,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 let indent = "  ".repeat(node.depth);
                 let indicator = if node.is_dir {
                     if node.is_expanded {
-                        format!("{} ", &ICONS.read().unwrap().folder_expanded)
+                        format!("{} ", &app.resources.icons.folder_expanded)
                     } else {
-                        format!("{} ", &ICONS.read().unwrap().folder_collapsed)
+                        format!("{} ", &app.resources.icons.folder_collapsed)
                     }
                 } else {
                     "  ".to_string()
@@ -735,8 +735,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 let count_suffix = if unresolved_count > 0 {
                     format!(
                         " ({} {})",
-                        &ICONS.read().unwrap().thread_unresolved,
-                        unresolved_count
+                        &app.resources.icons.thread_unresolved, unresolved_count
                     )
                 } else {
                     String::new()
@@ -759,32 +758,32 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 let item_style = if is_selected {
                     if diff_view.focus_on_files {
                         Style::default()
-                            .bg(THEME.read().unwrap().highlight_bg)
-                            .fg(THEME.read().unwrap().bg)
+                            .bg(app.resources.theme.highlight_bg)
+                            .fg(app.resources.theme.bg)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
-                            .bg(THEME.read().unwrap().border)
-                            .fg(THEME.read().unwrap().text_normal)
+                            .bg(app.resources.theme.border)
+                            .fg(app.resources.theme.text_normal)
                     }
                 } else if node.is_dir {
                     Style::default()
-                        .fg(THEME.read().unwrap().blue)
+                        .fg(app.resources.theme.blue)
                         .add_modifier(Modifier::BOLD)
                 } else if node.is_new_file {
                     Style::default()
-                        .fg(THEME.read().unwrap().green)
+                        .fg(app.resources.theme.green)
                         .add_modifier(Modifier::BOLD)
                 } else if node.is_deleted_file {
                     Style::default()
-                        .fg(THEME.read().unwrap().red)
+                        .fg(app.resources.theme.red)
                         .add_modifier(Modifier::BOLD)
                 } else if node.old_file_path.is_some() {
                     Style::default()
-                        .fg(THEME.read().unwrap().yellow)
+                        .fg(app.resources.theme.yellow)
                         .add_modifier(Modifier::ITALIC)
                 } else {
-                    Style::default().fg(THEME.read().unwrap().text_normal)
+                    Style::default().fg(app.resources.theme.text_normal)
                 };
 
                 // Build colored line spans
@@ -805,14 +804,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             line_spans.push(Span::styled(
                                 format!(" {}", part),
                                 Style::default()
-                                    .fg(THEME.read().unwrap().diff_addition_fg)
+                                    .fg(app.resources.theme.diff_addition_fg)
                                     .add_modifier(Modifier::BOLD),
                             ));
                         } else if part.starts_with('-') {
                             line_spans.push(Span::styled(
                                 format!(" {}", part),
                                 Style::default()
-                                    .fg(THEME.read().unwrap().diff_deletion_fg)
+                                    .fg(app.resources.theme.diff_deletion_fg)
                                     .add_modifier(Modifier::BOLD),
                             ));
                         }
@@ -823,7 +822,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 if !count_suffix.is_empty() {
                     line_spans.push(Span::styled(
                         count_suffix,
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ));
                 }
 
@@ -840,9 +839,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .title(format!(" {} ", icons.label_diff))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(if !diff_view.focus_on_files {
-                THEME.read().unwrap().border_focused
+                app.resources.theme.border_focused
             } else {
-                THEME.read().unwrap().border
+                app.resources.theme.border
             }));
 
         let list_height = (main_chunks[1].height as usize).saturating_sub(2);
@@ -882,22 +881,22 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     .zip(updated_diff_view.selection_end)
                     .map_or(false, |(s, e)| idx >= s && idx <= e);
 
-                let gutter_bg = THEME.read().unwrap().diff_gutter_bg;
+                let gutter_bg = app.resources.theme.diff_gutter_bg;
                 let marker_style = Style::default()
-                    .fg(THEME.read().unwrap().yellow)
+                    .fg(app.resources.theme.yellow)
                     .add_modifier(Modifier::BOLD)
                     .bg(gutter_bg);
                 let num_style = Style::default()
-                    .fg(THEME.read().unwrap().text_muted)
+                    .fg(app.resources.theme.text_muted)
                     .bg(gutter_bg);
                 let sep_style = Style::default()
-                    .fg(THEME.read().unwrap().diff_sep)
+                    .fg(app.resources.theme.diff_sep)
                     .bg(gutter_bg);
 
                 let sel_bg = if in_selection {
-                    Some(THEME.read().unwrap().highlight_bg)
+                    Some(app.resources.theme.highlight_bg)
                 } else if updated_diff_view.search_matches.contains(&idx) {
-                    Some(THEME.read().unwrap().yellow_bg)
+                    Some(app.resources.theme.yellow_bg)
                 } else {
                     None
                 };
@@ -927,7 +926,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
                     match line.line_type {
                         crate::app::DiffLineType::Deletion => {
-                            let theme = THEME.read().unwrap();
+                            let theme = app.resources.theme;
                             let code_fg = theme.diff_deletion_fg;
                             let code_bg = theme.diff_deletion_bg;
                             let prefix_fg = theme.diff_deletion_fg;
@@ -960,12 +959,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                 line,
                                 final_style,
                                 code_fg,
-                                THEME.read().unwrap().yellow,
+                                app.resources.theme.yellow,
                             );
                             left_spans.append(&mut content_spans);
                         }
                         crate::app::DiffLineType::Normal => {
-                            let actual_bg = sel_bg.unwrap_or(THEME.read().unwrap().bg);
+                            let actual_bg = sel_bg.unwrap_or(app.resources.theme.bg);
                             let prefix = line
                                 .content
                                 .chars()
@@ -975,12 +974,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             left_spans.push(Span::styled(
                                 prefix,
                                 Style::default()
-                                    .fg(THEME.read().unwrap().text_muted)
+                                    .fg(app.resources.theme.text_muted)
                                     .bg(actual_bg),
                             ));
 
                             let content_base = Style::default()
-                                .fg(THEME.read().unwrap().text_normal)
+                                .fg(app.resources.theme.text_normal)
                                 .bg(actual_bg);
                             let final_style = if is_cursor {
                                 content_base
@@ -993,14 +992,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             let mut content_spans = render_diff_line_content(
                                 line,
                                 final_style,
-                                THEME.read().unwrap().text_normal,
-                                THEME.read().unwrap().yellow,
+                                app.resources.theme.text_normal,
+                                app.resources.theme.yellow,
                             );
                             left_spans.append(&mut content_spans);
                         }
                         crate::app::DiffLineType::Meta => {
                             let mut s = Style::default()
-                                .fg(THEME.read().unwrap().blue)
+                                .fg(app.resources.theme.blue)
                                 .add_modifier(Modifier::BOLD);
                             if let Some(bg) = sel_bg {
                                 s = s.bg(bg);
@@ -1014,7 +1013,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             if let Some(ref highlighted) = line.syntax_highlighted {
                                 for (span_style, text) in highlighted {
                                     let merged = final_style
-                                        .fg(span_style.fg.unwrap_or(THEME.read().unwrap().blue))
+                                        .fg(span_style.fg.unwrap_or(app.resources.theme.blue))
                                         .add_modifier(span_style.add_modifier);
                                     left_spans.push(Span::styled(text.clone(), merged));
                                 }
@@ -1024,7 +1023,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         }
                         crate::app::DiffLineType::HunkHeader => {
                             let mut s = Style::default()
-                                .fg(THEME.read().unwrap().purple)
+                                .fg(app.resources.theme.purple)
                                 .add_modifier(Modifier::BOLD);
                             if let Some(bg) = sel_bg {
                                 s = s.bg(bg);
@@ -1038,7 +1037,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             if let Some(ref highlighted) = line.syntax_highlighted {
                                 for (span_style, text) in highlighted {
                                     let merged = final_style
-                                        .fg(span_style.fg.unwrap_or(THEME.read().unwrap().purple))
+                                        .fg(span_style.fg.unwrap_or(app.resources.theme.purple))
                                         .add_modifier(span_style.add_modifier);
                                     left_spans.push(Span::styled(text.clone(), merged));
                                 }
@@ -1093,7 +1092,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
                     match line.line_type {
                         crate::app::DiffLineType::Addition => {
-                            let theme = THEME.read().unwrap();
+                            let theme = app.resources.theme;
                             let code_fg = theme.diff_addition_fg;
                             let code_bg = theme.diff_addition_bg;
                             let prefix_fg = theme.diff_addition_fg;
@@ -1126,12 +1125,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                                 line,
                                 final_style,
                                 code_fg,
-                                THEME.read().unwrap().yellow,
+                                app.resources.theme.yellow,
                             );
                             right_spans.append(&mut content_spans);
                         }
                         crate::app::DiffLineType::Normal => {
-                            let actual_bg = sel_bg.unwrap_or(THEME.read().unwrap().bg);
+                            let actual_bg = sel_bg.unwrap_or(app.resources.theme.bg);
                             let prefix = line
                                 .content
                                 .chars()
@@ -1141,12 +1140,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             right_spans.push(Span::styled(
                                 prefix,
                                 Style::default()
-                                    .fg(THEME.read().unwrap().text_muted)
+                                    .fg(app.resources.theme.text_muted)
                                     .bg(actual_bg),
                             ));
 
                             let content_base = Style::default()
-                                .fg(THEME.read().unwrap().text_normal)
+                                .fg(app.resources.theme.text_normal)
                                 .bg(actual_bg);
                             let final_style = if is_cursor {
                                 content_base
@@ -1159,14 +1158,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             let mut content_spans = render_diff_line_content(
                                 line,
                                 final_style,
-                                THEME.read().unwrap().text_normal,
-                                THEME.read().unwrap().yellow,
+                                app.resources.theme.text_normal,
+                                app.resources.theme.yellow,
                             );
                             right_spans.append(&mut content_spans);
                         }
                         crate::app::DiffLineType::Meta => {
                             let mut s = Style::default()
-                                .fg(THEME.read().unwrap().blue)
+                                .fg(app.resources.theme.blue)
                                 .add_modifier(Modifier::BOLD);
                             if let Some(bg) = sel_bg {
                                 s = s.bg(bg);
@@ -1180,7 +1179,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             if let Some(ref highlighted) = line.syntax_highlighted {
                                 for (span_style, text) in highlighted {
                                     let merged = final_style
-                                        .fg(span_style.fg.unwrap_or(THEME.read().unwrap().blue))
+                                        .fg(span_style.fg.unwrap_or(app.resources.theme.blue))
                                         .add_modifier(span_style.add_modifier);
                                     right_spans.push(Span::styled(text.clone(), merged));
                                 }
@@ -1190,7 +1189,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         }
                         crate::app::DiffLineType::HunkHeader => {
                             let mut s = Style::default()
-                                .fg(THEME.read().unwrap().purple)
+                                .fg(app.resources.theme.purple)
                                 .add_modifier(Modifier::BOLD);
                             if let Some(bg) = sel_bg {
                                 s = s.bg(bg);
@@ -1204,7 +1203,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             if let Some(ref highlighted) = line.syntax_highlighted {
                                 for (span_style, text) in highlighted {
                                     let merged = final_style
-                                        .fg(span_style.fg.unwrap_or(THEME.read().unwrap().purple))
+                                        .fg(span_style.fg.unwrap_or(app.resources.theme.purple))
                                         .add_modifier(span_style.add_modifier);
                                     right_spans.push(Span::styled(text.clone(), merged));
                                 }
@@ -1259,8 +1258,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
                 for comment in matching_comments {
                     let comment_style = Style::default()
-                        .fg(THEME.read().unwrap().yellow)
-                        .bg(THEME.read().unwrap().comment_draft_bg);
+                        .fg(app.resources.theme.yellow)
+                        .bg(app.resources.theme.comment_draft_bg);
 
                     let range_info = match (comment.end_line_num, comment.end_old_line_num) {
                         (Some(end_l), _) if end_l != comment.line_num.unwrap_or(0) => {
@@ -1273,7 +1272,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     };
 
                     let prefix_style = Style::default()
-                        .fg(THEME.read().unwrap().yellow)
+                        .fg(app.resources.theme.yellow)
                         .add_modifier(Modifier::BOLD);
 
                     let right_prefix_first = format!(" 💬 Draft Note{}: ", range_info);
@@ -1288,6 +1287,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         &updated_diff_view.all_lines,
                         &right_prefix_first,
                         prefix_style,
+                        &app.resources.theme,
                     );
 
                     for (i, (right_prefix, prefix_style, content_spans)) in
@@ -1346,11 +1346,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
                 for comment in matching_current {
                     let comment_style = Style::default()
-                        .fg(THEME.read().unwrap().blue)
-                        .bg(THEME.read().unwrap().comment_bg);
+                        .fg(app.resources.theme.blue)
+                        .bg(app.resources.theme.comment_bg);
 
                     let prefix_style = Style::default()
-                        .fg(THEME.read().unwrap().blue)
+                        .fg(app.resources.theme.blue)
                         .add_modifier(Modifier::BOLD);
 
                     let right_prefix_first = format!(" 💬 @{}: ", comment.author.username);
@@ -1383,6 +1383,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         &updated_diff_view.all_lines,
                         &right_prefix_first,
                         prefix_style,
+                        &app.resources.theme,
                     );
 
                     for (i, (right_prefix, prefix_style, content_spans)) in
@@ -1430,19 +1431,19 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| " ".to_string());
 
-                let gutter_bg = THEME.read().unwrap().diff_gutter_bg;
+                let gutter_bg = app.resources.theme.diff_gutter_bg;
 
                 let marker_style = Style::default()
-                    .fg(THEME.read().unwrap().yellow)
+                    .fg(app.resources.theme.yellow)
                     .add_modifier(Modifier::BOLD)
                     .bg(gutter_bg);
 
                 let num_style = Style::default()
-                    .fg(THEME.read().unwrap().text_muted)
+                    .fg(app.resources.theme.text_muted)
                     .bg(gutter_bg);
 
                 let sep_style = Style::default()
-                    .fg(THEME.read().unwrap().diff_sep)
+                    .fg(app.resources.theme.diff_sep)
                     .bg(gutter_bg);
 
                 let mut line_spans = vec![
@@ -1462,16 +1463,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 ];
 
                 let sel_bg = if in_selection {
-                    Some(THEME.read().unwrap().highlight_bg)
+                    Some(app.resources.theme.highlight_bg)
                 } else if updated_diff_view.search_matches.contains(&idx) {
-                    Some(THEME.read().unwrap().yellow_bg)
+                    Some(app.resources.theme.yellow_bg)
                 } else {
                     None
                 };
 
                 match line.line_type {
                     crate::app::DiffLineType::Addition | crate::app::DiffLineType::Deletion => {
-                        let theme = THEME.read().unwrap();
+                        let theme = app.resources.theme;
                         let is_add = line.line_type == crate::app::DiffLineType::Addition;
                         let code_fg = if is_add {
                             theme.diff_addition_fg
@@ -1517,12 +1518,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                             line,
                             final_style,
                             code_fg,
-                            THEME.read().unwrap().yellow,
+                            app.resources.theme.yellow,
                         );
                         line_spans.append(&mut content_spans);
                     }
                     crate::app::DiffLineType::Normal => {
-                        let actual_bg = sel_bg.unwrap_or(THEME.read().unwrap().bg);
+                        let actual_bg = sel_bg.unwrap_or(app.resources.theme.bg);
                         let prefix = line
                             .content
                             .chars()
@@ -1532,12 +1533,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         line_spans.push(Span::styled(
                             prefix,
                             Style::default()
-                                .fg(THEME.read().unwrap().text_muted)
+                                .fg(app.resources.theme.text_muted)
                                 .bg(actual_bg),
                         ));
 
                         let content_base = Style::default()
-                            .fg(THEME.read().unwrap().text_normal)
+                            .fg(app.resources.theme.text_normal)
                             .bg(actual_bg);
                         let final_style = if is_cursor {
                             content_base
@@ -1550,14 +1551,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         let mut content_spans = render_diff_line_content(
                             line,
                             final_style,
-                            THEME.read().unwrap().text_normal,
-                            THEME.read().unwrap().yellow,
+                            app.resources.theme.text_normal,
+                            app.resources.theme.yellow,
                         );
                         line_spans.append(&mut content_spans);
                     }
                     crate::app::DiffLineType::Meta => {
                         let mut s = Style::default()
-                            .fg(THEME.read().unwrap().blue)
+                            .fg(app.resources.theme.blue)
                             .add_modifier(Modifier::BOLD);
                         if let Some(bg) = sel_bg {
                             s = s.bg(bg);
@@ -1571,7 +1572,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         if let Some(ref highlighted) = line.syntax_highlighted {
                             for (span_style, text) in highlighted {
                                 let merged = final_style
-                                    .fg(span_style.fg.unwrap_or(THEME.read().unwrap().blue))
+                                    .fg(span_style.fg.unwrap_or(app.resources.theme.blue))
                                     .add_modifier(span_style.add_modifier);
                                 if let Some(bg) = sel_bg {
                                     line_spans.push(Span::styled(text.clone(), merged.bg(bg)));
@@ -1585,7 +1586,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     }
                     crate::app::DiffLineType::HunkHeader => {
                         let mut s = Style::default()
-                            .fg(THEME.read().unwrap().purple)
+                            .fg(app.resources.theme.purple)
                             .add_modifier(Modifier::BOLD);
                         if let Some(bg) = sel_bg {
                             s = s.bg(bg);
@@ -1599,7 +1600,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         if let Some(ref highlighted) = line.syntax_highlighted {
                             for (span_style, text) in highlighted {
                                 let merged = final_style
-                                    .fg(span_style.fg.unwrap_or(THEME.read().unwrap().purple))
+                                    .fg(span_style.fg.unwrap_or(app.resources.theme.purple))
                                     .add_modifier(span_style.add_modifier);
                                 if let Some(bg) = sel_bg {
                                     line_spans.push(Span::styled(text.clone(), merged.bg(bg)));
@@ -1628,8 +1629,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
                 for comment in matching_comments {
                     let comment_style = Style::default()
-                        .fg(THEME.read().unwrap().yellow)
-                        .bg(THEME.read().unwrap().comment_draft_bg);
+                        .fg(app.resources.theme.yellow)
+                        .bg(app.resources.theme.comment_draft_bg);
 
                     let range_info = match (comment.end_line_num, comment.end_old_line_num) {
                         (Some(end_l), _) if end_l != comment.line_num.unwrap_or(0) => {
@@ -1642,7 +1643,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     };
 
                     let prefix_style = Style::default()
-                        .fg(THEME.read().unwrap().yellow)
+                        .fg(app.resources.theme.yellow)
                         .add_modifier(Modifier::BOLD);
 
                     let right_prefix_first = format!(" 💬 Draft Note{}: ", range_info);
@@ -1657,6 +1658,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         &updated_diff_view.all_lines,
                         &right_prefix_first,
                         prefix_style,
+                        &app.resources.theme,
                     );
 
                     for (right_prefix, prefix_style, content_spans) in formatted_lines {
@@ -1695,11 +1697,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
                 for comment in matching_current {
                     let comment_style = Style::default()
-                        .fg(THEME.read().unwrap().blue)
-                        .bg(THEME.read().unwrap().comment_bg);
+                        .fg(app.resources.theme.blue)
+                        .bg(app.resources.theme.comment_bg);
 
                     let prefix_style = Style::default()
-                        .fg(THEME.read().unwrap().blue)
+                        .fg(app.resources.theme.blue)
                         .add_modifier(Modifier::BOLD);
 
                     let right_prefix_first = format!(" 💬 @{}: ", comment.author.username);
@@ -1732,6 +1734,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                         &updated_diff_view.all_lines,
                         &right_prefix_first,
                         prefix_style,
+                        &app.resources.theme,
                     );
 
                     for (right_prefix, prefix_style, content_spans) in formatted_lines {
@@ -1750,10 +1753,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
         let footer_p = Paragraph::new(" Esc/q: Exit • d: Toggle Diff Layout • Enter/Space: Select File / Toggle Zoom • h/l: Collapse/Expand Dir • j/k/↑/↓: Navigate • J/K: Scroll 10 • [/]: Prev/Next Hunk • z/Z: Collapse/Expand All • v: Select Lines • c: Comment • e: Suggest Code • a: Comment Actions • r: Submit Review • / or f: Search • Ctrl+n/Ctrl+N: Next/Prev Match ")
             .alignment(Alignment::Center)
-            .style(Style::default().fg(THEME.read().unwrap().text_muted).add_modifier(Modifier::ITALIC))
+            .style(Style::default().fg(app.resources.theme.text_muted).add_modifier(Modifier::ITALIC))
             .wrap(ratatui::widgets::Wrap { trim: true });
 
-        clear_area(f, area);
+        clear_area(f, area, &app.resources.theme);
         f.render_widget(outer_block, area);
         if file_tree_visible {
             f.render_widget(files_list, main_chunks[0]);
@@ -1780,7 +1783,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .map(|_| {
                     Line::from(Span::styled(
                         "│",
-                        Style::default().fg(THEME.read().unwrap().diff_sep),
+                        Style::default().fg(app.resources.theme.diff_sep),
                     ))
                 })
                 .collect();
@@ -1823,7 +1826,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         );
         let toast = Paragraph::new(msg.as_str())
             .alignment(Alignment::Center)
-            .style(Style::default().fg(THEME.read().unwrap().red));
+            .style(Style::default().fg(app.resources.theme.red));
         f.render_widget(toast, toast_area);
     }
 }

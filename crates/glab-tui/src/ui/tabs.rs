@@ -1,5 +1,4 @@
 use crate::app::{App, Tab};
-use crate::config::THEME;
 use crate::utils::format::{format_ref, render_markdown, time_ago, truncate};
 use ratatui::{
     Frame,
@@ -29,13 +28,13 @@ pub(crate) fn render_tab_issues(
     highlight_style: Style,
     header_style: Style,
 ) {
-    let icons = crate::config::ICONS.read().unwrap();
+    let icons = &app.resources.icons;
     if app.issues.items.is_empty() && app.loading_tabs.contains(&app.active_tab) {
         f.render_widget(
             Paragraph::new(format!("\n\n {} Loading issues...", icons.label_loading))
                 .alignment(Alignment::Center)
                 .block(main_block.clone())
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             content_area,
         );
         f.render_widget(
@@ -44,9 +43,9 @@ pub(crate) fn render_tab_issues(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" {} Details ", icons.label_details))
-                        .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                        .border_style(Style::default().fg(app.resources.theme.border)),
                 )
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             detail_rect,
         );
     } else {
@@ -88,13 +87,13 @@ pub(crate) fn render_tab_issues(
                 (
                     format!("{} OPEN", icons.state_open),
                     Style::default()
-                        .fg(THEME.read().unwrap().green)
+                        .fg(app.resources.theme.green)
                         .bg(if is_selected {
-                            THEME.read().unwrap().highlight_bg
+                            app.resources.theme.highlight_bg
                         } else if is_checked {
-                            THEME.read().unwrap().checked_bg
+                            app.resources.theme.checked_bg
                         } else {
-                            THEME.read().unwrap().green_bg
+                            app.resources.theme.green_bg
                         })
                         .add_modifier(Modifier::BOLD),
                 )
@@ -102,13 +101,13 @@ pub(crate) fn render_tab_issues(
                 (
                     format!("{} CLOSED", icons.state_closed),
                     Style::default()
-                        .fg(THEME.read().unwrap().red)
+                        .fg(app.resources.theme.red)
                         .bg(if is_selected {
-                            THEME.read().unwrap().highlight_bg
+                            app.resources.theme.highlight_bg
                         } else if is_checked {
-                            THEME.read().unwrap().checked_bg
+                            app.resources.theme.checked_bg
                         } else {
-                            THEME.read().unwrap().red_bg
+                            app.resources.theme.red_bg
                         })
                         .add_modifier(Modifier::BOLD),
                 )
@@ -120,8 +119,9 @@ pub(crate) fn render_tab_issues(
                     &app.search_query,
                     is_selected,
                     false,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Issues, "State") {
@@ -132,6 +132,7 @@ pub(crate) fn render_tab_issues(
                     is_checked,
                     state_style,
                     Alignment::Center,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Issues, "Title") {
@@ -140,8 +141,9 @@ pub(crate) fn render_tab_issues(
                     &app.search_query,
                     is_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Issues, "Assignees") {
@@ -159,8 +161,9 @@ pub(crate) fn render_tab_issues(
                     &app.search_query,
                     is_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().blue),
+                    Style::default().fg(app.resources.theme.blue),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Issues, "Labels") {
@@ -171,6 +174,7 @@ pub(crate) fn render_tab_issues(
                     is_selected,
                     is_checked,
                     24,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Issues, "Milestone") {
@@ -184,8 +188,9 @@ pub(crate) fn render_tab_issues(
                     &app.search_query,
                     is_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().yellow),
+                    Style::default().fg(app.resources.theme.yellow),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Issues, "Due Date") {
@@ -195,8 +200,9 @@ pub(crate) fn render_tab_issues(
                     &app.search_query,
                     is_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().yellow),
+                    Style::default().fg(app.resources.theme.yellow),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Issues, "Author") {
@@ -206,14 +212,15 @@ pub(crate) fn render_tab_issues(
                     &app.search_query,
                     is_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().blue),
+                    Style::default().fg(app.resources.theme.blue),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             let row_style = if is_selected {
-                Style::default().bg(THEME.read().unwrap().highlight_bg)
+                Style::default().bg(app.resources.theme.highlight_bg)
             } else if is_checked {
-                Style::default().bg(THEME.read().unwrap().checked_bg)
+                Style::default().bg(app.resources.theme.checked_bg)
             } else {
                 Style::default()
             };
@@ -269,11 +276,11 @@ pub(crate) fn render_tab_issues(
         f.render_stateful_widget(table, content_area, &mut app.issues.state);
         let preview_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(THEME.read().unwrap().border))
+            .border_style(Style::default().fg(app.resources.theme.border))
             .title(format!(" {} Details ", icons.label_details))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().text_muted)
+                    .fg(app.resources.theme.text_muted)
                     .add_modifier(Modifier::BOLD),
             );
         let selected_issue_idx = app.issues.state.selected();
@@ -299,13 +306,13 @@ pub(crate) fn render_tab_issues(
                     Span::styled(
                         "Title:     ",
                         Style::default()
-                            .fg(THEME.read().unwrap().text_muted)
+                            .fg(app.resources.theme.text_muted)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         &issue.title,
                         Style::default()
-                            .fg(THEME.read().unwrap().text_normal)
+                            .fg(app.resources.theme.text_normal)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -313,40 +320,40 @@ pub(crate) fn render_tab_issues(
                 text.push(Line::from(vec![
                     Span::styled(
                         "Author:    ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         format!("@{}", issue.author.username),
-                        Style::default().fg(THEME.read().unwrap().blue),
+                        Style::default().fg(app.resources.theme.blue),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Assignees: ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
-                    Span::styled(assignees, Style::default().fg(THEME.read().unwrap().blue)),
+                    Span::styled(assignees, Style::default().fg(app.resources.theme.blue)),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Milestone: ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
-                    Span::styled(milestone, Style::default().fg(THEME.read().unwrap().purple)),
+                    Span::styled(milestone, Style::default().fg(app.resources.theme.purple)),
                 ]));
                 if let Some(due) = &issue.due_date {
                     text.push(Line::from(vec![
                         Span::styled(
                             "Due Date:  ",
-                            Style::default().fg(THEME.read().unwrap().text_muted),
+                            Style::default().fg(app.resources.theme.text_muted),
                         ),
-                        Span::styled(due, Style::default().fg(THEME.read().unwrap().yellow)),
+                        Span::styled(due, Style::default().fg(app.resources.theme.yellow)),
                     ]));
                 }
                 text.push(Line::from(vec![
                     Span::styled(
                         "State:     ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         if issue.state == "opened" {
@@ -356,9 +363,9 @@ pub(crate) fn render_tab_issues(
                         },
                         Style::default()
                             .fg(if issue.state == "opened" {
-                                THEME.read().unwrap().green
+                                app.resources.theme.green
                             } else {
-                                THEME.read().unwrap().red
+                                app.resources.theme.red
                             })
                             .add_modifier(Modifier::BOLD),
                     ),
@@ -366,32 +373,36 @@ pub(crate) fn render_tab_issues(
                 text.push(Line::from(vec![
                     Span::styled(
                         "Updated:   ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         time_ago(&issue.updated_at),
-                        Style::default().fg(THEME.read().unwrap().yellow),
+                        Style::default().fg(app.resources.theme.yellow),
                     ),
                 ]));
                 text.push(Line::from(""));
                 let mut label_spans = vec![Span::styled(
                     "Labels:    ",
-                    Style::default().fg(THEME.read().unwrap().text_muted),
+                    Style::default().fg(app.resources.theme.text_muted),
                 )];
                 if issue.labels.is_empty() {
                     label_spans.push(Span::styled(
                         "None",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ));
                 } else {
                     for (idx, label) in issue.labels.iter().enumerate() {
                         if idx > 0 {
                             label_spans.push(Span::styled(
                                 ", ",
-                                Style::default().fg(THEME.read().unwrap().text_normal),
+                                Style::default().fg(app.resources.theme.text_normal),
                             ));
                         }
-                        let label_color = super::helpers::get_label_color(label, &app.label_colors);
+                        let label_color = super::helpers::get_label_color(
+                            label,
+                            &app.label_colors,
+                            &app.resources.theme,
+                        );
                         label_spans.push(Span::styled(
                             label,
                             Style::default()
@@ -407,10 +418,10 @@ pub(crate) fn render_tab_issues(
                         text.push(Line::from(vec![Span::styled(
                             "Description:",
                             Style::default()
-                                .fg(THEME.read().unwrap().header_fg)
+                                .fg(app.resources.theme.header_fg)
                                 .add_modifier(Modifier::BOLD),
                         )]));
-                        text.extend(render_markdown(desc));
+                        text.extend(render_markdown(desc, &app.resources.theme));
                     }
                 }
 
@@ -428,11 +439,11 @@ pub(crate) fn render_tab_issues(
 
                 let preview_block = Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(THEME.read().unwrap().border))
+                    .border_style(Style::default().fg(app.resources.theme.border))
                     .title(format!(" Details{} ", title_suffix))
                     .title_style(
                         Style::default()
-                            .fg(THEME.read().unwrap().text_muted)
+                            .fg(app.resources.theme.text_muted)
                             .add_modifier(Modifier::BOLD),
                     );
 
@@ -450,7 +461,7 @@ pub(crate) fn render_tab_issues(
             f.render_widget(
                 Paragraph::new("Select an item to view details...")
                     .block(preview_block)
-                    .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                    .style(Style::default().fg(app.resources.theme.text_muted)),
                 detail_rect,
             );
         }
@@ -466,7 +477,7 @@ pub(crate) fn render_tab_merge_requests(
     highlight_style: Style,
     header_style: Style,
 ) {
-    let icons = crate::config::ICONS.read().unwrap();
+    let icons = &app.resources.icons;
     if app.mrs.items.is_empty() && app.loading_tabs.contains(&app.active_tab) {
         f.render_widget(
             Paragraph::new(format!(
@@ -475,7 +486,7 @@ pub(crate) fn render_tab_merge_requests(
             ))
             .alignment(Alignment::Center)
             .block(main_block.clone())
-            .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+            .style(Style::default().fg(app.resources.theme.text_muted)),
             content_area,
         );
         f.render_widget(
@@ -484,9 +495,9 @@ pub(crate) fn render_tab_merge_requests(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" {} Details ", icons.label_details))
-                        .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                        .border_style(Style::default().fg(app.resources.theme.border)),
                 )
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             detail_rect,
         );
     } else {
@@ -501,6 +512,7 @@ pub(crate) fn render_tab_merge_requests(
             app.group_by_column
                 .get(&Tab::MergeRequests)
                 .unwrap_or(&None),
+            &app.resources.icons,
         );
         App::apply_column_filters(
             &mut filtered_mrs,
@@ -540,13 +552,13 @@ pub(crate) fn render_tab_merge_requests(
                 (
                     format!("{} OPEN", icons.state_open),
                     Style::default()
-                        .fg(THEME.read().unwrap().green)
+                        .fg(app.resources.theme.green)
                         .bg(if is_selected {
-                            THEME.read().unwrap().highlight_bg
+                            app.resources.theme.highlight_bg
                         } else if is_checked {
-                            THEME.read().unwrap().checked_bg
+                            app.resources.theme.checked_bg
                         } else {
-                            THEME.read().unwrap().green_bg
+                            app.resources.theme.green_bg
                         })
                         .add_modifier(Modifier::BOLD),
                 )
@@ -554,13 +566,13 @@ pub(crate) fn render_tab_merge_requests(
                 (
                     format!("{} MERGED", icons.state_merged),
                     Style::default()
-                        .fg(THEME.read().unwrap().purple)
+                        .fg(app.resources.theme.purple)
                         .bg(if is_selected {
-                            THEME.read().unwrap().highlight_bg
+                            app.resources.theme.highlight_bg
                         } else if is_checked {
-                            THEME.read().unwrap().checked_bg
+                            app.resources.theme.checked_bg
                         } else {
-                            THEME.read().unwrap().purple_bg
+                            app.resources.theme.purple_bg
                         })
                         .add_modifier(Modifier::BOLD),
                 )
@@ -568,13 +580,13 @@ pub(crate) fn render_tab_merge_requests(
                 (
                     format!("{} CLOSED", icons.state_closed),
                     Style::default()
-                        .fg(THEME.read().unwrap().red)
+                        .fg(app.resources.theme.red)
                         .bg(if is_selected {
-                            THEME.read().unwrap().highlight_bg
+                            app.resources.theme.highlight_bg
                         } else if is_checked {
-                            THEME.read().unwrap().checked_bg
+                            app.resources.theme.checked_bg
                         } else {
-                            THEME.read().unwrap().red_bg
+                            app.resources.theme.red_bg
                         })
                         .add_modifier(Modifier::BOLD),
                 )
@@ -584,13 +596,13 @@ pub(crate) fn render_tab_merge_requests(
                 (
                     format!("{} DRAFT", icons.status_draft),
                     Style::default()
-                        .fg(THEME.read().unwrap().yellow)
+                        .fg(app.resources.theme.yellow)
                         .bg(if is_selected {
-                            THEME.read().unwrap().highlight_bg
+                            app.resources.theme.highlight_bg
                         } else if is_checked {
-                            THEME.read().unwrap().checked_bg
+                            app.resources.theme.checked_bg
                         } else {
-                            THEME.read().unwrap().yellow_bg
+                            app.resources.theme.yellow_bg
                         })
                         .add_modifier(Modifier::BOLD),
                 )
@@ -600,13 +612,13 @@ pub(crate) fn render_tab_merge_requests(
                     (
                         format!("{} DRAFT", icons.status_draft),
                         Style::default()
-                            .fg(THEME.read().unwrap().yellow)
+                            .fg(app.resources.theme.yellow)
                             .bg(if is_selected {
-                                THEME.read().unwrap().highlight_bg
+                                app.resources.theme.highlight_bg
                             } else if is_checked {
-                                THEME.read().unwrap().checked_bg
+                                app.resources.theme.checked_bg
                             } else {
-                                THEME.read().unwrap().yellow_bg
+                                app.resources.theme.yellow_bg
                             })
                             .add_modifier(Modifier::BOLD),
                     )
@@ -614,13 +626,13 @@ pub(crate) fn render_tab_merge_requests(
                     (
                         format!("{} READY", icons.approval_approved),
                         Style::default()
-                            .fg(THEME.read().unwrap().green)
+                            .fg(app.resources.theme.green)
                             .bg(if is_selected {
-                                THEME.read().unwrap().highlight_bg
+                                app.resources.theme.highlight_bg
                             } else if is_checked {
-                                THEME.read().unwrap().checked_bg
+                                app.resources.theme.checked_bg
                             } else {
-                                THEME.read().unwrap().green_bg
+                                app.resources.theme.green_bg
                             })
                             .add_modifier(Modifier::BOLD),
                     )
@@ -630,7 +642,10 @@ pub(crate) fn render_tab_merge_requests(
             let status_styled = format!(
                 "{}{}",
                 status_styled,
-                crate::domain::mr_state::status_flags(m.blocking_discussions_resolved)
+                crate::domain::mr_state::status_flags(
+                    m.blocking_discussions_resolved,
+                    &app.resources.icons
+                )
             );
 
             let mut cells = Vec::new();
@@ -640,8 +655,9 @@ pub(crate) fn render_tab_merge_requests(
                     &app.search_query,
                     is_selected,
                     false,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::MergeRequests, "State") {
@@ -652,6 +668,7 @@ pub(crate) fn render_tab_merge_requests(
                     is_checked,
                     state_style,
                     Alignment::Center,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::MergeRequests, "Status") {
@@ -662,12 +679,16 @@ pub(crate) fn render_tab_merge_requests(
                     is_checked,
                     status_style,
                     Alignment::Center,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::MergeRequests, "Mergeable") {
-                let (text, tone) = crate::domain::mr_state::mergeable_cell(m.mergeability.as_ref());
+                let (text, tone) = crate::domain::mr_state::mergeable_cell(
+                    m.mergeability.as_ref(),
+                    &app.resources.icons,
+                );
                 let style = {
-                    let t = THEME.read().unwrap();
+                    let t = app.resources.theme;
                     match tone {
                         crate::domain::mr_state::MergeTone::Conflict => Style::default()
                             .fg(t.red)
@@ -709,13 +730,17 @@ pub(crate) fn render_tab_merge_requests(
                     is_checked,
                     style,
                     Alignment::Center,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::MergeRequests, "Approval") {
-                let (text, tone) =
-                    crate::domain::mr_state::approval_cell(m.approval.as_ref(), app.is_github());
+                let (text, tone) = crate::domain::mr_state::approval_cell(
+                    m.approval.as_ref(),
+                    app.is_github(),
+                    &app.resources.icons,
+                );
                 let style = {
-                    let t = THEME.read().unwrap();
+                    let t = app.resources.theme;
                     match tone {
                         crate::domain::mr_state::ApprovalTone::ChangesRequested => Style::default()
                             .fg(t.red)
@@ -757,6 +782,7 @@ pub(crate) fn render_tab_merge_requests(
                     is_checked,
                     style,
                     Alignment::Center,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::MergeRequests, "Title") {
@@ -765,8 +791,9 @@ pub(crate) fn render_tab_merge_requests(
                     &app.search_query,
                     is_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::MergeRequests, "Assignees") {
@@ -784,8 +811,9 @@ pub(crate) fn render_tab_merge_requests(
                     &app.search_query,
                     is_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().blue),
+                    Style::default().fg(app.resources.theme.blue),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::MergeRequests, "Reviewers") {
@@ -803,26 +831,27 @@ pub(crate) fn render_tab_merge_requests(
                     &app.search_query,
                     is_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().blue),
+                    Style::default().fg(app.resources.theme.blue),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::MergeRequests, "Workflow") {
-                let text = crate::domain::mr_state::workflow_cell(m.workflow);
+                let text = crate::domain::mr_state::workflow_cell(m.workflow, &app.resources.icons);
                 let color = match m.workflow {
                     Some(crate::domain::mr_state::WorkflowStatus::ReturnedToYou) => {
-                        THEME.read().unwrap().red
+                        app.resources.theme.red
                     }
                     Some(crate::domain::mr_state::WorkflowStatus::ReviewRequested) => {
-                        THEME.read().unwrap().yellow
+                        app.resources.theme.yellow
                     }
                     Some(crate::domain::mr_state::WorkflowStatus::YourMergeRequest) => {
-                        THEME.read().unwrap().blue
+                        app.resources.theme.blue
                     }
                     Some(crate::domain::mr_state::WorkflowStatus::ApprovedByYou) => {
-                        THEME.read().unwrap().green
+                        app.resources.theme.green
                     }
-                    _ => THEME.read().unwrap().text_muted,
+                    _ => app.resources.theme.text_muted,
                 };
                 cells.push(super::helpers::render_fuzzy_cell(
                     &text,
@@ -831,6 +860,7 @@ pub(crate) fn render_tab_merge_requests(
                     is_checked,
                     Style::default().fg(color),
                     Alignment::Center,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::MergeRequests, "Labels") {
@@ -841,6 +871,7 @@ pub(crate) fn render_tab_merge_requests(
                     is_selected,
                     is_checked,
                     24,
+                    &app.resources.theme,
                 ));
             }
             let is_github = app.is_github();
@@ -860,7 +891,7 @@ pub(crate) fn render_tab_merge_requests(
                 });
                 if let Some(pipe) = resolved_pipe {
                     let stages_dots = if let Some(jobs) = app.pipeline_jobs.get(&pipe.id()) {
-                        super::helpers::get_stages_dots(jobs)
+                        super::helpers::get_stages_dots(jobs, &app.resources.icons)
                     } else {
                         icons.label_loading.clone()
                     };
@@ -869,44 +900,44 @@ pub(crate) fn render_tab_merge_requests(
                         let (pipe_text, pipe_color, pipe_bg) = match pipe.status() {
                             "success" => (
                                 format!("{} SUCCESS", icons.status_success),
-                                THEME.read().unwrap().green,
-                                THEME.read().unwrap().green_bg,
+                                app.resources.theme.green,
+                                app.resources.theme.green_bg,
                             ),
                             "failed" => (
                                 format!("{} FAILED", icons.status_failed),
-                                THEME.read().unwrap().red,
-                                THEME.read().unwrap().red_bg,
+                                app.resources.theme.red,
+                                app.resources.theme.red_bg,
                             ),
                             "running" => (
                                 format!("{} RUNNING", icons.status_running),
-                                THEME.read().unwrap().blue,
-                                THEME.read().unwrap().blue_bg,
+                                app.resources.theme.blue,
+                                app.resources.theme.blue_bg,
                             ),
                             "canceled" => (
                                 format!("{} CANCEL", icons.status_canceled),
-                                THEME.read().unwrap().text_muted,
-                                THEME.read().unwrap().inactive_bg,
+                                app.resources.theme.text_muted,
+                                app.resources.theme.inactive_bg,
                             ),
                             "pending" => (
                                 format!("{} PENDING", icons.status_pending),
-                                THEME.read().unwrap().yellow,
-                                THEME.read().unwrap().yellow_bg,
+                                app.resources.theme.yellow,
+                                app.resources.theme.yellow_bg,
                             ),
                             "skipped" => (
                                 format!("{} SKIP", icons.status_skipped),
-                                THEME.read().unwrap().text_muted,
-                                THEME.read().unwrap().inactive_bg,
+                                app.resources.theme.text_muted,
+                                app.resources.theme.inactive_bg,
                             ),
                             _ => (
                                 format!("{} UNKNOWN", icons.status_unknown),
-                                THEME.read().unwrap().text_muted,
-                                THEME.read().unwrap().inactive_bg,
+                                app.resources.theme.text_muted,
+                                app.resources.theme.inactive_bg,
                             ),
                         };
                         let bg = if is_selected {
-                            THEME.read().unwrap().highlight_bg
+                            app.resources.theme.highlight_bg
                         } else if is_checked {
-                            THEME.read().unwrap().checked_bg
+                            app.resources.theme.checked_bg
                         } else {
                             pipe_bg
                         };
@@ -920,6 +951,7 @@ pub(crate) fn render_tab_merge_requests(
                                 .bg(bg)
                                 .add_modifier(Modifier::BOLD),
                             Alignment::Center,
+                            &app.resources.theme,
                         ));
                     } else {
                         cells.push(super::helpers::render_fuzzy_cell(
@@ -927,8 +959,9 @@ pub(crate) fn render_tab_merge_requests(
                             &app.search_query,
                             is_selected,
                             is_checked,
-                            Style::default().fg(THEME.read().unwrap().text_normal),
+                            Style::default().fg(app.resources.theme.text_normal),
                             Alignment::Left,
+                            &app.resources.theme,
                         ));
                     }
                 } else {
@@ -937,8 +970,9 @@ pub(crate) fn render_tab_merge_requests(
                         &app.search_query,
                         is_selected,
                         is_checked,
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                         Alignment::Center,
+                        &app.resources.theme,
                     ));
                 }
             }
@@ -953,8 +987,9 @@ pub(crate) fn render_tab_merge_requests(
                     &app.search_query,
                     is_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().yellow),
+                    Style::default().fg(app.resources.theme.yellow),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::MergeRequests, "Author") {
@@ -964,14 +999,15 @@ pub(crate) fn render_tab_merge_requests(
                     &app.search_query,
                     is_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().blue),
+                    Style::default().fg(app.resources.theme.blue),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             let row_style = if is_selected {
-                Style::default().bg(THEME.read().unwrap().highlight_bg)
+                Style::default().bg(app.resources.theme.highlight_bg)
             } else if is_checked {
-                Style::default().bg(THEME.read().unwrap().checked_bg)
+                Style::default().bg(app.resources.theme.checked_bg)
             } else {
                 Style::default()
             };
@@ -1063,11 +1099,11 @@ pub(crate) fn render_tab_merge_requests(
 
         let preview_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(THEME.read().unwrap().border))
+            .border_style(Style::default().fg(app.resources.theme.border))
             .title(format!(" {} Details ", icons.label_details))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().text_muted)
+                    .fg(app.resources.theme.text_muted)
                     .add_modifier(Modifier::BOLD),
             );
         if let Some(selected) = app.mrs.state.selected() {
@@ -1097,9 +1133,9 @@ pub(crate) fn render_tab_merge_requests(
                 };
                 let draft_status = if mr.draft { "DRAFT" } else { "READY" };
                 let draft_color = if mr.draft {
-                    THEME.read().unwrap().yellow
+                    app.resources.theme.yellow
                 } else {
-                    THEME.read().unwrap().green
+                    app.resources.theme.green
                 };
 
                 let mut text = Vec::new();
@@ -1107,13 +1143,13 @@ pub(crate) fn render_tab_merge_requests(
                     Span::styled(
                         "Title:     ",
                         Style::default()
-                            .fg(THEME.read().unwrap().text_muted)
+                            .fg(app.resources.theme.text_muted)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         &mr.title,
                         Style::default()
-                            .fg(THEME.read().unwrap().text_normal)
+                            .fg(app.resources.theme.text_normal)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -1121,26 +1157,26 @@ pub(crate) fn render_tab_merge_requests(
                 text.push(Line::from(vec![
                     Span::styled(
                         "Author:    ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         format!("@{}", mr.author.username),
-                        Style::default().fg(THEME.read().unwrap().blue),
+                        Style::default().fg(app.resources.theme.blue),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Assignees: ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
-                    Span::styled(assignees, Style::default().fg(THEME.read().unwrap().blue)),
+                    Span::styled(assignees, Style::default().fg(app.resources.theme.blue)),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Reviewers: ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
-                    Span::styled(reviewers, Style::default().fg(THEME.read().unwrap().blue)),
+                    Span::styled(reviewers, Style::default().fg(app.resources.theme.blue)),
                 ]));
 
                 // Workflow — omitted entirely for `NotYours` and unknown, so
@@ -1150,15 +1186,18 @@ pub(crate) fn render_tab_merge_requests(
                     text.push(Line::from(vec![
                         Span::styled(
                             "Workflow:  ",
-                            Style::default().fg(THEME.read().unwrap().text_muted),
+                            Style::default().fg(app.resources.theme.text_muted),
                         ),
                         Span::styled(
                             format!(
                                 "{} {}",
-                                crate::domain::mr_state::workflow_icon(mr.workflow),
+                                crate::domain::mr_state::workflow_icon(
+                                    mr.workflow,
+                                    &app.resources.icons
+                                ),
                                 label
                             ),
-                            Style::default().fg(THEME.read().unwrap().text_normal),
+                            Style::default().fg(app.resources.theme.text_normal),
                         ),
                     ]));
                 }
@@ -1169,7 +1208,7 @@ pub(crate) fn render_tab_merge_requests(
                     let (label, color) = if ap.changes_requested {
                         (
                             format!("{} Changes requested", icons.approval_changes),
-                            THEME.read().unwrap().red,
+                            app.resources.theme.red,
                         )
                     } else if ap.awaiting_you {
                         let counts = match ap.approvals_required {
@@ -1178,7 +1217,7 @@ pub(crate) fn render_tab_merge_requests(
                         };
                         (
                             format!("{} Needs approval ({})", icons.approval_pending, counts),
-                            THEME.read().unwrap().yellow,
+                            app.resources.theme.yellow,
                         )
                     } else if ap.approved && !ap.approved_by.is_empty() {
                         let counts = match ap.approvals_required {
@@ -1187,18 +1226,18 @@ pub(crate) fn render_tab_merge_requests(
                         };
                         (
                             format!("{} Approved{}", icons.approval_approved, counts),
-                            THEME.read().unwrap().green,
+                            app.resources.theme.green,
                         )
                     } else {
                         (
                             "Pending approval".to_string(),
-                            THEME.read().unwrap().text_muted,
+                            app.resources.theme.text_muted,
                         )
                     };
                     text.push(Line::from(vec![
                         Span::styled(
                             "Approvals: ",
-                            Style::default().fg(THEME.read().unwrap().text_muted),
+                            Style::default().fg(app.resources.theme.text_muted),
                         ),
                         Span::styled(label, Style::default().fg(color)),
                     ]));
@@ -1225,9 +1264,9 @@ pub(crate) fn render_tab_merge_requests(
                     text.push(Line::from(vec![
                         Span::styled(
                             "Approvers: ",
-                            Style::default().fg(THEME.read().unwrap().text_muted),
+                            Style::default().fg(app.resources.theme.text_muted),
                         ),
-                        Span::styled(approvers, Style::default().fg(THEME.read().unwrap().blue)),
+                        Span::styled(approvers, Style::default().fg(app.resources.theme.blue)),
                     ]));
                 }
 
@@ -1236,28 +1275,28 @@ pub(crate) fn render_tab_merge_requests(
                     let (label, color) = if mg.conflicts {
                         (
                             format!("{} Merge conflicts", icons.merge_conflict),
-                            THEME.read().unwrap().red,
+                            app.resources.theme.red,
                         )
                     } else if mg.needs_rebase {
                         (
                             format!("{} Behind target — needs rebase", icons.merge_rebase),
-                            THEME.read().unwrap().yellow,
+                            app.resources.theme.yellow,
                         )
                     } else if mg.computing {
                         (
                             format!("{} Checking…", icons.merge_checking),
-                            THEME.read().unwrap().text_muted,
+                            app.resources.theme.text_muted,
                         )
                     } else {
                         (
                             format!("{} No conflicts", icons.merge_clean),
-                            THEME.read().unwrap().green,
+                            app.resources.theme.green,
                         )
                     };
                     text.push(Line::from(vec![
                         Span::styled(
                             "Mergeable: ",
-                            Style::default().fg(THEME.read().unwrap().text_muted),
+                            Style::default().fg(app.resources.theme.text_muted),
                         ),
                         Span::styled(label, Style::default().fg(color)),
                     ]));
@@ -1287,13 +1326,13 @@ pub(crate) fn render_tab_merge_requests(
                     &icons,
                 ) {
                     let threads_color = match tone {
-                        crate::domain::mr_state::ThreadsTone::Blocking => THEME.read().unwrap().red,
-                        crate::domain::mr_state::ThreadsTone::Clean => THEME.read().unwrap().green,
+                        crate::domain::mr_state::ThreadsTone::Blocking => app.resources.theme.red,
+                        crate::domain::mr_state::ThreadsTone::Clean => app.resources.theme.green,
                     };
                     text.push(Line::from(vec![
                         Span::styled(
                             "Threads:   ",
-                            Style::default().fg(THEME.read().unwrap().text_muted),
+                            Style::default().fg(app.resources.theme.text_muted),
                         ),
                         Span::styled(threads_text, Style::default().fg(threads_color)),
                     ]));
@@ -1302,24 +1341,24 @@ pub(crate) fn render_tab_merge_requests(
                 text.push(Line::from(vec![
                     Span::styled(
                         "Milestone: ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
-                    Span::styled(milestone, Style::default().fg(THEME.read().unwrap().purple)),
+                    Span::styled(milestone, Style::default().fg(app.resources.theme.purple)),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Target:    ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         &mr.target_branch,
-                        Style::default().fg(THEME.read().unwrap().purple),
+                        Style::default().fg(app.resources.theme.purple),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "State:     ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         if mr.state == "opened" {
@@ -1331,31 +1370,31 @@ pub(crate) fn render_tab_merge_requests(
                         },
                         Style::default()
                             .fg(if mr.state == "opened" {
-                                THEME.read().unwrap().green
+                                app.resources.theme.green
                             } else if mr.state == "merged" {
-                                THEME.read().unwrap().purple
+                                app.resources.theme.purple
                             } else {
-                                THEME.read().unwrap().red
+                                app.resources.theme.red
                             })
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(" (", Style::default().fg(THEME.read().unwrap().text_muted)),
+                    Span::styled(" (", Style::default().fg(app.resources.theme.text_muted)),
                     Span::styled(
                         draft_status,
                         Style::default()
                             .fg(draft_color)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(")", Style::default().fg(THEME.read().unwrap().text_muted)),
+                    Span::styled(")", Style::default().fg(app.resources.theme.text_muted)),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Updated:   ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         time_ago(&mr.updated_at),
-                        Style::default().fg(THEME.read().unwrap().yellow),
+                        Style::default().fg(app.resources.theme.yellow),
                     ),
                 ]));
                 let resolved_pipe = mr.head_pipeline.as_ref().or_else(|| {
@@ -1370,7 +1409,7 @@ pub(crate) fn render_tab_merge_requests(
                 });
                 if let Some(pipe) = resolved_pipe {
                     let stages_dots = if let Some(jobs) = app.pipeline_jobs.get(&pipe.id()) {
-                        super::helpers::get_stages_dots(jobs)
+                        super::helpers::get_stages_dots(jobs, &app.resources.icons)
                     } else {
                         icons.label_loading.clone()
                     };
@@ -1379,38 +1418,38 @@ pub(crate) fn render_tab_merge_requests(
                         let (pipe_text, pipe_color, pipe_bg) = match pipe.status() {
                             "success" => (
                                 format!("{} SUCCESS", icons.status_success),
-                                THEME.read().unwrap().green,
-                                THEME.read().unwrap().green_bg,
+                                app.resources.theme.green,
+                                app.resources.theme.green_bg,
                             ),
                             "failed" => (
                                 format!("{} FAILED", icons.status_failed),
-                                THEME.read().unwrap().red,
-                                THEME.read().unwrap().red_bg,
+                                app.resources.theme.red,
+                                app.resources.theme.red_bg,
                             ),
                             "running" => (
                                 format!("{} RUNNING", icons.status_running),
-                                THEME.read().unwrap().blue,
-                                THEME.read().unwrap().blue_bg,
+                                app.resources.theme.blue,
+                                app.resources.theme.blue_bg,
                             ),
                             "canceled" => (
                                 format!("{} CANCEL", icons.status_canceled),
-                                THEME.read().unwrap().text_muted,
-                                THEME.read().unwrap().inactive_bg,
+                                app.resources.theme.text_muted,
+                                app.resources.theme.inactive_bg,
                             ),
                             "pending" => (
                                 format!("{} PENDING", icons.status_pending),
-                                THEME.read().unwrap().yellow,
-                                THEME.read().unwrap().yellow_bg,
+                                app.resources.theme.yellow,
+                                app.resources.theme.yellow_bg,
                             ),
                             "skipped" => (
                                 format!("{} SKIP", icons.status_skipped),
-                                THEME.read().unwrap().text_muted,
-                                THEME.read().unwrap().inactive_bg,
+                                app.resources.theme.text_muted,
+                                app.resources.theme.inactive_bg,
                             ),
                             _ => (
                                 format!("{} UNKNOWN", icons.status_unknown),
-                                THEME.read().unwrap().text_muted,
-                                THEME.read().unwrap().inactive_bg,
+                                app.resources.theme.text_muted,
+                                app.resources.theme.inactive_bg,
                             ),
                         };
                         text.push(Line::from(vec![
@@ -1420,7 +1459,7 @@ pub(crate) fn render_tab_merge_requests(
                                 } else {
                                     "Pipeline:  "
                                 },
-                                Style::default().fg(THEME.read().unwrap().text_muted),
+                                Style::default().fg(app.resources.theme.text_muted),
                             ),
                             Span::styled(
                                 format!(" {} ", pipe_text),
@@ -1438,11 +1477,11 @@ pub(crate) fn render_tab_merge_requests(
                                 } else {
                                     "Pipeline:  "
                                 },
-                                Style::default().fg(THEME.read().unwrap().text_muted),
+                                Style::default().fg(app.resources.theme.text_muted),
                             ),
                             Span::styled(
                                 stages_dots,
-                                Style::default().fg(THEME.read().unwrap().text_normal),
+                                Style::default().fg(app.resources.theme.text_normal),
                             ),
                         ]));
                     }
@@ -1450,22 +1489,26 @@ pub(crate) fn render_tab_merge_requests(
                 text.push(Line::from(""));
                 let mut label_spans = vec![Span::styled(
                     "Labels:    ",
-                    Style::default().fg(THEME.read().unwrap().text_muted),
+                    Style::default().fg(app.resources.theme.text_muted),
                 )];
                 if mr.labels.is_empty() {
                     label_spans.push(Span::styled(
                         "None",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ));
                 } else {
                     for (idx, label) in mr.labels.iter().enumerate() {
                         if idx > 0 {
                             label_spans.push(Span::styled(
                                 ", ",
-                                Style::default().fg(THEME.read().unwrap().text_normal),
+                                Style::default().fg(app.resources.theme.text_normal),
                             ));
                         }
-                        let label_color = super::helpers::get_label_color(label, &app.label_colors);
+                        let label_color = super::helpers::get_label_color(
+                            label,
+                            &app.label_colors,
+                            &app.resources.theme,
+                        );
                         label_spans.push(Span::styled(
                             label,
                             Style::default()
@@ -1481,10 +1524,10 @@ pub(crate) fn render_tab_merge_requests(
                         text.push(Line::from(vec![Span::styled(
                             "Description:",
                             Style::default()
-                                .fg(THEME.read().unwrap().header_fg)
+                                .fg(app.resources.theme.header_fg)
                                 .add_modifier(Modifier::BOLD),
                         )]));
-                        text.extend(render_markdown(desc));
+                        text.extend(render_markdown(desc, &app.resources.theme));
                     }
                 }
 
@@ -1502,11 +1545,11 @@ pub(crate) fn render_tab_merge_requests(
 
                 let preview_block = Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(THEME.read().unwrap().border))
+                    .border_style(Style::default().fg(app.resources.theme.border))
                     .title(format!(" Details{} ", title_suffix))
                     .title_style(
                         Style::default()
-                            .fg(THEME.read().unwrap().text_muted)
+                            .fg(app.resources.theme.text_muted)
                             .add_modifier(Modifier::BOLD),
                     );
 
@@ -1524,7 +1567,7 @@ pub(crate) fn render_tab_merge_requests(
             f.render_widget(
                 Paragraph::new("Select an item to view details...")
                     .block(preview_block)
-                    .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                    .style(Style::default().fg(app.resources.theme.text_muted)),
                 detail_rect,
             );
         }
@@ -1540,7 +1583,7 @@ pub(crate) fn render_tab_pipelines(
     highlight_style: Style,
     header_style: Style,
 ) {
-    let icons = crate::config::ICONS.read().unwrap();
+    let icons = &app.resources.icons;
     let is_github = app.is_github();
     if app.pipelines.items.is_empty() && app.loading_tabs.contains(&app.active_tab) {
         f.render_widget(
@@ -1551,7 +1594,7 @@ pub(crate) fn render_tab_pipelines(
             })
             .alignment(Alignment::Center)
             .block(main_block.clone())
-            .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+            .style(Style::default().fg(app.resources.theme.text_muted)),
             content_area,
         );
         f.render_widget(
@@ -1564,9 +1607,9 @@ pub(crate) fn render_tab_pipelines(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(format!(" {} Details ", icons.label_details))
-                    .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                    .border_style(Style::default().fg(app.resources.theme.border)),
             )
-            .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+            .style(Style::default().fg(app.resources.theme.text_muted)),
             detail_rect,
         );
     } else {
@@ -1598,55 +1641,55 @@ pub(crate) fn render_tab_pipelines(
             let (status_text, status_color, bg_color) = match p.status() {
                 "success" => (
                     format!("{} SUCCESS", icons.status_success),
-                    THEME.read().unwrap().green,
-                    THEME.read().unwrap().green_bg,
+                    app.resources.theme.green,
+                    app.resources.theme.green_bg,
                 ),
                 "failed" => (
                     format!("{} FAILED", icons.status_failed),
-                    THEME.read().unwrap().red,
-                    THEME.read().unwrap().red_bg,
+                    app.resources.theme.red,
+                    app.resources.theme.red_bg,
                 ),
                 "running" => (
                     format!("{} RUNNING", icons.status_running),
-                    THEME.read().unwrap().blue,
-                    THEME.read().unwrap().blue_bg,
+                    app.resources.theme.blue,
+                    app.resources.theme.blue_bg,
                 ),
                 "canceled" => (
                     format!("{} CANCEL", icons.status_canceled),
-                    THEME.read().unwrap().text_muted,
-                    THEME.read().unwrap().inactive_bg,
+                    app.resources.theme.text_muted,
+                    app.resources.theme.inactive_bg,
                 ),
                 "pending" => (
                     format!("{} PENDING", icons.status_pending),
-                    THEME.read().unwrap().yellow,
-                    THEME.read().unwrap().yellow_bg,
+                    app.resources.theme.yellow,
+                    app.resources.theme.yellow_bg,
                 ),
                 "skipped" => (
                     format!("{} SKIP", icons.status_skipped),
-                    THEME.read().unwrap().text_muted,
-                    THEME.read().unwrap().inactive_bg,
+                    app.resources.theme.text_muted,
+                    app.resources.theme.inactive_bg,
                 ),
                 "manual" => (
                     format!("{} MANUAL", icons.status_manual),
-                    THEME.read().unwrap().text_muted,
-                    THEME.read().unwrap().inactive_bg,
+                    app.resources.theme.text_muted,
+                    app.resources.theme.inactive_bg,
                 ),
                 _ => (
                     format!("{} UNKNOWN", icons.status_unknown),
-                    THEME.read().unwrap().text_muted,
-                    THEME.read().unwrap().inactive_bg,
+                    app.resources.theme.text_muted,
+                    app.resources.theme.inactive_bg,
                 ),
             };
             let stages_dots = if let Some(jobs) = app.pipeline_jobs.get(&p.id()) {
-                super::helpers::get_stages_dots(jobs)
+                super::helpers::get_stages_dots(jobs, &app.resources.icons)
             } else {
                 icons.label_loading.clone()
             };
             let is_checked = app.selected_pipelines.contains(&p.id());
             let status_bg = if is_row_highlighted {
-                THEME.read().unwrap().highlight_bg
+                app.resources.theme.highlight_bg
             } else if is_checked {
-                THEME.read().unwrap().checked_bg
+                app.resources.theme.checked_bg
             } else {
                 bg_color
             };
@@ -1657,8 +1700,9 @@ pub(crate) fn render_tab_pipelines(
                     &app.search_query,
                     is_row_highlighted,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Pipelines, "Status") {
@@ -1672,6 +1716,7 @@ pub(crate) fn render_tab_pipelines(
                         .bg(status_bg)
                         .add_modifier(Modifier::BOLD),
                     Alignment::Center,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Pipelines, "Stages") {
@@ -1680,8 +1725,9 @@ pub(crate) fn render_tab_pipelines(
                     &app.search_query,
                     is_row_highlighted,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Pipelines, "Name") {
@@ -1690,8 +1736,9 @@ pub(crate) fn render_tab_pipelines(
                     &app.search_query,
                     is_row_highlighted,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Pipelines, "Event") {
@@ -1700,8 +1747,9 @@ pub(crate) fn render_tab_pipelines(
                     &app.search_query,
                     is_row_highlighted,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Pipelines, "SHA") {
@@ -1710,8 +1758,9 @@ pub(crate) fn render_tab_pipelines(
                     &app.search_query,
                     is_row_highlighted,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().text_muted),
+                    Style::default().fg(app.resources.theme.text_muted),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Pipelines, "Actor") {
@@ -1720,8 +1769,9 @@ pub(crate) fn render_tab_pipelines(
                     &app.search_query,
                     is_row_highlighted,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Pipelines, "Ref") {
@@ -1730,14 +1780,15 @@ pub(crate) fn render_tab_pipelines(
                     &app.search_query,
                     is_row_highlighted,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().purple),
+                    Style::default().fg(app.resources.theme.purple),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             let row_style = if is_row_highlighted {
-                Style::default().bg(THEME.read().unwrap().highlight_bg)
+                Style::default().bg(app.resources.theme.highlight_bg)
             } else if is_checked {
-                Style::default().bg(THEME.read().unwrap().checked_bg)
+                Style::default().bg(app.resources.theme.checked_bg)
             } else {
                 Style::default()
             };
@@ -1799,10 +1850,10 @@ pub(crate) fn render_tab_pipelines(
             .title(format!(" {} Details ", icons.label_details))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().text_muted)
+                    .fg(app.resources.theme.text_muted)
                     .add_modifier(Modifier::BOLD),
             )
-            .border_style(Style::default().fg(THEME.read().unwrap().border));
+            .border_style(Style::default().fg(app.resources.theme.border));
         if let Some(selected) = app.pipelines.state.selected() {
             if let Some(p) = filtered_pipelines.get(selected) {
                 let mut text = Vec::new();
@@ -1813,39 +1864,39 @@ pub(crate) fn render_tab_pipelines(
                         } else {
                             "Pipeline ID: "
                         },
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         format!("#{}", p.id()),
                         Style::default()
-                            .fg(THEME.read().unwrap().blue)
+                            .fg(app.resources.theme.blue)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Ref:         ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         format_ref(p.ref_branch()),
-                        Style::default().fg(THEME.read().unwrap().purple),
+                        Style::default().fg(app.resources.theme.purple),
                     ),
                 ]));
 
                 let (status_text, status_color) = match p.status() {
-                    "success" => ("success", THEME.read().unwrap().green),
-                    "failed" => ("failed", THEME.read().unwrap().red),
-                    "running" => ("running", THEME.read().unwrap().blue),
-                    "canceled" => ("canceled", THEME.read().unwrap().text_muted),
-                    "pending" => ("pending", THEME.read().unwrap().yellow),
-                    _ => ("unknown", THEME.read().unwrap().text_muted),
+                    "success" => ("success", app.resources.theme.green),
+                    "failed" => ("failed", app.resources.theme.red),
+                    "running" => ("running", app.resources.theme.blue),
+                    "canceled" => ("canceled", app.resources.theme.text_muted),
+                    "pending" => ("pending", app.resources.theme.yellow),
+                    _ => ("unknown", app.resources.theme.text_muted),
                 };
 
                 text.push(Line::from(vec![
                     Span::styled(
                         "Status:      ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         status_text,
@@ -1857,11 +1908,11 @@ pub(crate) fn render_tab_pipelines(
                 text.push(Line::from(vec![
                     Span::styled(
                         "Updated:     ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         time_ago(p.updated_at()),
-                        Style::default().fg(THEME.read().unwrap().yellow),
+                        Style::default().fg(app.resources.theme.yellow),
                     ),
                 ]));
                 text.push(Line::from(""));
@@ -1875,11 +1926,16 @@ pub(crate) fn render_tab_pipelines(
                     text.push(Line::from(vec![Span::styled(
                         format!("{} {stage_label}", icons.label_stages),
                         Style::default()
-                            .fg(THEME.read().unwrap().header_fg)
+                            .fg(app.resources.theme.header_fg)
                             .add_modifier(Modifier::BOLD),
                     )]));
                     text.push(Line::from(""));
-                    super::helpers::append_stage_summaries(&mut text, jobs);
+                    super::helpers::append_stage_summaries(
+                        &mut text,
+                        jobs,
+                        &app.resources.theme,
+                        &app.resources.icons,
+                    );
                 } else {
                     text.push(Line::from(vec![Span::styled(
                         if is_github {
@@ -1888,7 +1944,7 @@ pub(crate) fn render_tab_pipelines(
                             "Loading stages..."
                         },
                         Style::default()
-                            .fg(THEME.read().unwrap().text_muted)
+                            .fg(app.resources.theme.text_muted)
                             .add_modifier(Modifier::ITALIC),
                     )]));
                 }
@@ -1901,7 +1957,7 @@ pub(crate) fn render_tab_pipelines(
             f.render_widget(
                 Paragraph::new("Select an item to view details...")
                     .block(preview_block)
-                    .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                    .style(Style::default().fg(app.resources.theme.text_muted)),
                 detail_rect,
             );
         }
@@ -1917,13 +1973,13 @@ pub(crate) fn render_tab_jobs(
     highlight_style: Style,
     header_style: Style,
 ) {
-    let icons = crate::config::ICONS.read().unwrap();
+    let icons = &app.resources.icons;
     if app.jobs.items.is_empty() && app.loading_tabs.contains(&app.active_tab) {
         f.render_widget(
             Paragraph::new(format!("\n\n {} Loading jobs...", icons.label_loading))
                 .alignment(Alignment::Center)
                 .block(main_block.clone())
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             content_area,
         );
         f.render_widget(
@@ -1932,9 +1988,9 @@ pub(crate) fn render_tab_jobs(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" {} Details ", icons.label_details))
-                        .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                        .border_style(Style::default().fg(app.resources.theme.border)),
                 )
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             detail_rect,
         );
     } else if !app.jobs.items.is_empty() {
@@ -1991,28 +2047,28 @@ pub(crate) fn render_tab_jobs(
                     let (st, sc, sbg) = match overall_status {
                         "success" => (
                             format!("{} SUCCESS", icons.status_success),
-                            THEME.read().unwrap().green,
-                            THEME.read().unwrap().green_bg,
+                            app.resources.theme.green,
+                            app.resources.theme.green_bg,
                         ),
                         "failed" => (
                             format!("{} FAILED", icons.status_failed),
-                            THEME.read().unwrap().red,
-                            THEME.read().unwrap().red_bg,
+                            app.resources.theme.red,
+                            app.resources.theme.red_bg,
                         ),
                         "running" => (
                             format!("{} RUNNING", icons.status_running),
-                            THEME.read().unwrap().blue,
-                            THEME.read().unwrap().blue_bg,
+                            app.resources.theme.blue,
+                            app.resources.theme.blue_bg,
                         ),
                         "pending" => (
                             format!("{} PENDING", icons.status_pending),
-                            THEME.read().unwrap().yellow,
-                            THEME.read().unwrap().yellow_bg,
+                            app.resources.theme.yellow,
+                            app.resources.theme.yellow_bg,
                         ),
                         _ => (
                             format!("{} SKIP", icons.status_skipped),
-                            THEME.read().unwrap().text_muted,
-                            THEME.read().unwrap().inactive_bg,
+                            app.resources.theme.text_muted,
+                            app.resources.theme.inactive_bg,
                         ),
                     };
 
@@ -2029,43 +2085,43 @@ pub(crate) fn render_tab_jobs(
                     let (status_text, status_color, bg_color) = match j.status() {
                         "success" => (
                             format!("{} SUCCESS", icons.status_success),
-                            THEME.read().unwrap().green,
-                            THEME.read().unwrap().green_bg,
+                            app.resources.theme.green,
+                            app.resources.theme.green_bg,
                         ),
                         "failed" => (
                             format!("{} FAILED", icons.status_failed),
-                            THEME.read().unwrap().red,
-                            THEME.read().unwrap().red_bg,
+                            app.resources.theme.red,
+                            app.resources.theme.red_bg,
                         ),
                         "running" => (
                             format!("{} RUNNING", icons.status_running),
-                            THEME.read().unwrap().blue,
-                            THEME.read().unwrap().blue_bg,
+                            app.resources.theme.blue,
+                            app.resources.theme.blue_bg,
                         ),
                         "canceled" => (
                             format!("{} CANCEL", icons.status_canceled),
-                            THEME.read().unwrap().text_muted,
-                            THEME.read().unwrap().inactive_bg,
+                            app.resources.theme.text_muted,
+                            app.resources.theme.inactive_bg,
                         ),
                         "pending" => (
                             format!("{} PENDING", icons.status_pending),
-                            THEME.read().unwrap().yellow,
-                            THEME.read().unwrap().yellow_bg,
+                            app.resources.theme.yellow,
+                            app.resources.theme.yellow_bg,
                         ),
                         "skipped" => (
                             format!("{} SKIP", icons.status_skipped),
-                            THEME.read().unwrap().text_muted,
-                            THEME.read().unwrap().inactive_bg,
+                            app.resources.theme.text_muted,
+                            app.resources.theme.inactive_bg,
                         ),
                         "manual" => (
                             format!("{} MANUAL", icons.status_manual),
-                            THEME.read().unwrap().text_muted,
-                            THEME.read().unwrap().inactive_bg,
+                            app.resources.theme.text_muted,
+                            app.resources.theme.inactive_bg,
                         ),
                         _ => (
                             format!("{} UNKNOWN", icons.status_unknown),
-                            THEME.read().unwrap().text_muted,
-                            THEME.read().unwrap().inactive_bg,
+                            app.resources.theme.text_muted,
+                            app.resources.theme.inactive_bg,
                         ),
                     };
                     let m_str = if let Some(m) = j.matrix() {
@@ -2079,9 +2135,9 @@ pub(crate) fn render_tab_jobs(
             let is_job_selected = Some(i) == app.jobs.state.selected();
             let is_checked = app.selected_jobs.contains(&j.id());
             let status_bg = if is_job_selected {
-                THEME.read().unwrap().highlight_bg
+                app.resources.theme.highlight_bg
             } else if is_checked {
-                THEME.read().unwrap().checked_bg
+                app.resources.theme.checked_bg
             } else {
                 status_bg_display
             };
@@ -2096,8 +2152,9 @@ pub(crate) fn render_tab_jobs(
                     &app.search_query,
                     is_job_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Jobs, "Stage") {
@@ -2106,8 +2163,9 @@ pub(crate) fn render_tab_jobs(
                     &app.search_query,
                     is_job_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().purple),
+                    Style::default().fg(app.resources.theme.purple),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Jobs, "Status") {
@@ -2121,6 +2179,7 @@ pub(crate) fn render_tab_jobs(
                         .bg(status_bg)
                         .add_modifier(Modifier::BOLD),
                     Alignment::Center,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Jobs, "Name") {
@@ -2129,8 +2188,9 @@ pub(crate) fn render_tab_jobs(
                     &app.search_query,
                     is_job_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Jobs, "Matrix") {
@@ -2139,14 +2199,15 @@ pub(crate) fn render_tab_jobs(
                     &app.search_query,
                     is_job_selected,
                     is_checked,
-                    Style::default().fg(THEME.read().unwrap().text_muted),
+                    Style::default().fg(app.resources.theme.text_muted),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             let row_style = if is_job_selected {
-                Style::default().bg(THEME.read().unwrap().highlight_bg)
+                Style::default().bg(app.resources.theme.highlight_bg)
             } else if is_checked {
-                Style::default().bg(THEME.read().unwrap().checked_bg)
+                Style::default().bg(app.resources.theme.checked_bg)
             } else {
                 Style::default()
             };
@@ -2185,7 +2246,7 @@ pub(crate) fn render_tab_jobs(
 
         let kind = app.kind();
         let is_github = kind.is_github();
-        let jobs_title = Tab::Jobs.title(kind);
+        let jobs_title = Tab::Jobs.title(kind, &app.resources.icons);
         let table = Table::new(rows, widths)
             .header(Row::new(header_cells).style(header_style).height(1))
             .block(
@@ -2194,10 +2255,10 @@ pub(crate) fn render_tab_jobs(
                     .title(format!(" {} ", jobs_title))
                     .title_style(
                         Style::default()
-                            .fg(THEME.read().unwrap().header_fg)
+                            .fg(app.resources.theme.header_fg)
                             .add_modifier(Modifier::BOLD),
                     )
-                    .border_style(Style::default().fg(THEME.read().unwrap().border_focused)),
+                    .border_style(Style::default().fg(app.resources.theme.border_focused)),
             )
             .row_highlight_style(highlight_style)
             .highlight_symbol(format!(" {} ", icons.highlight_arrow));
@@ -2222,16 +2283,16 @@ pub(crate) fn render_tab_jobs(
                 .title(format!(" {} Details / Trace ", icons.label_details))
                 .title_style(
                     Style::default()
-                        .fg(THEME.read().unwrap().text_muted)
+                        .fg(app.resources.theme.text_muted)
                         .add_modifier(Modifier::BOLD),
                 )
-                .border_style(Style::default().fg(THEME.read().unwrap().border));
+                .border_style(Style::default().fg(app.resources.theme.border));
 
             f.render_widget(
                 Paragraph::new("\n\n  Loading job trace... (Press Esc to cancel)")
                     .alignment(Alignment::Center)
                     .block(preview_block)
-                    .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                    .style(Style::default().fg(app.resources.theme.text_muted)),
                 detail_rect,
             );
         } else if let Some(trace) = &app.job_trace {
@@ -2239,7 +2300,7 @@ pub(crate) fn render_tab_jobs(
             let height = detail_rect.height.saturating_sub(2) as usize;
 
             let formatted_lines =
-                crate::utils::format::parse_ansi_trace(trace, &THEME.read().unwrap());
+                crate::utils::format::parse_ansi_trace(trace, &app.resources.theme);
 
             let total_lines = if app.job_trace_wrap {
                 let stripped = crate::utils::format::strip_ansi_escapes(trace);
@@ -2275,17 +2336,17 @@ pub(crate) fn render_tab_jobs(
                 .title(format!(" Details / Trace{} ", title_suffix))
                 .title_style(
                     Style::default()
-                        .fg(THEME.read().unwrap().text_muted)
+                        .fg(app.resources.theme.text_muted)
                         .add_modifier(Modifier::BOLD),
                 )
                 .title_bottom(
                     ratatui::text::Line::from(vec![Span::styled(
                         help_text,
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     )])
                     .alignment(Alignment::Right),
                 )
-                .border_style(Style::default().fg(THEME.read().unwrap().border));
+                .border_style(Style::default().fg(app.resources.theme.border));
 
             let mut paragraph = Paragraph::new(formatted_lines)
                 .block(preview_block)
@@ -2302,10 +2363,10 @@ pub(crate) fn render_tab_jobs(
                 .title(format!(" {} Details / Trace ", icons.label_details))
                 .title_style(
                     Style::default()
-                        .fg(THEME.read().unwrap().text_muted)
+                        .fg(app.resources.theme.text_muted)
                         .add_modifier(Modifier::BOLD),
                 )
-                .border_style(Style::default().fg(THEME.read().unwrap().border));
+                .border_style(Style::default().fg(app.resources.theme.border));
             let mut text = Vec::new();
             let stage_label = if is_github {
                 "Jobs Status:"
@@ -2315,24 +2376,29 @@ pub(crate) fn render_tab_jobs(
             text.push(Line::from(vec![Span::styled(
                 stage_label,
                 Style::default()
-                    .fg(THEME.read().unwrap().header_fg)
+                    .fg(app.resources.theme.header_fg)
                     .add_modifier(Modifier::BOLD),
             )]));
             text.push(Line::from(""));
-            super::helpers::append_stage_summaries(&mut text, &app.jobs.items);
+            super::helpers::append_stage_summaries(
+                &mut text,
+                &app.jobs.items,
+                &app.resources.theme,
+                &app.resources.icons,
+            );
             f.render_widget(Paragraph::new(text).block(preview_block), detail_rect);
         }
     } else {
-        f.render_widget(Paragraph::new("\n\n No jobs loaded.\n Press 'p' to manually enter a pipeline ID to fetch jobs for,\n or view a pipeline in Pipelines tab and press Enter.").alignment(Alignment::Center).block(main_block).style(Style::default().fg(THEME.read().unwrap().text_muted)), content_area);
+        f.render_widget(Paragraph::new("\n\n No jobs loaded.\n Press 'p' to manually enter a pipeline ID to fetch jobs for,\n or view a pipeline in Pipelines tab and press Enter.").alignment(Alignment::Center).block(main_block).style(Style::default().fg(app.resources.theme.text_muted)), content_area);
         f.render_widget(
             Paragraph::new("Select a job to view details...")
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" {} Details ", icons.label_details))
-                        .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                        .border_style(Style::default().fg(app.resources.theme.border)),
                 )
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             detail_rect,
         );
     }
@@ -2347,13 +2413,13 @@ pub(crate) fn render_tab_runners(
     highlight_style: Style,
     header_style: Style,
 ) {
-    let icons = crate::config::ICONS.read().unwrap();
+    let icons = &app.resources.icons;
     if app.runners.items.is_empty() && app.loading_tabs.contains(&app.active_tab) {
         f.render_widget(
             Paragraph::new(format!("\n\n {} Loading runners...", icons.label_loading))
                 .alignment(Alignment::Center)
                 .block(main_block.clone())
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             content_area,
         );
         f.render_widget(
@@ -2362,9 +2428,9 @@ pub(crate) fn render_tab_runners(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" {} Details ", icons.label_details))
-                        .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                        .border_style(Style::default().fg(app.resources.theme.border)),
                 )
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             detail_rect,
         );
     } else {
@@ -2392,23 +2458,23 @@ pub(crate) fn render_tab_runners(
             let (status_text, status_color, bg_color) = match r.status.as_str() {
                 "online" => (
                     format!("{} ONLINE", icons.runner_online),
-                    THEME.read().unwrap().green,
-                    THEME.read().unwrap().green_bg,
+                    app.resources.theme.green,
+                    app.resources.theme.green_bg,
                 ),
                 "paused" => (
                     format!("{} PAUSED", icons.runner_paused),
-                    THEME.read().unwrap().yellow,
-                    THEME.read().unwrap().yellow_bg,
+                    app.resources.theme.yellow,
+                    app.resources.theme.yellow_bg,
                 ),
                 "offline" => (
                     format!("{} OFFLINE", icons.runner_offline),
-                    THEME.read().unwrap().red,
-                    THEME.read().unwrap().red_bg,
+                    app.resources.theme.red,
+                    app.resources.theme.red_bg,
                 ),
                 _ => (
                     format!("{} UNKNOWN", icons.status_unknown),
-                    THEME.read().unwrap().text_muted,
-                    THEME.read().unwrap().inactive_bg,
+                    app.resources.theme.text_muted,
+                    app.resources.theme.inactive_bg,
                 ),
             };
             let desc = r.description.as_deref().unwrap_or("No description");
@@ -2419,8 +2485,9 @@ pub(crate) fn render_tab_runners(
                     &app.search_query,
                     is_row_highlighted,
                     false,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Runners, "Description") {
@@ -2429,8 +2496,9 @@ pub(crate) fn render_tab_runners(
                     &app.search_query,
                     is_row_highlighted,
                     false,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Runners, "Status") {
@@ -2442,12 +2510,13 @@ pub(crate) fn render_tab_runners(
                     Style::default()
                         .fg(status_color)
                         .bg(if is_row_highlighted {
-                            THEME.read().unwrap().highlight_bg
+                            app.resources.theme.highlight_bg
                         } else {
                             bg_color
                         })
                         .add_modifier(Modifier::BOLD),
                     Alignment::Center,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Runners, "Active") {
@@ -2457,15 +2526,16 @@ pub(crate) fn render_tab_runners(
                     is_row_highlighted,
                     false,
                     Style::default().fg(if r.active {
-                        THEME.read().unwrap().green
+                        app.resources.theme.green
                     } else {
-                        THEME.read().unwrap().red
+                        app.resources.theme.red
                     }),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             let row_style = if is_row_highlighted {
-                Style::default().bg(THEME.read().unwrap().highlight_bg)
+                Style::default().bg(app.resources.theme.highlight_bg)
             } else {
                 Style::default()
             };
@@ -2513,10 +2583,10 @@ pub(crate) fn render_tab_runners(
             .title(format!(" {} Performance Dashboard ", icons.label_metrics))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().text_muted)
+                    .fg(app.resources.theme.text_muted)
                     .add_modifier(Modifier::BOLD),
             )
-            .border_style(Style::default().fg(THEME.read().unwrap().border));
+            .border_style(Style::default().fg(app.resources.theme.border));
         if let Some(selected) = app.runners.state.selected() {
             if let Some(r) = filtered_runners.get(selected) {
                 let desc = r.description.as_deref().unwrap_or("None");
@@ -2524,34 +2594,34 @@ pub(crate) fn render_tab_runners(
                 text.push(Line::from(vec![
                     Span::styled(
                         "Runner ID:   ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         r.id.to_string(),
                         Style::default()
-                            .fg(THEME.read().unwrap().blue)
+                            .fg(app.resources.theme.blue)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Description: ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
-                    Span::styled(desc, Style::default().fg(THEME.read().unwrap().text_normal)),
+                    Span::styled(desc, Style::default().fg(app.resources.theme.text_normal)),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Status:      ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         &r.status,
                         Style::default()
                             .fg(if r.status == "online" {
-                                THEME.read().unwrap().green
+                                app.resources.theme.green
                             } else {
-                                THEME.read().unwrap().red
+                                app.resources.theme.red
                             })
                             .add_modifier(Modifier::BOLD),
                     ),
@@ -2559,14 +2629,14 @@ pub(crate) fn render_tab_runners(
                 text.push(Line::from(vec![
                     Span::styled(
                         "Active:      ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         r.active.to_string(),
                         Style::default().fg(if r.active {
-                            THEME.read().unwrap().green
+                            app.resources.theme.green
                         } else {
-                            THEME.read().unwrap().red
+                            app.resources.theme.red
                         }),
                     ),
                 ]));
@@ -2575,7 +2645,7 @@ pub(crate) fn render_tab_runners(
                 text.push(Line::from(vec![Span::styled(
                     format!("── {} Performance & Queue Metrics ──", icons.label_metrics),
                     Style::default()
-                        .fg(THEME.read().unwrap().header_fg)
+                        .fg(app.resources.theme.header_fg)
                         .add_modifier(Modifier::BOLD),
                 )]));
                 text.push(Line::from(""));
@@ -2600,31 +2670,31 @@ pub(crate) fn render_tab_runners(
                 text.push(Line::from(vec![
                     Span::styled(
                         "Active Jobs: ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         format!("{}  ", gauge_chars),
-                        Style::default().fg(THEME.read().unwrap().green),
+                        Style::default().fg(app.resources.theme.green),
                     ),
                     Span::styled(
                         format!("{}/{}", active_jobs, max_capacity),
                         Style::default()
-                            .fg(THEME.read().unwrap().text_normal)
+                            .fg(app.resources.theme.text_normal)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
 
                 let util_color = if utilization > 80 {
-                    THEME.read().unwrap().red
+                    app.resources.theme.red
                 } else if utilization > 50 {
-                    THEME.read().unwrap().yellow
+                    app.resources.theme.yellow
                 } else {
-                    THEME.read().unwrap().green
+                    app.resources.theme.green
                 };
                 text.push(Line::from(vec![
                     Span::styled(
                         "Utilization: ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         format!("{}%", utilization),
@@ -2633,16 +2703,16 @@ pub(crate) fn render_tab_runners(
                 ]));
 
                 let q_color = if queue_depth > 3 {
-                    THEME.read().unwrap().red
+                    app.resources.theme.red
                 } else if queue_depth > 0 {
-                    THEME.read().unwrap().yellow
+                    app.resources.theme.yellow
                 } else {
-                    THEME.read().unwrap().green
+                    app.resources.theme.green
                 };
                 text.push(Line::from(vec![
                     Span::styled(
                         "Queue Depth: ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         format!("{} jobs waiting", queue_depth),
@@ -2651,16 +2721,16 @@ pub(crate) fn render_tab_runners(
                 ]));
 
                 let wait_color = if wait_time > 45 {
-                    THEME.read().unwrap().red
+                    app.resources.theme.red
                 } else if wait_time > 25 {
-                    THEME.read().unwrap().yellow
+                    app.resources.theme.yellow
                 } else {
-                    THEME.read().unwrap().green
+                    app.resources.theme.green
                 };
                 text.push(Line::from(vec![
                     Span::styled(
                         "Avg Wait:    ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         format!("{} seconds", wait_time),
@@ -2681,7 +2751,7 @@ pub(crate) fn render_tab_runners(
             f.render_widget(
                 Paragraph::new("Select an item to view details...")
                     .block(preview_block)
-                    .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                    .style(Style::default().fg(app.resources.theme.text_muted)),
                 detail_rect,
             );
         }
@@ -2697,13 +2767,13 @@ pub(crate) fn render_tab_releases(
     highlight_style: Style,
     header_style: Style,
 ) {
-    let icons = crate::config::ICONS.read().unwrap();
+    let icons = &app.resources.icons;
     if app.releases.items.is_empty() && app.loading_tabs.contains(&app.active_tab) {
         f.render_widget(
             Paragraph::new(format!("\n\n {} Loading releases...", icons.label_loading))
                 .alignment(Alignment::Center)
                 .block(main_block.clone())
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             content_area,
         );
         f.render_widget(
@@ -2712,9 +2782,9 @@ pub(crate) fn render_tab_releases(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" {} Details ", icons.label_details))
-                        .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                        .border_style(Style::default().fg(app.resources.theme.border)),
                 )
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             detail_rect,
         );
     } else {
@@ -2759,9 +2829,10 @@ pub(crate) fn render_tab_releases(
                     is_row_highlighted,
                     false,
                     Style::default()
-                        .fg(THEME.read().unwrap().green)
+                        .fg(app.resources.theme.green)
                         .add_modifier(Modifier::BOLD),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Releases, "Release Name") {
@@ -2770,8 +2841,9 @@ pub(crate) fn render_tab_releases(
                     &app.search_query,
                     is_row_highlighted,
                     false,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Releases, "Date") {
@@ -2780,8 +2852,9 @@ pub(crate) fn render_tab_releases(
                     &app.search_query,
                     is_row_highlighted,
                     false,
-                    Style::default().fg(THEME.read().unwrap().yellow),
+                    Style::default().fg(app.resources.theme.yellow),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Releases, "Author") {
@@ -2791,8 +2864,9 @@ pub(crate) fn render_tab_releases(
                     &app.search_query,
                     is_row_highlighted,
                     false,
-                    Style::default().fg(THEME.read().unwrap().blue),
+                    Style::default().fg(app.resources.theme.blue),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Releases, "Assets") {
@@ -2802,8 +2876,9 @@ pub(crate) fn render_tab_releases(
                     &app.search_query,
                     is_row_highlighted,
                     false,
-                    Style::default().fg(THEME.read().unwrap().blue),
+                    Style::default().fg(app.resources.theme.blue),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Releases, "Description") {
@@ -2813,12 +2888,13 @@ pub(crate) fn render_tab_releases(
                     &app.search_query,
                     is_row_highlighted,
                     false,
-                    Style::default().fg(THEME.read().unwrap().text_muted),
+                    Style::default().fg(app.resources.theme.text_muted),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             let row_style = if is_row_highlighted {
-                Style::default().bg(THEME.read().unwrap().highlight_bg)
+                Style::default().bg(app.resources.theme.highlight_bg)
             } else {
                 Style::default()
             };
@@ -2870,10 +2946,10 @@ pub(crate) fn render_tab_releases(
             .title(format!(" {} Details ", icons.label_details))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().text_muted)
+                    .fg(app.resources.theme.text_muted)
                     .add_modifier(Modifier::BOLD),
             )
-            .border_style(Style::default().fg(THEME.read().unwrap().border));
+            .border_style(Style::default().fg(app.resources.theme.border));
         if let Some(selected) = app.releases.state.selected() {
             if let Some(r) = filtered_releases.get(selected) {
                 let mut text = Vec::new();
@@ -2881,61 +2957,61 @@ pub(crate) fn render_tab_releases(
                     Span::styled(
                         "Release: ",
                         Style::default()
-                            .fg(THEME.read().unwrap().text_muted)
+                            .fg(app.resources.theme.text_muted)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         &r.name,
                         Style::default()
-                            .fg(THEME.read().unwrap().text_normal)
+                            .fg(app.resources.theme.text_normal)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Tag:     ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         &r.tag_name,
                         Style::default()
-                            .fg(THEME.read().unwrap().green)
+                            .fg(app.resources.theme.green)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Date:    ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         &r.released_at,
-                        Style::default().fg(THEME.read().unwrap().yellow),
+                        Style::default().fg(app.resources.theme.yellow),
                     ),
                 ]));
                 if let Some(ref author) = r.author_name {
                     text.push(Line::from(vec![
                         Span::styled(
                             "Author:  ",
-                            Style::default().fg(THEME.read().unwrap().text_muted),
+                            Style::default().fg(app.resources.theme.text_muted),
                         ),
-                        Span::styled(author, Style::default().fg(THEME.read().unwrap().blue)),
+                        Span::styled(author, Style::default().fg(app.resources.theme.blue)),
                     ]));
                 }
                 if let Some(ref cid) = r.commit_id {
                     text.push(Line::from(vec![
                         Span::styled(
                             "Commit:  ",
-                            Style::default().fg(THEME.read().unwrap().text_muted),
+                            Style::default().fg(app.resources.theme.text_muted),
                         ),
                         Span::styled(
                             truncate(cid, 8),
-                            Style::default().fg(THEME.read().unwrap().purple),
+                            Style::default().fg(app.resources.theme.purple),
                         ),
                         Span::raw(" "),
                         Span::styled(
                             r.commit_title.as_deref().unwrap_or(""),
-                            Style::default().fg(THEME.read().unwrap().text_normal),
+                            Style::default().fg(app.resources.theme.text_normal),
                         ),
                     ]));
                 }
@@ -2943,9 +3019,9 @@ pub(crate) fn render_tab_releases(
                     text.push(Line::from(vec![
                         Span::styled(
                             "Assets:  ",
-                            Style::default().fg(THEME.read().unwrap().text_muted),
+                            Style::default().fg(app.resources.theme.text_muted),
                         ),
-                        Span::styled(assets, Style::default().fg(THEME.read().unwrap().blue)),
+                        Span::styled(assets, Style::default().fg(app.resources.theme.blue)),
                     ]));
                 }
                 if let Some(ref desc) = r.description {
@@ -2954,7 +3030,7 @@ pub(crate) fn render_tab_releases(
                         text.push(Line::from(Span::styled(
                             "Description:",
                             Style::default()
-                                .fg(THEME.read().unwrap().header_fg)
+                                .fg(app.resources.theme.header_fg)
                                 .add_modifier(Modifier::BOLD),
                         )));
                         text.push(Line::from(desc.as_str()));
@@ -2973,7 +3049,7 @@ pub(crate) fn render_tab_releases(
             f.render_widget(
                 Paragraph::new("Select an item to view details...")
                     .block(preview_block)
-                    .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                    .style(Style::default().fg(app.resources.theme.text_muted)),
                 detail_rect,
             );
         }
@@ -2989,7 +3065,7 @@ pub(crate) fn render_tab_todos(
     highlight_style: Style,
     header_style: Style,
 ) {
-    let icons = crate::config::ICONS.read().unwrap();
+    let icons = &app.resources.icons;
     if app.todos.items.is_empty() {
         let entity_label = if app.kind().is_github() {
             "notifications"
@@ -3004,7 +3080,7 @@ pub(crate) fn render_tab_todos(
                 ))
                 .alignment(Alignment::Center)
                 .block(main_block.clone())
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
                 content_area,
             );
         } else {
@@ -3012,7 +3088,7 @@ pub(crate) fn render_tab_todos(
                 Paragraph::new(format!("\n\n {} No {}", icons.label_details, entity_label))
                     .alignment(Alignment::Center)
                     .block(main_block.clone())
-                    .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                    .style(Style::default().fg(app.resources.theme.text_muted)),
                 content_area,
             );
         }
@@ -3022,9 +3098,9 @@ pub(crate) fn render_tab_todos(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" {} Details ", icons.label_details))
-                        .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                        .border_style(Style::default().fg(app.resources.theme.border)),
                 )
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             detail_rect,
         );
     } else {
@@ -3060,23 +3136,20 @@ pub(crate) fn render_tab_todos(
                 (
                     " NEW",
                     Style::default()
-                        .fg(THEME.read().unwrap().green)
+                        .fg(app.resources.theme.green)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                (
-                    " READ",
-                    Style::default().fg(THEME.read().unwrap().text_muted),
-                )
+                (" READ", Style::default().fg(app.resources.theme.text_muted))
             };
 
             let type_style = if n.target_type == "MergeRequest" {
                 Style::default()
-                    .fg(THEME.read().unwrap().purple)
+                    .fg(app.resources.theme.purple)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(THEME.read().unwrap().blue)
+                    .fg(app.resources.theme.blue)
                     .add_modifier(Modifier::BOLD)
             };
 
@@ -3089,6 +3162,7 @@ pub(crate) fn render_tab_todos(
                     false,
                     state_style,
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Todos, "Project") {
@@ -3097,8 +3171,9 @@ pub(crate) fn render_tab_todos(
                     &app.search_query,
                     is_row_highlighted,
                     false,
-                    Style::default().fg(THEME.read().unwrap().text_muted),
+                    Style::default().fg(app.resources.theme.text_muted),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Todos, "Type") {
@@ -3109,6 +3184,7 @@ pub(crate) fn render_tab_todos(
                     false,
                     type_style,
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Todos, "ID") {
@@ -3117,8 +3193,9 @@ pub(crate) fn render_tab_todos(
                     &app.search_query,
                     is_row_highlighted,
                     false,
-                    Style::default().fg(THEME.read().unwrap().blue),
+                    Style::default().fg(app.resources.theme.blue),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Todos, "Title") {
@@ -3127,8 +3204,9 @@ pub(crate) fn render_tab_todos(
                     &app.search_query,
                     is_row_highlighted,
                     false,
-                    Style::default().fg(THEME.read().unwrap().text_normal),
+                    Style::default().fg(app.resources.theme.text_normal),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Todos, "Updated") {
@@ -3137,12 +3215,13 @@ pub(crate) fn render_tab_todos(
                     &app.search_query,
                     is_row_highlighted,
                     false,
-                    Style::default().fg(THEME.read().unwrap().yellow),
+                    Style::default().fg(app.resources.theme.yellow),
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             let row_style = if is_row_highlighted {
-                Style::default().bg(THEME.read().unwrap().highlight_bg)
+                Style::default().bg(app.resources.theme.highlight_bg)
             } else {
                 Style::default()
             };
@@ -3194,49 +3273,49 @@ pub(crate) fn render_tab_todos(
             .title(format!(" {} Details ", icons.label_details))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().text_muted)
+                    .fg(app.resources.theme.text_muted)
                     .add_modifier(Modifier::BOLD),
             )
-            .border_style(Style::default().fg(THEME.read().unwrap().border));
+            .border_style(Style::default().fg(app.resources.theme.border));
         if let Some(selected) = app.todos.state.selected() {
             if let Some(n) = filtered_todos.get(selected) {
                 let mut text = Vec::new();
                 text.push(Line::from(vec![
                     Span::styled(
                         "Title:    ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         &n.title,
                         Style::default()
-                            .fg(THEME.read().unwrap().text_normal)
+                            .fg(app.resources.theme.text_normal)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Project:  ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         &n.project_path,
-                        Style::default().fg(THEME.read().unwrap().text_normal),
+                        Style::default().fg(app.resources.theme.text_normal),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Target:   ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         format!("{} #{}", n.target_type, n.target_iid),
-                        Style::default().fg(THEME.read().unwrap().blue),
+                        Style::default().fg(app.resources.theme.blue),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "State:    ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         if n.state == "unread" || n.state == "pending" {
@@ -3245,20 +3324,20 @@ pub(crate) fn render_tab_todos(
                             "READ"
                         },
                         Style::default().fg(if n.state == "unread" || n.state == "pending" {
-                            THEME.read().unwrap().green
+                            app.resources.theme.green
                         } else {
-                            THEME.read().unwrap().text_muted
+                            app.resources.theme.text_muted
                         }),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Updated:  ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         time_ago(&n.updated_at),
-                        Style::default().fg(THEME.read().unwrap().yellow),
+                        Style::default().fg(app.resources.theme.yellow),
                     ),
                 ]));
                 text.push(Line::from(""));
@@ -3266,14 +3345,14 @@ pub(crate) fn render_tab_todos(
                     text.push(Line::from(Span::styled(
                         " Press Enter to mark read and switch to item",
                         Style::default()
-                            .fg(THEME.read().unwrap().text_muted)
+                            .fg(app.resources.theme.text_muted)
                             .add_modifier(Modifier::ITALIC),
                     )));
                 } else {
                     text.push(Line::from(Span::styled(
                         " Press Enter to switch to item",
                         Style::default()
-                            .fg(THEME.read().unwrap().text_muted)
+                            .fg(app.resources.theme.text_muted)
                             .add_modifier(Modifier::ITALIC),
                     )));
                 }
@@ -3290,7 +3369,7 @@ pub(crate) fn render_tab_todos(
             f.render_widget(
                 Paragraph::new("Select an item to view details...")
                     .block(preview_block)
-                    .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                    .style(Style::default().fg(app.resources.theme.text_muted)),
                 detail_rect,
             );
         }
@@ -3306,7 +3385,7 @@ pub(crate) fn render_tab_milestones(
     highlight_style: Style,
     header_style: Style,
 ) {
-    let icons = crate::config::ICONS.read().unwrap();
+    let icons = &app.resources.icons;
     if app.milestones.items.is_empty() && app.loading_tabs.contains(&app.active_tab) {
         f.render_widget(
             Paragraph::new(format!(
@@ -3315,7 +3394,7 @@ pub(crate) fn render_tab_milestones(
             ))
             .alignment(Alignment::Center)
             .block(main_block.clone())
-            .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+            .style(Style::default().fg(app.resources.theme.text_muted)),
             content_area,
         );
         f.render_widget(
@@ -3324,9 +3403,9 @@ pub(crate) fn render_tab_milestones(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" {} Details ", icons.label_details))
-                        .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                        .border_style(Style::default().fg(app.resources.theme.border)),
                 )
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             detail_rect,
         );
     } else {
@@ -3384,8 +3463,9 @@ pub(crate) fn render_tab_milestones(
                                 &app.search_query,
                                 is_selected,
                                 false,
-                                Style::default().fg(THEME.read().unwrap().text_normal),
+                                Style::default().fg(app.resources.theme.text_normal),
                                 Alignment::Left,
+                                &app.resources.theme,
                             ));
                         }
                         "Title" => {
@@ -3395,9 +3475,10 @@ pub(crate) fn render_tab_milestones(
                                 is_selected,
                                 false,
                                 Style::default()
-                                    .fg(THEME.read().unwrap().text_normal)
+                                    .fg(app.resources.theme.text_normal)
                                     .add_modifier(Modifier::BOLD),
                                 Alignment::Left,
+                                &app.resources.theme,
                             ));
                         }
                         "State" => {
@@ -3405,11 +3486,11 @@ pub(crate) fn render_tab_milestones(
                                 (
                                     "ACTIVE",
                                     Style::default()
-                                        .fg(THEME.read().unwrap().green)
+                                        .fg(app.resources.theme.green)
                                         .bg(if is_selected {
-                                            THEME.read().unwrap().highlight_bg
+                                            app.resources.theme.highlight_bg
                                         } else {
-                                            THEME.read().unwrap().green_bg
+                                            app.resources.theme.green_bg
                                         })
                                         .add_modifier(Modifier::BOLD),
                                 )
@@ -3417,11 +3498,11 @@ pub(crate) fn render_tab_milestones(
                                 (
                                     "CLOSED",
                                     Style::default()
-                                        .fg(THEME.read().unwrap().red)
+                                        .fg(app.resources.theme.red)
                                         .bg(if is_selected {
-                                            THEME.read().unwrap().highlight_bg
+                                            app.resources.theme.highlight_bg
                                         } else {
-                                            THEME.read().unwrap().red_bg
+                                            app.resources.theme.red_bg
                                         })
                                         .add_modifier(Modifier::BOLD),
                                 )
@@ -3439,8 +3520,9 @@ pub(crate) fn render_tab_milestones(
                                 &app.search_query,
                                 is_selected,
                                 false,
-                                Style::default().fg(THEME.read().unwrap().blue),
+                                Style::default().fg(app.resources.theme.blue),
                                 Alignment::Left,
+                                &app.resources.theme,
                             ));
                         }
                         "Due Date" => {
@@ -3450,8 +3532,9 @@ pub(crate) fn render_tab_milestones(
                                 &app.search_query,
                                 is_selected,
                                 false,
-                                Style::default().fg(THEME.read().unwrap().yellow),
+                                Style::default().fg(app.resources.theme.yellow),
                                 Alignment::Left,
+                                &app.resources.theme,
                             ));
                         }
                         "Progress" => {
@@ -3463,11 +3546,11 @@ pub(crate) fn render_tab_milestones(
                                             issues.iter().filter(|i| i.state == "closed").count();
                                         let pct = (closed as f32 / total as f32) * 100.0;
                                         let color = if pct <= 33.0 {
-                                            THEME.read().unwrap().red
+                                            app.resources.theme.red
                                         } else if pct <= 66.0 {
-                                            THEME.read().unwrap().yellow
+                                            app.resources.theme.yellow
                                         } else {
-                                            THEME.read().unwrap().green
+                                            app.resources.theme.green
                                         };
                                         let bar_segments = 10;
                                         let filled_len = (closed * bar_segments) / total;
@@ -3481,12 +3564,12 @@ pub(crate) fn render_tab_milestones(
                                             color,
                                         )
                                     } else {
-                                        ("[░░░░░░░░░░] 0%".to_string(), THEME.read().unwrap().red)
+                                        ("[░░░░░░░░░░] 0%".to_string(), app.resources.theme.red)
                                     }
                                 } else if app.selected_milestone_iid == Some(m.iid) {
-                                    ("Loading...".to_string(), THEME.read().unwrap().text_muted)
+                                    ("Loading...".to_string(), app.resources.theme.text_muted)
                                 } else {
-                                    ("-".to_string(), THEME.read().unwrap().text_muted)
+                                    ("-".to_string(), app.resources.theme.text_muted)
                                 };
                             cells.push(Cell::from(bar_text).style(Style::default().fg(color)));
                         }
@@ -3497,7 +3580,7 @@ pub(crate) fn render_tab_milestones(
                 }
             }
             let row_style = if is_selected {
-                Style::default().bg(THEME.read().unwrap().highlight_bg)
+                Style::default().bg(app.resources.theme.highlight_bg)
             } else {
                 Style::default()
             };
@@ -3521,10 +3604,10 @@ pub(crate) fn render_tab_milestones(
             .title(format!(" {} Milestone Details ", icons.label_milestone))
             .title_style(
                 Style::default()
-                    .fg(THEME.read().unwrap().text_muted)
+                    .fg(app.resources.theme.text_muted)
                     .add_modifier(Modifier::BOLD),
             )
-            .border_style(Style::default().fg(THEME.read().unwrap().border));
+            .border_style(Style::default().fg(app.resources.theme.border));
 
         if let Some(selected_idx) = app.milestones.state.selected() {
             if let Some(m) = filtered_milestones.get(selected_idx) {
@@ -3532,27 +3615,27 @@ pub(crate) fn render_tab_milestones(
                 text.push(Line::from(vec![
                     Span::styled(
                         "Title:       ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         &m.title,
                         Style::default()
-                            .fg(THEME.read().unwrap().text_normal)
+                            .fg(app.resources.theme.text_normal)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "State:       ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         m.state.to_uppercase(),
                         Style::default()
                             .fg(if m.state == "active" {
-                                THEME.read().unwrap().green
+                                app.resources.theme.green
                             } else {
-                                THEME.read().unwrap().red
+                                app.resources.theme.red
                             })
                             .add_modifier(Modifier::BOLD),
                     ),
@@ -3560,21 +3643,21 @@ pub(crate) fn render_tab_milestones(
                 text.push(Line::from(vec![
                     Span::styled(
                         "Start Date:  ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         m.start_date.as_deref().unwrap_or("N/A"),
-                        Style::default().fg(THEME.read().unwrap().blue),
+                        Style::default().fg(app.resources.theme.blue),
                     ),
                 ]));
                 text.push(Line::from(vec![
                     Span::styled(
                         "Due Date:    ",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     ),
                     Span::styled(
                         m.due_date.as_deref().unwrap_or("N/A"),
-                        Style::default().fg(THEME.read().unwrap().yellow),
+                        Style::default().fg(app.resources.theme.yellow),
                     ),
                 ]));
                 if let Some(desc) = &m.description {
@@ -3583,7 +3666,7 @@ pub(crate) fn render_tab_milestones(
                         text.push(Line::from(Span::styled(
                             "Description:",
                             Style::default()
-                                .fg(THEME.read().unwrap().header_fg)
+                                .fg(app.resources.theme.header_fg)
                                 .add_modifier(Modifier::BOLD),
                         )));
                         text.push(Line::from(desc.as_str()));
@@ -3600,17 +3683,17 @@ pub(crate) fn render_tab_milestones(
                         Span::styled(
                             "Issues Status: ",
                             Style::default()
-                                .fg(THEME.read().unwrap().header_fg)
+                                .fg(app.resources.theme.header_fg)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             format!("{} Closed", closed),
-                            Style::default().fg(THEME.read().unwrap().green),
+                            Style::default().fg(app.resources.theme.green),
                         ),
                         Span::raw(" / "),
                         Span::styled(
                             format!("{} Open", open),
-                            Style::default().fg(THEME.read().unwrap().yellow),
+                            Style::default().fg(app.resources.theme.yellow),
                         ),
                         Span::raw(format!(" (Total {})", total)),
                     ]));
@@ -3628,11 +3711,11 @@ pub(crate) fn render_tab_milestones(
                         pct,
                     );
                     let progress_color = if pct <= 33.0 {
-                        THEME.read().unwrap().red
+                        app.resources.theme.red
                     } else if pct <= 66.0 {
-                        THEME.read().unwrap().yellow
+                        app.resources.theme.yellow
                     } else {
-                        THEME.read().unwrap().green
+                        app.resources.theme.green
                     };
                     text.push(Line::from(Span::styled(
                         bar,
@@ -3642,7 +3725,7 @@ pub(crate) fn render_tab_milestones(
                 } else {
                     text.push(Line::from(Span::styled(
                         "Loading issues details...",
-                        Style::default().fg(THEME.read().unwrap().text_muted),
+                        Style::default().fg(app.resources.theme.text_muted),
                     )));
                 }
 
@@ -3659,7 +3742,7 @@ pub(crate) fn render_tab_milestones(
             f.render_widget(
                 Paragraph::new("Select a milestone to view details...")
                     .block(preview_block)
-                    .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                    .style(Style::default().fg(app.resources.theme.text_muted)),
                 detail_rect,
             );
         }
@@ -3675,13 +3758,13 @@ pub(crate) fn render_tab_branches(
     highlight_style: Style,
     header_style: Style,
 ) {
-    let icons = crate::config::ICONS.read().unwrap();
+    let icons = &app.resources.icons;
     if app.branches.items.is_empty() && app.loading_tabs.contains(&app.active_tab) {
         f.render_widget(
             Paragraph::new(format!("\n\n {} Loading branches...", icons.label_loading))
                 .alignment(Alignment::Center)
                 .block(main_block.clone())
-                .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+                .style(Style::default().fg(app.resources.theme.text_muted)),
             content_area,
         );
     } else {
@@ -3708,23 +3791,24 @@ pub(crate) fn render_tab_branches(
                     false,
                     row_style,
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Branches, "Default") {
                 let text = if b.default { "YES" } else { "NO" };
                 let style = if b.default {
-                    Style::default().fg(THEME.read().unwrap().green)
+                    Style::default().fg(app.resources.theme.green)
                 } else {
-                    Style::default().fg(THEME.read().unwrap().text_muted)
+                    Style::default().fg(app.resources.theme.text_muted)
                 };
                 cells.push(Cell::from(Span::styled(text, style)));
             }
             if app.is_column_visible(Tab::Branches, "Protected") {
                 let text = if b.protected { "YES" } else { "NO" };
                 let style = if b.protected {
-                    Style::default().fg(THEME.read().unwrap().yellow)
+                    Style::default().fg(app.resources.theme.yellow)
                 } else {
-                    Style::default().fg(THEME.read().unwrap().text_muted)
+                    Style::default().fg(app.resources.theme.text_muted)
                 };
                 cells.push(Cell::from(Span::styled(text, style)));
             }
@@ -3736,6 +3820,7 @@ pub(crate) fn render_tab_branches(
                     false,
                     row_style,
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             Row::new(cells).style(row_style).height(1)
@@ -3786,9 +3871,9 @@ pub(crate) fn render_tab_branches(
                         Block::default()
                             .borders(Borders::ALL)
                             .title(format!(" {} Branch Details ", icons.label_branch))
-                            .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                            .border_style(Style::default().fg(app.resources.theme.border)),
                     )
-                    .style(Style::default().fg(THEME.read().unwrap().text_normal))
+                    .style(Style::default().fg(app.resources.theme.text_normal))
                     .scroll((app.detail_scroll, 0));
                 f.render_widget(detail, detail_rect);
             }
@@ -3805,7 +3890,7 @@ pub(crate) fn render_tab_environments(
     highlight_style: Style,
     header_style: Style,
 ) {
-    let icons = crate::config::ICONS.read().unwrap();
+    let icons = &app.resources.icons;
     if app.environments.items.is_empty() && app.loading_tabs.contains(&app.active_tab) {
         f.render_widget(
             Paragraph::new(format!(
@@ -3814,7 +3899,7 @@ pub(crate) fn render_tab_environments(
             ))
             .alignment(Alignment::Center)
             .block(main_block.clone())
-            .style(Style::default().fg(THEME.read().unwrap().text_muted)),
+            .style(Style::default().fg(app.resources.theme.text_muted)),
             content_area,
         );
     } else {
@@ -3841,6 +3926,7 @@ pub(crate) fn render_tab_environments(
                     false,
                     row_style,
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Environments, "State") {
@@ -3851,6 +3937,7 @@ pub(crate) fn render_tab_environments(
                     false,
                     row_style,
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Environments, "Deployment Status") {
@@ -3866,13 +3953,14 @@ pub(crate) fn render_tab_environments(
                     false,
                     row_style,
                     Alignment::Left,
+                    &app.resources.theme,
                 ));
             }
             if app.is_column_visible(Tab::Environments, "URL") {
                 let url = e.external_url.as_deref().unwrap_or("-");
                 cells.push(Cell::from(Span::styled(
                     url,
-                    Style::default().fg(THEME.read().unwrap().blue),
+                    Style::default().fg(app.resources.theme.blue),
                 )));
             }
             Row::new(cells).style(row_style).height(1)
@@ -3933,9 +4021,9 @@ pub(crate) fn render_tab_environments(
                             Block::default()
                                 .borders(Borders::ALL)
                                 .title(format!(" {} Environment Details ", icons.label_environment))
-                                .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                                .border_style(Style::default().fg(app.resources.theme.border)),
                         )
-                        .style(Style::default().fg(THEME.read().unwrap().text_normal))
+                        .style(Style::default().fg(app.resources.theme.text_normal))
                         .scroll((app.detail_scroll, 0));
                     f.render_widget(detail, detail_rect);
                 }
@@ -3975,7 +4063,7 @@ pub(crate) fn render_tab_environments(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" {} Deployments ", icons.label_deployment))
-                        .border_style(Style::default().fg(THEME.read().unwrap().border)),
+                        .border_style(Style::default().fg(app.resources.theme.border)),
                 )
                 .row_highlight_style(highlight_style);
             f.render_stateful_widget(deploy_table, detail_rect, &mut app.deployments.state);
@@ -3997,9 +4085,9 @@ pub(crate) fn render_tab_terminal(
     let base_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if app.focus_column_checklist {
-            THEME.read().unwrap().border
+            app.resources.theme.border
         } else {
-            THEME.read().unwrap().border_focused
+            app.resources.theme.border_focused
         }));
     let inner_rect = base_block.inner(area);
     let log_height = inner_rect.height as usize;
@@ -4010,7 +4098,12 @@ pub(crate) fn render_tab_terminal(
             .terminal_commands
             .iter()
             .map(|cmd| {
-                let line = super::helpers::build_log_line(cmd, usize::MAX);
+                let line = super::helpers::build_log_line(
+                    cmd,
+                    usize::MAX,
+                    &app.resources.theme,
+                    &app.resources.icons,
+                );
                 line.spans
                     .iter()
                     .map(|s| s.content.as_ref())
@@ -4039,7 +4132,7 @@ pub(crate) fn render_tab_terminal(
     };
     let custom_main_block = base_block.clone().title(block_title).title_style(
         Style::default()
-            .fg(THEME.read().unwrap().header_fg)
+            .fg(app.resources.theme.header_fg)
             .add_modifier(Modifier::BOLD),
     );
 
@@ -4047,7 +4140,14 @@ pub(crate) fn render_tab_terminal(
         let all_lines: Vec<Line> = app
             .terminal_commands
             .iter()
-            .map(|cmd| super::helpers::build_log_line(cmd, usize::MAX))
+            .map(|cmd| {
+                super::helpers::build_log_line(
+                    cmd,
+                    usize::MAX,
+                    &app.resources.theme,
+                    &app.resources.icons,
+                )
+            })
             .collect();
 
         let paragraph = Paragraph::new(all_lines)
@@ -4073,6 +4173,8 @@ pub(crate) fn render_tab_terminal(
                 log_lines.push(super::helpers::build_log_line(
                     cmd,
                     inner_rect.width as usize,
+                    &app.resources.theme,
+                    &app.resources.icons,
                 ));
             }
         }

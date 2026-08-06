@@ -7,7 +7,6 @@ use ratatui::{
     widgets::Cell,
 };
 
-use crate::config::THEME;
 use crate::utils::format::truncate;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -58,7 +57,11 @@ pub(crate) fn highlight_fuzzy_match(
     spans
 }
 
-pub(crate) fn get_label_color(label: &str, label_colors: &HashMap<String, Color>) -> Color {
+pub(crate) fn get_label_color(
+    label: &str,
+    label_colors: &HashMap<String, Color>,
+    theme: &crate::config::Theme,
+) -> Color {
     // Prefer the label's real color from the API when it is dark enough to
     // read as foreground text on the active theme background.
     if let Some(&c) = label_colors.get(label) {
@@ -70,7 +73,7 @@ pub(crate) fn get_label_color(label: &str, label_colors: &HashMap<String, Color>
     for c in label.bytes() {
         hash = ((hash << 5).wrapping_add(hash)).wrapping_add(c as u32);
     }
-    let palette = crate::config::THEME.read().unwrap().label_palette;
+    let palette = theme.label_palette;
     let idx = (hash % (palette.len() as u32)) as usize;
     palette[idx]
 }
@@ -105,15 +108,14 @@ pub(crate) fn render_labels_cell(
     is_selected: bool,
     is_checked: bool,
     max_len: usize,
+    theme: &crate::config::Theme,
 ) -> Cell<'static> {
     if labels.is_empty() {
-        let mut style = Style::default().fg(THEME.read().unwrap().text_muted);
+        let mut style = Style::default().fg(theme.text_muted);
         if is_selected {
-            style = style
-                .bg(THEME.read().unwrap().highlight_bg)
-                .add_modifier(Modifier::BOLD);
+            style = style.bg(theme.highlight_bg).add_modifier(Modifier::BOLD);
         } else if is_checked {
-            style = style.bg(THEME.read().unwrap().checked_bg);
+            style = style.bg(theme.checked_bg);
         }
         return Cell::from(Line::from("—").alignment(Alignment::Left)).style(style);
     }
@@ -122,9 +124,9 @@ pub(crate) fn render_labels_cell(
     let mut current_len = 0;
 
     let base_bg = if is_selected {
-        Some(THEME.read().unwrap().highlight_bg)
+        Some(theme.highlight_bg)
     } else if is_checked {
-        Some(THEME.read().unwrap().checked_bg)
+        Some(theme.checked_bg)
     } else {
         None
     };
@@ -136,14 +138,14 @@ pub(crate) fn render_labels_cell(
         if idx > 0 {
             let comma = ", ";
             if current_len + comma.len() > max_len {
-                let mut style = Style::default().fg(THEME.read().unwrap().text_muted);
+                let mut style = Style::default().fg(theme.text_muted);
                 if let Some(bg) = base_bg {
                     style = style.bg(bg);
                 }
                 char_styles.push(('…', style));
                 break;
             }
-            let mut style = Style::default().fg(THEME.read().unwrap().text_normal);
+            let mut style = Style::default().fg(theme.text_normal);
             if let Some(bg) = base_bg {
                 style = style.bg(bg);
             }
@@ -153,7 +155,7 @@ pub(crate) fn render_labels_cell(
             current_len += comma.len();
         }
 
-        let label_color = get_label_color(label, label_colors);
+        let label_color = get_label_color(label, label_colors, theme);
         let mut label_style = Style::default()
             .fg(label_color)
             .add_modifier(Modifier::BOLD);
@@ -172,7 +174,7 @@ pub(crate) fn render_labels_cell(
                 text_to_add = &text_to_add[..safe_end];
                 truncated = true;
             } else {
-                let mut style = Style::default().fg(THEME.read().unwrap().text_muted);
+                let mut style = Style::default().fg(theme.text_muted);
                 if let Some(bg) = base_bg {
                     style = style.bg(bg);
                 }
@@ -187,7 +189,7 @@ pub(crate) fn render_labels_cell(
         current_len += text_to_add.len();
 
         if truncated {
-            let mut style = Style::default().fg(THEME.read().unwrap().text_muted);
+            let mut style = Style::default().fg(theme.text_muted);
             if let Some(bg) = base_bg {
                 style = style.bg(bg);
             }
@@ -215,9 +217,7 @@ pub(crate) fn render_labels_cell(
 
     for (i, (c, mut style)) in char_styles.into_iter().enumerate() {
         if index_set.contains(&i) {
-            style = style
-                .fg(THEME.read().unwrap().yellow)
-                .add_modifier(Modifier::BOLD);
+            style = style.fg(theme.yellow).add_modifier(Modifier::BOLD);
         }
 
         if first {
@@ -312,8 +312,10 @@ pub(crate) fn get_stages_summary(jobs: &[crate::domain::pipelines::Job]) -> Vec<
     summaries
 }
 
-pub(crate) fn get_stages_dots(jobs: &[crate::domain::pipelines::Job]) -> String {
-    let icons = crate::config::ICONS.read().unwrap();
+pub(crate) fn get_stages_dots(
+    jobs: &[crate::domain::pipelines::Job],
+    icons: &crate::config::Icons,
+) -> String {
     let summaries = get_stages_summary(jobs);
     let mut dots = String::new();
     for s in summaries {
@@ -333,22 +335,24 @@ pub(crate) fn get_stages_dots(jobs: &[crate::domain::pipelines::Job]) -> String 
 pub(crate) fn append_stage_summaries(
     text: &mut Vec<Line<'static>>,
     jobs: &[crate::domain::pipelines::Job],
+    theme: &crate::config::Theme,
+    icons: &crate::config::Icons,
 ) {
     let summaries = get_stages_summary(jobs);
     for s in summaries {
         let status_color = match s.status.as_str() {
-            "success" => THEME.read().unwrap().green,
-            "failed" => THEME.read().unwrap().red,
-            "running" => THEME.read().unwrap().blue,
-            "pending" => THEME.read().unwrap().yellow,
-            _ => THEME.read().unwrap().text_muted,
+            "success" => theme.green,
+            "failed" => theme.red,
+            "running" => theme.blue,
+            "pending" => theme.yellow,
+            _ => theme.text_muted,
         };
         text.push(Line::from(vec![
             Span::styled(
                 format!("{:15} ", truncate(&s.name, 15)),
-                Style::default().fg(THEME.read().unwrap().text_normal),
+                Style::default().fg(theme.text_normal),
             ),
-            Span::styled(" ❯ ", Style::default().fg(THEME.read().unwrap().text_muted)),
+            Span::styled(" ❯ ", Style::default().fg(theme.text_muted)),
             Span::styled(
                 format!("{:>4} ", format!("{}%", s.percent)),
                 Style::default()
@@ -357,31 +361,33 @@ pub(crate) fn append_stage_summaries(
             ),
             Span::styled(
                 format!("({}/{})", s.success, s.total),
-                Style::default().fg(THEME.read().unwrap().text_muted),
+                Style::default().fg(theme.text_muted),
             ),
         ]));
     }
 }
 
 #[allow(dead_code)]
-fn add_cmd(text: &mut Vec<Line<'static>>, key: &str, desc: &str) {
+fn add_cmd(text: &mut Vec<Line<'static>>, key: &str, desc: &str, theme: &crate::config::Theme) {
     let padded_key = format!(" {:^3} ", key);
     text.push(Line::from(vec![
         Span::styled(
             padded_key,
             Style::default()
-                .bg(THEME.read().unwrap().border_focused)
-                .fg(THEME.read().unwrap().bg)
+                .bg(theme.border_focused)
+                .fg(theme.bg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!(" {}", desc),
-            Style::default().fg(THEME.read().unwrap().text_normal),
-        ),
+        Span::styled(format!(" {}", desc), Style::default().fg(theme.text_normal)),
     ]));
 }
 
-pub(crate) fn build_log_line(cmd: &crate::app::TerminalCommand, width: usize) -> Line<'static> {
+pub(crate) fn build_log_line(
+    cmd: &crate::app::TerminalCommand,
+    width: usize,
+    theme: &crate::config::Theme,
+    icons: &crate::config::Icons,
+) -> Line<'static> {
     let time_str = if cmd.timestamp.len() >= 8 {
         let parts: Vec<&str> = cmd.timestamp.split('T').collect();
         if parts.len() > 1 {
@@ -393,24 +399,11 @@ pub(crate) fn build_log_line(cmd: &crate::app::TerminalCommand, width: usize) ->
         cmd.timestamp.clone()
     };
 
-    let icons = crate::config::ICONS.read().unwrap();
     let (status_text, status_color) = match cmd.status.as_str() {
-        "Success" => (
-            format!("{} SUCCESS", icons.status_success),
-            THEME.read().unwrap().green,
-        ),
-        "Running" => (
-            format!("{} RUNNING", icons.status_running),
-            THEME.read().unwrap().yellow,
-        ),
-        s if s.starts_with("Failed") => (
-            format!("{} FAILED ", icons.status_failed),
-            THEME.read().unwrap().red,
-        ),
-        _ => (
-            format!("{} PENDING", icons.status_pending),
-            THEME.read().unwrap().yellow,
-        ),
+        "Success" => (format!("{} SUCCESS", icons.status_success), theme.green),
+        "Running" => (format!("{} RUNNING", icons.status_running), theme.yellow),
+        s if s.starts_with("Failed") => (format!("{} FAILED ", icons.status_failed), theme.red),
+        _ => (format!("{} PENDING", icons.status_pending), theme.yellow),
     };
 
     let err_detail = if cmd.status.starts_with("Failed: ") {
@@ -462,7 +455,7 @@ pub(crate) fn build_log_line(cmd: &crate::app::TerminalCommand, width: usize) ->
         // 1. Time
         Span::styled(
             format!("[{}] ", time_str),
-            Style::default().fg(THEME.read().unwrap().text_muted),
+            Style::default().fg(theme.text_muted),
         ),
         // 2. Status
         Span::styled(
@@ -472,16 +465,14 @@ pub(crate) fn build_log_line(cmd: &crate::app::TerminalCommand, width: usize) ->
                 .add_modifier(Modifier::BOLD),
         ),
         // 3. Sep1
-        Span::styled(" • ", Style::default().fg(THEME.read().unwrap().text_muted)),
+        Span::styled(" • ", Style::default().fg(theme.text_muted)),
         // 4. Action
         Span::styled(
             format!("{: <25}", desc_str),
-            Style::default()
-                .fg(THEME.read().unwrap().blue)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.blue).add_modifier(Modifier::BOLD),
         ),
         // 5. Sep2
-        Span::styled(" • ", Style::default().fg(THEME.read().unwrap().text_muted)),
+        Span::styled(" • ", Style::default().fg(theme.text_muted)),
     ];
 
     // 6. API
@@ -489,20 +480,20 @@ pub(crate) fn build_log_line(cmd: &crate::app::TerminalCommand, width: usize) ->
         spans.push(Span::styled(
             cmd_bin,
             Style::default()
-                .fg(THEME.read().unwrap().yellow)
+                .fg(theme.yellow)
                 .add_modifier(Modifier::BOLD),
         ));
     }
     spans.push(Span::styled(
         cmd_args,
-        Style::default().fg(THEME.read().unwrap().text_normal),
+        Style::default().fg(theme.text_normal),
     ));
 
     // 7. Error Detail
     if let Some(detail) = err_detail {
         spans.push(Span::styled(
             format!(" ({})", detail),
-            Style::default().fg(THEME.read().unwrap().red),
+            Style::default().fg(theme.red),
         ));
     }
 
@@ -516,14 +507,15 @@ pub(crate) fn render_fuzzy_cell(
     is_checked: bool,
     base_style: Style,
     alignment: Alignment,
+    theme: &crate::config::Theme,
 ) -> Cell<'static> {
     let mut styled_base = base_style;
     if is_selected {
         styled_base = styled_base
-            .bg(THEME.read().unwrap().highlight_bg)
+            .bg(theme.highlight_bg)
             .add_modifier(Modifier::BOLD);
     } else if is_checked {
-        styled_base = styled_base.bg(THEME.read().unwrap().checked_bg);
+        styled_base = styled_base.bg(theme.checked_bg);
     }
     let line = if query.trim().is_empty() {
         Line::from(text.to_string()).alignment(alignment)
@@ -531,7 +523,7 @@ pub(crate) fn render_fuzzy_cell(
         let matcher = SkimMatcherV2::default();
         if let Some((_, indices)) = matcher.fuzzy_indices(text, query) {
             let mut highlight_style = Style::default()
-                .fg(THEME.read().unwrap().yellow)
+                .fg(theme.yellow)
                 .add_modifier(Modifier::BOLD);
             if let Some(bg) = styled_base.bg {
                 highlight_style = highlight_style.bg(bg);
@@ -612,9 +604,9 @@ mod tests {
     #[test]
     fn test_get_label_color() {
         let colors = HashMap::new();
-        let color1 = get_label_color("bug", &colors);
-        let _color2 = get_label_color("feature", &colors);
-        let color3 = get_label_color("bug", &colors);
+        let color1 = get_label_color("bug", &colors, &crate::config::Theme::default());
+        let _color2 = get_label_color("feature", &colors, &crate::config::Theme::default());
+        let color3 = get_label_color("bug", &colors, &crate::config::Theme::default());
 
         assert_eq!(color1, color3);
         match color1 {
@@ -627,7 +619,10 @@ mod tests {
     fn test_get_label_color_uses_api_color() {
         let mut colors = HashMap::new();
         colors.insert("bug".to_string(), Color::Rgb(215, 58, 74));
-        assert_eq!(get_label_color("bug", &colors), Color::Rgb(215, 58, 74));
+        assert_eq!(
+            get_label_color("bug", &colors, &crate::config::Theme::default()),
+            Color::Rgb(215, 58, 74)
+        );
     }
 
     #[test]
@@ -635,19 +630,38 @@ mod tests {
         let mut colors = HashMap::new();
         // GitHub yellow (fbca04) is too light to read as foreground text.
         colors.insert("bug".to_string(), Color::Rgb(251, 202, 4));
-        let fallback = get_label_color("bug", &HashMap::new());
-        assert_eq!(get_label_color("bug", &colors), fallback);
+        let fallback = get_label_color("bug", &HashMap::new(), &crate::config::Theme::default());
+        assert_eq!(
+            get_label_color("bug", &colors, &crate::config::Theme::default()),
+            fallback
+        );
     }
 
     #[test]
     fn test_render_labels_cell() {
         let labels = vec!["bug".to_string(), "backend".to_string()];
         let colors = HashMap::new();
-        let cell_empty = render_labels_cell(&[], &colors, "", false, false, 24);
+        let cell_empty = render_labels_cell(
+            &[],
+            &colors,
+            "",
+            false,
+            false,
+            24,
+            &crate::config::Theme::default(),
+        );
         let cell_str_empty = format!("{:?}", cell_empty);
         assert!(cell_str_empty.contains("—"));
 
-        let cell_normal = render_labels_cell(&labels, &colors, "", false, false, 24);
+        let cell_normal = render_labels_cell(
+            &labels,
+            &colors,
+            "",
+            false,
+            false,
+            24,
+            &crate::config::Theme::default(),
+        );
         let cell_str = format!("{:?}", cell_normal);
         assert!(cell_str.contains("bug"));
         assert!(cell_str.contains("backend"));
@@ -679,6 +693,7 @@ mod tests {
             &all_lines,
             prefix,
             prefix_style,
+            &crate::config::Theme::default(),
         );
 
         assert_eq!(formatted.len(), 6);

@@ -2,8 +2,6 @@ use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::LazyLock as Lazy;
-use std::sync::RwLock;
 
 /// Serializes tests that mutate process-global environment variables
 /// (config paths, cache dirs). Env vars are visible to every test thread,
@@ -1453,9 +1451,6 @@ toggle_wrap = "w"
     }
 }
 
-pub static THEME: Lazy<RwLock<Theme>> = Lazy::new(|| RwLock::new(Config::load().resolve_theme()));
-pub static ICONS: Lazy<RwLock<Icons>> = Lazy::new(|| RwLock::new(Icons::default()));
-
 pub fn all_theme_presets() -> Vec<String> {
     let mut presets: Vec<String> = BUNDLED_THEMES
         .iter()
@@ -1669,20 +1664,6 @@ impl Config {
         std::fs::write(&target_path, &toml_str)?;
 
         Ok(())
-    }
-}
-
-pub fn reload_theme() {
-    if let Ok(mut theme) = THEME.write() {
-        *theme = Config::load().resolve_theme();
-    }
-}
-
-pub fn set_theme_preset(name: &str) {
-    if let Some(preset) = Theme::preset(name) {
-        if let Ok(mut theme) = THEME.write() {
-            *theme = preset;
-        }
     }
 }
 

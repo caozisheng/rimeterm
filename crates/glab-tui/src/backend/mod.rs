@@ -52,6 +52,7 @@ impl BackendKind {
 
 #[async_trait]
 pub trait Backend: Send + Sync {
+    fn clone_box(&self) -> Box<dyn Backend>;
     fn kind(&self) -> BackendKind;
     fn program(&self) -> &'static str;
 
