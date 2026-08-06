@@ -11,6 +11,7 @@ mod config;
 pub(crate) mod controller;
 mod domain;
 mod editor;
+pub mod embed;
 mod entity_editor;
 mod event;
 mod fetch;
