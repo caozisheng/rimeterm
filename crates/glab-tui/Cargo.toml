@@ -1,0 +1,19 @@
+[package]
+name = "glab-tui"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+description = "Bounded embedded GitLab/GitHub todo view for RimeTerm"
+
+[lib]
+name = "glab_tui"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"

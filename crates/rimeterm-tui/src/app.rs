@@ -53,6 +53,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::file_manager_pane::FileManagerPane;
 use crate::fr_pane::{FrAction, FrPane};
+use crate::glab_pane::GlabPane;
 use crate::keymap::{Keymap, KeymapOutcome, QUADRANT_COMMANDS, tab_goto_command_id};
 use crate::menu::{
     MenuKeyOutcome, MenuState, handle_key as menu_key, popup_rect as menu_rect,
@@ -888,7 +889,7 @@ impl App {
         let mut pinned_pane_ids: std::collections::HashSet<PaneId> =
             std::collections::HashSet::new();
 
-        // Files group — native explorer, global Todo, then Fast Resume.
+        // Files group — native explorer, Todo, Glab, then Fast Resume.
         let mut file_manager_pane = FileManagerPane::with_event_bus(
             workspace_root.clone(),
             workspace_root.clone(),
@@ -912,6 +913,13 @@ impl App {
         let todo_pane_id = todo_pane.id();
         panes.insert(Box::new(todo_pane));
         pinned_pane_ids.insert(todo_pane_id);
+        let mut glab_pane = GlabPane::new(resolved_root.clone(), Color::White);
+        if let Some(state) = memory.ui.glab.as_ref() {
+            glab_pane.restore_state(state);
+        }
+        let glab_pane_id = glab_pane.id();
+        panes.insert(Box::new(glab_pane));
+        pinned_pane_ids.insert(glab_pane_id);
 
         let (fr_action_tx, fr_action_rx) = mpsc::unbounded_channel();
         let mut fr_pane = FrPane::new(fr_action_tx);
@@ -1074,10 +1082,6 @@ impl App {
             }
             shells_members.push(pane_id);
         }
-        // Build the stable left-column tab catalogs. Order here is
-        // canonical — used both as the default order in a fresh
-        // workspace and as a fallback when `LeftTabsState::normalize`
-        // needs to insert a tab id the persisted file didn't mention.
         let left_top_catalog: Vec<LeftTabCatalogEntry> = vec![
             LeftTabCatalogEntry::new(
                 rimeterm_config::left_tabs_state::ANCHOR_TOP,
@@ -1085,6 +1089,7 @@ impl App {
                 file_manager_pane_id,
             ),
             LeftTabCatalogEntry::new("todo", "Todo", todo_pane_id),
+            LeftTabCatalogEntry::new("glab", "Glab", glab_pane_id),
             LeftTabCatalogEntry::new("fr", "Fast Resume", fr_pane_id),
         ];
         let left_bottom_catalog: Vec<LeftTabCatalogEntry> = vec![
@@ -4767,6 +4772,8 @@ impl App {
             .flatten();
         self.remembered_ui.todo =
             self.snapshot_catalog_pane("todo", self.memory_policy.todo, TodoPane::snapshot_state);
+        self.remembered_ui.glab =
+            self.snapshot_catalog_pane("glab", self.memory_policy.glab, GlabPane::snapshot_state);
         self.remembered_ui.fast_resume = self.snapshot_catalog_pane(
             "fr",
             self.memory_policy.fast_resume,

@@ -19,6 +19,7 @@ pub mod fr_pane;
 pub mod git_model;
 pub mod git_pane;
 pub mod git_worker;
+pub mod glab_pane;
 pub mod keymap;
 pub mod menu;
 pub mod models_model;

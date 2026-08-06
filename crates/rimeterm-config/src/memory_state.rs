@@ -39,6 +39,8 @@ pub struct MemoryPolicy {
     #[serde(default = "default_true")]
     pub todo: bool,
     #[serde(default = "default_true")]
+    pub glab: bool,
+    #[serde(default = "default_true")]
     pub fast_resume: bool,
     #[serde(default = "default_true")]
     pub sysmon: bool,
@@ -64,6 +66,7 @@ impl Default for MemoryPolicy {
             files: true,
             git: true,
             todo: true,
+            glab: true,
             fast_resume: true,
             sysmon: true,
             agtop: true,
@@ -108,6 +111,7 @@ pub struct UiState {
     pub files: Option<PaneState>,
     pub git: Option<PaneState>,
     pub todo: Option<PaneState>,
+    pub glab: Option<PaneState>,
     pub fast_resume: Option<PaneState>,
     pub sysmon: Option<PaneState>,
     pub agtop: Option<PaneState>,
@@ -145,6 +149,9 @@ impl UiState {
         }
         if !policy.todo {
             self.todo = None;
+        }
+        if !policy.glab {
+            self.glab = None;
         }
         if !policy.fast_resume {
             self.fast_resume = None;

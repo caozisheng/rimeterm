@@ -2572,6 +2572,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "glab-tui"
+version = "0.2.32"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5116,6 +5126,7 @@ dependencies = [
  "futures",
  "gix",
  "gix-diff",
+ "glab-tui",
  "humansize",
  "image",
  "nvml-wrapper",

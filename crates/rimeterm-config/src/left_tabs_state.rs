@@ -206,7 +206,7 @@ impl LeftTabsState {
 mod tests {
     use super::*;
 
-    const TOP: &[&str] = &["files", "todo", "fr"];
+    const TOP: &[&str] = &["files", "todo", "glab", "fr"];
     const BOTTOM: &[&str] = &["git", "sysmon", "agtop", "models", "stock"];
 
     #[test]
