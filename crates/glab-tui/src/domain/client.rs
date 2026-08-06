@@ -1,7 +1,11 @@
 use crate::backend::{Backend, BackendKind};
+use crate::command::{CommandRequest, CommandRunner, ProcessCommandRunner};
 use anyhow::{Context, Result};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 pub struct GitlabClient {
+    pub root: PathBuf,
     pub is_github: bool,
     pub backend: Box<dyn Backend>,
     pub tx: Option<tokio::sync::mpsc::UnboundedSender<crate::event::Event>>,
@@ -14,20 +18,28 @@ impl GitlabClient {
         self.backend.kind()
     }
 
-    pub async fn new() -> Result<Self> {
-        let is_github = match tokio::process::Command::new("git")
-            .args(["remote", "get-url", "origin"])
-            .output()
+    pub async fn new(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::new_with_runner(root, Arc::new(ProcessCommandRunner)).await
+    }
+
+    pub async fn new_with_runner(
+        root: impl Into<PathBuf>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<Self> {
+        let root = root.into();
+        let output = runner
+            .output(CommandRequest::new(
+                &root,
+                "git",
+                ["remote", "get-url", "origin"],
+            ))
             .await
-        {
-            Ok(output) if output.status.success() => {
-                let url = String::from_utf8_lossy(&output.stdout);
-                url.contains("github.com")
-            }
-            _ => false,
-        };
-        let backend = crate::backend::create_backend(is_github);
+            .map_err(|error| anyhow::anyhow!(error.0))?;
+        let is_github =
+            output.status == 0 && String::from_utf8_lossy(&output.stdout).contains("github.com");
+        let backend = crate::backend::create_backend_with_runner(is_github, root.clone(), runner);
         Ok(Self {
+            root,
             is_github,
             backend,
             tx: None,
@@ -591,10 +603,11 @@ impl GitlabClient {
 impl Clone for GitlabClient {
     fn clone(&self) -> Self {
         let mut backend = self.backend.clone_box();
-        if let Some(ref tx) = self.tx {
+        if let Some(tx) = &self.tx {
             backend.set_tx(tx.clone());
         }
         Self {
+            root: self.root.clone(),
             is_github: self.is_github,
             backend,
             tx: self.tx.clone(),
@@ -613,18 +626,17 @@ impl std::fmt::Debug for GitlabClient {
     }
 }
 
-pub async fn get_project_context() -> Result<String> {
+pub async fn get_project_context(root: impl AsRef<std::path::Path>) -> Result<String> {
+    let root = root.as_ref();
     let output = std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
+        .current_dir(root)
         .output()
         .context("Failed to execute git command")?;
-
     if !output.status.success() {
         return Ok("unknown/unknown".to_string());
     }
-
     let url = String::from_utf8(output.stdout)?;
-
     Ok(crate::git_helpers::parse_project_path(&url)
         .unwrap_or_else(|| "unknown/unknown".to_string()))
 }

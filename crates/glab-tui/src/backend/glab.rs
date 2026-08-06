@@ -1,4 +1,5 @@
 use super::Backend;
+use crate::command::{CommandRequest, CommandRunner, ProcessCommandRunner};
 use crate::domain::branches::Branch;
 use crate::domain::deployments::{Deployment, Environment};
 use crate::domain::issues::Issue;
@@ -10,12 +11,12 @@ use crate::domain::pipelines::{Job, Pipeline};
 use crate::domain::releases::Release;
 use crate::domain::runners::Runner;
 use crate::event::Event;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinSet;
@@ -243,25 +244,21 @@ pub fn parse_mr_state_response(json: &str) -> anyhow::Result<MrStateMap> {
 const MAX_CONCURRENT_REQUESTS: usize = 8;
 
 /// Run one `glab` invocation and log it to the terminal pane.
-///
-/// Free-standing rather than a method so its future is `'static` and can be
-/// spawned: `tx` is the only state a command needs from `GlabBackend`.
 async fn run_glab_command(
+    runner: Arc<dyn CommandRunner>,
+    root: PathBuf,
     tx: Option<UnboundedSender<Event>>,
     args: Vec<String>,
     desc: String,
 ) -> Result<String> {
     let label = desc.to_uppercase();
     let cmd_str = format!("glab {}", args.join(" "));
-
-    let output = Command::new("glab")
-        .args(&args)
-        .output()
+    let output = runner
+        .output(CommandRequest::new(&root, "glab", args))
         .await
-        .with_context(|| format!("Failed to execute: glab {}", args.join(" ")))?;
-
+        .map_err(|error| anyhow::anyhow!("Failed to execute {cmd_str}: {}", error.0))?;
     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
-    if output.status.success() {
+    if output.status == 0 {
         let s = String::from_utf8(output.stdout)?;
         if let Some(ref tx) = tx {
             let _ = tx.send(Event::TerminalCommandLogged {
@@ -292,6 +289,8 @@ async fn run_glab_command(
 /// or is cancelled yields an `Err` for its index rather than a silently
 /// missing response, so no caller can mistake it for a short page.
 async fn run_glab_concurrent(
+    runner: Arc<dyn CommandRunner>,
+    root: PathBuf,
     tx: Option<UnboundedSender<Event>>,
     requests: Vec<Vec<String>>,
     desc: &str,
@@ -301,14 +300,14 @@ async fn run_glab_concurrent(
     let mut tasks = JoinSet::new();
 
     for (index, args) in requests.into_iter().enumerate() {
+        let runner = Arc::clone(&runner);
+        let root = root.clone();
         let tx = tx.clone();
         let desc = desc.to_string();
         let permits = Arc::clone(&permits);
         tasks.spawn(async move {
-            // Held until the request finishes, so the permit — not the number
-            // of spawned tasks — bounds the subprocesses in flight.
             let _permit = permits.acquire_owned().await;
-            (index, run_glab_command(tx, args, desc).await)
+            (index, run_glab_command(runner, root, tx, args, desc).await)
         });
     }
 
@@ -391,12 +390,22 @@ fn merge_tolerating_partial_failure(
 
 #[derive(Clone)]
 pub struct GlabBackend {
+    root: PathBuf,
+    runner: Arc<dyn CommandRunner>,
     tx: Option<UnboundedSender<Event>>,
 }
 
 impl GlabBackend {
-    pub fn new() -> Self {
-        Self { tx: None }
+    pub fn new(root: PathBuf) -> Self {
+        Self::new_with_runner(root, Arc::new(ProcessCommandRunner))
+    }
+
+    pub fn new_with_runner(root: PathBuf, runner: Arc<dyn CommandRunner>) -> Self {
+        Self {
+            root,
+            runner,
+            tx: None,
+        }
     }
 
     fn encode_path(project: &str) -> String {
@@ -405,6 +414,8 @@ impl GlabBackend {
 
     async fn run_glab(&self, args: &[&str], desc: &str) -> Result<String> {
         run_glab_command(
+            Arc::clone(&self.runner),
+            self.root.clone(),
             self.tx.clone(),
             args.iter().map(|a| (*a).to_string()).collect(),
             desc.to_string(),
@@ -500,7 +511,14 @@ impl Backend for GlabBackend {
             })
             .collect();
         let responses = ordered_or_first_error(
-            run_glab_concurrent(self.tx.clone(), requests, "Fetching Issues").await,
+            run_glab_concurrent(
+                Arc::clone(&self.runner),
+                self.root.clone(),
+                self.tx.clone(),
+                requests,
+                "Fetching Issues",
+            )
+            .await,
         )?;
 
         let mut all: Vec<Issue> = Vec::new();
@@ -921,10 +939,15 @@ impl Backend for GlabBackend {
                 args
             })
             .collect();
-        // Pages are merged in page order, not completion order: the MR table's
-        // row order is this list's order.
         let responses = ordered_or_first_error(
-            run_glab_concurrent(self.tx.clone(), requests, "Fetching MRs").await,
+            run_glab_concurrent(
+                Arc::clone(&self.runner),
+                self.root.clone(),
+                self.tx.clone(),
+                requests,
+                "Fetching MRs",
+            )
+            .await,
         )?;
 
         let mut all: Vec<MergeRequest> = Vec::new();
@@ -1298,13 +1321,17 @@ impl Backend for GlabBackend {
             .into_iter()
             .map(|batch| Self::mr_state_batch_args(project, batch))
             .collect();
-
-        let parsed: Vec<(usize, Result<MrStateMap>)> =
-            run_glab_concurrent(self.tx.clone(), requests, "FETCHING MR STATE")
-                .await
-                .into_iter()
-                .map(|(index, raw)| (index, raw.and_then(|r| parse_mr_state_response(&r))))
-                .collect();
+        let parsed: Vec<(usize, Result<MrStateMap>)> = run_glab_concurrent(
+            Arc::clone(&self.runner),
+            self.root.clone(),
+            self.tx.clone(),
+            requests,
+            "FETCHING MR STATE",
+        )
+        .await
+        .into_iter()
+        .map(|(index, raw)| (index, raw.and_then(|r| parse_mr_state_response(&r))))
+        .collect();
 
         // Unlike the paged list fetches, a single failed batch must not fail
         // the whole call — see `merge_tolerating_partial_failure`.
@@ -1634,7 +1661,14 @@ impl Backend for GlabBackend {
             })
             .collect();
         let responses = ordered_or_first_error(
-            run_glab_concurrent(self.tx.clone(), requests, "Fetching Pipelines").await,
+            run_glab_concurrent(
+                Arc::clone(&self.runner),
+                self.root.clone(),
+                self.tx.clone(),
+                requests,
+                "Fetching Pipelines",
+            )
+            .await,
         )?;
 
         let mut all: Vec<Pipeline> = Vec::new();
@@ -2587,45 +2621,23 @@ impl Backend for GlabBackend {
             cmd_args.push("-X".into());
             cmd_args.push(method.into());
         }
+        if body.is_some_and(|value| !value.is_empty()) {
+            cmd_args.push("--input".into());
+            cmd_args.push("-".into());
+        }
         cmd_args.push(endpoint.into());
         let cmd_str = format!("glab {}", cmd_args.join(" "));
         let label = desc.to_uppercase();
-
-        let mut cmd = Command::new("glab");
-        cmd.arg("api");
-        if method != "GET" {
-            cmd.arg("-X");
-            cmd.arg(method);
+        let mut request = CommandRequest::new(&self.root, "glab", cmd_args);
+        if let Some(body) = body.filter(|value| !value.is_empty()) {
+            request = request.with_stdin(body.as_bytes());
         }
-        if let Some(b) = body {
-            if !b.is_empty() {
-                cmd.arg("--input");
-                cmd.arg("-");
-                cmd.stdin(std::process::Stdio::piped());
-            }
-        }
-        cmd.arg(endpoint);
-
-        let output = if let Some(b) = body {
-            if !b.is_empty() {
-                let mut child = cmd.spawn().context("Failed to spawn glab api command")?;
-                use tokio::io::AsyncWriteExt;
-                if let Some(mut stdin) = child.stdin.take() {
-                    stdin.write_all(b.as_bytes()).await?;
-                    stdin.flush().await?;
-                }
-                child.wait_with_output().await
-            } else {
-                cmd.output().await
-            }
-        } else {
-            cmd.output().await
-        };
+        let output = self.runner.output(request).await;
 
         let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
         match output {
             Ok(out) => {
-                if out.status.success() {
+                if out.status == 0 {
                     let s = String::from_utf8(out.stdout)?;
                     if let Some(ref tx) = self.tx {
                         let _ = tx.send(Event::TerminalCommandLogged {
@@ -2648,7 +2660,7 @@ impl Backend for GlabBackend {
                 }
             }
             Err(e) => {
-                let err_msg = format!("{}", e);
+                let err_msg = e.0;
                 if let Some(ref tx) = self.tx {
                     let _ = tx.send(Event::TerminalCommandLogged {
                         timestamp,
@@ -2656,7 +2668,7 @@ impl Backend for GlabBackend {
                         status: format!("Failed: {}", err_msg),
                     });
                 }
-                Err(e.into())
+                anyhow::bail!(err_msg)
             }
         }
     }
@@ -3119,5 +3131,38 @@ mod tests {
             !a.you_reviewed,
             "cannot have reviewed when the user is unknown"
         );
+    }
+}
+
+#[cfg(test)]
+mod command_context_tests {
+    use super::*;
+    use crate::command::{CommandError, CommandOutput, CommandRequest, CommandRunner};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct RecordingRunner(Arc<Mutex<Vec<CommandRequest>>>);
+
+    #[async_trait]
+    impl CommandRunner for RecordingRunner {
+        async fn output(&self, request: CommandRequest) -> Result<CommandOutput, CommandError> {
+            self.0.lock().push(request);
+            Ok(CommandOutput {
+                status: 0,
+                stdout: b"[]\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn gitlab_backend_sends_requests_to_explicit_root() {
+        let root = PathBuf::from("C:/fixture/gitlab");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let backend =
+            GlabBackend::new_with_runner(root.clone(), Arc::new(RecordingRunner(requests.clone())));
+        let _ = backend.run_glab(&["issue", "list"], "FETCH ISSUES").await;
+        assert_eq!(requests.lock()[0].cwd, root);
     }
 }

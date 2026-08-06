@@ -6,6 +6,7 @@
 mod app;
 mod backend;
 mod cli;
+mod command;
 mod config;
 mod domain;
 mod editor;

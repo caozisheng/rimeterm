@@ -27,6 +27,7 @@ syntect = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["process", "io-util", "rt", "time"] }
 toml = { workspace = true }
+parking_lot = "0.12"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

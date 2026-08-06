@@ -1,4 +1,5 @@
 use super::Backend;
+use crate::command::{CommandRequest, CommandRunner, ProcessCommandRunner};
 use crate::domain::branches::Branch;
 use crate::domain::deployments::{Deployment, Environment};
 use crate::domain::issues::Issue;
@@ -10,11 +11,12 @@ use crate::domain::pipelines::{Job, Pipeline};
 use crate::domain::releases::Release;
 use crate::domain::runners::Runner;
 use crate::event::Event;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashMap;
-use tokio::process::Command;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 fn strip_ats(s: &str) -> String {
@@ -141,15 +143,23 @@ pub fn gh_state_from_fields(
 /// forbids.
 #[derive(Clone)]
 pub struct GhBackend {
+    root: PathBuf,
+    runner: Arc<dyn CommandRunner>,
     tx: Option<UnboundedSender<Event>>,
-    current_user: std::sync::Arc<tokio::sync::OnceCell<Option<String>>>,
+    current_user: Arc<tokio::sync::OnceCell<Option<String>>>,
 }
 
 impl GhBackend {
-    pub fn new() -> Self {
+    pub fn new(root: PathBuf) -> Self {
+        Self::new_with_runner(root, Arc::new(ProcessCommandRunner))
+    }
+
+    pub fn new_with_runner(root: PathBuf, runner: Arc<dyn CommandRunner>) -> Self {
         Self {
+            root,
+            runner,
             tx: None,
-            current_user: std::sync::Arc::new(tokio::sync::OnceCell::const_new()),
+            current_user: Arc::new(tokio::sync::OnceCell::const_new()),
         }
     }
 
@@ -174,17 +184,15 @@ impl GhBackend {
     async fn run_gh(&self, args: &[&str], desc: &str) -> Result<String> {
         let label = desc.to_uppercase();
         let cmd_str = format!("gh {}", args.join(" "));
-
-        let output = Command::new("gh")
-            .args(args)
-            .output()
+        let output = self
+            .runner
+            .output(CommandRequest::new(&self.root, "gh", args.iter().copied()))
             .await
-            .with_context(|| format!("Failed to execute: gh {}", args.join(" ")))?;
-
+            .map_err(|error| anyhow::anyhow!("Failed to execute {cmd_str}: {}", error.0))?;
         let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
-        if output.status.success() {
+        if output.status == 0 {
             let s = String::from_utf8(output.stdout)?;
-            if let Some(ref tx) = self.tx {
+            if let Some(tx) = &self.tx {
                 let _ = tx.send(Event::TerminalCommandLogged {
                     timestamp,
                     command: format!("{}: {}", label, cmd_str),
@@ -194,7 +202,7 @@ impl GhBackend {
             Ok(s)
         } else {
             let err_msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if let Some(ref tx) = self.tx {
+            if let Some(tx) = &self.tx {
                 let _ = tx.send(Event::TerminalCommandLogged {
                     timestamp,
                     command: format!("{}: {}", label, cmd_str),
@@ -2318,22 +2326,28 @@ impl Backend for GhBackend {
         let url = format!("https://github.com/{}/milestone/{}", project, id);
         let label = "OPENING IN BROWSER";
         let cmd_str = format!("git web--browse {}", url);
-        let output = tokio::process::Command::new("git")
-            .args(["web--browse", &url])
-            .output()
+        let output = self
+            .runner
+            .output(CommandRequest::new(
+                &self.root,
+                "git",
+                ["web--browse", &url],
+            ))
             .await;
         let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
         let status = match &output {
-            Ok(out) if out.status.success() => "Success".to_string(),
-            _ => "Success".to_string(),
+            Ok(out) if out.status == 0 => "Success".to_string(),
+            Ok(out) => format!("Failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+            Err(error) => format!("Failed: {}", error.0),
         };
-        if let Some(ref tx) = self.tx {
-            let _ = tx.send(crate::event::Event::TerminalCommandLogged {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Event::TerminalCommandLogged {
                 timestamp,
                 command: format!("{}: {}", label, cmd_str),
                 status,
             });
         }
+        output.map_err(|error| anyhow::anyhow!(error.0))?;
         Ok(())
     }
     // ── Raw API ──
@@ -2350,76 +2364,52 @@ impl Backend for GhBackend {
             cmd_args.push("-X".into());
             cmd_args.push(method.into());
         }
+        if body.is_some_and(|value| !value.is_empty()) {
+            cmd_args.push("--input".into());
+            cmd_args.push("-".into());
+        }
         cmd_args.push(endpoint.into());
         let cmd_str = format!("gh {}", cmd_args.join(" "));
         let label = desc.to_uppercase();
-
-        let mut cmd = Command::new("gh");
-        cmd.arg("api");
-        if method != "GET" {
-            cmd.arg("-X");
-            cmd.arg(method);
+        let mut request = CommandRequest::new(&self.root, "gh", cmd_args);
+        if let Some(body) = body.filter(|value| !value.is_empty()) {
+            request = request.with_stdin(body.as_bytes());
         }
-        if let Some(b) = body {
-            if !b.is_empty() {
-                cmd.arg("--input");
-                cmd.arg("-");
-                cmd.stdin(std::process::Stdio::piped());
-            }
-        }
-        cmd.arg(endpoint);
-
-        let output = if let Some(b) = body {
-            if !b.is_empty() {
-                let mut child = cmd.spawn().context("Failed to spawn gh api command")?;
-                use tokio::io::AsyncWriteExt;
-                if let Some(mut stdin) = child.stdin.take() {
-                    stdin.write_all(b.as_bytes()).await?;
-                    stdin.flush().await?;
-                }
-                child.wait_with_output().await
-            } else {
-                cmd.output().await
-            }
-        } else {
-            cmd.output().await
-        };
-
+        let output = self.runner.output(request).await;
         let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
         match output {
-            Ok(out) => {
-                if out.status.success() {
-                    let s = String::from_utf8(out.stdout)?;
-                    if let Some(ref tx) = self.tx {
-                        let _ = tx.send(Event::TerminalCommandLogged {
-                            timestamp,
-                            command: format!("{}: {}", label, cmd_str),
-                            status: "Success".to_string(),
-                        });
-                    }
-                    Ok(s)
-                } else {
-                    let err_msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    if let Some(ref tx) = self.tx {
-                        let _ = tx.send(Event::TerminalCommandLogged {
-                            timestamp,
-                            command: format!("{}: {}", label, cmd_str),
-                            status: format!("Failed: {}", err_msg),
-                        });
-                    }
-                    anyhow::bail!("gh api failed: {}", err_msg)
+            Ok(out) if out.status == 0 => {
+                let result = String::from_utf8(out.stdout)?;
+                if let Some(tx) = &self.tx {
+                    let _ = tx.send(Event::TerminalCommandLogged {
+                        timestamp,
+                        command: format!("{}: {}", label, cmd_str),
+                        status: "Success".to_string(),
+                    });
                 }
+                Ok(result)
             }
-            Err(e) => {
-                let err_msg = format!("{}", e);
-                if let Some(ref tx) = self.tx {
+            Ok(out) => {
+                let err_msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if let Some(tx) = &self.tx {
                     let _ = tx.send(Event::TerminalCommandLogged {
                         timestamp,
                         command: format!("{}: {}", label, cmd_str),
                         status: format!("Failed: {}", err_msg),
                     });
                 }
-                Err(e.into())
+                anyhow::bail!("gh api failed: {}", err_msg)
+            }
+            Err(error) => {
+                let err_msg = error.0;
+                if let Some(tx) = &self.tx {
+                    let _ = tx.send(Event::TerminalCommandLogged {
+                        timestamp,
+                        command: format!("{}: {}", label, cmd_str),
+                        status: format!("Failed: {}", err_msg),
+                    });
+                }
+                anyhow::bail!(err_msg)
             }
         }
     }
@@ -2493,9 +2483,9 @@ mod tests {
 
     #[tokio::test]
     async fn current_user_cache_is_shared_only_by_backend_clones() {
-        let backend = GhBackend::new();
+        let backend = GhBackend::new(std::path::PathBuf::from("."));
         let clone = backend.clone();
-        let separate = GhBackend::new();
+        let separate = GhBackend::new(std::path::PathBuf::from("."));
 
         assert!(std::sync::Arc::ptr_eq(
             &backend.current_user,
@@ -2696,5 +2686,38 @@ mod tests {
             &["someone.else".to_string()],
         );
         assert!(!approval.unwrap().you_approved);
+    }
+}
+
+#[cfg(test)]
+mod command_context_tests {
+    use super::*;
+    use crate::command::{CommandError, CommandOutput};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct RecordingRunner(Arc<Mutex<Vec<CommandRequest>>>);
+
+    #[async_trait]
+    impl CommandRunner for RecordingRunner {
+        async fn output(&self, request: CommandRequest) -> Result<CommandOutput, CommandError> {
+            self.0.lock().push(request);
+            Ok(CommandOutput {
+                status: 0,
+                stdout: b"octocat\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn github_backend_sends_requests_to_explicit_root() {
+        let root = PathBuf::from("C:/fixture/github");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let backend =
+            GhBackend::new_with_runner(root.clone(), Arc::new(RecordingRunner(requests.clone())));
+        let _ = backend.current_user().await;
+        assert_eq!(requests.lock()[0].cwd, root);
     }
 }

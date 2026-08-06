@@ -263,7 +263,12 @@ pub async fn handle_active_tab_key(
                                 ("Source Branch".to_string(), source_branch_val),
                                 (
                                     "Target Branch".to_string(),
-                                    get_default_branch().unwrap_or_else(|| "main".to_string()),
+                                    app.gitlab_client
+                                        .as_ref()
+                                        .and_then(|client| {
+                                            crate::git_helpers::get_default_branch(&client.root)
+                                        })
+                                        .unwrap_or_else(|| "main".to_string()),
                                 ),
                                 ("Labels".to_string(), labels_val),
                                 ("Assignees".to_string(), assignees_val),
@@ -565,18 +570,12 @@ pub async fn handle_active_tab_key(
                             let mr_iid_str = mr_iid.to_string();
                             let client = app.gitlab_client.clone();
                             let project_context = app.project_context.clone();
+                            let is_github = app.is_github();
+                            let root = client
+                                .as_ref()
+                                .map(|client| client.root.clone())
+                                .unwrap_or_else(|| std::path::PathBuf::from("."));
                             tokio::spawn(async move {
-                                let is_github = match tokio::process::Command::new("git")
-                                    .args(["remote", "get-url", "origin"])
-                                    .output()
-                                    .await
-                                    .map(|o| {
-                                        String::from_utf8_lossy(&o.stdout).contains("github.com")
-                                    }) {
-                                    Ok(true) => true,
-                                    _ => false,
-                                };
-
                                 let program = if is_github { "gh" } else { "glab" };
                                 let (entity, sub) = if is_github {
                                     ("pr", "diff")
@@ -588,37 +587,36 @@ pub async fn handle_active_tab_key(
                                 let status_msg =
                                     format!("Fetching Diff: {} {}", program, cmd_args.join(" "));
                                 let _ = tx.send(Event::CommandStarted(status_msg));
-
-                                let mut cmd = tokio::process::Command::new(program);
-                                cmd.args(&cmd_args);
-
-                                let diff_res = cmd.output().await;
-
-                                let comments = if let Some(ref c) = client {
-                                    crate::domain::mr::list_mr_notes(c, &project_context, mr_iid)
-                                        .await
-                                        .unwrap_or_default()
+                                let output = tokio::process::Command::new(program)
+                                    .args(&cmd_args)
+                                    .current_dir(root)
+                                    .output()
+                                    .await;
+                                let comments = if let Some(ref client) = client {
+                                    crate::domain::mr::list_mr_notes(
+                                        client,
+                                        &project_context,
+                                        mr_iid,
+                                    )
+                                    .await
+                                    .unwrap_or_default()
                                 } else {
                                     vec![]
                                 };
-
-                                match diff_res {
+                                match output {
+                                    Ok(output) if output.status.success() => {
+                                        let _ = tx.send(Event::DiffFetched {
+                                            mr_iid,
+                                            raw_diff: String::from_utf8_lossy(&output.stdout)
+                                                .into_owned(),
+                                            comments,
+                                        });
+                                    }
                                     Ok(output) => {
-                                        if output.status.success() {
-                                            let raw_diff = String::from_utf8_lossy(&output.stdout)
-                                                .into_owned();
-                                            let _ = tx.send(Event::DiffFetched {
-                                                mr_iid,
-                                                raw_diff,
-                                                comments,
-                                            });
-                                        } else {
-                                            let err_msg = String::from_utf8_lossy(&output.stderr);
-                                            let _ = tx.send(Event::DiffFetchFailed(format!(
-                                                "Failed to fetch diff: {}",
-                                                err_msg
-                                            )));
-                                        }
+                                        let _ = tx.send(Event::DiffFetchFailed(format!(
+                                            "Failed to fetch diff: {}",
+                                            String::from_utf8_lossy(&output.stderr)
+                                        )));
                                     }
                                     Err(_) => {
                                         let _ = tx.send(Event::DiffFetchFailed(
@@ -759,14 +757,16 @@ pub async fn handle_active_tab_key(
         }
         crate::app::Tab::Pipelines => {
             if key_event.code == KeyCode::Char('n') {
-                let current_branch =
-                    crate::git_helpers::get_current_branch().unwrap_or_else(|| "main".to_string());
+                let current_branch = app
+                    .gitlab_client
+                    .as_ref()
+                    .and_then(|client| crate::git_helpers::get_current_branch(&client.root))
+                    .unwrap_or_else(|| "main".to_string());
 
                 let is_github = app.is_github();
-                let mut fields = vec![("Branch / Ref".to_string(), current_branch.clone())];
+                let mut fields = vec![("Branch / Ref".to_string(), current_branch)];
                 if is_github {
                     fields.push(("Workflow File".to_string(), String::new()));
-                } else {
                     fields.push(("Merge Request Pipeline".to_string(), "No".to_string()));
                 }
                 fields.push(("Inputs".to_string(), String::new()));
@@ -792,7 +792,7 @@ pub async fn handle_active_tab_key(
                 )
             {
                 if let Some(client) = app.gitlab_client.clone() {
-                    let branch = crate::git_helpers::get_current_branch()
+                    let branch = crate::git_helpers::get_current_branch(&client.root)
                         .unwrap_or_else(|| "main".to_string());
                     let project_path = app.project_context.clone();
                     let tx2 = tx.clone();

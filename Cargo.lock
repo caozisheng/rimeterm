@@ -2591,6 +2591,7 @@ dependencies = [
  "crossterm",
  "fuzzy-matcher",
  "libc",
+ "parking_lot",
  "ratatui",
  "serde",
  "serde_json",

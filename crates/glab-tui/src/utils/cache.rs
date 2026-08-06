@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct ProjectCache {
@@ -44,8 +45,12 @@ pub fn load_cache(project_context: &str) -> ProjectCache {
 
 pub fn save_cache(project_context: &str, cache: &ProjectCache) {
     let path = get_cache_file_path(project_context);
-    if let Ok(content) = serde_json::to_string(cache) {
-        let _ = fs::write(path, content);
+    if let Ok(content) = serde_json::to_vec(cache) {
+        if let Ok(mut temp) = NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))
+        {
+            use std::io::Write;
+            if temp.write_all(&content).is_ok() && temp.persist(&path).is_ok() {}
+        }
     }
 }
 
@@ -194,7 +199,8 @@ pub fn clean_cache(dry_run: bool) -> CleanCacheResult {
 
 fn get_project_context_for_path(repo_path: &str) -> Option<String> {
     let output = std::process::Command::new("git")
-        .args(["-C", repo_path, "remote", "get-url", "origin"])
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo_path)
         .output()
         .ok()?;
     if !output.status.success() {

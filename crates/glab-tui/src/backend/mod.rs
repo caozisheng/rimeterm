@@ -356,10 +356,25 @@ pub trait Backend: Send + Sync {
     ) -> Result<String>;
 }
 
-pub fn create_backend(project_url_contains_github: bool) -> Box<dyn Backend> {
+pub fn create_backend(
+    project_url_contains_github: bool,
+    root: std::path::PathBuf,
+) -> Box<dyn Backend> {
     if project_url_contains_github {
-        Box::new(gh::GhBackend::new())
+        Box::new(gh::GhBackend::new(root))
     } else {
-        Box::new(glab::GlabBackend::new())
+        Box::new(glab::GlabBackend::new(root))
+    }
+}
+
+pub fn create_backend_with_runner(
+    project_url_contains_github: bool,
+    root: std::path::PathBuf,
+    runner: std::sync::Arc<dyn crate::command::CommandRunner>,
+) -> Box<dyn Backend> {
+    if project_url_contains_github {
+        Box::new(gh::GhBackend::new_with_runner(root, runner))
+    } else {
+        Box::new(glab::GlabBackend::new_with_runner(root, runner))
     }
 }

@@ -218,7 +218,8 @@ pub async fn run_doctor() {
     println!();
     subheader("Repository context");
     println!("{}", styled("-------------------", C_DIM));
-    match crate::domain::client::get_project_context().await {
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    match crate::domain::client::get_project_context(&root).await {
         Ok(context) => {
             println!("  Remote:  {}", styled(&context, C_BOLD));
             let is_github = detect_github();
