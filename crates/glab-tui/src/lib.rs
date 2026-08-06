@@ -3,13 +3,15 @@
 //! This library deliberately does not own a terminal, cwd, PTY, or process
 //! loop. The host supplies the workspace root and forwards input and frames.
 
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
+    },
 };
 use serde::Deserialize;
 use std::{
@@ -404,13 +406,44 @@ struct Completion {
     generation: u64,
     result: Result<GlabSnapshot, GlabError>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TextPoint {
+    line: usize,
+    column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextSelection {
+    anchor: TextPoint,
+    focus: TextPoint,
+}
+
+impl TextSelection {
+    fn bounds(self) -> (TextPoint, TextPoint) {
+        if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+}
 pub struct EmbeddedApp {
     workspace_root: PathBuf,
     area: Rect,
     theme: Color,
     snapshot: GlabSnapshot,
     selected: usize,
-    guide_scroll: u16,
+    guide_lines: Vec<String>,
+    text_area: Rect,
+    scrollbar_rect: Option<Rect>,
+    guide_scroll: usize,
+    ready_scroll: usize,
+    ready_viewport: usize,
+    selection: Option<TextSelection>,
+    selection_dragging: bool,
+    scrollbar_dragging: bool,
+    pending_copy: Option<String>,
     generation: u64,
     rx: mpsc::Receiver<Completion>,
     tx: mpsc::Sender<Completion>,
@@ -428,7 +461,16 @@ impl EmbeddedApp {
             theme,
             snapshot: GlabSnapshot::loading(),
             selected: 0,
+            guide_lines: Vec::new(),
+            text_area: Rect::default(),
+            scrollbar_rect: None,
             guide_scroll: 0,
+            ready_scroll: 0,
+            ready_viewport: 0,
+            selection: None,
+            selection_dragging: false,
+            scrollbar_dragging: false,
+            pending_copy: None,
             generation: 0,
             rx,
             tx,
@@ -447,14 +489,73 @@ impl EmbeddedApp {
         self.selected
     }
     pub fn guide_scroll(&self) -> u16 {
-        self.guide_scroll
+        self.guide_scroll.min(u16::MAX as usize) as u16
+    }
+    pub fn guide_max_scroll(&self) -> usize {
+        self.guide_lines
+            .len()
+            .saturating_sub((self.text_area.height as usize).max(1))
+    }
+    pub fn ready_scroll(&self) -> usize {
+        self.ready_scroll
+    }
+    pub fn ready_max_scroll(&self) -> usize {
+        self.snapshot
+            .todos
+            .len()
+            .saturating_sub(self.ready_viewport)
+    }
+    pub fn scrollbar_rect(&self) -> Option<Rect> {
+        self.scrollbar_rect
+    }
+    pub fn scrollbar_dragging(&self) -> bool {
+        self.scrollbar_dragging || self.selection_dragging
+    }
+    pub fn has_active_selection(&self) -> bool {
+        self.selection_text().is_some_and(|text| !text.is_empty())
+    }
+    pub fn wants_mouse_priority(&self) -> bool {
+        matches!(
+            self.snapshot.status,
+            GlabStatus::Error(_) | GlabStatus::Ready
+        )
+    }
+    pub fn take_copy_request(&mut self) -> Option<String> {
+        self.pending_copy.take()
+    }
+    pub fn selection_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let (start, end) = selection.bounds();
+        let mut selected = String::new();
+        for line_index in start.line..=end.line {
+            let line = self.guide_lines.get(line_index)?;
+            let chars: Vec<char> = line.chars().collect();
+            let from = if line_index == start.line {
+                start.column.min(chars.len())
+            } else {
+                0
+            };
+            let to = if line_index == end.line {
+                end.column.saturating_add(1).min(chars.len())
+            } else {
+                chars.len()
+            };
+            if from < to {
+                selected.extend(chars[from..to].iter());
+            }
+            if line_index < end.line {
+                selected.push('\n');
+            }
+        }
+        (!selected.is_empty()).then_some(selected)
     }
     pub fn snapshot(&self) -> &GlabSnapshot {
         &self.snapshot
     }
     pub fn set_snapshot(&mut self, snapshot: GlabSnapshot) {
         self.snapshot = snapshot;
-        self.guide_scroll = 0;
+        self.reset_interaction();
+        self.sync_guide_lines();
         self.clamp_selected();
     }
     pub fn set_error(&mut self, error: GlabError) {
@@ -467,8 +568,14 @@ impl EmbeddedApp {
             notifications: Vec::new(),
             status: GlabStatus::Error(message),
         };
-        self.guide_scroll = 0;
+        self.reset_interaction();
         self.clamp_selected();
+        self.sync_guide_lines();
+    }
+    fn sync_guide_lines(&mut self) {
+        if let GlabStatus::Error(message) = &self.snapshot.status {
+            self.guide_lines = message.lines().map(str::to_owned).collect();
+        }
     }
     pub fn set_workspace_root(&mut self, root: &Path) {
         self.workspace_root = root.to_path_buf();
@@ -478,7 +585,7 @@ impl EmbeddedApp {
         self.generation = self.generation.saturating_add(1);
         self.snapshot = GlabSnapshot::loading();
         self.selected = 0;
-        self.guide_scroll = 0;
+        self.reset_interaction();
         let generation = self.generation;
         let root = self.workspace_root.clone();
         let tx = self.tx.clone();
@@ -490,6 +597,18 @@ impl EmbeddedApp {
             });
         });
     }
+    fn reset_interaction(&mut self) {
+        self.guide_lines.clear();
+        self.text_area = Rect::default();
+        self.scrollbar_rect = None;
+        self.guide_scroll = 0;
+        self.ready_scroll = 0;
+        self.ready_viewport = 0;
+        self.selection = None;
+        self.selection_dragging = false;
+        self.scrollbar_dragging = false;
+        self.pending_copy = None;
+    }
     fn selectable_len(&self) -> usize {
         self.snapshot.todos.len()
     }
@@ -498,17 +617,26 @@ impl EmbeddedApp {
     }
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         if self.is_showing_guide() {
+            if key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && self.has_active_selection()
+            {
+                self.request_copy();
+                return true;
+            }
             return match key.code {
                 KeyCode::Up => self.scroll_guide_by(-1),
                 KeyCode::Down => self.scroll_guide_by(1),
-                KeyCode::PageUp => self.scroll_guide_by(-10),
-                KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_guide_by(10),
+                KeyCode::PageUp => self.scroll_guide_by(-(self.text_area.height.max(10) as isize)),
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    self.scroll_guide_by(self.text_area.height.max(10) as isize)
+                }
                 KeyCode::Home => {
                     self.guide_scroll = 0;
                     true
                 }
                 KeyCode::End => {
-                    self.guide_scroll = u16::MAX;
+                    self.guide_scroll = self.guide_max_scroll();
                     true
                 }
                 KeyCode::Char('r') if key.modifiers.is_empty() => {
@@ -521,11 +649,13 @@ impl EmbeddedApp {
         match key.code {
             KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
+                self.keep_selected_visible();
                 true
             }
             KeyCode::Down => {
                 self.selected = self.selected.saturating_add(1);
                 self.clamp_selected();
+                self.keep_selected_visible();
                 true
             }
             KeyCode::Char('r') if key.modifiers.is_empty() => {
@@ -536,33 +666,181 @@ impl EmbeddedApp {
         }
     }
     pub fn on_mouse(&mut self, event: MouseEvent, area: Rect) -> bool {
-        if !area.contains((event.column, event.row).into()) {
+        let sticky = matches!(event.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
+            && self.scrollbar_dragging();
+        if !sticky && !area.contains((event.column, event.row).into()) {
             return false;
         }
         if self.is_showing_guide() {
-            return match event.kind {
-                MouseEventKind::ScrollUp => self.scroll_guide_by(-3),
-                MouseEventKind::ScrollDown => self.scroll_guide_by(3),
-                _ => false,
-            };
+            return self.on_guide_mouse(event);
         }
-        if matches!(event.kind, MouseEventKind::ScrollUp) {
-            self.selected = self.selected.saturating_sub(1);
-            return true;
+        self.on_ready_mouse(event)
+    }
+    fn on_guide_mouse(&mut self, event: MouseEvent) -> bool {
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if self
+                    .scrollbar_rect
+                    .is_some_and(|rect| rect.contains((event.column, event.row).into())) =>
+            {
+                self.scrollbar_dragging = true;
+                self.drag_scrollbar(event.row, self.guide_max_scroll());
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(point) = self.text_point(event.column, event.row) else {
+                    return false;
+                };
+                self.selection = Some(TextSelection {
+                    anchor: point,
+                    focus: point,
+                });
+                self.selection_dragging = true;
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.scrollbar_dragging => {
+                self.drag_scrollbar(event.row, self.guide_max_scroll());
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.selection_dragging => {
+                if let Some(point) = self.text_point(event.column, event.row)
+                    && let Some(selection) = self.selection.as_mut()
+                {
+                    selection.focus = point;
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.scrollbar_dragging => {
+                self.scrollbar_dragging = false;
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.selection_dragging => {
+                if let Some(point) = self.text_point(event.column, event.row)
+                    && let Some(selection) = self.selection.as_mut()
+                {
+                    selection.focus = point;
+                }
+                self.selection_dragging = false;
+                self.request_copy();
+                true
+            }
+            MouseEventKind::Down(MouseButton::Right) if self.has_active_selection() => {
+                self.request_copy();
+                true
+            }
+            MouseEventKind::ScrollUp => self.scroll_guide_by(-3),
+            MouseEventKind::ScrollDown => self.scroll_guide_by(3),
+            _ => false,
         }
-        if matches!(event.kind, MouseEventKind::ScrollDown) {
-            self.selected = self.selected.saturating_add(1);
-            self.clamp_selected();
-            return true;
+    }
+    fn on_ready_mouse(&mut self, event: MouseEvent) -> bool {
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if self
+                    .scrollbar_rect
+                    .is_some_and(|rect| rect.contains((event.column, event.row).into())) =>
+            {
+                self.scrollbar_dragging = true;
+                self.drag_ready_scrollbar(event.row);
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.scrollbar_dragging => {
+                self.drag_ready_scrollbar(event.row);
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.scrollbar_dragging => {
+                self.scrollbar_dragging = false;
+                true
+            }
+            MouseEventKind::ScrollUp => {
+                self.ready_scroll = self.ready_scroll.saturating_sub(3);
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.ready_scroll = self
+                    .ready_scroll
+                    .saturating_add(3)
+                    .min(self.ready_max_scroll());
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if self.text_area.contains((event.column, event.row).into()) =>
+            {
+                let row = event.row.saturating_sub(self.text_area.y) as usize;
+                if row == 0 {
+                    return false;
+                }
+                let index = self.ready_scroll + row - 1;
+                if index < self.snapshot.todos.len() {
+                    self.selected = index;
+                    return true;
+                }
+                false
+            }
+            _ => false,
         }
-        false
     }
     fn is_showing_guide(&self) -> bool {
         matches!(&self.snapshot.status, GlabStatus::Error(message) if message.contains("setup required"))
     }
-    fn scroll_guide_by(&mut self, delta: i16) -> bool {
-        self.guide_scroll = self.guide_scroll.saturating_add_signed(delta);
+    fn scroll_guide_by(&mut self, delta: isize) -> bool {
+        self.guide_scroll = self
+            .guide_scroll
+            .saturating_add_signed(delta)
+            .min(self.guide_max_scroll());
         true
+    }
+    fn request_copy(&mut self) {
+        self.pending_copy = self.selection_text();
+    }
+    fn text_point(&self, column: u16, row: u16) -> Option<TextPoint> {
+        if !self.text_area.contains((column, row).into()) {
+            return None;
+        }
+        let line = self.guide_scroll + row.saturating_sub(self.text_area.y) as usize;
+        let text = self.guide_lines.get(line)?;
+        let column = column.saturating_sub(self.text_area.x) as usize;
+        (column < text.chars().count()).then_some(TextPoint { line, column })
+    }
+    fn drag_scrollbar(&mut self, row: u16, max_scroll: usize) {
+        let Some(rect) = self.scrollbar_rect else {
+            return;
+        };
+        let denominator = rect.height.saturating_sub(1) as usize;
+        let position = row
+            .saturating_sub(rect.y)
+            .min(rect.height.saturating_sub(1)) as usize;
+        self.guide_scroll = if denominator == 0 {
+            0
+        } else {
+            position.saturating_mul(max_scroll) / denominator
+        };
+    }
+    fn drag_ready_scrollbar(&mut self, row: u16) {
+        let max_scroll = self.ready_max_scroll();
+        let Some(rect) = self.scrollbar_rect else {
+            return;
+        };
+        let denominator = rect.height.saturating_sub(1) as usize;
+        let position = row
+            .saturating_sub(rect.y)
+            .min(rect.height.saturating_sub(1)) as usize;
+        self.ready_scroll = if denominator == 0 {
+            0
+        } else {
+            position.saturating_mul(max_scroll) / denominator
+        };
+    }
+    fn keep_selected_visible(&mut self) {
+        if self.ready_viewport == 0 {
+            return;
+        }
+        if self.selected < self.ready_scroll {
+            self.ready_scroll = self.selected;
+        } else if self.selected >= self.ready_scroll + self.ready_viewport {
+            self.ready_scroll = self.selected + 1 - self.ready_viewport;
+        }
+        self.ready_scroll = self.ready_scroll.min(self.ready_max_scroll());
     }
     pub fn poll_background(&mut self) -> bool {
         let mut changed = false;
@@ -600,44 +878,128 @@ impl EmbeddedApp {
             .border_style(border_style);
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        self.text_area = inner;
+        self.scrollbar_rect = None;
         if inner.width == 0 || inner.height == 0 {
+            self.ready_viewport = 0;
             return;
         }
-        let project_line = Line::from(match &self.snapshot.project {
+        let project = match &self.snapshot.project {
             Some(project) => format!("{:?}: {}/{}", project.host, project.owner, project.name),
             None => "No project detected".into(),
-        });
+        };
         match &self.snapshot.status {
-            GlabStatus::Loading => frame.render_widget(
-                Paragraph::new(vec![project_line, Line::raw("Loading remote data...")])
-                    .style(Style::default().fg(Color::White)),
-                inner,
-            ),
-            GlabStatus::Error(message) => frame.render_widget(
-                Paragraph::new(message.as_str())
-                    .style(Style::default().fg(Color::Red))
-                    .wrap(Wrap { trim: false })
-                    .scroll((self.guide_scroll, 0)),
-                inner,
-            ),
-            GlabStatus::Ready => {
-                let mut lines = vec![project_line, Line::raw("Todos")];
-                lines.extend(self.snapshot.todos.iter().enumerate().map(|(index, todo)| {
-                    let marker = if index == self.selected { ">" } else { " " };
-                    Line::from(format!("{marker} [{}] {}", todo.state, todo.title))
-                }));
-                lines.push(Line::raw("Notifications"));
-                lines.extend(self.snapshot.notifications.iter().map(|item| {
-                    Line::from(format!(
-                        "  {} {}",
-                        if item.unread { "*" } else { " " },
-                        item.title
-                    ))
-                }));
+            GlabStatus::Loading => {
+                self.ready_viewport = 0;
                 frame.render_widget(
-                    Paragraph::new(lines).style(Style::default().fg(Color::White)),
+                    Paragraph::new(vec![
+                        Line::raw(project),
+                        Line::raw("Loading remote data..."),
+                    ])
+                    .style(Style::default().fg(Color::White)),
                     inner,
                 );
+            }
+            GlabStatus::Error(message) => {
+                self.ready_viewport = 0;
+                self.guide_lines = message.lines().map(str::to_owned).collect();
+                self.guide_scroll = self.guide_scroll.min(self.guide_max_scroll());
+                let scrollable = self.guide_max_scroll() > 0 && inner.width > 1;
+                self.text_area.width = inner.width.saturating_sub(u16::from(scrollable));
+                if scrollable {
+                    self.scrollbar_rect = Some(Rect::new(
+                        inner.right().saturating_sub(1),
+                        inner.y,
+                        1,
+                        inner.height,
+                    ));
+                }
+                let visible = self
+                    .guide_lines
+                    .iter()
+                    .skip(self.guide_scroll)
+                    .take(self.text_area.height as usize)
+                    .enumerate()
+                    .map(|(visible_row, line)| {
+                        let absolute_line = self.guide_scroll + visible_row;
+                        Line::from(
+                            line.chars()
+                                .enumerate()
+                                .map(|(column, character)| {
+                                    let selected = self.selection.is_some_and(|selection| {
+                                        let (start, end) = selection.bounds();
+                                        let point = TextPoint {
+                                            line: absolute_line,
+                                            column,
+                                        };
+                                        point >= start && point <= end
+                                    });
+                                    Span::styled(
+                                        character.to_string(),
+                                        if selected {
+                                            Style::default().fg(Color::White).bg(Color::Blue)
+                                        } else {
+                                            Style::default().fg(Color::Red)
+                                        },
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                frame.render_widget(Paragraph::new(visible), self.text_area);
+                if let Some(scrollbar_rect) = self.scrollbar_rect {
+                    let mut state = ScrollbarState::new(self.guide_lines.len())
+                        .position(self.guide_scroll)
+                        .viewport_content_length(self.text_area.height as usize);
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .begin_symbol(None)
+                        .end_symbol(None)
+                        .render(scrollbar_rect, frame.buffer_mut(), &mut state);
+                }
+            }
+            GlabStatus::Ready => {
+                self.guide_lines.clear();
+                self.selection = None;
+                self.ready_viewport = inner.height.saturating_sub(1) as usize;
+                self.ready_scroll = self.ready_scroll.min(self.ready_max_scroll());
+                self.keep_selected_visible();
+                let scrollable = self.ready_max_scroll() > 0 && inner.width > 1;
+                self.text_area.width = inner.width.saturating_sub(u16::from(scrollable));
+                if scrollable {
+                    self.scrollbar_rect = Some(Rect::new(
+                        inner.right().saturating_sub(1),
+                        inner.y,
+                        1,
+                        inner.height,
+                    ));
+                }
+                let mut lines = vec![Line::raw(project)];
+                lines.extend(
+                    self.snapshot
+                        .todos
+                        .iter()
+                        .enumerate()
+                        .skip(self.ready_scroll)
+                        .take(self.ready_viewport)
+                        .map(|(index, todo)| {
+                            let marker = if index == self.selected { ">" } else { " " };
+                            Line::from(format!("{marker} [{}] {}", todo.state, todo.title))
+                        }),
+                );
+                frame.render_widget(
+                    Paragraph::new(lines).style(Style::default().fg(Color::White)),
+                    self.text_area,
+                );
+                if let Some(scrollbar_rect) = self.scrollbar_rect {
+                    let mut state = ScrollbarState::new(self.snapshot.todos.len())
+                        .position(self.ready_scroll)
+                        .viewport_content_length(self.ready_viewport);
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .begin_symbol(None)
+                        .end_symbol(None)
+                        .render(scrollbar_rect, frame.buffer_mut(), &mut state);
+                }
             }
         }
     }
@@ -646,7 +1008,7 @@ impl EmbeddedApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyModifiers, MouseButton};
     use std::sync::{Arc, Mutex};
 
     struct FixtureBackend {
@@ -704,6 +1066,219 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn guide_app(text: &str) -> EmbeddedApp {
+        let mut app = EmbeddedApp::new(Path::new("C:/repo"), Color::White);
+        app.set_snapshot(GlabSnapshot {
+            project: None,
+            todos: Vec::new(),
+            notifications: Vec::new(),
+            status: GlabStatus::Error(format!("setup required\n{text}")),
+        });
+        app
+    }
+
+    fn ready_app(todo_count: usize) -> EmbeddedApp {
+        let mut app = EmbeddedApp::new(Path::new("C:/repo"), Color::White);
+        app.set_snapshot(GlabSnapshot::ready(
+            None,
+            (0..todo_count)
+                .map(|index| TodoItem {
+                    id: index.to_string(),
+                    title: format!("todo {index}"),
+                    state: "pending".into(),
+                })
+                .collect(),
+            Vec::new(),
+        ));
+        app
+    }
+
+    fn render_to_buffer(app: &mut EmbeddedApp, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.render(frame, Rect::new(0, 0, width, height)))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn guide_selection_extracts_unicode_by_character_and_highlights_cells() {
+        let mut app = guide_app("héllo");
+        let _ = render_to_buffer(&mut app, 24, 6);
+
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 1, 2),
+            app.area()
+        ));
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 2, 2),
+            app.area()
+        ));
+        assert_eq!(app.selection_text().as_deref(), Some("hé"));
+
+        let buffer = render_to_buffer(&mut app, 24, 6);
+        assert_eq!(buffer.cell((1, 2)).unwrap().bg, Color::Blue);
+        assert_eq!(buffer.cell((2, 2)).unwrap().bg, Color::Blue);
+    }
+
+    #[test]
+    fn guide_mouse_up_requests_copy_without_touching_os_clipboard() {
+        let mut app = guide_app("copy this");
+        let _ = render_to_buffer(&mut app, 24, 6);
+
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 1, 2),
+            app.area()
+        ));
+        assert!(app.scrollbar_dragging());
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 4, 2),
+            app.area()
+        ));
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 4, 2),
+            app.area()
+        ));
+        assert!(!app.scrollbar_dragging());
+        assert_eq!(app.take_copy_request().as_deref(), Some("copy"));
+    }
+
+    #[test]
+    fn guide_copy_keys_and_right_click_request_copy_but_ctrl_v_is_unhandled() {
+        let mut app = guide_app("copy this");
+        let _ = render_to_buffer(&mut app, 24, 6);
+        app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 1, 2),
+            app.area(),
+        );
+        app.on_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 4, 2),
+            app.area(),
+        );
+        let _ = app.take_copy_request();
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert_eq!(app.take_copy_request().as_deref(), Some("copy"));
+        assert!(app.handle_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )));
+        assert_eq!(app.take_copy_request().as_deref(), Some("copy"));
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 4, 2),
+            app.area()
+        ));
+        assert_eq!(app.take_copy_request().as_deref(), Some("copy"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)));
+        assert!(app.take_copy_request().is_none());
+    }
+
+    #[test]
+    fn guide_scroll_clamps_and_scrollbar_drag_reaches_end() {
+        let mut app = guide_app("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
+        let _ = render_to_buffer(&mut app, 20, 5);
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let max_scroll = app.guide_max_scroll();
+        assert_eq!(app.guide_scroll() as usize, max_scroll);
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 2, 2), app.area());
+        assert_eq!(app.guide_scroll() as usize, max_scroll);
+
+        let scrollbar = app.scrollbar_rect().expect("guide scrollbar");
+        assert!(app.on_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                scrollbar.x,
+                scrollbar.y
+            ),
+            app.area(),
+        ));
+        assert!(app.scrollbar_dragging());
+        assert!(app.on_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                scrollbar.x,
+                scrollbar.bottom().saturating_sub(1),
+            ),
+            app.area(),
+        ));
+        assert_eq!(app.guide_scroll() as usize, max_scroll);
+        assert!(app.on_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                scrollbar.x,
+                scrollbar.bottom().saturating_sub(1),
+            ),
+            app.area(),
+        ));
+        assert!(!app.scrollbar_dragging());
+    }
+
+    #[test]
+    fn ready_list_wheel_scrolls_and_click_selects_visible_todo() {
+        let mut app = ready_app(20);
+        let _ = render_to_buffer(&mut app, 30, 7);
+
+        assert!(app.on_mouse(mouse(MouseEventKind::ScrollDown, 4, 4), app.area()));
+        assert!(app.ready_scroll() > 0);
+        let scroll = app.ready_scroll();
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 4, 3),
+            app.area(),
+        ));
+        assert_eq!(app.selected(), scroll + 1);
+    }
+
+    #[test]
+    fn ready_keyboard_keeps_selection_visible_and_scrollbar_drag_scrolls_viewport() {
+        let mut app = ready_app(20);
+        let _ = render_to_buffer(&mut app, 30, 7);
+
+        for _ in 0..8 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(app.selected(), 8);
+        assert!(app.ready_scroll() > 0);
+
+        let scrollbar = app.scrollbar_rect().expect("ready scrollbar");
+        app.on_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                scrollbar.x,
+                scrollbar.y,
+            ),
+            app.area(),
+        );
+        app.on_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                scrollbar.x,
+                scrollbar.bottom().saturating_sub(1),
+            ),
+            app.area(),
+        );
+        assert_eq!(app.ready_scroll(), app.ready_max_scroll());
+        app.on_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                scrollbar.x,
+                scrollbar.y,
+            ),
+            app.area(),
+        );
+        assert!(!app.scrollbar_dragging());
     }
 
     #[test]

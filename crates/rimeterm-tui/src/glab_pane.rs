@@ -41,6 +41,15 @@ impl GlabPane {
         }
     }
     pub(crate) fn restore_state(&mut self, _state: &rimeterm_config::memory_state::PaneState) {}
+    fn drain_copy_request(&mut self) {
+        let Some(text) = self.app.take_copy_request() else {
+            return;
+        };
+        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+            return;
+        };
+        let _ = clipboard.set_text(text);
+    }
 }
 impl PaneProvider for GlabPane {
     fn as_any(&self) -> Option<&dyn Any> {
@@ -72,16 +81,31 @@ impl PaneProvider for GlabPane {
         }
     }
     fn on_key(&mut self, key: KeyEvent) -> bool {
-        self.app.handle_key(key)
+        let handled = self.app.handle_key(key);
+        self.drain_copy_request();
+        handled
     }
     fn on_mouse(&mut self, event: MouseEvent, area: Rect) -> bool {
-        self.app.on_mouse(event, area)
+        let handled = self.app.on_mouse(event, area);
+        self.drain_copy_request();
+        handled
     }
     fn poll_background(&mut self) -> bool {
-        self.app.poll_background()
+        let changed = self.app.poll_background();
+        self.drain_copy_request();
+        changed
     }
     fn reload(&mut self) {
         self.app.refresh();
+    }
+    fn scrollbar_dragging(&self) -> bool {
+        self.app.scrollbar_dragging()
+    }
+    fn has_active_selection(&self) -> bool {
+        self.app.has_active_selection()
+    }
+    fn wants_mouse_priority(&self, _shift_held: bool) -> bool {
+        self.app.wants_mouse_priority()
     }
 }
 
@@ -126,5 +150,42 @@ mod tests {
             terminal.backend().buffer().cell((0, 0)).unwrap().fg,
             Color::Magenta
         );
+    }
+
+    #[test]
+    fn pane_delegates_mouse_capabilities() {
+        let mut pane = GlabPane::new(PathBuf::from("C:/repo"), Color::White);
+        pane.app.set_error(glab_tui::GlabError::CliMissing {
+            cli: "glab".into(),
+            host: Some(glab_tui::ProjectHost::GitLab),
+        });
+        let backend = TestBackend::new(30, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| pane.app.render(frame, Rect::new(0, 0, 30, 8)))
+            .unwrap();
+
+        assert!(pane.wants_mouse_priority(false));
+        assert!(!pane.has_active_selection());
+        assert!(pane.on_mouse(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 30, 8),
+        ));
+        assert!(pane.scrollbar_dragging());
+        assert!(pane.has_active_selection());
+    }
+
+    #[test]
+    fn ready_pane_wants_mouse_priority() {
+        let mut pane = GlabPane::new(PathBuf::from("C:/repo"), Color::White);
+        pane.app
+            .set_snapshot(glab_tui::GlabSnapshot::ready(None, Vec::new(), Vec::new()));
+
+        assert!(pane.wants_mouse_priority(false));
     }
 }
