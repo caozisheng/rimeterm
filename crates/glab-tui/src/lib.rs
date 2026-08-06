@@ -207,11 +207,10 @@ RimeTerm contains the Glab pane UI. Do not install the glab-tui binary.
    git remote add origin https://gitlab.com/OWNER/REPOSITORY.git
 
 2. Install the glab business backend for your platform:
-   Windows (winget): winget install --id GitLab.glab
+   Windows (winget): winget install --id GLab.GLab
    Windows (Scoop): scoop install glab
    macOS (Homebrew): brew install glab
-   Linux: use your distribution package manager or follow the official instructions at https://gitlab.com/gitlab-org/cli
-   Cargo fallback: cargo install gitlab-cli
+   Linux and other platforms: use your package manager or download an official release from https://gitlab.com/gitlab-org/cli/-/releases
 
 3. Authenticate in your terminal:
    glab auth login
@@ -718,11 +717,10 @@ mod tests {
         for required in [
             "git --version",
             "git remote get-url origin",
-            "winget install --id GitLab.glab",
+            "winget install --id GLab.GLab",
             "scoop install glab",
             "brew install glab",
-            "gitlab.com/gitlab-org/cli",
-            "cargo install gitlab-cli",
+            "https://gitlab.com/gitlab-org/cli/-/releases",
             "glab auth login",
             "RimeTerm does not read or save tokens",
             "Reload",
@@ -732,6 +730,7 @@ mod tests {
                 "missing `{required}` from {guide}"
             );
         }
+        assert!(!guide.contains("cargo install gitlab-cli"));
         assert!(!guide.contains("cargo install glab-tui"));
     }
 
