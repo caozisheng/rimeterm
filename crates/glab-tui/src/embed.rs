@@ -250,8 +250,8 @@ impl EmbeddedApp {
 
     /// Render into the provided frame and rect.  The host is responsible for
     /// setting up the terminal and calling this within `Terminal::draw`.
-    pub fn render(&mut self, frame: &mut Frame<'_>, _area: Rect) {
-        ui::render(frame, &mut self.app);
+    pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        ui::draw_in(frame, area, &mut self.app);
     }
 
     // -- Deadline / visibility ----------------------------------------------
