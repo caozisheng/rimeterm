@@ -22,6 +22,7 @@ use crate::app::{App, Tab};
 use crate::controller::{self, ControllerOutcome, HostAction};
 use crate::event::Event;
 use crate::ui;
+use crate::{GlabError, install_guide};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -105,6 +106,30 @@ pub enum EmbeddedOutcome {
     HostAction(HostAction),
 }
 
+/// Describes why the workspace cannot proceed (CLI missing, auth, etc.).
+#[derive(Debug, Clone)]
+pub struct SetupProblem {
+    /// The underlying error that prevented loading.
+    pub error: GlabError,
+    /// Human-readable install / auth guide text.
+    pub guide: &'static str,
+}
+
+/// Bootstrap state machine for the embedded pane.
+///
+/// The host constructs the pane in [`Detecting`](AppShell::Detecting), and the
+/// first successful or failing poll transitions to one of the other states.
+pub enum AppShell {
+    /// Waiting for the first backend probe to complete.
+    Detecting,
+    /// CLI or authentication is missing; show the install guide.
+    Setup(SetupProblem),
+    /// Fully operational — normal rendering and interaction.
+    Ready(App),
+    /// Previously loaded data is available but the last refresh failed.
+    Offline(App, String),
+}
+
 /// Serialisable state snapshot that the host can persist and later restore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddedState {
@@ -121,6 +146,10 @@ pub struct EmbeddedState {
 pub enum HostActionResult {
     /// An `EditText` action completed; the edited content is returned.
     EditedText(String),
+    /// An `OpenUrl` action completed (success or failure is informational).
+    OpenUrlCompleted,
+    /// A `CopyText` action completed.
+    CopyCompleted,
     /// The host cancelled the action.
     Cancelled,
 }
@@ -149,7 +178,7 @@ pub struct TaggedCompletion {
 /// roots bumps the generation counter, causing in-flight completions to be
 /// silently dropped.
 pub struct EmbeddedApp {
-    app: App,
+    shell: AppShell,
     generation: u64,
     rx: mpsc::UnboundedReceiver<TaggedCompletion>,
     tx: mpsc::UnboundedSender<TaggedCompletion>,
@@ -166,22 +195,17 @@ pub struct EmbeddedApp {
 impl EmbeddedApp {
     /// Create a new embedded app.
     ///
-    /// Returns immediately with the view in a `Loading` state.  The initial
-    /// data fetch is spawned on the supplied `handle`.
+    /// Returns immediately in [`AppShell::Detecting`] state.  The initial
+    /// backend probe is spawned on the supplied `handle`.
     pub fn new(options: EmbeddedOptions, handle: tokio::runtime::Handle) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let mut app = App::new();
-        if let Some(tab) = options.initial_tab {
-            app.active_tab = tab;
-        }
 
         let now = Instant::now();
         let next_refresh = options.refresh.map(|d| now + d);
 
         let mut this = Self {
-            app,
+            shell: AppShell::Detecting,
             generation: 0,
             rx,
             tx,
@@ -201,19 +225,24 @@ impl EmbeddedApp {
     // -- Input handling -----------------------------------------------------
 
     /// Forward a key event.  Returns the outcome the host should act on.
+    /// In non-ready states the key is ignored.
     pub fn handle_key(&mut self, key: KeyEvent) -> EmbeddedOutcome {
-        let outcome = controller::handle_key(
-            &mut self.app,
-            key,
-            self.event_tx.clone(),
-            &mut self.last_refresh,
-        );
+        let app = match &mut self.shell {
+            AppShell::Ready(app) | AppShell::Offline(app, _) => app,
+            _ => return EmbeddedOutcome::Unchanged,
+        };
+        let outcome =
+            controller::handle_key(app, key, self.event_tx.clone(), &mut self.last_refresh);
         Self::translate(outcome)
     }
 
     /// Forward a mouse event.  `area` is the rect this view occupies.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> EmbeddedOutcome {
-        let outcome = controller::handle_mouse(&mut self.app, mouse, area);
+        let app = match &mut self.shell {
+            AppShell::Ready(app) | AppShell::Offline(app, _) => app,
+            _ => return EmbeddedOutcome::Unchanged,
+        };
+        let outcome = controller::handle_mouse(app, mouse, area);
         Self::translate(outcome)
     }
 
@@ -248,10 +277,37 @@ impl EmbeddedApp {
 
     // -- Rendering ----------------------------------------------------------
 
-    /// Render into the provided frame and rect.  The host is responsible for
-    /// setting up the terminal and calling this within `Terminal::draw`.
+    /// Render into the provided frame and rect.
+    ///
+    /// - `Detecting` → shows a brief "loading…" placeholder.
+    /// - `Setup` → shows the install / auth guide from [`install_guide`].
+    /// - `Ready` → delegates to [`ui::draw_in`].
+    /// - `Offline` → delegates to [`ui::draw_in`] with an error banner set.
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        ui::draw_in(frame, area, &mut self.app);
+        match &mut self.shell {
+            AppShell::Detecting => {
+                let block = ratatui::widgets::Block::bordered().title(" glab ");
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                let text = ratatui::widgets::Paragraph::new("Detecting workspace…");
+                frame.render_widget(text, inner);
+            }
+            AppShell::Setup(problem) => {
+                let block = ratatui::widgets::Block::bordered().title(" Setup required ");
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                let text = ratatui::widgets::Paragraph::new(problem.guide)
+                    .wrap(ratatui::widgets::Wrap { trim: false });
+                frame.render_widget(text, inner);
+            }
+            AppShell::Ready(app) => {
+                ui::draw_in(frame, area, app);
+            }
+            AppShell::Offline(app, err) => {
+                app.error_message = Some(err.clone());
+                ui::draw_in(frame, area, app);
+            }
+        }
     }
 
     // -- Deadline / visibility ----------------------------------------------
@@ -280,7 +336,7 @@ impl EmbeddedApp {
     pub fn set_workspace_root(&mut self, root: &Path) {
         self.options.workspace_root = root.to_path_buf();
         self.generation = self.generation.wrapping_add(1);
-        self.app = App::new();
+        self.shell = AppShell::Detecting;
         self.start_load();
     }
 
@@ -294,9 +350,13 @@ impl EmbeddedApp {
 
     /// Take a serialisable snapshot of the current state.
     pub fn snapshot(&self) -> EmbeddedState {
+        let active_tab = match &self.shell {
+            AppShell::Ready(app) | AppShell::Offline(app, _) => app.active_tab,
+            _ => Tab::Issues,
+        };
         EmbeddedState {
             workspace_root: self.options.workspace_root.clone(),
-            active_tab: self.app.active_tab,
+            active_tab,
             generation: self.generation,
         }
     }
@@ -306,9 +366,12 @@ impl EmbeddedApp {
     pub fn restore(&mut self, state: EmbeddedState) {
         let root_changed = self.options.workspace_root != state.workspace_root;
         self.options.workspace_root = state.workspace_root;
-        self.app.active_tab = state.active_tab;
+        if let AppShell::Ready(app) | AppShell::Offline(app, _) = &mut self.shell {
+            app.active_tab = state.active_tab;
+        }
         if root_changed {
             self.generation = self.generation.wrapping_add(1);
+            self.shell = AppShell::Detecting;
             self.start_load();
         }
     }
@@ -318,19 +381,25 @@ impl EmbeddedApp {
         match result {
             HostActionResult::EditedText(text) => {
                 let generation_id = self.generation;
-                let _ = self.tx.send(TaggedCompletion {
-                    generation: generation_id,
-                    event: Event::CommandCompleted(
-                        self.app.active_tab,
-                        if text.is_empty() {
-                            Err("empty edit".into())
-                        } else {
-                            Ok(())
-                        },
-                    ),
-                });
+                let tx = self.tx.clone();
+                if let Some(app) = self.app_mut() {
+                    let tab = app.active_tab;
+                    let _ = tx.send(TaggedCompletion {
+                        generation: generation_id,
+                        event: Event::CommandCompleted(
+                            tab,
+                            if text.is_empty() {
+                                Err("empty edit".into())
+                            } else {
+                                Ok(())
+                            },
+                        ),
+                    });
+                }
             }
-            HostActionResult::Cancelled => { /* no-op */ }
+            HostActionResult::Cancelled
+            | HostActionResult::OpenUrlCompleted
+            | HostActionResult::CopyCompleted => {}
         }
     }
 
@@ -346,9 +415,27 @@ impl EmbeddedApp {
 
     // -- Accessors ----------------------------------------------------------
 
+    /// Borrow the current bootstrap shell state.
+    pub fn shell(&self) -> &AppShell {
+        &self.shell
+    }
+
     /// Borrow the inner `App` for read-only inspection.
-    pub fn app(&self) -> &App {
-        &self.app
+    /// Returns `None` in `Detecting` or `Setup` states.
+    pub fn app(&self) -> Option<&App> {
+        match &self.shell {
+            AppShell::Ready(app) | AppShell::Offline(app, _) => Some(app),
+            _ => None,
+        }
+    }
+
+    /// Mutable borrow of the inner `App`.
+    /// Returns `None` in `Detecting` or `Setup` states.
+    pub fn app_mut(&mut self) -> Option<&mut App> {
+        match &mut self.shell {
+            AppShell::Ready(app) | AppShell::Offline(app, _) => Some(app),
+            _ => None,
+        }
     }
 
     /// Current generation counter.
@@ -387,36 +474,140 @@ impl EmbeddedApp {
     }
 
     fn apply_event(&mut self, event: Event) {
+        // In Detecting state, the first event determines the shell outcome.
+        if matches!(self.shell, AppShell::Detecting) {
+            match &event {
+                Event::FetchFailed(_tab, msg) => {
+                    // Try to parse the message as a setup problem via
+                    // known error patterns.
+                    let problem = Self::detect_setup_problem(msg);
+                    if let Some(p) = problem {
+                        self.shell = AppShell::Setup(p);
+                    } else {
+                        // Unknown failure while detecting — promote to
+                        // Ready with the error message shown.
+                        let mut app = App::new();
+                        if let Some(tab) = self.options.initial_tab {
+                            app.active_tab = tab;
+                        }
+                        app.error_message = Some(msg.clone());
+                        self.shell = AppShell::Ready(app);
+                    }
+                    return;
+                }
+                _ => {
+                    // Any non-failure event → backend is alive → Ready.
+                    let mut app = App::new();
+                    if let Some(tab) = self.options.initial_tab {
+                        app.active_tab = tab;
+                    }
+                    self.shell = AppShell::Ready(app);
+                    // Fall through to apply the event to the new app.
+                }
+            }
+        }
+
+        // Now apply to the inner app (Ready or Offline).
+        let app = match &mut self.shell {
+            AppShell::Ready(app) | AppShell::Offline(app, _) => app,
+            _ => return,
+        };
+
         match event {
             Event::Tick => {
-                self.app.tick();
+                app.tick();
             }
             Event::IssuesFetched(issues) => {
-                self.app.issues.items = issues;
+                app.issues.items = issues;
+                // Successful fetch in Offline → promote back to Ready.
+                self.promote_to_ready_if_offline();
             }
             Event::MrsFetched(mrs) => {
-                self.app.mrs.items = mrs;
+                app.mrs.items = mrs;
+                self.promote_to_ready_if_offline();
             }
             Event::PipelinesFetched(pipelines) => {
-                self.app.pipelines.items = pipelines;
+                app.pipelines.items = pipelines;
+                self.promote_to_ready_if_offline();
             }
             Event::RunnersFetched(runners) => {
-                self.app.runners.items = runners;
+                app.runners.items = runners;
+                self.promote_to_ready_if_offline();
             }
             Event::ReleasesFetched(releases) => {
-                self.app.releases.items = releases;
+                app.releases.items = releases;
+                self.promote_to_ready_if_offline();
             }
             Event::BranchesFetched(branches) => {
-                self.app.branches.items = branches;
+                app.branches.items = branches;
+                self.promote_to_ready_if_offline();
             }
             Event::MilestonesFetched(milestones) => {
-                self.app.milestones.items = milestones;
+                app.milestones.items = milestones;
+                self.promote_to_ready_if_offline();
             }
             Event::FetchFailed(_tab, msg) => {
-                self.app.error_message = Some(msg);
+                // Transition Ready → Offline, keeping cached data.
+                if matches!(self.shell, AppShell::Ready(_)) {
+                    if let AppShell::Ready(app) = std::mem::replace(
+                        &mut self.shell,
+                        AppShell::Detecting, // placeholder
+                    ) {
+                        self.shell = AppShell::Offline(app, msg);
+                    }
+                } else if let AppShell::Offline(_, ref mut err) = self.shell {
+                    *err = msg;
+                }
             }
             _ => { /* other events handled as needed */ }
         }
+    }
+
+    /// If currently `Offline`, promote back to `Ready` (clears the error).
+    fn promote_to_ready_if_offline(&mut self) {
+        if matches!(self.shell, AppShell::Offline(_, _)) {
+            if let AppShell::Offline(app, _) = std::mem::replace(
+                &mut self.shell,
+                AppShell::Detecting, // placeholder
+            ) {
+                self.shell = AppShell::Ready(app);
+            }
+        }
+    }
+
+    /// Try to map an error message into a [`SetupProblem`].
+    fn detect_setup_problem(msg: &str) -> Option<SetupProblem> {
+        // Match the Display output of known GlabError variants.
+        let error = if msg.contains("is not installed") {
+            if msg.contains("glab") {
+                GlabError::CliMissing {
+                    cli: "glab".into(),
+                    host: None,
+                }
+            } else if msg.contains("gh") {
+                GlabError::CliMissing {
+                    cli: "gh".into(),
+                    host: None,
+                }
+            } else {
+                GlabError::CliMissing {
+                    cli: msg.to_string(),
+                    host: None,
+                }
+            }
+        } else if msg.contains("not authenticated") {
+            // Default to GitLab; the guide still helps.
+            GlabError::NotAuthenticated {
+                message: msg.to_string(),
+                host: crate::ProjectHost::GitLab,
+            }
+        } else if msg.contains("not a Git repository") {
+            GlabError::NotRepository
+        } else {
+            return None;
+        };
+
+        install_guide(&error).map(|guide| SetupProblem { error, guide })
     }
 
     fn translate(outcome: ControllerOutcome) -> EmbeddedOutcome {
@@ -468,7 +659,7 @@ mod tests {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let app = EmbeddedApp {
-            app: App::new(),
+            shell: AppShell::Ready(App::new()),
             generation: 1,
             rx,
             tx: tx.clone(),
@@ -483,6 +674,45 @@ mod tests {
         };
 
         // Keep rt alive by leaking — test-only.
+        std::mem::forget(rt);
+
+        (app, tx)
+    }
+
+    /// Helper: create an `EmbeddedApp` in `Detecting` state.
+    fn test_app_detecting() -> (EmbeddedApp, mpsc::UnboundedSender<TaggedCompletion>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+
+        let opts = EmbeddedOptions {
+            workspace_root: PathBuf::from("/test/repo"),
+            initial_tab: None,
+            cache_policy: CachePolicy::Manual,
+            refresh: None,
+            features: EmbeddedFeatures::default(),
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let app = EmbeddedApp {
+            shell: AppShell::Detecting,
+            generation: 1,
+            rx,
+            tx: tx.clone(),
+            handle,
+            event_tx,
+            event_rx: Some(event_rx),
+            visible: true,
+            next_refresh: None,
+            refresh_interval: None,
+            last_refresh: Instant::now(),
+            options: opts,
+        };
+
         std::mem::forget(rt);
 
         (app, tx)
@@ -538,7 +768,9 @@ mod tests {
     #[test]
     fn snapshot_restore_roundtrip() {
         let (mut app, _tx) = test_app();
-        app.app.active_tab = Tab::Pipelines;
+        if let Some(inner) = app.app_mut() {
+            inner.active_tab = Tab::Pipelines;
+        }
 
         let snap = app.snapshot();
         assert_eq!(snap.active_tab, Tab::Pipelines);
@@ -560,9 +792,6 @@ mod tests {
         let (mut app, tx) = test_app();
         app.shutdown();
 
-        // Sending after shutdown should still succeed on the sender side
-        // (unbounded channel sender doesn't error on closed receiver until
-        // it's dropped), but poll should not process anything.
         let generation_id = app.generation();
         let _ = tx.send(TaggedCompletion {
             generation: generation_id,
@@ -583,5 +812,55 @@ mod tests {
 
         app.set_visible(true);
         assert!(app.visible);
+    }
+
+    // -- AppShell bootstrap tests -------------------------------------------
+
+    #[test]
+    fn detecting_stays_when_no_completions() {
+        let (mut app, _tx) = test_app_detecting();
+        assert!(matches!(app.shell(), &AppShell::Detecting));
+
+        let changed = app.poll_background();
+        assert!(!changed, "no completions → no state change");
+        assert!(matches!(app.shell(), &AppShell::Detecting));
+    }
+
+    #[test]
+    fn detecting_transitions_to_setup_on_cli_missing() {
+        let (mut app, tx) = test_app_detecting();
+        let generation_id = app.generation();
+
+        tx.send(TaggedCompletion {
+            generation: generation_id,
+            event: Event::FetchFailed(Tab::Issues, "glab is not installed".into()),
+        })
+        .unwrap();
+
+        let changed = app.poll_background();
+        assert!(changed);
+        assert!(
+            matches!(app.shell(), AppShell::Setup(_)),
+            "CLI-missing failure in Detecting should transition to Setup"
+        );
+    }
+
+    #[test]
+    fn detecting_transitions_to_ready_on_success() {
+        let (mut app, tx) = test_app_detecting();
+        let generation_id = app.generation();
+
+        tx.send(TaggedCompletion {
+            generation: generation_id,
+            event: Event::Tick,
+        })
+        .unwrap();
+
+        let changed = app.poll_background();
+        assert!(changed);
+        assert!(
+            matches!(app.shell(), AppShell::Ready(_)),
+            "successful event in Detecting should transition to Ready"
+        );
     }
 }

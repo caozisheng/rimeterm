@@ -48,6 +48,14 @@ pub enum HostAction {
     /// spawn the editor, then return the edited content through the
     /// event channel.
     EditText { content: String, suffix: String },
+    /// Open a URL in the system browser.
+    /// The host should call the platform opener (e.g. `open`, `xdg-open`,
+    /// `start`) and report completion via [`HostActionResult::OpenUrlCompleted`].
+    OpenUrl(String),
+    /// Copy text to the system clipboard.
+    /// The host should interact with the OS clipboard and report completion
+    /// via [`HostActionResult::CopyCompleted`].
+    CopyText(String),
 }
 
 // ---------------------------------------------------------------------------
