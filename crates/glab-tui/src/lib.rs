@@ -8,6 +8,7 @@ mod backend;
 mod cli;
 mod command;
 mod config;
+pub(crate) mod controller;
 mod domain;
 mod editor;
 mod entity_editor;

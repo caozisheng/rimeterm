@@ -1,4 +1,3 @@
-use crate::AppTerminal;
 use crate::app::App;
 use crate::entity_editor::{apply_field_text_change, rebuild_edit_menu};
 use crate::event::Event;
@@ -12,7 +11,6 @@ use tokio::sync::mpsc::UnboundedSender;
 pub fn handle_confirm_popup(
     app: &mut App,
     key_event: &KeyEvent,
-    terminal: &mut AppTerminal,
     tx: UnboundedSender<Event>,
 ) -> bool {
     if let Some(confirm_action) = app.confirm_popup.take() {
@@ -402,12 +400,7 @@ pub fn handle_refresh(
     false
 }
 
-pub fn handle_date_picker(
-    app: &mut App,
-    key_event: &KeyEvent,
-    terminal: &mut AppTerminal,
-    tx: UnboundedSender<Event>,
-) -> bool {
+pub fn handle_date_picker(app: &mut App, key_event: &KeyEvent, tx: UnboundedSender<Event>) -> bool {
     if let Some(mut date_picker) = app.date_picker.take() {
         match key_event.code {
             KeyCode::Esc | KeyCode::Char('q') => {}
@@ -450,7 +443,6 @@ pub fn handle_date_picker(
                             entity_iid,
                             &field_type,
                             selected_val,
-                            terminal,
                             tx,
                             active_tab,
                         );

@@ -1,0 +1,156 @@
+//! Pure event→outcome reducer for glab-tui.
+//!
+//! Every key or mouse event enters through [`handle_key`] or [`handle_mouse`]
+//! and returns a [`ControllerOutcome`] that the host loop can interpret without
+//! the controller touching the terminal or spawning processes itself.
+
+use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
+use std::time::Instant;
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::app::App;
+use crate::event::Event;
+
+// ---------------------------------------------------------------------------
+// Outcome types
+// ---------------------------------------------------------------------------
+
+/// What the host loop should do after a key/mouse event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControllerOutcome {
+    /// Nothing changed; the host may skip a redraw.
+    Unchanged,
+    /// App state mutated; the host should redraw.
+    Changed,
+    /// The user requested to quit the application.
+    ExitRequested,
+    /// The controller wants to run an external command.
+    Command(CommandIntent),
+    /// The controller needs the host to perform a side-effect that
+    /// requires terminal ownership (e.g. spawning an editor).
+    HostAction(HostAction),
+}
+
+/// An intent to run a command — the host decides *how*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandIntent {
+    /// Run a CLI command and feed the result back through the event channel.
+    Cli { program: String, args: Vec<String> },
+}
+
+/// Side-effects that require terminal ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostAction {
+    /// Open an external editor with the given text content.
+    /// `suffix` is the temp-file extension (e.g. ".md", ".txt").
+    /// The host should write `content` to a temp file, leave raw mode,
+    /// spawn the editor, then return the edited content through the
+    /// event channel.
+    EditText { content: String, suffix: String },
+}
+
+// ---------------------------------------------------------------------------
+// Key handling
+// ---------------------------------------------------------------------------
+
+/// Top-level key dispatcher. Calls into the handler modules and translates
+/// their results into a [`ControllerOutcome`].
+pub fn handle_key(
+    app: &mut App,
+    key: KeyEvent,
+    tx: UnboundedSender<Event>,
+    last_refresh: &mut Instant,
+) -> ControllerOutcome {
+    // Overlay handlers run first — they swallow keys when an overlay is active.
+    if crate::handlers::overlays::handle_confirm_popup(app, &key, tx.clone()) {
+        return ControllerOutcome::Changed;
+    }
+    if crate::handlers::overlays::handle_help_overlay(app, &key) {
+        return ControllerOutcome::Changed;
+    }
+    if crate::handlers::overlays::handle_date_picker(app, &key, tx.clone()) {
+        return ControllerOutcome::Changed;
+    }
+    if crate::handlers::overlays::handle_help_keybinding(app, &key) {
+        return ControllerOutcome::Changed;
+    }
+    if crate::handlers::overlays::handle_switch_repo(app, &key) {
+        return ControllerOutcome::Changed;
+    }
+    if crate::handlers::overlays::handle_refresh(app, &key, last_refresh, tx.clone()) {
+        return ControllerOutcome::Changed;
+    }
+
+    // Tab-specific key handling is async; we cannot call it directly from a
+    // sync fn.  The host loop should call `handle_active_tab_key` itself
+    // when none of the overlay handlers consumed the key.
+    //
+    // For now return Unchanged to signal "not consumed by overlays".
+    ControllerOutcome::Unchanged
+}
+
+/// Top-level mouse dispatcher.  Routes the mouse event to the correct
+/// widget based on a z-order hit-test against the current layout rectangles.
+pub fn handle_mouse(_app: &mut App, _mouse: MouseEvent, _area: Rect) -> ControllerOutcome {
+    // Mouse z-order routing will be wired in a later phase once the
+    // UI layout rectangles are exposed on App.  For now, delegate to
+    // per-widget on_mouse methods that already exist on App/EmbeddedApp.
+    ControllerOutcome::Unchanged
+}
+
+// ---------------------------------------------------------------------------
+// Geometry helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when (`col`, `row`) falls inside `rect` (inclusive).
+#[inline]
+pub fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && col < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+/// Shrink `rect` by one cell on each side (the border of a `Block`).
+/// Returns `Rect::ZERO` when the area is too small.
+#[inline]
+pub fn border_inner(rect: Rect) -> Rect {
+    if rect.width < 2 || rect.height < 2 {
+        Rect::ZERO
+    } else {
+        Rect {
+            x: rect.x + 1,
+            y: rect.y + 1,
+            width: rect.width - 2,
+            height: rect.height - 2,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rect_contains_basic() {
+        let r = Rect::new(5, 5, 10, 10);
+        assert!(rect_contains(r, 5, 5));
+        assert!(rect_contains(r, 14, 14));
+        assert!(!rect_contains(r, 15, 15));
+        assert!(!rect_contains(r, 4, 5));
+    }
+
+    #[test]
+    fn border_inner_shrinks() {
+        let r = Rect::new(0, 0, 10, 10);
+        let inner = border_inner(r);
+        assert_eq!(inner, Rect::new(1, 1, 8, 8));
+    }
+
+    #[test]
+    fn border_inner_too_small() {
+        assert_eq!(border_inner(Rect::new(0, 0, 1, 1)), Rect::ZERO);
+        assert_eq!(border_inner(Rect::new(0, 0, 0, 0)), Rect::ZERO);
+    }
+}

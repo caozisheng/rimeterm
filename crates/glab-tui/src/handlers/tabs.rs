@@ -1,4 +1,3 @@
-use crate::AppTerminal;
 use crate::app::App;
 use crate::entity_editor::rebuild_edit_menu;
 use crate::event::Event;
@@ -13,7 +12,6 @@ use tokio::sync::mpsc::UnboundedSender;
 pub async fn handle_active_tab_key(
     app: &mut App,
     key_event: &KeyEvent,
-    terminal: &mut AppTerminal,
     tx: UnboundedSender<Event>,
 ) {
     let mut handled = true;
@@ -1216,39 +1214,17 @@ pub async fn handle_active_tab_key(
                             key_event,
                         ) =>
                         {
+                            // TODO(Task 8): Replace with HostAction::EditText
+                            // The upstream code launched an external editor with
+                            // raw-mode suspension here. That terminal side effect
+                            // is removed; the trace is written to a temp file but
+                            // the editor is not opened until the host action flow
+                            // is implemented.
                             let temp_file =
                                 std::env::temp_dir().join(format!("job_{}_trace.txt", job_id));
                             if let Some(trace) = &app.job_trace {
                                 let _ = std::fs::write(&temp_file, trace);
-                            } else if let Some(_) = &app.gitlab_client {
-                                let _ = std::fs::write(&temp_file, "Trace will be here");
                             }
-                            crate::event::PAUSED.store(true, std::sync::atomic::Ordering::Relaxed);
-                            let _ = crossterm::terminal::disable_raw_mode();
-                            let _ = crossterm::execute!(
-                                std::io::stdout(),
-                                crossterm::terminal::LeaveAlternateScreen,
-                                crossterm::event::DisableMouseCapture
-                            );
-                            let editor = std::env::var("EDITOR")
-                                .or_else(|_| std::env::var("VISUAL"))
-                                .unwrap_or_else(|_| "helix".to_string());
-                            let mut cmd = std::process::Command::new(&editor);
-                            cmd.arg(temp_file.as_os_str());
-                            cmd.stdin(std::process::Stdio::inherit());
-                            cmd.stdout(std::process::Stdio::inherit());
-                            cmd.stderr(std::process::Stdio::inherit());
-                            if let Ok(mut child) = cmd.spawn() {
-                                let _ = child.wait();
-                            }
-                            let _ = crossterm::terminal::enable_raw_mode();
-                            let _ = crossterm::execute!(
-                                std::io::stdout(),
-                                crossterm::terminal::EnterAlternateScreen,
-                                crossterm::event::EnableMouseCapture
-                            );
-                            let _ = terminal.clear();
-                            crate::event::PAUSED.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
                         _ if keybinding_matches(
                             &app.config.keybindings.jobs.view_trace,

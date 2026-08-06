@@ -1,4 +1,3 @@
-use crate::AppTerminal;
 use crate::app::App;
 use crate::event::Event;
 
@@ -8,7 +7,6 @@ pub fn apply_field_text_change(
     iid: u64,
     field_type: &str,
     value: String,
-    terminal: &mut AppTerminal,
     tx: tokio::sync::mpsc::UnboundedSender<Event>,
     tab: crate::app::Tab,
 ) {
@@ -271,7 +269,6 @@ pub fn apply_selector_changes(
     iid: u64,
     field_type: &str,
     values: Vec<String>,
-    terminal: &mut AppTerminal,
     tx: tokio::sync::mpsc::UnboundedSender<Event>,
     tab: crate::app::Tab,
 ) {
@@ -756,15 +753,6 @@ mod tests {
         app.mrs.items = vec![mr];
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
-        let mut terminal = ratatui::Terminal::with_options(
-            backend,
-            ratatui::TerminalOptions {
-                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
-            },
-        )
-        .unwrap();
-
         // Clear milestone by passing empty values or "None" on Issue
         apply_selector_changes(
             &mut app,
@@ -772,7 +760,6 @@ mod tests {
             1,
             "milestone",
             vec!["None".to_string()],
-            &mut terminal,
             tx.clone(),
             crate::app::Tab::Issues,
         );
@@ -786,7 +773,6 @@ mod tests {
             1,
             "milestone",
             vec!["None".to_string()],
-            &mut terminal,
             tx,
             crate::app::Tab::MergeRequests,
         );
