@@ -62,9 +62,10 @@ impl PaneProvider for GlabPane {
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        _ctx: &PaneRenderCtx<'_>,
+        ctx: &PaneRenderCtx<'_>,
     ) -> RenderOutcome {
-        self.app.render(frame, area);
+        self.app
+            .render_with_context(frame, area, ctx.focused, ctx.focus_color);
         RenderOutcome {
             request_redraw: matches!(self.app.snapshot().status, glab_tui::GlabStatus::Loading),
             cursor: None,
@@ -88,15 +89,42 @@ impl PaneProvider for GlabPane {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
+
     #[test]
     fn pane_uses_native_embedded_app() {
         let pane = GlabPane::new(PathBuf::from("C:/repo"), Color::White);
         assert_eq!(pane.title(), "Glab");
         assert_eq!(pane.workspace_root(), Path::new("C:/repo"));
     }
+
     #[test]
     fn pane_forwards_keys_without_pty() {
         let mut pane = GlabPane::new(PathBuf::from("C:/repo"), Color::White);
         assert!(pane.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn focused_render_uses_context_focus_color() {
+        let mut pane = GlabPane::new(PathBuf::from("C:/repo"), Color::White);
+        let backend = TestBackend::new(30, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                pane.render(
+                    Rect::new(0, 0, 30, 8),
+                    frame,
+                    &PaneRenderCtx {
+                        focused: true,
+                        title_override: None,
+                        focus_color: Color::Magenta,
+                    },
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 0)).unwrap().fg,
+            Color::Magenta
+        );
     }
 }

@@ -4485,6 +4485,21 @@ impl App {
                 }
             }
         }
+        if let Some(glab_id) = self
+            .left_top_catalog
+            .iter()
+            .find(|entry| entry.id == "glab")
+            .map(|entry| entry.pane)
+        {
+            if let Some(pane) = self.panes.get_mut(glab_id) {
+                if let Some(glab) = pane
+                    .as_any_mut()
+                    .and_then(|any| any.downcast_mut::<crate::glab_pane::GlabPane>())
+                {
+                    glab.refresh_for(&resolved);
+                }
+            }
+        }
     }
     /// Clear the boot-progress spinner if either the target pane has
     /// produced first output or the timeout deadline hit. Called each

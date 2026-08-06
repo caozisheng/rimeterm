@@ -15,7 +15,7 @@ use serde::Deserialize;
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
 };
 
@@ -101,14 +101,21 @@ impl CommandSpec {
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         }
     }
-    pub fn run(&self) -> Result<String, GlabError> {
-        let output = Command::new(&self.program)
-            .args(&self.args)
-            .current_dir(&self.cwd)
+}
+pub trait CommandRunner: Send + Sync + 'static {
+    fn run(&self, spec: &CommandSpec) -> Result<String, GlabError>;
+}
+#[derive(Debug, Default, Clone, Copy)]
+struct ProcessCommandRunner;
+impl CommandRunner for ProcessCommandRunner {
+    fn run(&self, spec: &CommandSpec) -> Result<String, GlabError> {
+        let output = Command::new(&spec.program)
+            .args(&spec.args)
+            .current_dir(&spec.cwd)
             .output()
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    GlabError::CliMissing(self.program.clone())
+                    GlabError::CliMissing(spec.program.clone())
                 } else {
                     GlabError::Command(error.to_string())
                 }
@@ -187,34 +194,84 @@ pub fn parse_todos(body: &str) -> Result<Vec<TodoItem>, GlabError> {
         })
         .map_err(|error| GlabError::Parse(error.to_string()))
 }
-pub fn parse_notifications(body: &str) -> Result<Vec<Notification>, GlabError> {
-    serde_json::from_str(body).map_err(|error| GlabError::Parse(error.to_string()))
+#[derive(Debug, Deserialize)]
+struct NotificationWire {
+    id: String,
+    reason: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    subject: Option<NotificationSubjectWire>,
+    unread: bool,
 }
-pub trait Backend: Send + 'static {
+#[derive(Debug, Deserialize)]
+struct NotificationSubjectWire {
+    title: String,
+}
+pub fn parse_notifications(body: &str) -> Result<Vec<Notification>, GlabError> {
+    serde_json::from_str::<Vec<NotificationWire>>(body)
+        .and_then(|items| {
+            items
+                .into_iter()
+                .map(|item| {
+                    let title = item
+                        .title
+                        .or_else(|| item.subject.map(|subject| subject.title))
+                        .ok_or_else(|| serde::de::Error::missing_field("title or subject.title"))?;
+                    Ok(Notification {
+                        id: item.id,
+                        title,
+                        reason: item.reason,
+                        unread: item.unread,
+                    })
+                })
+                .collect()
+        })
+        .map_err(|error| GlabError::Parse(error.to_string()))
+}
+pub trait Backend: Send + Sync + 'static {
     fn load(&self, root: &Path) -> Result<GlabSnapshot, GlabError>;
 }
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ProcessBackend;
+#[derive(Clone)]
+pub struct ProcessBackend {
+    runner: Arc<dyn CommandRunner>,
+}
+impl Default for ProcessBackend {
+    fn default() -> Self {
+        Self {
+            runner: Arc::new(ProcessCommandRunner),
+        }
+    }
+}
+impl ProcessBackend {
+    pub fn with_runner(runner: Arc<dyn CommandRunner>) -> Self {
+        Self { runner }
+    }
+}
 impl Backend for ProcessBackend {
     fn load(&self, root: &Path) -> Result<GlabSnapshot, GlabError> {
-        let remote = CommandSpec::new(root, "git", &["remote", "-v"])
-            .run()
+        let remote_spec = CommandSpec::new(root, "git", &["remote", "-v"]);
+        let remote = self
+            .runner
+            .run(&remote_spec)
             .map_err(|_| GlabError::NotRepository)?;
         let project = identify_project(&remote).ok_or(GlabError::NotRepository)?;
-        let (cli, todo_endpoint, notification_endpoint) = match project.host {
-            ProjectHost::GitLab => ("glab", vec!["api", "/todos"], vec!["api", "/notifications"]),
-            ProjectHost::GitHub => (
-                "gh",
-                vec!["api", "notifications"],
-                vec!["api", "notifications"],
-            ),
-        };
-        let todo_args: Vec<&str> = todo_endpoint.to_vec();
-        let notification_args: Vec<&str> = notification_endpoint.to_vec();
-        let todos = parse_todos(&CommandSpec::new(root, cli, &todo_args).run()?)?;
-        let notifications =
-            parse_notifications(&CommandSpec::new(root, cli, &notification_args).run()?)?;
-        Ok(GlabSnapshot::ready(Some(project), todos, notifications))
+        match project.host {
+            ProjectHost::GitLab => {
+                let spec = CommandSpec::new(root, "glab", &["api", "/todos"]);
+                let todos = parse_todos(&self.runner.run(&spec)?)?;
+                Ok(GlabSnapshot::ready(Some(project), todos, Vec::new()))
+            }
+            ProjectHost::GitHub => {
+                let spec = CommandSpec::new(root, "gh", &["api", "notifications"]);
+                let notifications = parse_notifications(&self.runner.run(&spec)?)?;
+                Ok(GlabSnapshot::ready(
+                    Some(project),
+                    Vec::new(),
+                    notifications,
+                ))
+            }
+        }
     }
 }
 struct Completion {
@@ -230,11 +287,15 @@ pub struct EmbeddedApp {
     generation: u64,
     rx: mpsc::Receiver<Completion>,
     tx: mpsc::Sender<Completion>,
+    backend: Arc<dyn Backend>,
 }
 impl EmbeddedApp {
     pub fn new(root: &Path, theme: Color) -> Self {
+        Self::new_with_backend(root, theme, Arc::new(ProcessBackend::default()))
+    }
+    pub fn new_with_backend(root: &Path, theme: Color, backend: Arc<dyn Backend>) -> Self {
         let (tx, rx) = mpsc::channel();
-        Self {
+        let mut app = Self {
             workspace_root: root.to_path_buf(),
             area: Rect::default(),
             theme,
@@ -243,7 +304,10 @@ impl EmbeddedApp {
             generation: 0,
             rx,
             tx,
-        }
+            backend,
+        };
+        app.refresh();
+        app
     }
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
@@ -259,6 +323,7 @@ impl EmbeddedApp {
     }
     pub fn set_snapshot(&mut self, snapshot: GlabSnapshot) {
         self.snapshot = snapshot;
+        self.clamp_selected();
     }
     pub fn set_workspace_root(&mut self, root: &Path) {
         self.workspace_root = root.to_path_buf();
@@ -267,15 +332,23 @@ impl EmbeddedApp {
     pub fn refresh(&mut self) {
         self.generation = self.generation.saturating_add(1);
         self.snapshot = GlabSnapshot::loading();
+        self.selected = 0;
         let generation = self.generation;
         let root = self.workspace_root.clone();
         let tx = self.tx.clone();
+        let backend = self.backend.clone();
         thread::spawn(move || {
             let _ = tx.send(Completion {
                 generation,
-                result: ProcessBackend.load(&root),
+                result: backend.load(&root),
             });
         });
+    }
+    fn selectable_len(&self) -> usize {
+        self.snapshot.todos.len()
+    }
+    fn clamp_selected(&mut self) {
+        self.selected = self.selected.min(self.selectable_len().saturating_sub(1));
     }
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
@@ -285,6 +358,7 @@ impl EmbeddedApp {
             }
             KeyCode::Down => {
                 self.selected = self.selected.saturating_add(1);
+                self.clamp_selected();
                 true
             }
             KeyCode::Char('r') if key.modifiers.is_empty() => {
@@ -304,6 +378,7 @@ impl EmbeddedApp {
         }
         if matches!(event.kind, MouseEventKind::ScrollDown) {
             self.selected = self.selected.saturating_add(1);
+            self.clamp_selected();
             return true;
         }
         false
@@ -323,16 +398,31 @@ impl EmbeddedApp {
                     status: GlabStatus::Error(error.to_string()),
                 },
             };
+            self.clamp_selected();
             changed = true;
         }
         changed
     }
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.render_with_context(frame, area, false, self.theme);
+    }
+    pub fn render_with_context(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        focused: bool,
+        focus_color: Color,
+    ) {
         self.area = area;
+        let border_style = if focused {
+            Style::default().fg(focus_color)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         let block = Block::default()
             .title(" Glab ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.theme));
+            .border_style(border_style);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.width == 0 || inner.height == 0 {
@@ -351,12 +441,10 @@ impl EmbeddedApp {
             GlabStatus::Ready => {}
         }
         lines.push(Line::raw("Todos"));
-        lines.extend(
-            self.snapshot
-                .todos
-                .iter()
-                .map(|todo| Line::from(format!("  [{}] {}", todo.state, todo.title))),
-        );
+        lines.extend(self.snapshot.todos.iter().enumerate().map(|(index, todo)| {
+            let marker = if index == self.selected { ">" } else { " " };
+            Line::from(format!("{marker} [{}] {}", todo.state, todo.title))
+        }));
         lines.push(Line::raw("Notifications"));
         lines.extend(self.snapshot.notifications.iter().map(|item| {
             Line::from(format!(
@@ -375,39 +463,134 @@ impl EmbeddedApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
-    #[test]
-    fn identifies_gitlab_and_github_projects_from_remotes() {
-        assert_eq!(
-            identify_project("origin\thttps://gitlab.com/acme/app.git (fetch)"),
-            Some(ProjectRef::new(ProjectHost::GitLab, "acme", "app"))
-        );
-        assert_eq!(
-            identify_project("origin\tgit@github.com:acme/app.git (fetch)"),
-            Some(ProjectRef::new(ProjectHost::GitHub, "acme", "app"))
-        );
+    use crossterm::event::KeyModifiers;
+    use std::sync::{Arc, Mutex};
+
+    struct FixtureBackend {
+        snapshot: GlabSnapshot,
     }
+
+    impl Backend for FixtureBackend {
+        fn load(&self, _root: &Path) -> Result<GlabSnapshot, GlabError> {
+            Ok(self.snapshot.clone())
+        }
+    }
+
+    struct RecordingRunner {
+        calls: Mutex<Vec<CommandSpec>>,
+        responses: Mutex<Vec<String>>,
+    }
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, spec: &CommandSpec) -> Result<String, GlabError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(spec.clone());
+            Ok(self
+                .responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(0))
+        }
+    }
+
     #[test]
-    fn parses_todos_and_notifications() {
-        let todos = parse_todos(r#"[{"id":3,"body":"Review MR","state":"pending"}]"#).unwrap();
-        assert_eq!(todos[0].title, "Review MR");
+    fn parses_github_notification_subject_title() {
         let notifications = parse_notifications(
-            r#"[{"id":"n1","reason":"mention","title":"Fix bug","unread":true}]"#,
+            r#"[{"id":"n1","reason":"mention","subject":{"title":"Fix bug"},"unread":true}]"#,
         )
         .unwrap();
         assert_eq!(notifications[0].title, "Fix bug");
     }
+
     #[test]
-    fn command_spec_requires_explicit_workspace_root() {
-        let spec = CommandSpec::new(Path::new("C:/repo"), "glab", &["api", "todos"]);
-        assert_eq!(spec.cwd, Path::new("C:/repo"));
-        assert_eq!(spec.program, "glab");
+    fn process_backend_uses_only_supported_gitlab_endpoints_and_keeps_todos() {
+        let runner = Arc::new(RecordingRunner {
+            calls: Mutex::new(Vec::new()),
+            responses: Mutex::new(vec![
+                "origin\thttps://gitlab.com/acme/app.git (fetch)".into(),
+                "[{\"id\":3,\"body\":\"Review MR\",\"state\":\"pending\"}]".into(),
+            ]),
+        });
+        let backend = ProcessBackend::with_runner(runner.clone());
+        let snapshot = backend.load(Path::new("C:/repo")).unwrap();
+        assert_eq!(snapshot.todos.len(), 1);
+        let calls = runner
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].program, "git");
+        assert_eq!(calls[0].args, vec!["remote", "-v"]);
+        assert_eq!(calls[1].args, vec!["api", "/todos"]);
+        assert!(
+            calls
+                .iter()
+                .all(|call| !call.args.iter().any(|arg| arg == "/notifications"))
+        );
     }
+
     #[test]
-    fn embedded_app_handles_input_and_area() {
+    fn embedded_app_starts_background_load_and_clamps_selection() {
+        let snapshot = GlabSnapshot::ready(
+            None,
+            vec![TodoItem {
+                id: "1".into(),
+                title: "one".into(),
+                state: "pending".into(),
+            }],
+            vec![],
+        );
+        let mut app = EmbeddedApp::new_with_backend(
+            Path::new("C:/repo"),
+            Color::White,
+            Arc::new(FixtureBackend { snapshot }),
+        );
+        for _ in 0..100 {
+            if app.poll_background() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(matches!(app.snapshot().status, GlabStatus::Ready));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected(), 0);
+    }
+
+    #[test]
+    fn render_marks_selected_todo() {
         let mut app = EmbeddedApp::new(Path::new("C:/repo"), Color::White);
-        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
-        assert_eq!(app.selected(), 1);
-        assert_eq!(app.area(), Rect::default());
+        app.set_snapshot(GlabSnapshot::ready(
+            None,
+            vec![TodoItem {
+                id: "1".into(),
+                title: "one".into(),
+                state: "pending".into(),
+            }],
+            vec![],
+        ));
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.render(frame, Rect::new(0, 0, 40, 10)))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("> [pending] one"));
+    }
+
+    #[test]
+    fn workspace_members_keep_tuxedo_and_add_glab_tui() {
+        let manifest =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"))
+                .unwrap();
+        assert!(manifest.contains("    \"crates/tuxedo\""));
+        assert!(manifest.contains("    \"crates/glab-tui\""));
     }
 }

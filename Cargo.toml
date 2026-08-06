@@ -13,6 +13,7 @@ members = [
     "crates/rimeterm-models",
     "crates/rimeterm-stock",
     "crates/rimeterm-zones",
+    "crates/tuxedo",
     "crates/glab-tui",
 ]
 
