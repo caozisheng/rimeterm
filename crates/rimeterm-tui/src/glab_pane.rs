@@ -1,11 +1,6 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 use glab_tui::EmbeddedApp;
-use ratatui::{
-    Frame,
-    layout::Rect,
-    style::{Color, Style},
-    widgets::{Block, Borders, Paragraph},
-};
+use ratatui::{Frame, layout::Rect, style::Color};
 use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
 use std::any::Any;
 use std::path::{Path, PathBuf};
@@ -14,7 +9,6 @@ pub struct GlabPane {
     id: PaneId,
     root: PathBuf,
     app: EmbeddedApp,
-    theme: Color,
 }
 impl GlabPane {
     pub fn new(root: PathBuf, theme: Color) -> Self {
@@ -22,7 +16,6 @@ impl GlabPane {
             id: PaneId::next(),
             app: EmbeddedApp::new(&root, theme),
             root,
-            theme,
         }
     }
     pub fn workspace_root(&self) -> &Path {
