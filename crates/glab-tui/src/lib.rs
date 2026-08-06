@@ -3,6 +3,24 @@
 //! This library deliberately does not own a terminal, cwd, PTY, or process
 //! loop. The host supplies the workspace root and forwards input and frames.
 
+mod app;
+mod backend;
+mod cli;
+mod config;
+mod domain;
+mod editor;
+mod entity_editor;
+mod event;
+mod fetch;
+mod git_helpers;
+pub mod handlers;
+mod keybinding;
+mod templates;
+mod ui;
+pub mod utils;
+
+type AppTerminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
