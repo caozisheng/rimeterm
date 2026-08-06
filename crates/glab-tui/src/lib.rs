@@ -500,10 +500,7 @@ impl EmbeddedApp {
         self.ready_scroll
     }
     pub fn ready_max_scroll(&self) -> usize {
-        self.snapshot
-            .todos
-            .len()
-            .saturating_sub(self.ready_viewport)
+        self.ready_content_len().saturating_sub(self.ready_viewport)
     }
     pub fn scrollbar_rect(&self) -> Option<Rect> {
         self.scrollbar_rect
@@ -608,6 +605,11 @@ impl EmbeddedApp {
         self.selection_dragging = false;
         self.scrollbar_dragging = false;
         self.pending_copy = None;
+    }
+    fn ready_content_len(&self) -> usize {
+        self.snapshot.todos.len().saturating_add(
+            (!self.snapshot.notifications.is_empty()) as usize + self.snapshot.notifications.len(),
+        )
     }
     fn selectable_len(&self) -> usize {
         self.snapshot.todos.len()
@@ -721,7 +723,12 @@ impl EmbeddedApp {
                     selection.focus = point;
                 }
                 self.selection_dragging = false;
-                self.request_copy();
+                if self
+                    .selection
+                    .is_some_and(|selection| selection.anchor != selection.focus)
+                {
+                    self.request_copy();
+                }
                 true
             }
             MouseEventKind::Down(MouseButton::Right) if self.has_active_selection() => {
@@ -963,7 +970,6 @@ impl EmbeddedApp {
                 self.selection = None;
                 self.ready_viewport = inner.height.saturating_sub(1) as usize;
                 self.ready_scroll = self.ready_scroll.min(self.ready_max_scroll());
-                self.keep_selected_visible();
                 let scrollable = self.ready_max_scroll() > 0 && inner.width > 1;
                 self.text_area.width = inner.width.saturating_sub(u16::from(scrollable));
                 if scrollable {
@@ -980,19 +986,30 @@ impl EmbeddedApp {
                         .todos
                         .iter()
                         .enumerate()
-                        .skip(self.ready_scroll)
-                        .take(self.ready_viewport)
                         .map(|(index, todo)| {
                             let marker = if index == self.selected { ">" } else { " " };
                             Line::from(format!("{marker} [{}] {}", todo.state, todo.title))
-                        }),
+                        })
+                        .chain(
+                            (!self.snapshot.notifications.is_empty())
+                                .then(|| Line::raw("Notifications")),
+                        )
+                        .chain(self.snapshot.notifications.iter().map(|item| {
+                            Line::from(format!(
+                                "  {} {}",
+                                if item.unread { "*" } else { " " },
+                                item.title
+                            ))
+                        }))
+                        .skip(self.ready_scroll)
+                        .take(self.ready_viewport),
                 );
                 frame.render_widget(
                     Paragraph::new(lines).style(Style::default().fg(Color::White)),
                     self.text_area,
                 );
                 if let Some(scrollbar_rect) = self.scrollbar_rect {
-                    let mut state = ScrollbarState::new(self.snapshot.todos.len())
+                    let mut state = ScrollbarState::new(self.ready_content_len())
                         .position(self.ready_scroll)
                         .viewport_content_length(self.ready_viewport);
                     Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -1156,6 +1173,36 @@ mod tests {
     }
 
     #[test]
+    fn guide_click_does_not_copy_but_drag_selection_does() {
+        let mut app = guide_app("copy this");
+        let _ = render_to_buffer(&mut app, 24, 6);
+
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 1, 2),
+            app.area()
+        ));
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 1, 2),
+            app.area()
+        ));
+        assert!(app.take_copy_request().is_none());
+
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 1, 2),
+            app.area()
+        ));
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 4, 2),
+            app.area()
+        ));
+        assert!(app.on_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 4, 2),
+            app.area()
+        ));
+        assert_eq!(app.take_copy_request().as_deref(), Some("copy"));
+    }
+
+    #[test]
     fn guide_copy_keys_and_right_click_request_copy_but_ctrl_v_is_unhandled() {
         let mut app = guide_app("copy this");
         let _ = render_to_buffer(&mut app, 24, 6);
@@ -1279,6 +1326,35 @@ mod tests {
             app.area(),
         );
         assert!(!app.scrollbar_dragging());
+    }
+
+    #[test]
+    fn ready_notifications_render_titles_and_scrollbar() {
+        let mut app = EmbeddedApp::new(Path::new("C:/repo"), Color::White);
+        app.set_snapshot(GlabSnapshot::ready(
+            Some(ProjectRef::new(ProjectHost::GitHub, "acme", "app")),
+            Vec::new(),
+            (0..12)
+                .map(|index| Notification {
+                    id: index.to_string(),
+                    title: format!("notification {index}"),
+                    reason: "mention".into(),
+                    unread: index % 2 == 0,
+                })
+                .collect(),
+        ));
+
+        let rendered = rendered_text(&mut app, 30, 7);
+        assert!(rendered.contains("Notifications"));
+        assert!(rendered.contains("notification 0"));
+        assert!(app.scrollbar_rect().is_some());
+
+        for _ in 0..10 {
+            assert!(app.on_mouse(mouse(MouseEventKind::ScrollDown, 4, 4), app.area()));
+        }
+        assert_eq!(app.ready_scroll(), app.ready_max_scroll());
+        let rendered = rendered_text(&mut app, 30, 7);
+        assert!(rendered.contains("notification 11"));
     }
 
     #[test]
