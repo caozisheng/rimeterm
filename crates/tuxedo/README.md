@@ -27,7 +27,7 @@ For a more in-depth walkthrough, please watch [this video](https://www.youtube.c
 - **Command palette.** `:` or `Ctrl-P` opens a fuzzy palette over every action — type a few letters, hit Enter. Same matcher as `/` search, ranked so start-of-label hits beat word-boundary hits beat mid-word hits.
 - **Atomic, sync-friendly writes.** Every change goes through write-temp-then-rename. If another process — Dropbox, an editor, a script — modifies the file, tuxedo reloads on the next keypress (or within ~250 ms while idle) and flashes a notice.
 - **Sibling-file archive.** `A` moves completed tasks to `done.txt` next to your file, atomically.
-- **Filter, sort, multi-select.** Cycle by `+project` or `@context`, sort by priority / due / file order, and bulk-complete or bulk-delete in visual mode.
+- **Filter, sort, multi-select.** Cycle filters by `+project` or `@context`, sort by priority / due / project / context / file order, and bulk-complete or bulk-delete in visual mode.
 - **Saved searches.** Name the active `/`-search with `fs`, then recall it any time by cycling saved filters with `ff`. Stored as plain `filter.<name>` lines in the config — hand-editable like everything else.
 - **Five themes, three densities.** Cycle with `T` and `D`. Choices persist across runs and hot-reload when you edit `config.toml` externally.
 - **No daemon, no database, no cloud.** One file in, one file out.
@@ -399,7 +399,7 @@ The modal keys below apply in Normal mode:
 | `fc` | filter by context (`j` / `k` cycles, `Esc` clears) |
 | `ff` | pick a saved search (`j` / `k` cycles, `Enter` keeps, `Esc` reverts) |
 | `fs` | save the active `/`-search as a named filter |
-| `S` | cycle sort: priority → due → file order |
+| `S` | cycle sort: priority → due → project → context → file order |
 | `v` | enter visual / multi-select; `space` toggles a row |
 | `x` / `dd` (in visual) | bulk-complete / bulk-delete the selection |
 | `l` | list (default) view |

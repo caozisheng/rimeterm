@@ -391,7 +391,7 @@ mod tests {
     fn embedded_cycle_sort_advances_view_sort_pref() {
         // The embedded pane omits the `config` feature by default, but sort
         // is a view preference and MUST still cycle so hosts (like the
-        // rimeterm Todo tab) can group by project / due date on demand.
+        // rimeterm Todo tab) can use every supported grouping mode.
         let (todo, done) = paths("cycle-sort");
         std::fs::write(&todo, "live\n").expect("write todo");
         let mut embedded = EmbeddedApp::new(todo, done, "live\n".into());

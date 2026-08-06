@@ -16,7 +16,10 @@ pub enum GroupKey {
     /// First `+project` name (case-preserved) under `Sort::Project`; `None`
     /// covers tasks with no project tag.
     ListProject(Option<String>),
-    /// Completed tasks under `Sort::Priority` / `Sort::Due` / `Sort::Project`.
+    /// First `@context` name (case-preserved) under `Sort::Context`; `None`
+    /// covers tasks with no context tag.
+    ListContext(Option<String>),
+    /// Completed tasks under every grouped list sort.
     /// Rendered as a COMPLETED section pinned to the bottom of the live list.
     Completed,
 }
@@ -49,8 +52,8 @@ impl App {
         let tasks = self.store.tasks();
         let today = self.store.today();
 
-        // Partition into pending vs done so the COMPLETED group can be pinned
-        // to the bottom under Priority/Due sorts. File sort keeps disk order.
+        // Partition pending vs done so COMPLETED stays pinned below every
+        // grouped sort. File sort keeps disk order and interleaves both.
         let (mut pending, mut done): (Vec<usize>, Vec<usize>) = (0..tasks.len())
             .filter(|&i| {
                 filter::list_predicate(
@@ -118,6 +121,19 @@ impl App {
                 let mut groups = Vec::with_capacity(pending.len() + done.len());
                 for &i in &pending {
                     groups.push(GroupKey::ListProject(tasks[i].projects.first().cloned()));
+                    idxs.push(i);
+                }
+                for &i in &done {
+                    groups.push(GroupKey::Completed);
+                    idxs.push(i);
+                }
+                (idxs, groups)
+            }
+            Sort::Context => {
+                let mut idxs = Vec::with_capacity(pending.len() + done.len());
+                let mut groups = Vec::with_capacity(pending.len() + done.len());
+                for &i in &pending {
+                    groups.push(GroupKey::ListContext(tasks[i].contexts.first().cloned()));
                     idxs.push(i);
                 }
                 for &i in &done {
@@ -404,5 +420,69 @@ mod tests {
         assert_eq!(groups[0], GroupKey::ListProject(Some("alpha".into())));
         assert_eq!(groups[1], GroupKey::ListProject(Some("Beta".into())));
         assert_eq!(groups[2], GroupKey::ListProject(Some("BETA".into())));
+    }
+
+    #[test]
+    fn list_groups_track_first_context_under_sort_context() {
+        let mut app = build_app(
+            "(B) beta @zeta @alpha\n\
+             (B) alpha-b @alpha\n\
+             untagged\n\
+             (A) alpha-a @alpha\n\
+             x 2026-05-05 finished @alpha\n",
+        );
+        app.prefs.sort = Sort::Context;
+        app.recompute_visible();
+
+        assert_eq!(
+            app.visible_groups(),
+            &[
+                GroupKey::ListContext(Some("alpha".into())),
+                GroupKey::ListContext(Some("alpha".into())),
+                GroupKey::ListContext(Some("zeta".into())),
+                GroupKey::ListContext(None),
+                GroupKey::Completed,
+            ]
+        );
+        let idxs = app.visible_indices();
+        assert_eq!(app.tasks()[idxs[0]].priority, Some('A'));
+        assert_eq!(app.tasks()[idxs[2]].contexts[0], "zeta");
+    }
+
+    #[test]
+    fn context_sort_respects_context_filter_and_completed_group() {
+        let mut app = build_app(
+            "pending @Beta\n\
+             filtered @alpha\n\
+             x 2026-05-05 completed @Beta\n\
+             other @gamma\n",
+        );
+        app.prefs.sort = Sort::Context;
+        app.filter.context = Some("Beta".into());
+        app.recompute_visible();
+
+        assert_eq!(
+            app.visible_groups(),
+            &[
+                GroupKey::ListContext(Some("Beta".into())),
+                GroupKey::Completed,
+            ]
+        );
+    }
+
+    #[test]
+    fn context_sort_is_case_insensitive_but_preserves_display_case() {
+        let mut app = build_app("a @Beta\nb @alpha\nc @BETA\n");
+        app.prefs.sort = Sort::Context;
+        app.recompute_visible();
+
+        assert_eq!(
+            app.visible_groups(),
+            &[
+                GroupKey::ListContext(Some("alpha".into())),
+                GroupKey::ListContext(Some("Beta".into())),
+                GroupKey::ListContext(Some("BETA".into())),
+            ]
+        );
     }
 }

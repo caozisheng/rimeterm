@@ -264,8 +264,7 @@ impl Store {
     ///
     /// State is preserved verbatim: a task archived while done comes back done,
     /// a task archived while pending comes back pending. Restoration point is
-    /// the tail of the live list — priority/due-based sorts will place it
-    /// visually next to its peers.
+    /// the tail of the live list; grouped sorts place it next to its peers.
     pub fn unarchive(&mut self, archive_idx: usize) -> UnarchiveOutcome {
         match self.reconcile() {
             Reconcile::Unchanged => {}

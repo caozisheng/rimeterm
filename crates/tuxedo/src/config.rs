@@ -262,7 +262,7 @@ mod tests {
         let c = Config {
             theme: Some("Nord".into()),
             density: Some(Density::Cozy),
-            sort: Some(Sort::Due),
+            sort: Some(Sort::Context),
             show_left: Some(false),
             show_right: Some(true),
             show_line_num: Some(false),
@@ -282,6 +282,7 @@ mod tests {
         let s = serialize(&c);
         let parsed = parse(&s);
         assert_eq!(parsed, c);
+        assert!(s.contains("sort = context\n"));
     }
 
     #[test]

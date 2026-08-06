@@ -101,7 +101,8 @@ impl Prefs {
         self.sort = match self.sort {
             Sort::Priority => Sort::Due,
             Sort::Due => Sort::Project,
-            Sort::Project => Sort::File,
+            Sort::Project => Sort::Context,
+            Sort::Context => Sort::File,
             Sort::File => Sort::Priority,
         };
         format!("sort: {}", self.sort)
@@ -151,5 +152,23 @@ impl Prefs {
         cfg.show_future = Some(self.show_future);
         cfg.hidden_keys = self.hidden_keys.clone();
         cfg.save()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cycle_sort_includes_context_between_project_and_file() {
+        let mut prefs = Prefs::from_config(Config {
+            sort: Some(Sort::Project),
+            ..Config::default()
+        });
+
+        assert_eq!(prefs.cycle_sort(), "sort: context");
+        assert_eq!(prefs.sort, Sort::Context);
+        assert_eq!(prefs.cycle_sort(), "sort: file");
+        assert_eq!(prefs.sort, Sort::File);
     }
 }

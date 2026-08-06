@@ -1,0 +1,36 @@
+---
+source: crates/tuxedo/tests/snapshots.rs
+expression: buffer_to_styled(&buf)
+---
+{bg=#1f232b} {/}{fg=#8aa9c9 bg=#1f232b}▶{/}{fg=#e07a7a bg=#1f232b}▮{/}{fg=#8aa9c9 bg=#1f232b}◀{/}{bg=#1f232b} {/}{fg=#c8ccd4 bg=#1f232b mod=bold}/tmp/tuxedo-snapshot.txt{/}{fg=#6b7280 bg=#1f232b}  •  5 tasks  •  {/}{fg=#8aa9c9 bg=#1f232b}sort:context{/}{bg=#1f232b}                                          {/}
+{bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23} {/}{fg=#6b7280 bg=#1a1d23}(1){/}{fg=#c8ccd4 bg=#1a1d23}  {/}{fg=#c89a6e bg=#1a1d23 mod=bold}@alpha{/}{fg=#c8ccd4 bg=#1a1d23}  {/}{fg=#2a2f38 bg=#1a1d23}─────────────────────────────────────────────────────────────────────────{/}{fg=#c8ccd4 bg=#1a1d23}             {/}
+{fg=#6b7280 bg=#1a1d23}  1 {/}{fg=#8aa9c9 bg=#1a1d23 mod=bold}▸ {/}{fg=#e07a7a bg=#1a1d23 mod=bold}(A) {/}{fg=#c8ccd4 bg=#1a1d23}Fix build {/}{fg=#c89a6e bg=#1a1d23}@alpha{/}{fg=#c8ccd4 bg=#1a1d23}                                                                          {/}
+{fg=#c8ccd4 bg=#1a1d23} {/}{fg=#6b7280 bg=#1a1d23}(1){/}{fg=#c8ccd4 bg=#1a1d23}  {/}{fg=#c89a6e bg=#1a1d23 mod=bold}@phone{/}{fg=#c8ccd4 bg=#1a1d23}  {/}{fg=#2a2f38 bg=#1a1d23}─────────────────────────────────────────────────────────────────────────{/}{fg=#c8ccd4 bg=#1a1d23}             {/}
+{fg=#6b7280 bg=#1a1d23}  2 {/}{fg=#8aa9c9 bg=#1a1d23}  {/}{fg=#e07a7a bg=#1a1d23 mod=bold}(A) {/}{fg=#c8ccd4 bg=#1a1d23}Call Alice {/}{fg=#c89a6e bg=#1a1d23}@phone{/}{fg=#c8ccd4 bg=#1a1d23}                                                                         {/}
+{fg=#c8ccd4 bg=#1a1d23} {/}{fg=#6b7280 bg=#1a1d23}(1){/}{fg=#c8ccd4 bg=#1a1d23}  {/}{fg=#c89a6e bg=#1a1d23 mod=bold}@zeta{/}{fg=#c8ccd4 bg=#1a1d23}  {/}{fg=#2a2f38 bg=#1a1d23}──────────────────────────────────────────────────────────────────────────{/}{fg=#c8ccd4 bg=#1a1d23}             {/}
+{fg=#6b7280 bg=#1a1d23}  3 {/}{fg=#8aa9c9 bg=#1a1d23}  {/}{fg=#d4b06a bg=#1a1d23 mod=bold}(B) {/}{fg=#c8ccd4 bg=#1a1d23}Review draft {/}{fg=#c89a6e bg=#1a1d23}@zeta{/}{fg=#c8ccd4 bg=#1a1d23} {/}{fg=#c89a6e bg=#1a1d23}@alpha{/}{fg=#c8ccd4 bg=#1a1d23}                                                                 {/}
+{fg=#c8ccd4 bg=#1a1d23} {/}{fg=#6b7280 bg=#1a1d23}(1){/}{fg=#c8ccd4 bg=#1a1d23}  {/}{fg=#6b7280 bg=#1a1d23 mod=bold}NO CONTEXT{/}{fg=#c8ccd4 bg=#1a1d23}  {/}{fg=#2a2f38 bg=#1a1d23}─────────────────────────────────────────────────────────────────────{/}{fg=#c8ccd4 bg=#1a1d23}             {/}
+{fg=#6b7280 bg=#1a1d23}  4 {/}{fg=#8aa9c9 bg=#1a1d23}  {/}{fg=#c8ccd4 bg=#1a1d23}    Untagged task                                                                             {/}
+{fg=#c8ccd4 bg=#1a1d23} {/}{fg=#6b7280 bg=#1a1d23}(1){/}{fg=#c8ccd4 bg=#1a1d23}  {/}{fg=#6b7280 bg=#1a1d23 mod=bold}COMPLETED{/}{fg=#c8ccd4 bg=#1a1d23}  {/}{fg=#2a2f38 bg=#1a1d23}──────────────────────────────────────────────────────────────────────{/}{fg=#c8ccd4 bg=#1a1d23}             {/}
+{fg=#6b7280 bg=#1a1d23}  5 {/}{fg=#5a6270 bg=#1a1d23}✓     {/}{fg=#5a6270 bg=#1a1d23 mod=dim}Finished{/}{fg=#c8ccd4 bg=#1a1d23} {/}{fg=#5a6270 bg=#1a1d23 mod=dim}task{/}{fg=#c8ccd4 bg=#1a1d23} {/}{fg=#5a6270 bg=#1a1d23}@phone{/}{fg=#c8ccd4 bg=#1a1d23}                                                                      {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#c8ccd4 bg=#1a1d23}                                                                                                    {/}
+{fg=#1a1d23 bg=#8aa9c9 mod=bold} NORMAL {/}{bg=#252a33}  {/}{fg=#a8b0bc bg=#252a33}j/k · n new · x done · dd archive · a archived · / s{/}{fg=#6b7280 bg=#252a33}5 open · 2026-05-06 · tuxedo 2026.7.1 {/}

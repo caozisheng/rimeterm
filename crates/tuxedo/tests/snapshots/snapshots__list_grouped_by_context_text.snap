@@ -1,0 +1,36 @@
+---
+source: crates/tuxedo/tests/snapshots.rs
+expression: buffer_to_text(&buf)
+---
+ ▶▮◀ /tmp/tuxedo-snapshot.txt  •  5 tasks  •  sort:context                                          
+                                                                                                    
+ (1)  @alpha  ─────────────────────────────────────────────────────────────────────────             
+  1 ▸ (A) Fix build @alpha                                                                          
+ (1)  @phone  ─────────────────────────────────────────────────────────────────────────             
+  2   (A) Call Alice @phone                                                                         
+ (1)  @zeta  ──────────────────────────────────────────────────────────────────────────             
+  3   (B) Review draft @zeta @alpha                                                                 
+ (1)  NO CONTEXT  ─────────────────────────────────────────────────────────────────────             
+  4       Untagged task                                                                             
+ (1)  COMPLETED  ──────────────────────────────────────────────────────────────────────             
+  5 ✓     Finished task @phone                                                                      
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+ NORMAL   j/k · n new · x done · dd archive · a archived · / s5 open · 2026-05-06 · tuxedo 2026.7.1

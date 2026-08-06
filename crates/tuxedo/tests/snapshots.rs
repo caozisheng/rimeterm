@@ -269,6 +269,34 @@ fn list_grouped_by_due() {
 }
 
 #[test]
+fn list_grouped_by_context() {
+    let body = "(B) Review draft @zeta @alpha\n\
+                (A) Call Alice @phone\n\
+                Untagged task\n\
+                (A) Fix build @alpha\n\
+                x 2026-05-05 2026-05-01 Finished task @phone\n";
+    let fixture = Path::new(FIXTURE_PATH);
+    if let Some(parent) = fixture.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(fixture, body).expect("seed context fixture file");
+    let mut app = App::new(
+        PathBuf::from(FIXTURE_PATH),
+        body.to_string(),
+        "2026-05-06".to_string(),
+        Config {
+            sort: Some(tuxedo::app::Sort::Context),
+            density: Some(Density::Compact),
+            show_left: Some(false),
+            show_right: Some(false),
+            ..Config::default()
+        },
+    );
+    app.config_path = Some(PathBuf::from(FIXTURE_CONFIG_PATH));
+    snapshot_app("list_grouped_by_context", &mut app);
+}
+
+#[test]
 fn list_no_sidebars() {
     let mut app = make_app();
     app.prefs.layout.left = false;

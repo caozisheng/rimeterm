@@ -206,6 +206,8 @@ fn group_count_key(gk: &GroupKey) -> String {
         GroupKey::ListDue(b) => format!("d:{}", b.label()),
         GroupKey::ListProject(Some(name)) => format!("proj:{name}"),
         GroupKey::ListProject(None) => "proj:_".to_string(),
+        GroupKey::ListContext(Some(name)) => format!("ctx:{name}"),
+        GroupKey::ListContext(None) => "ctx:_".to_string(),
         GroupKey::Completed => "completed".to_string(),
         // Not produced for List view; encode defensively.
         GroupKey::Archive => "archive".to_string(),
@@ -220,6 +222,8 @@ fn group_header<'a>(theme: &Theme, gk: &GroupKey, count: usize) -> Line<'a> {
         GroupKey::ListDue(b) => (b.label().to_string(), due_bucket_color(theme, *b)),
         GroupKey::ListProject(Some(name)) => (format!("+{name}"), theme.accent),
         GroupKey::ListProject(None) => ("NO PROJECT".to_string(), theme.dim),
+        GroupKey::ListContext(Some(name)) => (format!("@{name}"), theme.context),
+        GroupKey::ListContext(None) => ("NO CONTEXT".to_string(), theme.dim),
         GroupKey::Completed => ("COMPLETED".to_string(), theme.dim),
         // Defensive fallthrough — not produced under List view.
         GroupKey::Archive => ("ARCHIVE".to_string(), theme.accent),

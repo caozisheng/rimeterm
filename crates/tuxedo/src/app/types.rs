@@ -69,6 +69,7 @@ pub enum Sort {
     Priority,
     Due,
     Project,
+    Context,
     File,
 }
 
@@ -78,6 +79,7 @@ impl Sort {
             Sort::Priority => "priority",
             Sort::Due => "due",
             Sort::Project => "project",
+            Sort::Context => "context",
             Sort::File => "file",
         }
     }
@@ -96,6 +98,7 @@ impl FromStr for Sort {
             "priority" => Ok(Sort::Priority),
             "due" => Ok(Sort::Due),
             "project" => Ok(Sort::Project),
+            "context" => Ok(Sort::Context),
             "file" => Ok(Sort::File),
             _ => Err(()),
         }

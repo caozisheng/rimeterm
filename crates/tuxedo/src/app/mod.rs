@@ -117,8 +117,8 @@ pub struct App {
     visible_cache: Vec<usize>,
     /// Parallel to `visible_cache`: `visible_groups[i]` is the group key for
     /// the row at `visible_cache[i]`. `GroupKey::None` for List under
-    /// `Sort::File`; priority/due bucket keys under other List sorts; date
-    /// keys for Archive. Renderers read this to draw section headers.
+    /// `Sort::File`; priority, due, project, or context keys under grouped
+    /// List sorts; date keys for Archive. Renderers read this for headings.
     visible_groups: Vec<crate::app::visibility::GroupKey>,
     /// Latest known release tag, populated asynchronously by the update
     /// checker. `None` while we haven't heard back (or the check is disabled,
