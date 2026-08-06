@@ -223,7 +223,7 @@ RimeTerm 继续读取唯一 crossterm event stream。全局菜单、tab strip、
 
 浏览器和 editor 只能作为 `HostAction` 交给 RimeTerm；初始 editor feature 关闭。
 
-认证沿用 `glab auth login` / `gh auth login` 已有配置和环境。RimeTerm 不读取、复制、缓存或记录 token，也不自动发起 login。缺少 CLI 或未认证时，pane 保留 offline cache 并显示可操作错误。命令日志不得记录 token、请求 body 或 credential-bearing URL。
+认证沿用 `glab auth login` / `gh auth login` 已有配置和环境。RimeTerm 不读取、复制、缓存或记录 token，也不自动发起 login。缺少 CLI、未认证或当前目录无法识别为带有效 `origin` 的 GitLab/GitHub 仓库时，首次打开 pane 显示完整、可执行的多行安装说明，而不是单行错误；已有 cache 可继续保留。说明包含 `git` 前置与 `origin` 检查、GitLab 的 Windows winget/Scoop、macOS Homebrew、Linux 包管理器/官方安装方式与 Cargo fallback、GitHub 的 Windows winget/Scoop、macOS Homebrew、Linux 包管理器/官方安装页、对应的 `glab auth login`/`gh auth login` 和重新加载动作。说明在 pane 内用换行与滚动保证小区域完整可查看；不得安装 `glab-tui` binary。
 
 ## 11. Workspace root 更新
 
@@ -256,7 +256,7 @@ RimeTerm 继续读取唯一 crossterm event stream。全局菜单、tab strip、
 
 remote data cache 保留 project-keyed 语义，路径由显式 root/project 计算，写入使用临时文件 + rename。UI memory 与 remote data cache 分开。
 
-读取失败显示错误且不覆盖当前内存；网络失败时若已有 cache，显示 Offline 状态并继续可读；无 cache 才进入 Error/Empty。错误不得使 RimeTerm 退出。
+读取失败显示错误且不覆盖当前内存；网络失败时若已有 cache，显示 Offline 状态并继续可读；无 cache 才进入 Error/Empty。CLI 缺失、认证缺失和仓库识别失败进入 setup guide 状态，Ready 状态不重复显示安装说明。错误不得使 RimeTerm 退出。
 
 ## 13. 测试与验收
 
@@ -268,9 +268,9 @@ remote data cache 保留 project-keyed 语义，路径由显式 root/project 计
 - generation 过滤：切 root 后旧 completion 不污染新项目。
 - `set_workspace_root` 不改变 process cwd，所有 Command 收到显式 cwd。
 - hidden pane 不启动周期刷新，但仍 drain completion；visible 恢复时到期刷新一次。
-- snapshot/restore 稳定字段 round-trip，不含 secret/transient state。
-- fake command runner 验证 argv、cwd、stdout/stderr、缺失 CLI 和 auth failure。
-- GitLab/GitHub 双 backend 的 Todos/Notifications 与 project context。
+- setup guide 映射测试覆盖 `CliMissing`、`NotAuthenticated`、`NotRepository`、GitLab/GitHub 关键命令、token 脱敏提示和不安装 `glab-tui`。
+- Ready 状态不含安装说明；小 pane 的多行 guide 渲染、键盘和鼠标滚动不 panic 且可移动。
+- fake command runner 验证缺失 CLI/认证错误保留已识别的 host。
 
 ### RimeTerm 集成测试
 
