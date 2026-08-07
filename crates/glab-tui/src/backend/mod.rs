@@ -1,0 +1,380 @@
+pub mod gh;
+pub mod glab;
+
+use crate::domain::branches::Branch;
+use crate::domain::deployments::{Deployment, Environment};
+use crate::domain::issues::Issue;
+use crate::domain::milestones::Milestone;
+use crate::domain::mr::{DiscussionNote, MergeRequest};
+use crate::domain::notifications::Notification;
+use crate::domain::pipelines::{Job, Pipeline};
+use crate::domain::releases::Release;
+use crate::domain::runners::Runner;
+use crate::event::Event;
+use anyhow::Result;
+use async_trait::async_trait;
+use std::collections::HashMap;
+use tokio::sync::mpsc::UnboundedSender;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    GitLab,
+    GitHub,
+}
+
+impl BackendKind {
+    pub fn is_github(self) -> bool {
+        matches!(self, BackendKind::GitHub)
+    }
+
+    pub fn is_gitlab(self) -> bool {
+        matches!(self, BackendKind::GitLab)
+    }
+
+    pub fn term(self, key: &str) -> &'static str {
+        match (self, key) {
+            (BackendKind::GitLab, "mr") => "Merge Request",
+            (BackendKind::GitHub, "mr") => "Pull Request",
+            (BackendKind::GitLab, "mr_short") => "MR",
+            (BackendKind::GitHub, "mr_short") => "PR",
+            (BackendKind::GitLab, "pipeline") => "Pipeline",
+            (BackendKind::GitHub, "pipeline") => "Action",
+            (BackendKind::GitLab, "pipeline_plural") => "Pipelines",
+            (BackendKind::GitHub, "pipeline_plural") => "Actions",
+            (BackendKind::GitLab, "todo") => "Todo",
+            (BackendKind::GitHub, "todo") => "Notification",
+            (BackendKind::GitLab, "todo_plural") => "Todos",
+            (BackendKind::GitHub, "todo_plural") => "Notifications",
+            _ => "",
+        }
+    }
+}
+
+#[async_trait]
+pub trait Backend: Send + Sync {
+    fn clone_box(&self) -> Box<dyn Backend>;
+    fn kind(&self) -> BackendKind;
+    fn program(&self) -> &'static str;
+
+    fn set_tx(&mut self, tx: UnboundedSender<Event>);
+
+    // ── Issues ──
+    /// `page_size` is the total item budget across all pages; `per_request` is how many
+    /// items each HTTP call asks for.
+    async fn list_issues(
+        &self,
+        project: &str,
+        show_closed: bool,
+        page_size: usize,
+        per_request: usize,
+    ) -> Result<Vec<Issue>>;
+    async fn get_issue(&self, project: &str, iid: u64) -> Result<Issue>;
+    async fn close_issue(&self, project: &str, iid: u64) -> Result<()>;
+    async fn reopen_issue(&self, project: &str, iid: u64) -> Result<()>;
+    async fn delete_issue(&self, project: &str, iid: u64) -> Result<()>;
+    async fn create_issue(
+        &self,
+        project: &str,
+        title: &str,
+        description: &str,
+        labels: &str,
+        assignees: &str,
+        milestone: &str,
+        due_date: &str,
+        weight: &str,
+    ) -> Result<()>;
+    async fn update_issue_title(&self, project: &str, iid: u64, title: &str) -> Result<()>;
+    async fn update_issue_description(
+        &self,
+        project: &str,
+        iid: u64,
+        description: &str,
+    ) -> Result<()>;
+    async fn update_issue_labels(
+        &self,
+        project: &str,
+        iid: u64,
+        add_labels: &[String],
+        remove_labels: &[String],
+    ) -> Result<()>;
+    async fn update_issue_assignees(
+        &self,
+        project: &str,
+        iid: u64,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<()>;
+    async fn update_issue_milestone(&self, project: &str, iid: u64, milestone: &str) -> Result<()>;
+    async fn update_issue_due_date(&self, project: &str, iid: u64, due_date: &str) -> Result<()>;
+    async fn update_issue_weight(&self, project: &str, iid: u64, weight: &str) -> Result<()>;
+    async fn update_issue_confidential(
+        &self,
+        project: &str,
+        iid: u64,
+        confidential: bool,
+    ) -> Result<()>;
+
+    // ── Merge Requests ──
+    /// `page_size` is the total item budget across all pages; `per_request` is how many
+    /// items each HTTP call asks for.
+    async fn list_mrs(
+        &self,
+        project: &str,
+        show_closed: bool,
+        page_size: usize,
+        per_request: usize,
+    ) -> Result<Vec<MergeRequest>>;
+    async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest>;
+    async fn get_mr_diff(&self, project: &str, iid: u64) -> Result<String>;
+    async fn list_mr_notes(
+        &self,
+        project: &str,
+        mr_iid: u64,
+        page_size: usize,
+    ) -> Result<Vec<DiscussionNote>>;
+    async fn close_mr(&self, project: &str, iid: u64) -> Result<()>;
+    async fn reopen_mr(&self, project: &str, iid: u64) -> Result<()>;
+    async fn delete_mr(&self, project: &str, iid: u64) -> Result<()>;
+    async fn approve_mr(&self, project: &str, iid: u64) -> Result<()>;
+    /// Revoke your own approval. GitLab only — see the GhBackend impl.
+    async fn revoke_mr(&self, project: &str, iid: u64) -> Result<()>;
+    /// Rebase the source branch onto the target. Supported on both hosts.
+    async fn rebase_mr(&self, project: &str, iid: u64) -> Result<()>;
+    async fn merge_mr(
+        &self,
+        project: &str,
+        iid: u64,
+        squash: bool,
+        delete_branch: bool,
+        strategy: Option<&str>,
+    ) -> Result<()>;
+    async fn toggle_mr_draft(&self, project: &str, iid: u64, is_draft: bool) -> Result<()>;
+    async fn create_mr(
+        &self,
+        project: &str,
+        title: &str,
+        description: &str,
+        source_branch: &str,
+        target_branch: &str,
+        labels: &str,
+        assignees: &str,
+        reviewers: &str,
+        milestone: &str,
+        issue_iid: Option<u64>,
+    ) -> Result<()>;
+    async fn add_mr_comment(
+        &self,
+        project: &str,
+        iid: u64,
+        body: &str,
+        file_path: Option<&str>,
+        line: Option<u64>,
+        old_line: Option<u64>,
+    ) -> Result<()>;
+    async fn update_mr_title(&self, project: &str, iid: u64, title: &str) -> Result<()>;
+    async fn update_mr_description(&self, project: &str, iid: u64, description: &str)
+    -> Result<()>;
+    async fn update_mr_labels(
+        &self,
+        project: &str,
+        iid: u64,
+        add_labels: &[String],
+        remove_labels: &[String],
+    ) -> Result<()>;
+    async fn update_mr_assignees(
+        &self,
+        project: &str,
+        iid: u64,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<()>;
+    async fn update_mr_reviewers(
+        &self,
+        project: &str,
+        iid: u64,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<()>;
+    async fn update_mr_milestone(&self, project: &str, iid: u64, milestone: &str) -> Result<()>;
+    async fn update_mr_target_branch(&self, project: &str, iid: u64, branch: &str) -> Result<()>;
+
+    // ── Browser ──
+    async fn open_in_browser(&self, project: &str, entity: &str, id: &str) -> Result<()>;
+    async fn open_pipeline_in_browser(&self, project: &str, id: &str) -> Result<()>;
+    async fn open_job_in_browser(&self, project: &str, id: &str) -> Result<()>;
+    async fn open_milestone_in_browser(&self, project: &str, id: &str) -> Result<()>;
+
+    // ── Pipelines ──
+    /// `page_size` is the total item budget across all pages; `per_request` is how many
+    /// items each HTTP call asks for.
+    async fn list_pipelines(
+        &self,
+        project: &str,
+        page_size: usize,
+        per_request: usize,
+    ) -> Result<Vec<Pipeline>>;
+    async fn list_pipeline_jobs(
+        &self,
+        project: &str,
+        pipeline_id: u64,
+        page_size: usize,
+    ) -> Result<Vec<Job>>;
+    async fn get_job_trace(&self, project: &str, job_id: u64) -> Result<String>;
+
+    // ── Pipeline / Job actions ──
+    async fn retry_pipeline(&self, project: &str, pipeline_id: u64) -> Result<()>;
+    async fn cancel_pipeline(&self, project: &str, pipeline_id: u64) -> Result<()>;
+    async fn retry_job(&self, project: &str, job_id: u64) -> Result<()>;
+    async fn start_job(&self, project: &str, job_id: u64) -> Result<()>;
+    async fn cancel_job(&self, project: &str, job_id: u64) -> Result<()>;
+    async fn run_pipeline(
+        &self,
+        project: &str,
+        branch: &str,
+        mr: bool,
+        variables: &[(String, String)],
+        inputs: &[(String, String)],
+        workflow_file: &str,
+    ) -> Result<()>;
+    async fn download_artifact(&self, project: &str, ref_name: &str, job_name: &str) -> Result<()>;
+
+    // ── Runners ──
+    async fn list_runners(&self, project: &str, page_size: usize) -> Result<Vec<Runner>>;
+    async fn pause_runner(&self, project: &str, runner_id: u64) -> Result<()>;
+    async fn resume_runner(&self, project: &str, runner_id: u64) -> Result<()>;
+    async fn update_runner_description(
+        &self,
+        project: &str,
+        runner_id: u64,
+        description: &str,
+    ) -> Result<()>;
+
+    // ── Releases ──
+    async fn list_releases(&self, project: &str, page_size: usize) -> Result<Vec<Release>>;
+    async fn create_release(
+        &self,
+        project: &str,
+        tag: &str,
+        name: &str,
+        description: &str,
+    ) -> Result<()>;
+    async fn update_release(
+        &self,
+        project: &str,
+        tag_name: &str,
+        name: &str,
+        description: &str,
+    ) -> Result<()>;
+    async fn delete_release(&self, project: &str, tag_name: &str) -> Result<()>;
+
+    // ── Milestones ──
+    async fn list_milestones(&self, project: &str, page_size: usize) -> Result<Vec<Milestone>>;
+    async fn list_milestone_issues(
+        &self,
+        project: &str,
+        milestone_iid: u64,
+        page_size: usize,
+    ) -> Result<Vec<Issue>>;
+    async fn create_milestone(
+        &self,
+        project: &str,
+        title: &str,
+        description: &str,
+        start_date: Option<&str>,
+        due_date: Option<&str>,
+    ) -> Result<()>;
+    async fn update_milestone_state(
+        &self,
+        project: &str,
+        milestone_iid: u64,
+        close: bool,
+    ) -> Result<()>;
+    async fn update_milestone(
+        &self,
+        project: &str,
+        milestone_iid: u64,
+        title: &str,
+        description: &str,
+        start_date: Option<&str>,
+        due_date: Option<&str>,
+    ) -> Result<()>;
+    async fn delete_milestone(&self, project: &str, milestone_iid: u64) -> Result<()>;
+
+    // ── Notifications ──
+    async fn list_notifications(&self, show_read: bool) -> Result<Vec<Notification>>;
+    async fn mark_notification_as_read(&self, id: &str) -> Result<()>;
+
+    // ── Branches ──
+    async fn list_branches(&self, project: &str, page_size: usize) -> Result<Vec<Branch>>;
+    async fn create_branch(&self, project: &str, branch_name: &str, ref_branch: &str)
+    -> Result<()>;
+    async fn delete_branch(&self, project: &str, branch_name: &str) -> Result<()>;
+
+    // ── Environments / Deployments ──
+    async fn list_environments(&self, project: &str, page_size: usize) -> Result<Vec<Environment>>;
+    async fn list_deployments(
+        &self,
+        project: &str,
+        page_size: usize,
+        environment: Option<&str>,
+    ) -> Result<Vec<Deployment>>;
+
+    // ── Labels / Members / Misc ──
+    async fn fetch_labels(
+        &self,
+        project: &str,
+        per_request: usize,
+    ) -> Result<Vec<crate::domain::labels::Label>>;
+    async fn fetch_members(&self, project: &str) -> Result<Vec<String>>;
+
+    // ── MR review state (approval + mergeability) ──
+    /// Bulk-fetch both readiness axes for the given MR iids.
+    ///
+    /// Returns a per-iid pair; either element may be `None`, meaning *unknown*.
+    /// An absent map entry likewise means unknown for that MR.
+    async fn list_mr_state(
+        &self,
+        project: &str,
+        iids: &[u64],
+    ) -> Result<
+        HashMap<
+            u64,
+            (
+                Option<crate::domain::mr_state::ApprovalState>,
+                Option<crate::domain::mr_state::MergeabilityState>,
+            ),
+        >,
+    >;
+
+    // ── Raw API fallback ──
+    async fn raw_api(
+        &self,
+        endpoint: &str,
+        method: &str,
+        body: Option<&str>,
+        desc: &str,
+    ) -> Result<String>;
+}
+
+pub fn create_backend(
+    project_url_contains_github: bool,
+    root: std::path::PathBuf,
+) -> Box<dyn Backend> {
+    if project_url_contains_github {
+        Box::new(gh::GhBackend::new(root))
+    } else {
+        Box::new(glab::GlabBackend::new(root))
+    }
+}
+
+pub fn create_backend_with_runner(
+    project_url_contains_github: bool,
+    root: std::path::PathBuf,
+    runner: std::sync::Arc<dyn crate::command::CommandRunner>,
+) -> Box<dyn Backend> {
+    if project_url_contains_github {
+        Box::new(gh::GhBackend::new_with_runner(root, runner))
+    } else {
+        Box::new(glab::GlabBackend::new_with_runner(root, runner))
+    }
+}

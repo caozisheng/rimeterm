@@ -913,7 +913,11 @@ impl App {
         let todo_pane_id = todo_pane.id();
         panes.insert(Box::new(todo_pane));
         pinned_pane_ids.insert(todo_pane_id);
-        let mut glab_pane = GlabPane::new(resolved_root.clone(), Color::White);
+        let mut glab_pane = GlabPane::new(
+            resolved_root.clone(),
+            Color::White,
+            tokio::runtime::Handle::current(),
+        );
         if let Some(state) = memory.ui.glab.as_ref() {
             glab_pane.restore_state(state);
         }

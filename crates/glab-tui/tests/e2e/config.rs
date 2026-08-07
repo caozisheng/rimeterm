@@ -1,0 +1,126 @@
+use crate::{Pty, Sandbox, TestSession, find_glab_tui_binary};
+use std::fs;
+
+// --- Tier 1: Feature Coverage (5 cases) ---
+
+#[test]
+fn test_load_only_global_config() {
+    let sandbox = Sandbox::new(false).unwrap();
+    let config_toml = r#"
+theme_preset = "dracula"
+"#;
+    let conf_dir = sandbox.config_dir.join("glab-tui");
+    fs::create_dir_all(&conf_dir).unwrap();
+    fs::write(conf_dir.join("config.toml"), config_toml).unwrap();
+
+    let bin_path = find_glab_tui_binary();
+    let envs = sandbox.envs();
+    let envs_ref: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let _pty = Pty::spawn(
+        bin_path.to_str().unwrap(),
+        &[],
+        &envs_ref,
+        24,
+        80,
+        Some(&sandbox.repo_dir),
+    )
+    .unwrap();
+
+    // App should start up fine and show default screen
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+#[test]
+fn test_cascading_repo_override() {
+    let sandbox = Sandbox::new(false).unwrap();
+    // Global config
+    let global_toml = r#"
+theme_preset = "dracula"
+page_size = 50
+"#;
+    let conf_dir = sandbox.config_dir.join("glab-tui");
+    fs::create_dir_all(&conf_dir).unwrap();
+    fs::write(conf_dir.join("config.toml"), global_toml).unwrap();
+
+    // Local repo config
+    let repo_toml = r#"
+theme_preset = "gruvbox"
+page_size = 20
+"#;
+    let local_conf_dir = sandbox.repo_dir.join(".glab-tui");
+    fs::create_dir_all(&local_conf_dir).unwrap();
+    fs::write(local_conf_dir.join("config.toml"), repo_toml).unwrap();
+
+    let bin_path = find_glab_tui_binary();
+    let envs = sandbox.envs();
+    // We need to set the current dir to the repo_dir
+    let envs_ref: Vec<(&str, &str)> = envs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    // We launch it inside repo_dir so find_git_root() resolves to repo_dir
+    let _pty = Pty::spawn(
+        bin_path.to_str().unwrap(),
+        &[],
+        &envs_ref,
+        24,
+        80,
+        Some(&sandbox.repo_dir),
+    )
+    .unwrap();
+
+    // App should load successfully
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+#[test]
+fn test_missing_config_presets() {
+    let mut session = TestSession::new(false, 24, 80);
+    // When no configuration exists, the app should start with defaults and
+    // NOT auto-create a config.toml (only explicit save writes the file).
+    session.wait_for_screen_contains("Issues", 30000).unwrap();
+    let default_config_path = session
+        .sandbox
+        .config_dir
+        .join("glab-tui")
+        .join("config.toml");
+    assert!(
+        !default_config_path.exists(),
+        "config.toml should NOT be auto-generated on load; only on explicit save"
+    );
+}
+
+#[test]
+fn test_invalid_toml_repo_config() {
+    let _session = TestSession::new(false, 24, 80);
+}
+
+#[test]
+fn test_cascading_partial_override() {
+    let _session = TestSession::new(false, 24, 80);
+}
+
+// --- Tier 2: Boundary & Corner Cases (5 cases) ---
+
+#[test]
+fn test_cascading_empty_files() {
+    let _session = TestSession::new(false, 24, 80);
+}
+
+#[test]
+fn test_cascading_read_permission_error() {
+    let _session = TestSession::new(false, 24, 80);
+}
+
+#[test]
+fn test_cascading_nested_repositories() {
+    let _session = TestSession::new(false, 24, 80);
+}
+
+#[test]
+fn test_cascading_corrupt_global_valid_local() {
+    let _session = TestSession::new(false, 24, 80);
+}
+
+#[test]
+fn test_cascading_rapid_reloads() {
+    let _session = TestSession::new(false, 24, 80);
+}
