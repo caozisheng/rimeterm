@@ -231,7 +231,8 @@ fn init_tracing() {
              rimeterm_config=info,\
              rimeterm_ipc=info,\
              rimeterm_core=info,\
-             rimectl=info",
+             rimectl=info,\
+             glab_tui=info",
         )
     });
 

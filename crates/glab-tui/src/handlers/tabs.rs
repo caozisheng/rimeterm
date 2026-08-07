@@ -1981,8 +1981,8 @@ pub async fn handle_active_tab_key(
                     }
                 }
             },
-            _ if (key_event.code == KeyCode::Right
-                || key_event.code == KeyCode::Char('l')
+            _ if (key_event.code == KeyCode::Down
+                || key_event.code == KeyCode::Char('j')
                 || keybinding_matches(&app.config.keybindings.global.next_tab, &key_event)) =>
             {
                 app.next_tab();
@@ -2002,8 +2002,8 @@ pub async fn handle_active_tab_key(
                     }
                 }
             }
-            _ if (key_event.code == KeyCode::Left
-                || key_event.code == KeyCode::Char('h')
+            _ if (key_event.code == KeyCode::Up
+                || key_event.code == KeyCode::Char('k')
                 || keybinding_matches(&app.config.keybindings.global.prev_tab, &key_event)) =>
             {
                 app.previous_tab();
@@ -2023,7 +2023,7 @@ pub async fn handle_active_tab_key(
                     }
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Right | KeyCode::Char('l') => {
                 if app.details_zoomed {
                     app.detail_scroll = app.detail_scroll.saturating_add(1);
                 } else {
@@ -2067,7 +2067,7 @@ pub async fn handle_active_tab_key(
                     }
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 if app.details_zoomed {
                     app.detail_scroll = app.detail_scroll.saturating_sub(1);
                 } else {

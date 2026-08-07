@@ -1,11 +1,12 @@
 use std::path::Path;
 
 fn run_git(root: &Path, args: &[&str]) -> Option<std::process::Output> {
-    std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .ok()
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(args).current_dir(root);
+    if let Some((key, value)) = rimeterm_config::paths::augmented_path_env() {
+        cmd.env(key, value);
+    }
+    cmd.output().ok()
 }
 
 pub(crate) fn get_current_branch(root: &Path) -> Option<String> {

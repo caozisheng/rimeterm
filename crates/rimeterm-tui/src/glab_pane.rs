@@ -31,6 +31,7 @@ impl GlabPane {
             cache_policy: Default::default(),
             refresh: Some(std::time::Duration::from_secs(300)),
             features: Default::default(),
+            glab_config: None,
         };
         Self {
             id: PaneId::next(),
@@ -48,6 +49,10 @@ impl GlabPane {
     pub fn refresh_for(&mut self, root: &Path) {
         self.root = root.to_path_buf();
         self.app.set_workspace_root(root);
+    }
+
+    pub fn set_config(&mut self, config: rimeterm_config::glab_config::GlabConfig) {
+        self.app.set_config(config);
     }
 
     /// Whether the embedded controller signalled an exit intent.

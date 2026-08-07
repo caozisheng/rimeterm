@@ -37,6 +37,9 @@ pub enum SettingsTab {
     Integration,
     /// Global remembered-state categories shared by every workspace.
     Memory,
+    /// Glab pane configuration: repository URL override and
+    /// authentication token for GitLab/GitHub CLI backends.
+    Glab,
 }
 
 impl Default for SettingsTab {
@@ -81,8 +84,17 @@ pub enum SettingsAction {
     /// side.
     SetLeftTabsState(rimeterm_config::left_tabs_state::LeftTabsState),
     SetMemoryPolicy(rimeterm_config::memory_state::MemoryPolicy),
+    ApplyGlabConfig(rimeterm_config::glab_config::GlabConfig),
+    ClearGlabConfig,
     Refresh,
     Close,
+}
+
+/// Which field is currently being edited in the Glab settings tab.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum GlabEditField {
+    RepositoryUrl,
+    Token,
 }
 
 #[derive(Debug)]
@@ -124,6 +136,12 @@ pub struct SettingsState {
     pub left_tab_labels: std::collections::HashMap<String, String>,
     /// Live copy of the global remembered-state policy.
     pub memory_policy: rimeterm_config::memory_state::MemoryPolicy,
+    /// Glab pane configuration — seeded from App on open.
+    pub glab_config: rimeterm_config::glab_config::GlabConfig,
+    /// Which Glab field is being inline-edited, if any.
+    pub glab_editing: Option<GlabEditField>,
+    /// Text buffer for the field currently being edited.
+    pub glab_edit_buffer: String,
 }
 
 impl Default for SettingsState {
@@ -141,6 +159,9 @@ impl Default for SettingsState {
             left_tabs_state: rimeterm_config::left_tabs_state::LeftTabsState::default(),
             left_tab_labels: std::collections::HashMap::new(),
             memory_policy: rimeterm_config::memory_state::MemoryPolicy::default(),
+            glab_config: rimeterm_config::glab_config::GlabConfig::default(),
+            glab_editing: None,
+            glab_edit_buffer: String::new(),
         }
     }
 }
@@ -212,6 +233,12 @@ impl SettingsState {
         self.memory_policy = policy;
     }
 
+    pub fn set_glab_config(&mut self, config: rimeterm_config::glab_config::GlabConfig) {
+        self.glab_config = config;
+        self.glab_editing = None;
+        self.glab_edit_buffer.clear();
+    }
+
     fn row_count(&self) -> usize {
         match self.tab {
             SettingsTab::Agents => self.agents.len(),
@@ -229,6 +256,7 @@ impl SettingsState {
                 }
             }
             SettingsTab::Memory => MEMORY_LABELS.len(),
+            SettingsTab::Glab => GLAB_ROW_COUNT,
         }
     }
 
@@ -335,6 +363,10 @@ impl SettingsState {
         if !self.open {
             return None;
         }
+        // Glab inline editing mode: capture all keys before anything else.
+        if self.tab == SettingsTab::Glab && self.glab_editing.is_some() {
+            return self.handle_glab_edit_key(key);
+        }
         // Tabs-panel-specific mutation keys are checked BEFORE the
         // shared arrow-key cursor movement so `Shift+Up` reorders
         // instead of just moving the cursor.
@@ -356,6 +388,10 @@ impl SettingsState {
         if self.tab == SettingsTab::Memory && key.code == KeyCode::Char(' ') {
             return self.toggle_memory_at_cursor();
         }
+        // Glab tab: 'd' clears the field under cursor.
+        if self.tab == SettingsTab::Glab && key.code == KeyCode::Char('d') {
+            return self.glab_clear_field_at_cursor();
+        }
         match key.code {
             KeyCode::Esc => Some(SettingsAction::Close),
             KeyCode::Tab => {
@@ -366,19 +402,21 @@ impl SettingsState {
                     SettingsTab::Shell => SettingsTab::Tabs,
                     SettingsTab::Tabs => SettingsTab::Integration,
                     SettingsTab::Integration => SettingsTab::Memory,
-                    SettingsTab::Memory => SettingsTab::Agents,
+                    SettingsTab::Memory => SettingsTab::Glab,
+                    SettingsTab::Glab => SettingsTab::Agents,
                 };
                 self.reset_cursor_for_tab();
                 None
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.tab = match self.tab {
-                    SettingsTab::Agents => SettingsTab::Memory,
+                    SettingsTab::Agents => SettingsTab::Glab,
                     SettingsTab::Viewer => SettingsTab::Agents,
                     SettingsTab::Shell => SettingsTab::Viewer,
                     SettingsTab::Tabs => SettingsTab::Shell,
                     SettingsTab::Integration => SettingsTab::Tabs,
                     SettingsTab::Memory => SettingsTab::Integration,
+                    SettingsTab::Glab => SettingsTab::Memory,
                 };
                 self.reset_cursor_for_tab();
                 None
@@ -390,7 +428,8 @@ impl SettingsState {
                     SettingsTab::Shell => SettingsTab::Tabs,
                     SettingsTab::Tabs => SettingsTab::Integration,
                     SettingsTab::Integration => SettingsTab::Memory,
-                    SettingsTab::Memory => SettingsTab::Agents,
+                    SettingsTab::Memory => SettingsTab::Glab,
+                    SettingsTab::Glab => SettingsTab::Agents,
                 };
                 self.reset_cursor_for_tab();
                 None
@@ -443,6 +482,89 @@ impl SettingsState {
                 }
             }
             SettingsTab::Memory => self.toggle_memory_at_cursor(),
+            SettingsTab::Glab => self.glab_selected_action(),
+        }
+    }
+
+    // -- Glab tab helpers ---------------------------------------------------
+
+    fn handle_glab_edit_key(&mut self, key: KeyEvent) -> Option<SettingsAction> {
+        use crossterm::event::KeyModifiers;
+        match key.code {
+            KeyCode::Esc => {
+                self.glab_editing = None;
+                self.glab_edit_buffer.clear();
+                None
+            }
+            KeyCode::Enter => {
+                let value = if self.glab_edit_buffer.is_empty() {
+                    None
+                } else {
+                    Some(self.glab_edit_buffer.clone())
+                };
+                match self.glab_editing {
+                    Some(GlabEditField::RepositoryUrl) => {
+                        self.glab_config.repository_url = value;
+                    }
+                    Some(GlabEditField::Token) => {
+                        self.glab_config.token = value;
+                    }
+                    None => {}
+                }
+                self.glab_editing = None;
+                self.glab_edit_buffer.clear();
+                None
+            }
+            KeyCode::Backspace => {
+                self.glab_edit_buffer.pop();
+                None
+            }
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    if let Ok(text) = clipboard.get_text() {
+                        let clean = text.lines().next().unwrap_or("").trim();
+                        self.glab_edit_buffer.push_str(clean);
+                    }
+                }
+                None
+            }
+            KeyCode::Char(c) => {
+                self.glab_edit_buffer.push(c);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn glab_selected_action(&mut self) -> Option<SettingsAction> {
+        match self.cursor {
+            GLAB_ROW_REPO => {
+                self.glab_editing = Some(GlabEditField::RepositoryUrl);
+                self.glab_edit_buffer = self.glab_config.repository_url.clone().unwrap_or_default();
+                None
+            }
+            GLAB_ROW_TOKEN => {
+                self.glab_editing = Some(GlabEditField::Token);
+                self.glab_edit_buffer = self.glab_config.token.clone().unwrap_or_default();
+                None
+            }
+            GLAB_ROW_APPLY => Some(SettingsAction::ApplyGlabConfig(self.glab_config.clone())),
+            GLAB_ROW_CLEAR => Some(SettingsAction::ClearGlabConfig),
+            _ => None,
+        }
+    }
+
+    fn glab_clear_field_at_cursor(&mut self) -> Option<SettingsAction> {
+        match self.cursor {
+            GLAB_ROW_REPO => {
+                self.glab_config.repository_url = None;
+                None
+            }
+            GLAB_ROW_TOKEN => {
+                self.glab_config.token = None;
+                None
+            }
+            _ => None,
         }
     }
 
@@ -485,7 +607,10 @@ impl SettingsState {
                 }
             }
             SettingsTab::Memory => 0,
+            SettingsTab::Glab => 0,
         };
+        self.glab_editing = None;
+        self.glab_edit_buffer.clear();
     }
 
     /// Compute the popup rect for the current draw area. Extracted
@@ -548,6 +673,8 @@ impl SettingsState {
                 " Memory ",
                 tab_style(self.tab == SettingsTab::Memory, accent),
             ),
+            Span::raw("  "),
+            Span::styled(" Glab ", tab_style(self.tab == SettingsTab::Glab, accent)),
             Span::styled(
                 "   [Tab] switch",
                 Style::default().add_modifier(Modifier::DIM),
@@ -709,6 +836,89 @@ impl SettingsState {
                     ));
                 }
             }
+            SettingsTab::Glab => {
+                lines.push(Line::styled(
+                    " ↑/↓ select · [Enter] edit · [d] clear field",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                // Row 0: Repository URL
+                let repo_display = if self.glab_editing == Some(GlabEditField::RepositoryUrl) {
+                    format!("  Repository:  {}_", self.glab_edit_buffer)
+                } else {
+                    let value = self
+                        .glab_config
+                        .repository_url
+                        .as_deref()
+                        .unwrap_or("(auto-detect from git remote)");
+                    format!("  Repository:  {value}")
+                };
+                lines.push(Line::styled(
+                    repo_display,
+                    if self.glab_editing == Some(GlabEditField::RepositoryUrl) {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::UNDERLINED)
+                    } else {
+                        row_style(self.cursor == GLAB_ROW_REPO)
+                    },
+                ));
+                // Row 1: Token
+                let token_display = if self.glab_editing == Some(GlabEditField::Token) {
+                    let masked: String =
+                        std::iter::repeat_n('*', self.glab_edit_buffer.len()).collect();
+                    format!("  Token:       {masked}_")
+                } else {
+                    let value = self
+                        .glab_config
+                        .token
+                        .as_ref()
+                        .map(|t| {
+                            if t.len() <= 8 {
+                                "****".to_string()
+                            } else {
+                                let visible = &t[..4];
+                                format!("{visible}...****")
+                            }
+                        })
+                        .unwrap_or_else(|| "(not set)".to_string());
+                    format!("  Token:       {value}")
+                };
+                lines.push(Line::styled(
+                    token_display,
+                    if self.glab_editing == Some(GlabEditField::Token) {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::UNDERLINED)
+                    } else {
+                        row_style(self.cursor == GLAB_ROW_TOKEN)
+                    },
+                ));
+                // Row 2: Apply & Reload
+                lines.push(Line::styled(
+                    "  [Apply & Reload]",
+                    row_style(self.cursor == GLAB_ROW_APPLY),
+                ));
+                // Row 3: Clear & Auto-detect
+                lines.push(Line::styled(
+                    "  [Clear All & Auto-detect]",
+                    row_style(self.cursor == GLAB_ROW_CLEAR),
+                ));
+                // Info section
+                lines.push(Line::raw(""));
+                let backend = self
+                    .glab_config
+                    .is_github()
+                    .map(|g| if g { "GitHub (gh)" } else { "GitLab (glab)" })
+                    .unwrap_or("(determined by repository URL)");
+                lines.push(Line::styled(
+                    format!("  Backend: {backend}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                lines.push(Line::styled(
+                    "  Token is passed via GITLAB_TOKEN / GH_TOKEN env var to child processes.",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
         }
         if let Some(busy) = &self.busy {
             lines.push(Line::styled(
@@ -754,7 +964,14 @@ impl SettingsState {
     }
 }
 
-const MEMORY_LABELS: [&str; 15] = [
+// Glab tab row indices
+const GLAB_ROW_REPO: usize = 0;
+const GLAB_ROW_TOKEN: usize = 1;
+const GLAB_ROW_APPLY: usize = 2;
+const GLAB_ROW_CLEAR: usize = 3;
+const GLAB_ROW_COUNT: usize = 4;
+
+const MEMORY_LABELS: [&str; 16] = [
     "Last workspace directory",
     "Pane sizes",
     "Tab visibility and order",
@@ -764,6 +981,7 @@ const MEMORY_LABELS: [&str; 15] = [
     "Files settings",
     "Git settings",
     "Todo settings",
+    "Glab settings",
     "Fast Resume settings",
     "Sysmon settings",
     "Agtop settings",
@@ -783,12 +1001,13 @@ fn memory_policy_value(policy: &rimeterm_config::memory_state::MemoryPolicy, ind
         6 => policy.files,
         7 => policy.git,
         8 => policy.todo,
-        9 => policy.fast_resume,
-        10 => policy.sysmon,
-        11 => policy.agtop,
-        12 => policy.models,
-        13 => policy.stock,
-        14 => policy.zones,
+        9 => policy.glab,
+        10 => policy.fast_resume,
+        11 => policy.sysmon,
+        12 => policy.agtop,
+        13 => policy.models,
+        14 => policy.stock,
+        15 => policy.zones,
         _ => false,
     }
 }
@@ -807,12 +1026,13 @@ fn toggle_memory_policy(
         6 => &mut policy.files,
         7 => &mut policy.git,
         8 => &mut policy.todo,
-        9 => &mut policy.fast_resume,
-        10 => &mut policy.sysmon,
-        11 => &mut policy.agtop,
-        12 => &mut policy.models,
-        13 => &mut policy.stock,
-        14 => &mut policy.zones,
+        9 => &mut policy.glab,
+        10 => &mut policy.fast_resume,
+        11 => &mut policy.sysmon,
+        12 => &mut policy.agtop,
+        13 => &mut policy.models,
+        14 => &mut policy.stock,
+        15 => &mut policy.zones,
         _ => return None,
     };
     *value = !*value;
@@ -884,7 +1104,7 @@ mod tests {
 
     #[test]
     fn tab_cycle_visits_every_tab() {
-        // Agents → Viewer → Shell → Tabs → Integration → Memory → Agents
+        // Agents → Viewer → Shell → Tabs → Integration → Memory → Glab → Agents
         let mut state = SettingsState::default();
         state.open = true;
         assert_eq!(state.tab, SettingsTab::Agents);
@@ -899,16 +1119,18 @@ mod tests {
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Memory);
         state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Glab);
+        state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Agents);
     }
 
     #[test]
-    fn left_arrow_wraps_from_agents_to_memory() {
+    fn left_arrow_wraps_from_agents_to_glab() {
         let mut state = SettingsState::default();
         state.open = true;
         assert_eq!(state.tab, SettingsTab::Agents);
         state.handle_key(key(KeyCode::Char('h')));
-        assert_eq!(state.tab, SettingsTab::Memory);
+        assert_eq!(state.tab, SettingsTab::Glab);
     }
 
     #[test]
@@ -1031,6 +1253,7 @@ mod tests {
             ],
             bottom: vec![
                 LeftTab::new("git", true),
+                LeftTab::new("glab", true),
                 LeftTab::new("sysmon", true),
                 LeftTab::new("agtop", true),
                 LeftTab::new("models", true),
@@ -1039,13 +1262,14 @@ mod tests {
         };
         s.normalize(
             &["files", "todo", "fr"],
-            &["git", "sysmon", "agtop", "models", "stock"],
+            &["git", "glab", "sysmon", "agtop", "models", "stock"],
         );
         let labels = [
             ("files", "Files"),
             ("todo", "Todo"),
             ("fr", "Fast Resume"),
             ("git", "Git"),
+            ("glab", "Glab"),
             ("sysmon", "Sysmon"),
             ("agtop", "Agtop"),
             ("models", "Models"),
@@ -1063,8 +1287,8 @@ mod tests {
         state.open = true;
         state.tab = SettingsTab::Tabs;
         seed_left_tabs(&mut state);
-        // 3 top + 5 bottom = 8 rows.
-        assert_eq!(state.row_count(), 8);
+        // 3 top + 6 bottom = 9 rows.
+        assert_eq!(state.row_count(), 9);
     }
 
     #[test]
@@ -1160,6 +1384,8 @@ mod tests {
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Memory);
         state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Glab);
+        state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Agents);
     }
 
@@ -1169,7 +1395,7 @@ mod tests {
         state.open = true;
         state.tab = SettingsTab::Memory;
 
-        assert_eq!(state.row_count(), 15);
+        assert_eq!(state.row_count(), 16);
     }
 
     #[test]
@@ -1195,7 +1421,7 @@ mod tests {
         let mut state = SettingsState::default();
         state.open = true;
         state.tab = SettingsTab::Memory;
-        state.cursor = 14;
+        state.cursor = 15;
 
         let action = state.handle_key(key(KeyCode::Enter));
 
@@ -1229,5 +1455,103 @@ mod tests {
         let mut buffer = Buffer::empty(area);
 
         state.render(area, &mut buffer);
+    }
+
+    #[test]
+    fn glab_tab_row_count() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Glab;
+        assert_eq!(state.row_count(), GLAB_ROW_COUNT);
+    }
+
+    #[test]
+    fn glab_tab_enter_on_repo_starts_edit() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Glab;
+        state.cursor = GLAB_ROW_REPO;
+        let action = state.handle_key(key(KeyCode::Enter));
+        assert!(action.is_none());
+        assert_eq!(state.glab_editing, Some(GlabEditField::RepositoryUrl));
+    }
+
+    #[test]
+    fn glab_tab_edit_mode_captures_text() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Glab;
+        state.cursor = GLAB_ROW_REPO;
+        state.handle_key(key(KeyCode::Enter)); // start edit
+        state.handle_key(key(KeyCode::Char('h')));
+        state.handle_key(key(KeyCode::Char('i')));
+        assert_eq!(state.glab_edit_buffer, "hi");
+        state.handle_key(key(KeyCode::Backspace));
+        assert_eq!(state.glab_edit_buffer, "h");
+        state.handle_key(key(KeyCode::Enter)); // confirm
+        assert_eq!(state.glab_editing, None);
+        assert_eq!(state.glab_config.repository_url.as_deref(), Some("h"));
+    }
+
+    #[test]
+    fn glab_tab_edit_esc_cancels() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Glab;
+        state.glab_config.repository_url = Some("original".into());
+        state.cursor = GLAB_ROW_REPO;
+        state.handle_key(key(KeyCode::Enter)); // start edit
+        state.handle_key(key(KeyCode::Char('x')));
+        state.handle_key(key(KeyCode::Esc)); // cancel
+        assert_eq!(state.glab_editing, None);
+        assert_eq!(
+            state.glab_config.repository_url.as_deref(),
+            Some("original")
+        );
+    }
+
+    #[test]
+    fn glab_tab_d_clears_repo() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Glab;
+        state.glab_config.repository_url = Some("https://gitlab.com/x/y".into());
+        state.cursor = GLAB_ROW_REPO;
+        state.handle_key(key(KeyCode::Char('d')));
+        assert!(state.glab_config.repository_url.is_none());
+    }
+
+    #[test]
+    fn glab_tab_apply_returns_config() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Glab;
+        state.glab_config.repository_url = Some("https://github.com/a/b".into());
+        state.cursor = GLAB_ROW_APPLY;
+        let action = state.handle_key(key(KeyCode::Enter));
+        assert!(matches!(action, Some(SettingsAction::ApplyGlabConfig(_))));
+    }
+
+    #[test]
+    fn glab_tab_clear_returns_action() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Glab;
+        state.cursor = GLAB_ROW_CLEAR;
+        let action = state.handle_key(key(KeyCode::Enter));
+        assert_eq!(action, Some(SettingsAction::ClearGlabConfig));
+    }
+
+    #[test]
+    fn glab_tab_renders_without_panic() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Glab;
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buffer = Buffer::empty(area);
+        state.render(area, &mut buffer);
+        let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Repository"));
+        assert!(text.contains("Token"));
     }
 }

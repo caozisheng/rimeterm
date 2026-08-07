@@ -646,11 +646,12 @@ impl std::fmt::Debug for GitlabClient {
 
 pub(crate) async fn get_project_context(root: impl AsRef<std::path::Path>) -> Result<String> {
     let root = root.as_ref();
-    let output = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(root)
-        .output()
-        .context("Failed to execute git command")?;
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["remote", "get-url", "origin"]).current_dir(root);
+    if let Some((key, value)) = rimeterm_config::paths::augmented_path_env() {
+        cmd.env(key, value);
+    }
+    let output = cmd.output().context("Failed to execute git command")?;
     if !output.status.success() {
         return Ok("unknown/unknown".to_string());
     }

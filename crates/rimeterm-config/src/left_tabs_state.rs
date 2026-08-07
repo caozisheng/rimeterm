@@ -206,8 +206,8 @@ impl LeftTabsState {
 mod tests {
     use super::*;
 
-    const TOP: &[&str] = &["files", "todo", "glab", "fr"];
-    const BOTTOM: &[&str] = &["git", "sysmon", "agtop", "models", "stock"];
+    const TOP: &[&str] = &["files", "todo", "fr"];
+    const BOTTOM: &[&str] = &["git", "glab", "sysmon", "agtop", "models", "stock"];
 
     #[test]
     fn normalize_fills_defaults_when_empty() {
@@ -261,7 +261,7 @@ mod tests {
         let bottom_ids: Vec<&str> = state.bottom.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(
             bottom_ids,
-            vec!["git", "agtop", "sysmon", "models", "stock"]
+            vec!["git", "agtop", "glab", "sysmon", "models", "stock"]
         );
     }
 

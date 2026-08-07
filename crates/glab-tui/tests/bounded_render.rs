@@ -9,6 +9,7 @@ fn make_options() -> EmbeddedOptions {
         cache_policy: CachePolicy::Manual,
         refresh: None,
         features: EmbeddedFeatures::default(),
+        glab_config: None,
     }
 }
 

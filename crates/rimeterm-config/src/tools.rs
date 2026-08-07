@@ -51,11 +51,16 @@ pub enum ToolKind {
     Plugin,
 }
 
-/// After C25 the essentials tier is empty — the Native SysmonPane
-/// replaced `bottom`, the last bundled binary. The constant is
-/// deliberately retained so the detector's four-tier probe order stays
-/// intact and any future bundled binary just extends this slice.
-pub const ESSENTIALS_REGISTRY: &[ToolSpec] = &[];
+/// C26.8: `gh` (GitHub CLI) is bundled with rimeterm so the Glab pane
+/// can access GitHub repositories out of the box. The binary is a Go
+/// build, not a cargo crate — `crates` is empty, and installation is
+/// handled by the release packaging pipeline.
+pub const ESSENTIALS_REGISTRY: &[ToolSpec] = &[ToolSpec {
+    name: "gh",
+    binary: "gh",
+    crates: &[],
+    hint: "GitHub CLI — bundled with rimeterm, extracted to ~/.rimeterm/bin/",
+}];
 
 /// Non-essential tools rimeterm knows how to install on demand via
 /// `cargo install --locked --root ~/.rimeterm/plugins/<name>`. Empty
@@ -288,10 +293,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn essentials_registry_is_empty_after_c25() {
-        // Bottom retired with the Native SysmonPane in C25; no bundled
-        // binary remains. Registry stays declared for future re-use.
-        assert!(ESSENTIALS_REGISTRY.is_empty());
+    fn essentials_registry_contains_gh() {
+        assert_eq!(ESSENTIALS_REGISTRY.len(), 1);
+        assert_eq!(ESSENTIALS_REGISTRY[0].name, "gh");
+        assert_eq!(kind_of("gh"), Some(ToolKind::Essential));
     }
 
     #[test]
@@ -304,6 +309,8 @@ mod tests {
 
     #[test]
     fn kind_of_matches_registries() {
+        // `gh` is now an essential.
+        assert_eq!(kind_of("gh"), Some(ToolKind::Essential));
         // Retired names — bottom (C25), yazi + gitui (C24), trippy
         // (C25.1) — must not resolve to any tier. `agtop` is
         // intentionally NOT a plugin binary: rimeterm hosts an
@@ -320,7 +327,8 @@ mod tests {
     }
 
     #[test]
-    fn find_returns_none_for_all_retired_names() {
+    fn find_returns_gh_and_none_for_retired_names() {
+        assert!(find("gh").is_some(), "gh is an essential");
         assert!(find("trippy").is_none(), "trippy retired in C25.1");
         assert!(find("agtop").is_none(), "agtop lives as a native pane");
         assert!(find("bottom").is_none(), "bottom retired in C25");
@@ -331,13 +339,8 @@ mod tests {
     }
 
     #[test]
-    fn every_spec_has_nonempty_crates_and_hint() {
+    fn every_spec_has_nonempty_hint() {
         for (spec, _kind) in all_tools() {
-            assert!(
-                !spec.crates.is_empty(),
-                "tool `{}` must declare at least one crates.io package",
-                spec.name
-            );
             assert!(
                 !spec.hint.trim().is_empty(),
                 "tool `{}` must have a non-empty install hint",

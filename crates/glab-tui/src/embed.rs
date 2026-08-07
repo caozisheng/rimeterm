@@ -87,6 +87,9 @@ pub struct EmbeddedOptions {
     /// Feature gates.
     #[serde(default)]
     pub features: EmbeddedFeatures,
+    /// Optional manual repository/token config from Settings.
+    #[serde(default)]
+    pub glab_config: Option<rimeterm_config::glab_config::GlabConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +378,14 @@ impl EmbeddedApp {
         self.start_load();
     }
 
+    /// Update the Glab config (repo URL, token) and trigger a reload.
+    pub fn set_config(&mut self, config: rimeterm_config::glab_config::GlabConfig) {
+        self.options.glab_config = Some(config);
+        self.generation = self.generation.wrapping_add(1);
+        self.shell = AppShell::Detecting;
+        self.start_load();
+    }
+
     // -- Snapshot / restore -------------------------------------------------
 
     /// Take a serialisable snapshot of the current state.
@@ -494,31 +505,79 @@ impl EmbeddedApp {
         self.next_refresh = self.refresh_interval.map(|d| now + d);
         let event_tx = self.event_tx.clone();
         let pending_client = self.pending_client.clone();
+        let glab_config = self.options.glab_config.clone();
+        let augmented_path = rimeterm_config::paths::augmented_path_env();
+        tracing::info!(
+            root = %root.display(),
+            has_config = glab_config.is_some(),
+            has_augmented_path = augmented_path.is_some(),
+            "glab: start_load"
+        );
         handle.spawn(async move {
-            // 0. Detect git host from remote URL.
-            let remote_output = tokio::process::Command::new("git")
-                .args(["remote", "get-url", "origin"])
-                .current_dir(&root)
-                .output()
-                .await;
-            let is_github = match &remote_output {
-                Ok(o) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout).contains("github.com")
+            // Helper: inject augmented PATH (includes ~/.rimeterm/bin/)
+            // into a child command so bundled binaries are discoverable.
+            let inject_path = |cmd: &mut tokio::process::Command| {
+                if let Some((ref key, ref value)) = augmented_path {
+                    cmd.env(key, value);
                 }
-                _ => false,
-            };
-            let cli = if is_github { "gh" } else { "glab" };
-            let host = if is_github {
-                crate::ProjectHost::GitHub
-            } else {
-                crate::ProjectHost::GitLab
             };
 
+            // 0. Detect git host — use config override if set.
+            let (is_github, config_url) = if let Some(ref cfg) = glab_config {
+                if let Some(ref url) = cfg.repository_url {
+                    let gh = url.contains("github.com") || url.contains("github:");
+                    (gh, Some(url.clone()))
+                } else {
+                    (false, None)
+                }
+            } else {
+                (false, None)
+            };
+
+            let is_github = if config_url.is_some() {
+                is_github
+            } else {
+                let mut git_cmd = tokio::process::Command::new("git");
+                git_cmd
+                    .args(["remote", "get-url", "origin"])
+                    .current_dir(&root);
+                inject_path(&mut git_cmd);
+                let remote_output = git_cmd.output().await;
+                match &remote_output {
+                    Ok(o) if o.status.success() => {
+                        String::from_utf8_lossy(&o.stdout).contains("github.com")
+                    }
+                    _ => false,
+                }
+            };
+
+            let cli = if is_github { "gh" } else { "glab" };
+            tracing::info!(is_github, cli, "glab: detected host");
+
             // 0a. Check if the CLI is installed.
-            let cli_check = tokio::process::Command::new(cli)
-                .arg("--version")
-                .output()
-                .await;
+            let mut cli_cmd = tokio::process::Command::new(cli);
+            cli_cmd.arg("--version");
+            inject_path(&mut cli_cmd);
+            if let Some(ref cfg) = glab_config {
+                if let Some(ref token) = cfg.token {
+                    let env_key = if is_github {
+                        "GH_TOKEN"
+                    } else {
+                        "GITLAB_TOKEN"
+                    };
+                    cli_cmd.env(env_key, token);
+                }
+            }
+            let cli_check = cli_cmd.output().await;
+            match &cli_check {
+                Ok(o) => tracing::info!(
+                    cli,
+                    status = %o.status,
+                    stdout = %String::from_utf8_lossy(&o.stdout).chars().take(80).collect::<String>(),
+                    "glab: CLI version check"
+                ),
+                Err(e) => tracing::warn!(cli, error = %e, "glab: CLI not found"),
+            }
             if cli_check.is_err() {
                 let _ = tx.send(TaggedCompletion {
                     generation: generation_id,
@@ -530,14 +589,19 @@ impl EmbeddedApp {
             let project_context = match crate::domain::client::get_project_context(&root).await {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    let _ = tx.send(TaggedCompletion {
-                        generation: generation_id,
-                        event: Event::FetchFailed(
-                            Tab::Issues,
-                            format!("Failed to detect project: {}", e),
-                        ),
-                    });
-                    return;
+                    if let Some(ref url) = config_url {
+                        crate::git_helpers::parse_project_path(url)
+                            .unwrap_or_else(|| "unknown/unknown".to_string())
+                    } else {
+                        let _ = tx.send(TaggedCompletion {
+                            generation: generation_id,
+                            event: Event::FetchFailed(
+                                Tab::Issues,
+                                format!("Failed to detect project: {}", e),
+                            ),
+                        });
+                        return;
+                    }
                 }
             };
 
@@ -545,14 +609,27 @@ impl EmbeddedApp {
             let client = match crate::domain::client::GitlabClient::new(&root).await {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(TaggedCompletion {
-                        generation: generation_id,
-                        event: Event::FetchFailed(
-                            Tab::Issues,
-                            format!("Failed to create backend: {}", e),
-                        ),
-                    });
-                    return;
+                    if config_url.is_some() {
+                        // Config-driven: create backend directly
+                        let backend = crate::backend::create_backend(is_github, root.clone());
+                        crate::domain::client::GitlabClient {
+                            root: root.clone(),
+                            is_github,
+                            backend,
+                            tx: None,
+                            page_size: 100,
+                            api_per_page: 100,
+                        }
+                    } else {
+                        let _ = tx.send(TaggedCompletion {
+                            generation: generation_id,
+                            event: Event::FetchFailed(
+                                Tab::Issues,
+                                format!("Failed to create backend: {}", e),
+                            ),
+                        });
+                        return;
+                    }
                 }
             };
             // Store client + ctx for apply_event to install onto App.
@@ -582,20 +659,13 @@ impl EmbeddedApp {
         if matches!(self.shell, AppShell::Detecting) {
             match &event {
                 Event::FetchFailed(_tab, msg) => {
+                    tracing::warn!(msg, "glab: Detecting→Setup (FetchFailed)");
                     let problem = Self::detect_setup_problem(msg);
-                    if let Some(p) = problem {
-                        self.shell = AppShell::Setup(p);
-                    } else {
-                        let mut app = App::new();
-                        if let Some(tab) = self.options.initial_tab {
-                            app.active_tab = tab;
-                        }
-                        app.error_message = Some(msg.clone());
-                        self.shell = AppShell::Ready(app);
-                    }
+                    self.shell = AppShell::Setup(problem);
                     return;
                 }
                 _ => {
+                    tracing::info!("glab: Detecting→Ready");
                     let mut app = App::new();
                     if let Some(tab) = self.options.initial_tab {
                         app.active_tab = tab;
@@ -676,8 +746,7 @@ impl EmbeddedApp {
     }
 
     /// Try to map an error message into a [`SetupProblem`].
-    fn detect_setup_problem(msg: &str) -> Option<SetupProblem> {
-        // Match the Display output of known GlabError variants.
+    fn detect_setup_problem(msg: &str) -> SetupProblem {
         let error = if msg.contains("is not installed") {
             if msg.contains("glab") {
                 GlabError::CliMissing {
@@ -696,18 +765,22 @@ impl EmbeddedApp {
                 }
             }
         } else if msg.contains("not authenticated") {
-            // Default to GitLab; the guide still helps.
             GlabError::NotAuthenticated {
                 message: msg.to_string(),
                 host: crate::ProjectHost::GitLab,
             }
         } else if msg.contains("not a Git repository") {
             GlabError::NotRepository
+        } else if msg.contains("Failed to detect project")
+            || msg.contains("Failed to create backend")
+        {
+            GlabError::Command(msg.to_string())
         } else {
-            return None;
+            GlabError::Command(msg.to_string())
         };
 
-        install_guide(&error).map(|guide| SetupProblem { error, guide })
+        let guide = install_guide(&error).unwrap_or(crate::GENERIC_SETUP_GUIDE);
+        SetupProblem { error, guide }
     }
 
     fn translate(outcome: ControllerOutcome) -> EmbeddedOutcome {
@@ -753,6 +826,7 @@ mod tests {
             cache_policy: CachePolicy::Manual,
             refresh: None,
             features: EmbeddedFeatures::default(),
+            glab_config: None,
         };
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -794,6 +868,7 @@ mod tests {
             cache_policy: CachePolicy::Manual,
             refresh: None,
             features: EmbeddedFeatures::default(),
+            glab_config: None,
         };
 
         let (tx, rx) = mpsc::unbounded_channel();

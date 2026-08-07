@@ -100,6 +100,8 @@ pub fn handle_key(
 
 /// Top-level mouse dispatcher.
 pub fn handle_mouse(app: &mut App, mouse: MouseEvent, _area: Rect) -> ControllerOutcome {
+    let col = mouse.column;
+    let row = mouse.row;
     match mouse.kind {
         MouseEventKind::ScrollDown => {
             scroll_active_list(app, true);
@@ -109,7 +111,35 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent, _area: Rect) -> Controller
             scroll_active_list(app, false);
             ControllerOutcome::Changed
         }
-        MouseEventKind::Down(crossterm::event::MouseButton::Left) => ControllerOutcome::Changed,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            // Click on sidebar tab → switch tab
+            if let Some(sidebar) = app.sidebar_rect {
+                if rect_contains(sidebar, col, row) {
+                    let tabs = app.available_tabs();
+                    let inner_y = row.saturating_sub(sidebar.y + 1);
+                    if let Some(&tab) = tabs.get(inner_y as usize) {
+                        if app.active_tab != tab {
+                            app.active_tab = tab;
+                            return ControllerOutcome::Changed;
+                        }
+                    }
+                }
+            }
+            // Click on content row → select it
+            if let Some(content) = app.content_rect {
+                if rect_contains(content, col, row) {
+                    let header_offset = 3u16;
+                    if row >= content.y + header_offset {
+                        let clicked_row = (row - content.y - header_offset) as usize;
+                        if let Some(state) = app.active_table_state_mut() {
+                            state.select(Some(clicked_row));
+                            return ControllerOutcome::Changed;
+                        }
+                    }
+                }
+            }
+            ControllerOutcome::Changed
+        }
         _ => ControllerOutcome::Unchanged,
     }
 }

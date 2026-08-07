@@ -187,6 +187,22 @@ RimeTerm needs git and an origin that identifies a GitLab or GitHub repository.
 RimeTerm contains the UI, does not install glab-tui, and does not read or save tokens.
 Reload this pane with F5 or r after setup.";
 
+const GENERIC_SETUP_GUIDE: &str = "Glab pane could not connect
+
+The pane failed during workspace detection. Check the following:
+
+1. Verify this directory is a git repository with a valid remote:
+   git remote get-url origin
+
+2. Make sure the appropriate CLI is installed and authenticated:
+   GitLab: glab auth login
+   GitHub: gh auth login
+
+3. You can also configure the repository and token manually:
+   Press F10 → Settings → Glab tab
+
+Reload this pane with F5 or r after setup.";
+
 pub fn install_guide(error: &GlabError) -> Option<&'static str> {
     match error {
         GlabError::CliMissing {
@@ -208,6 +224,6 @@ pub fn install_guide(error: &GlabError) -> Option<&'static str> {
         GlabError::CliMissing { cli, host: None } if cli == "glab" => Some(GITLAB_INSTALL_GUIDE),
         GlabError::CliMissing { cli, host: None } if cli == "gh" => Some(GITHUB_INSTALL_GUIDE),
         GlabError::CliMissing { .. } | GlabError::NotRepository => Some(REPOSITORY_INSTALL_GUIDE),
-        GlabError::Parse(_) | GlabError::Command(_) => None,
+        GlabError::Parse(_) | GlabError::Command(_) => Some(GENERIC_SETUP_GUIDE),
     }
 }

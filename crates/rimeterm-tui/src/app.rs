@@ -701,6 +701,7 @@ pub struct App {
     /// dialog itself MUST NOT dismiss it — mirrors ack overlay).
     last_upgrade_popup_rect: Option<Rect>,
     settings_state: crate::settings::SettingsState,
+    glab_config: rimeterm_config::glab_config::GlabConfig,
     ack_state: crate::acknowledgement::AckOverlayState,
     upgrade_state: crate::upgrade::UpgradeState,
     upgrade_tx: mpsc::UnboundedSender<crate::upgrade::WorkerEvent>,
@@ -1093,7 +1094,6 @@ impl App {
                 file_manager_pane_id,
             ),
             LeftTabCatalogEntry::new("todo", "Todo", todo_pane_id),
-            LeftTabCatalogEntry::new("glab", "Glab", glab_pane_id),
             LeftTabCatalogEntry::new("fr", "Fast Resume", fr_pane_id),
         ];
         let left_bottom_catalog: Vec<LeftTabCatalogEntry> = vec![
@@ -1102,6 +1102,7 @@ impl App {
                 "Git",
                 git_pane_id,
             ),
+            LeftTabCatalogEntry::new("glab", "Glab", glab_pane_id),
             LeftTabCatalogEntry::new("sysmon", "Sysmon", sysmon_id),
             LeftTabCatalogEntry::new("agtop", "Agtop", agtop_id),
             LeftTabCatalogEntry::new("models", "Models", models_id),
@@ -1233,6 +1234,11 @@ impl App {
             viewer_picker,
             viewer_markdown_theme,
             settings_state: crate::settings::SettingsState::default(),
+            glab_config: rimeterm_config::glab_config::glab_config_file()
+                .and_then(|path| {
+                    rimeterm_config::glab_config::GlabConfig::load_or_default(&path).ok()
+                })
+                .unwrap_or_default(),
             last_menu_popup_rect: None,
             last_picker_popup_rect: None,
             last_settings_popup_rect: None,
@@ -1809,6 +1815,8 @@ impl App {
             .set_left_tabs_state(self.left_tabs_state.clone(), labels);
         self.settings_state
             .set_memory_policy(self.memory_policy.clone());
+        self.settings_state
+            .set_glab_config(self.glab_config.clone());
         let _ = self.redraw_tx.send(());
     }
 
@@ -1888,6 +1896,47 @@ impl App {
                 }
                 self.persist_ui_state();
                 let _ = self.redraw_tx.send(());
+            }
+            SettingsAction::ApplyGlabConfig(config) => {
+                if let Some(path) = rimeterm_config::glab_config::glab_config_file() {
+                    if let Err(error) = config.save_to(&path) {
+                        warn!(error = %error, "failed to persist glab config");
+                        self.set_hint(format!("glab config save failed: {error}"));
+                    }
+                }
+                self.glab_config = config;
+                self.apply_glab_config_to_pane();
+                self.set_hint("glab config applied — reloading pane".to_string());
+                let _ = self.redraw_tx.send(());
+            }
+            SettingsAction::ClearGlabConfig => {
+                self.glab_config = rimeterm_config::glab_config::GlabConfig::default();
+                self.settings_state
+                    .set_glab_config(self.glab_config.clone());
+                if let Some(path) = rimeterm_config::glab_config::glab_config_file() {
+                    let _ = self.glab_config.save_to(&path);
+                }
+                self.apply_glab_config_to_pane();
+                self.set_hint("glab config cleared — auto-detecting from git remote".to_string());
+                let _ = self.redraw_tx.send(());
+            }
+        }
+    }
+
+    fn apply_glab_config_to_pane(&mut self) {
+        let glab_id = self
+            .left_bottom_catalog
+            .iter()
+            .find(|entry| entry.id == "glab")
+            .map(|entry| entry.pane);
+        if let Some(id) = glab_id {
+            if let Some(pane) = self.panes.get_mut(id) {
+                if let Some(glab) = pane
+                    .as_any_mut()
+                    .and_then(|any| any.downcast_mut::<crate::glab_pane::GlabPane>())
+                {
+                    glab.set_config(self.glab_config.clone());
+                }
             }
         }
     }

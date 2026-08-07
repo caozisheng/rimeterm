@@ -8,6 +8,7 @@ pub struct CommandRequest {
     pub args: Vec<OsString>,
     pub cwd: PathBuf,
     pub stdin: Option<Vec<u8>>,
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,7 @@ impl CommandRequest {
             args: args.into_iter().map(Into::into).collect(),
             cwd: root.to_path_buf(),
             stdin: None,
+            env: Vec::new(),
         }
     }
 
@@ -68,10 +70,33 @@ fn convert_output(output: Output) -> CommandOutput {
     }
 }
 
+fn apply_env(command: &mut std::process::Command, request: &CommandRequest) {
+    if let Some((key, value)) = rimeterm_config::paths::augmented_path_env() {
+        command.env(key, value);
+    }
+    for (key, value) in &request.env {
+        command.env(key, value);
+    }
+}
+
+fn apply_env_tokio(command: &mut tokio::process::Command, request: &CommandRequest) {
+    if let Some((key, value)) = rimeterm_config::paths::augmented_path_env() {
+        command.env(key, value);
+    }
+    for (key, value) in &request.env {
+        command.env(key, value);
+    }
+}
+
 impl SyncCommandRunner for ProcessCommandRunner {
     fn output_sync(&self, request: CommandRequest) -> Result<CommandOutput, CommandError> {
-        let mut command = std::process::Command::new(request.program);
-        command.args(request.args).current_dir(request.cwd);
+        let mut command = std::process::Command::new(&request.program);
+        command
+            .args(&request.args)
+            .current_dir(&request.cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        apply_env(&mut command, &request);
         if request.stdin.is_some() {
             command.stdin(std::process::Stdio::piped());
         }
@@ -93,8 +118,13 @@ impl SyncCommandRunner for ProcessCommandRunner {
 #[async_trait::async_trait]
 impl CommandRunner for ProcessCommandRunner {
     async fn output(&self, request: CommandRequest) -> Result<CommandOutput, CommandError> {
-        let mut command = tokio::process::Command::new(request.program);
-        command.args(request.args).current_dir(request.cwd);
+        let mut command = tokio::process::Command::new(&request.program);
+        command
+            .args(&request.args)
+            .current_dir(&request.cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        apply_env_tokio(&mut command, &request);
         if request.stdin.is_some() {
             command.stdin(std::process::Stdio::piped());
         }

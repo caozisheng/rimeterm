@@ -13,6 +13,7 @@ pub mod agents_state;
 pub mod assets;
 pub mod env;
 pub mod files_state;
+pub mod glab_config;
 pub mod install_hint;
 pub mod layout_state;
 pub mod left_tabs_state;
