@@ -35,8 +35,26 @@ impl GitlabClient {
             ))
             .await
             .map_err(|error| anyhow::anyhow!(error.0))?;
+        let url = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         let is_github =
-            output.status == 0 && String::from_utf8_lossy(&output.stdout).contains("github.com");
+            output.status == 0 && (url.contains("github.com") || url.contains("github:"));
+        tracing::info!(
+            root = %root.display(),
+            status = output.status,
+            url = %url.trim(),
+            stderr = %stderr.trim(),
+            is_github,
+            "glab-tui: git remote probe"
+        );
+        if output.status != 0 {
+            anyhow::bail!(
+                "git remote get-url origin failed (status {}) in {}: {}",
+                output.status,
+                root.display(),
+                stderr.trim()
+            );
+        }
         let backend = crate::backend::create_backend_with_runner(is_github, root.clone(), runner);
         Ok(Self {
             root,
