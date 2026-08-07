@@ -493,7 +493,38 @@ impl EmbeddedApp {
         let event_tx = self.event_tx.clone();
 
         handle.spawn(async move {
-            // 1. Detect project context from the workspace root.
+            // 0. Detect git host from remote URL.
+            let remote_output = tokio::process::Command::new("git")
+                .args(["remote", "get-url", "origin"])
+                .current_dir(&root)
+                .output()
+                .await;
+            let is_github = match &remote_output {
+                Ok(o) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).contains("github.com")
+                }
+                _ => false,
+            };
+            let cli = if is_github { "gh" } else { "glab" };
+            let host = if is_github {
+                crate::ProjectHost::GitHub
+            } else {
+                crate::ProjectHost::GitLab
+            };
+
+            // 0a. Check if the CLI is installed.
+            let cli_check = tokio::process::Command::new(cli)
+                .arg("--version")
+                .output()
+                .await;
+            if cli_check.is_err() {
+                let _ = tx.send(TaggedCompletion {
+                    generation: generation_id,
+                    event: Event::FetchFailed(Tab::Issues, format!("{} is not installed", cli)),
+                });
+                return;
+            }
+
             let project_context = match crate::domain::client::get_project_context(&root).await {
                 Ok(ctx) => ctx,
                 Err(e) => {
