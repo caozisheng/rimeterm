@@ -596,28 +596,25 @@ impl EmbeddedApp {
                     if let Some(tab) = self.options.initial_tab {
                         app.active_tab = tab;
                     }
-                    // Try to create a GitlabClient for this workspace.
+                    // Create backend client synchronously so App can
+                    // refresh tabs immediately.
                     let root = self.options.workspace_root.clone();
                     let handle = self.handle.clone();
-                    let tx = self.event_tx.clone();
-                    let generation_id = self.generation;
-                    handle.spawn(async move {
-                        if let Ok(client) = crate::domain::client::GitlabClient::new(&root).await {
-                            if let Ok(ctx) = crate::domain::client::get_project_context(&root).await
-                            {
-                                let _ = tx.send(Event::RepoAttributesFetched {
-                                    labels: Vec::new(),
-                                    members: Vec::new(),
-                                });
-                                crate::fetch::spawn_refresh_active_tab(
-                                    &client,
-                                    &ctx,
-                                    Tab::Issues,
-                                    tx.clone(),
-                                );
-                            }
-                        }
+                    let event_tx = self.event_tx.clone();
+                    let result = tokio::task::block_in_place(|| {
+                        handle.block_on(async {
+                            let client =
+                                crate::domain::client::GitlabClient::new(&root).await.ok()?;
+                            let ctx = crate::domain::client::get_project_context(&root)
+                                .await
+                                .ok()?;
+                            Some((client, ctx))
+                        })
                     });
+                    if let Some((client, ctx)) = result {
+                        app.project_context = ctx;
+                        app.gitlab_client = Some(client);
+                    }
                     self.shell = AppShell::Ready(app);
                 }
             }
