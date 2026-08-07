@@ -233,7 +233,7 @@ pub(crate) fn centered_rect_fixed(width: u16, height: u16, r: Rect) -> Rect {
     Rect::new(x, y, w, h)
 }
 
-pub fn count_wrapped_lines(text: &str, width: usize) -> usize {
+pub(super) fn count_wrapped_lines(text: &str, width: usize) -> usize {
     if width == 0 {
         return 0;
     }

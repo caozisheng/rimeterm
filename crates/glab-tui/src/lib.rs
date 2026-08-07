@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_variables)]
+
 //! Bounded embedded GitLab/GitHub data view.
 //!
 //! This library deliberately does not own a terminal, cwd, PTY, or process
@@ -25,7 +27,6 @@ pub mod utils;
 type AppTerminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
 use serde::Deserialize;
-use std::path::Path;
 
 // Re-export the full embedded API so callers can write `glab_tui::EmbeddedApp`.
 pub use embed::*;

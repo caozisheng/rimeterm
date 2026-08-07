@@ -132,7 +132,7 @@ fn merge_syntax_with_fuzzy(
     result
 }
 
-pub fn draw_in(f: &mut Frame, area: Rect, app: &mut App) {
+pub(crate) fn draw_in(f: &mut Frame, area: Rect, app: &mut App) {
     let size = area;
 
     // Paint full canvas with theme background so theme renders consistently regardless of terminal emulator defaults

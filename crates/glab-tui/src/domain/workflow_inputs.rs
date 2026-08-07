@@ -46,7 +46,7 @@ struct WorkflowInputDef {
     options: Option<Vec<String>>,
 }
 
-pub fn parse_workflow_inputs(yaml_path: &str) -> Option<Vec<WorkflowInput>> {
+pub(crate) fn parse_workflow_inputs(yaml_path: &str) -> Option<Vec<WorkflowInput>> {
     let content = std::fs::read_to_string(yaml_path).ok()?;
     let wf: WorkflowTop = serde_yaml::from_str(&content)
         .inspect_err(|e| eprintln!("workflow YAML parse error for {}: {}", yaml_path, e))

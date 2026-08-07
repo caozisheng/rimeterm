@@ -1,4 +1,4 @@
-pub fn list_templates(template_type: &str) -> Vec<(String, String)> {
+pub(crate) fn list_templates(template_type: &str) -> Vec<(String, String)> {
     let mut templates: Vec<(String, String)> = Vec::new();
 
     let paths = if template_type == "issue" {
@@ -63,7 +63,7 @@ pub fn list_templates(template_type: &str) -> Vec<(String, String)> {
     templates
 }
 
-pub fn get_default_template(template_type: &str) -> Option<String> {
+pub(crate) fn get_default_template(template_type: &str) -> Option<String> {
     let templates = list_templates(template_type);
     if let Some((_, content)) = templates.iter().find(|(n, _)| n == "default") {
         return Some(content.clone());

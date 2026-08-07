@@ -8,7 +8,7 @@ fn run_git(root: &Path, args: &[&str]) -> Option<std::process::Output> {
         .ok()
 }
 
-pub fn get_current_branch(root: &Path) -> Option<String> {
+pub(crate) fn get_current_branch(root: &Path) -> Option<String> {
     let output = run_git(root, &["symbolic-ref", "--short", "HEAD"])?;
     if output.status.success() {
         return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
@@ -29,7 +29,7 @@ pub fn get_current_branch(root: &Path) -> Option<String> {
 /// (`group/subgroup/subsubgroup/project`).
 ///
 /// Returns `None` when the URL has no parseable namespace.
-pub fn parse_project_path(url: &str) -> Option<String> {
+pub(crate) fn parse_project_path(url: &str) -> Option<String> {
     let url = url.trim();
     // Drop everything up to and including the host, keeping the rest intact.
     // Splitting on "://" must be tried first, since those URLs also contain ':'.
@@ -46,7 +46,7 @@ pub fn parse_project_path(url: &str) -> Option<String> {
     path.contains('/').then(|| path.to_string())
 }
 
-pub fn slugify(s: &str) -> String {
+pub(crate) fn slugify(s: &str) -> String {
     let mut slug = String::with_capacity(s.len());
     for c in s.to_lowercase().chars() {
         if c.is_ascii_alphanumeric() {
@@ -58,7 +58,7 @@ pub fn slugify(s: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
-pub fn get_default_branch(root: &Path) -> Option<String> {
+pub(crate) fn get_default_branch(root: &Path) -> Option<String> {
     let output = run_git(root, &["rev-parse", "--abbrev-ref", "origin/HEAD"])?;
     if output.status.success() {
         return String::from_utf8_lossy(&output.stdout)
@@ -69,7 +69,7 @@ pub fn get_default_branch(root: &Path) -> Option<String> {
     None
 }
 
-pub fn get_branches(root: &Path) -> Vec<String> {
+pub(crate) fn get_branches(root: &Path) -> Vec<String> {
     let output = match run_git(root, &["branch", "-a"]) {
         Some(output) if output.status.success() => output,
         _ => return Vec::new(),
@@ -89,7 +89,7 @@ pub fn get_branches(root: &Path) -> Vec<String> {
 /// Returns a list of workflow/CI files available in the repo.
 /// For GitHub repos: scans `.github/workflows/*.yml` and `*.yaml`.
 /// For GitLab repos: returns `.gitlab-ci.yml` if it exists, else empty.
-pub fn get_workflow_files(root: &Path, is_github: bool) -> Vec<String> {
+pub(crate) fn get_workflow_files(root: &Path, is_github: bool) -> Vec<String> {
     if is_github {
         let dir = root.join(".github").join("workflows");
         let Ok(entries) = std::fs::read_dir(dir) else {

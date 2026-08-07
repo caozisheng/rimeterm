@@ -2,7 +2,7 @@ use crate::app::App;
 use crate::entity_editor::rebuild_edit_menu;
 use crate::event::Event;
 use crate::fetch::spawn_refresh_active_tab;
-use crate::git_helpers::{get_default_branch, slugify};
+use crate::git_helpers::slugify;
 use crate::keybinding::keybinding_matches;
 use crate::templates::get_default_template;
 use crossterm::event::{KeyCode, KeyEvent};

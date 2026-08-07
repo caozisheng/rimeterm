@@ -132,7 +132,7 @@ pub struct DiscussionNote {
     pub resolvable: Option<bool>,
 }
 
-pub async fn list_mrs(
+pub(crate) async fn list_mrs(
     client: &GitlabClient,
     project_path: &str,
     show_closed: bool,
@@ -149,11 +149,15 @@ pub async fn list_mrs(
 }
 
 #[allow(dead_code)]
-pub async fn get_mr(client: &GitlabClient, project_path: &str, iid: u64) -> Result<MergeRequest> {
+pub(crate) async fn get_mr(
+    client: &GitlabClient,
+    project_path: &str,
+    iid: u64,
+) -> Result<MergeRequest> {
     client.backend.get_mr(project_path, iid).await
 }
 
-pub async fn list_mr_notes(
+pub(crate) async fn list_mr_notes(
     client: &GitlabClient,
     project_path: &str,
     mr_iid: u64,

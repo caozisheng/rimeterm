@@ -10,7 +10,7 @@ pub struct Runner {
     pub active: bool,
 }
 
-pub async fn list_runners(client: &GitlabClient, project_path: &str) -> Result<Vec<Runner>> {
+pub(crate) async fn list_runners(client: &GitlabClient, project_path: &str) -> Result<Vec<Runner>> {
     client
         .backend
         .list_runners(project_path, client.page_size)

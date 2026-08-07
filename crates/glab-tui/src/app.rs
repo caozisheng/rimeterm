@@ -28,7 +28,7 @@ fn file_extension(file_path: &str) -> Option<&str> {
 }
 
 /// Highlight a single line's content using syntect, returning colored spans.
-pub fn highlight_line_syntax(
+pub(crate) fn highlight_line_syntax(
     file_path: &str,
     line_content: &str,
     ext: Option<&str>,
@@ -98,7 +98,7 @@ fn syntect_style_to_ratatui(style: SyntectStyle) -> ratatui::style::Style {
         .add_modifier(modifier)
 }
 
-pub use crate::config::SaveMenu;
+pub(crate) use crate::config::SaveMenu;
 
 #[derive(
     Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
@@ -347,7 +347,7 @@ impl EditMenu {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FieldType {
+pub(crate) enum FieldType {
     Text,
     MultiSelect,
     Date,
@@ -356,42 +356,42 @@ pub enum FieldType {
 }
 
 #[derive(Clone, Debug)]
-pub struct Field {
+pub(crate) struct Field {
     pub label: String,
     pub kind: FieldType,
     pub value: String,
 }
 
 impl Field {
-    pub fn text(label: &str, value: String) -> Self {
+    pub(crate) fn text(label: &str, value: String) -> Self {
         Self {
             label: label.to_string(),
             kind: FieldType::Text,
             value,
         }
     }
-    pub fn multi_select(label: &str, value: String) -> Self {
+    pub(crate) fn multi_select(label: &str, value: String) -> Self {
         Self {
             label: label.to_string(),
             kind: FieldType::MultiSelect,
             value,
         }
     }
-    pub fn toggle(label: &str, value: String) -> Self {
+    pub(crate) fn toggle(label: &str, value: String) -> Self {
         Self {
             label: label.to_string(),
             kind: FieldType::Toggle,
             value,
         }
     }
-    pub fn ref_field(label: &str, value: String) -> Self {
+    pub(crate) fn ref_field(label: &str, value: String) -> Self {
         Self {
             label: label.to_string(),
             kind: FieldType::Ref,
             value,
         }
     }
-    pub fn date(label: &str, value: String) -> Self {
+    pub(crate) fn date(label: &str, value: String) -> Self {
         Self {
             label: label.to_string(),
             kind: FieldType::Date,
@@ -1531,7 +1531,7 @@ impl DiffView {
     }
 }
 
-pub fn build_side_by_side_lines(lines: &[DiffLine]) -> Vec<SideBySideLine> {
+pub(crate) fn build_side_by_side_lines(lines: &[DiffLine]) -> Vec<SideBySideLine> {
     let mut side_lines = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -1682,7 +1682,7 @@ pub enum DatePickerAction {
     },
 }
 
-pub fn days_in_month(year: i32, month: u32) -> u32 {
+pub(crate) fn days_in_month(year: i32, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,

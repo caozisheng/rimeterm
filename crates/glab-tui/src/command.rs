@@ -11,7 +11,7 @@ pub struct CommandRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectContext {
+pub(crate) struct ProjectContext {
     pub root: PathBuf,
     pub host: crate::backend::BackendKind,
     pub project: String,
@@ -53,12 +53,12 @@ pub trait CommandRunner: Send + Sync {
     async fn output(&self, request: CommandRequest) -> Result<CommandOutput, CommandError>;
 }
 
-pub trait SyncCommandRunner: Send + Sync {
+pub(crate) trait SyncCommandRunner: Send + Sync {
     fn output_sync(&self, request: CommandRequest) -> Result<CommandOutput, CommandError>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct ProcessCommandRunner;
+pub(crate) struct ProcessCommandRunner;
 
 fn convert_output(output: Output) -> CommandOutput {
     CommandOutput {

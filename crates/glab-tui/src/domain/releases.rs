@@ -14,14 +14,17 @@ pub struct Release {
     pub assets_link: Option<String>,
 }
 
-pub async fn list_releases(client: &GitlabClient, project_path: &str) -> Result<Vec<Release>> {
+pub(crate) async fn list_releases(
+    client: &GitlabClient,
+    project_path: &str,
+) -> Result<Vec<Release>> {
     client
         .backend
         .list_releases(project_path, client.page_size)
         .await
 }
 
-pub async fn update_release(
+pub(crate) async fn update_release(
     client: &GitlabClient,
     project_path: &str,
     tag_name: &str,
@@ -34,7 +37,7 @@ pub async fn update_release(
         .await
 }
 
-pub async fn delete_release(
+pub(crate) async fn delete_release(
     client: &GitlabClient,
     project_path: &str,
     tag_name: &str,

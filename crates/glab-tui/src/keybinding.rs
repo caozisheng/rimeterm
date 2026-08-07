@@ -1,6 +1,6 @@
 use crossterm::event::KeyCode;
 
-pub fn keybinding_matches(binding: &str, event: &crossterm::event::KeyEvent) -> bool {
+pub(crate) fn keybinding_matches(binding: &str, event: &crossterm::event::KeyEvent) -> bool {
     match binding {
         "Tab" => event.code == KeyCode::Tab && event.modifiers.is_empty(),
         "Shift+Tab" => event.code == KeyCode::BackTab,

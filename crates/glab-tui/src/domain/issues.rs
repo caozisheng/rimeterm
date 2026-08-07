@@ -36,7 +36,7 @@ pub struct Issue {
     pub due_date: Option<String>,
 }
 
-pub async fn list_issues(
+pub(crate) async fn list_issues(
     client: &GitlabClient,
     project_path: &str,
     show_closed: bool,
@@ -53,7 +53,11 @@ pub async fn list_issues(
 }
 
 #[allow(dead_code)]
-pub async fn get_issue(client: &GitlabClient, project_path: &str, iid: u64) -> Result<Issue> {
+pub(crate) async fn get_issue(
+    client: &GitlabClient,
+    project_path: &str,
+    iid: u64,
+) -> Result<Issue> {
     client.backend.get_issue(project_path, iid).await
 }
 

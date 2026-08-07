@@ -1,5 +1,5 @@
-pub mod gh;
-pub mod glab;
+pub(crate) mod gh;
+pub(crate) mod glab;
 
 use crate::domain::branches::Branch;
 use crate::domain::deployments::{Deployment, Environment};
@@ -356,7 +356,7 @@ pub trait Backend: Send + Sync {
     ) -> Result<String>;
 }
 
-pub fn create_backend(
+pub(crate) fn create_backend(
     project_url_contains_github: bool,
     root: std::path::PathBuf,
 ) -> Box<dyn Backend> {
@@ -367,7 +367,7 @@ pub fn create_backend(
     }
 }
 
-pub fn create_backend_with_runner(
+pub(crate) fn create_backend_with_runner(
     project_url_contains_github: bool,
     root: std::path::PathBuf,
     runner: std::sync::Arc<dyn crate::command::CommandRunner>,

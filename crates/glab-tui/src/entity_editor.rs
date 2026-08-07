@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::event::Event;
 
-pub fn apply_field_text_change(
+pub(crate) fn apply_field_text_change(
     app: &mut App,
     entity_type: &str,
     iid: u64,
@@ -263,7 +263,7 @@ pub fn apply_field_text_change(
     }
 }
 
-pub fn apply_selector_changes(
+pub(crate) fn apply_selector_changes(
     app: &mut App,
     entity_type: &str,
     iid: u64,
@@ -529,7 +529,7 @@ pub fn apply_selector_changes(
     }
 }
 
-pub fn rebuild_edit_menu(app: &mut App, entity_type: &str, entity_iid: u64) {
+pub(crate) fn rebuild_edit_menu(app: &mut App, entity_type: &str, entity_iid: u64) {
     if entity_type == "issue" {
         if let Some(issue) = app.issues.items.iter().find(|i| i.iid == entity_iid) {
             let labels = if issue.labels.is_empty() {

@@ -84,7 +84,7 @@ impl Job {
     }
 }
 
-pub fn process_pipeline_jobs(all_jobs: Vec<Job>) -> Vec<Job> {
+pub(crate) fn process_pipeline_jobs(all_jobs: Vec<Job>) -> Vec<Job> {
     let all_jobs: Vec<Job> = all_jobs
         .into_iter()
         .map(|mut job_item| {
@@ -144,14 +144,17 @@ pub fn process_pipeline_jobs(all_jobs: Vec<Job>) -> Vec<Job> {
     all_jobs
 }
 
-pub async fn list_pipelines(client: &GitlabClient, project_path: &str) -> Result<Vec<Pipeline>> {
+pub(crate) async fn list_pipelines(
+    client: &GitlabClient,
+    project_path: &str,
+) -> Result<Vec<Pipeline>> {
     client
         .backend
         .list_pipelines(project_path, client.page_size, client.api_per_page)
         .await
 }
 
-pub async fn list_pipeline_jobs(
+pub(crate) async fn list_pipeline_jobs(
     client: &GitlabClient,
     project_path: &str,
     pipeline_id: u64,
@@ -162,7 +165,7 @@ pub async fn list_pipeline_jobs(
         .await
 }
 
-pub async fn get_job_trace(
+pub(crate) async fn get_job_trace(
     client: &GitlabClient,
     project_path: &str,
     job_id: u64,

@@ -70,7 +70,7 @@ fn split_review_authors(latest_reviews: &[serde_json::Value]) -> (Vec<String>, V
 ///
 /// `mergeStateStatus == "BLOCKED"` means blocked by branch protection, NOT a
 /// merge conflict — conflicts come only from `mergeable == "CONFLICTING"`.
-pub fn gh_state_from_fields(
+pub(crate) fn gh_state_from_fields(
     review_decision: Option<&str>,
     mergeable: Option<&str>,
     merge_state_status: Option<&str>,
@@ -142,7 +142,7 @@ pub fn gh_state_from_fields(
 /// retry on every refresh, which is the per-refresh request the design
 /// forbids.
 #[derive(Clone)]
-pub struct GhBackend {
+pub(crate) struct GhBackend {
     root: PathBuf,
     runner: Arc<dyn CommandRunner>,
     tx: Option<UnboundedSender<Event>>,
@@ -150,11 +150,11 @@ pub struct GhBackend {
 }
 
 impl GhBackend {
-    pub fn new(root: PathBuf) -> Self {
+    pub(crate) fn new(root: PathBuf) -> Self {
         Self::new_with_runner(root, Arc::new(ProcessCommandRunner))
     }
 
-    pub fn new_with_runner(root: PathBuf, runner: Arc<dyn CommandRunner>) -> Self {
+    pub(crate) fn new_with_runner(root: PathBuf, runner: Arc<dyn CommandRunner>) -> Self {
         Self {
             root,
             runner,

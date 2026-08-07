@@ -65,7 +65,7 @@ type MrStateMap = HashMap<
 /// The project path originates from `git remote get-url` and is interpolated
 /// into a GraphQL query string, so it must be constrained before use.
 /// Permits only the characters that legitimately appear in a GitLab path.
-pub fn validate_project_path(path: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_project_path(path: &str) -> anyhow::Result<()> {
     if path.is_empty() {
         anyhow::bail!("empty project path");
     }
@@ -83,7 +83,7 @@ pub fn validate_project_path(path: &str) -> anyhow::Result<()> {
 /// A top-level `errors` array is a hard error: GraphQL is all-or-nothing, so a
 /// single unknown field yields no data at all, and that must not be mistaken
 /// for "this project has no approval state".
-pub fn parse_mr_state_response(json: &str) -> anyhow::Result<MrStateMap> {
+pub(crate) fn parse_mr_state_response(json: &str) -> anyhow::Result<MrStateMap> {
     use crate::domain::mr_state::{
         ApprovalState, MergeabilityState, derive_awaiting_you, is_transient_merge_status,
     };
@@ -389,18 +389,18 @@ fn merge_tolerating_partial_failure(
 }
 
 #[derive(Clone)]
-pub struct GlabBackend {
+pub(crate) struct GlabBackend {
     root: PathBuf,
     runner: Arc<dyn CommandRunner>,
     tx: Option<UnboundedSender<Event>>,
 }
 
 impl GlabBackend {
-    pub fn new(root: PathBuf) -> Self {
+    pub(crate) fn new(root: PathBuf) -> Self {
         Self::new_with_runner(root, Arc::new(ProcessCommandRunner))
     }
 
-    pub fn new_with_runner(root: PathBuf, runner: Arc<dyn CommandRunner>) -> Self {
+    pub(crate) fn new_with_runner(root: PathBuf, runner: Arc<dyn CommandRunner>) -> Self {
         Self {
             root,
             runner,

@@ -43,7 +43,7 @@ fn subheader(text: &str) {
 #[command(name = "glab-tui")]
 #[command(about = "GitLab/GitHub terminal user interface")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
-pub struct Cli {
+pub(crate) struct Cli {
     #[arg(
         short = 'r',
         long = "repo",
@@ -66,7 +66,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
-pub enum Commands {
+pub(crate) enum Commands {
     /// Check system health and dependency availability
     Doctor,
     /// Remove stale cache entries for repos that no longer exist
@@ -88,7 +88,7 @@ pub enum Commands {
     Repos,
 }
 
-pub async fn run_doctor() {
+pub(crate) async fn run_doctor() {
     let mut has_backend = false;
 
     header("glab-tui doctor");
@@ -262,7 +262,7 @@ pub async fn run_doctor() {
     }
 }
 
-pub fn run_clean_cache(dry_run: bool) {
+pub(crate) fn run_clean_cache(dry_run: bool) {
     if dry_run {
         header("glab-tui clean-cache --dry-run");
         println!("{}", styled("===============================", C_CYAN));
@@ -352,7 +352,7 @@ fn find_git_root() -> Option<std::path::PathBuf> {
     None
 }
 
-pub fn run_cache_list() {
+pub(crate) fn run_cache_list() {
     let cache_dir = crate::utils::cache::get_cache_dir();
     if !cache_dir.exists() {
         warn(
@@ -422,7 +422,7 @@ pub fn run_cache_list() {
     );
 }
 
-pub fn run_open_in_browser(entity: &str, id: &str) {
+pub(crate) fn run_open_in_browser(entity: &str, id: &str) {
     let is_github = detect_github();
 
     let (program, subcommand) = match entity {
@@ -499,7 +499,7 @@ pub fn run_open_in_browser(entity: &str, id: &str) {
     }
 }
 
-pub fn run_repos_list() {
+pub(crate) fn run_repos_list() {
     subheader("Recent repositories:");
     let recent = crate::utils::cache::get_recent_repos();
     if recent.is_empty() {
@@ -529,7 +529,7 @@ pub fn run_repos_list() {
     }
 }
 
-pub async fn run_update() {
+pub(crate) async fn run_update() {
     println!("Checking for updates...");
     match crate::utils::update::perform_self_update().await {
         Ok(updated) => {

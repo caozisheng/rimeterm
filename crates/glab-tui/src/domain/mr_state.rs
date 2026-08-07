@@ -23,7 +23,7 @@ pub enum WorkflowStatus {
 }
 
 /// Everything the cascade needs, gathered in one place so the rules stay pure.
-pub struct WorkflowInputs<'a> {
+pub(crate) struct WorkflowInputs<'a> {
     /// `None` when the current user could not be determined — the whole
     /// cascade is then unanswerable.
     pub current_user: Option<&'a str>,
@@ -39,7 +39,7 @@ pub struct WorkflowInputs<'a> {
 
 /// First-match cascade. Returns `None` only when the answer is unknowable —
 /// never as a stand-in for "not yours", which is `NotYours`.
-pub fn workflow_status(i: &WorkflowInputs) -> Option<WorkflowStatus> {
+pub(crate) fn workflow_status(i: &WorkflowInputs) -> Option<WorkflowStatus> {
     let me = i.current_user?;
     if me.is_empty() {
         return None;
@@ -78,7 +78,7 @@ pub fn workflow_status(i: &WorkflowInputs) -> Option<WorkflowStatus> {
 /// Returned to the table as a decimal string by the caller, so the
 /// comparator's `u64` fast path orders by ordinal rather than alphabetically
 /// by label. Grouping uses the same value, because group-by is sort.
-pub fn workflow_sort_key(s: Option<WorkflowStatus>) -> u8 {
+pub(crate) fn workflow_sort_key(s: Option<WorkflowStatus>) -> u8 {
     match s {
         Some(WorkflowStatus::ReturnedToYou) => 0,
         Some(WorkflowStatus::ReviewRequested) => 1,
@@ -114,7 +114,7 @@ fn workflow_icon_and_word(
 
 /// Abbreviated cell text. Full wording lives in the Details pane, because
 /// "Returned to you" is 16 chars and the column clamps to 10 below 90 columns.
-pub fn workflow_cell(s: Option<WorkflowStatus>, icons: &crate::config::Icons) -> String {
+pub(crate) fn workflow_cell(s: Option<WorkflowStatus>, icons: &crate::config::Icons) -> String {
     match s {
         // Known "not yours" renders blank so the 24-of-33 common case stays quiet.
         Some(WorkflowStatus::NotYours) => String::new(),
@@ -132,7 +132,7 @@ pub fn workflow_cell(s: Option<WorkflowStatus>, icons: &crate::config::Icons) ->
 /// icon and text together like the table column does. Reads from the same
 /// `workflow_icon_and_word` match as `workflow_cell` so the two can never
 /// disagree on which glyph a status gets.
-pub fn workflow_icon(s: Option<WorkflowStatus>, icons: &crate::config::Icons) -> String {
+pub(crate) fn workflow_icon(s: Option<WorkflowStatus>, icons: &crate::config::Icons) -> String {
     match s {
         Some(status) => workflow_icon_and_word(status, icons)
             .map(|(icon, _)| icon)
@@ -143,7 +143,7 @@ pub fn workflow_icon(s: Option<WorkflowStatus>, icons: &crate::config::Icons) ->
 
 /// GitLab's full wording, for the Details pane and filter values.
 /// `None` for both `NotYours` and unknown — neither gets a Details line.
-pub fn workflow_label(s: Option<WorkflowStatus>) -> Option<&'static str> {
+pub(crate) fn workflow_label(s: Option<WorkflowStatus>) -> Option<&'static str> {
     match s {
         Some(WorkflowStatus::ReturnedToYou) => Some("Returned to you"),
         Some(WorkflowStatus::ReviewRequested) => Some("Review requested"),
@@ -158,7 +158,7 @@ pub fn workflow_label(s: Option<WorkflowStatus>) -> Option<&'static str> {
 /// The abbreviated word shown in the Workflow table cell (e.g. "Returned",
 /// "Review req"). Used as the column-filter picker value so it matches
 /// exactly what the user sees. `None` for statuses that render blank.
-pub fn workflow_cell_word(
+pub(crate) fn workflow_cell_word(
     s: Option<WorkflowStatus>,
     icons: &crate::config::Icons,
 ) -> Option<&'static str> {
@@ -217,7 +217,7 @@ pub struct MergeabilityState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalTone {
+pub(crate) enum ApprovalTone {
     Unknown,
     ChangesRequested,
     AwaitingYou,
@@ -226,7 +226,7 @@ pub enum ApprovalTone {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MergeTone {
+pub(crate) enum MergeTone {
     Unknown,
     Conflict,
     Rebase,
@@ -239,7 +239,7 @@ const TRANSIENT_MERGE_STATUSES: [&str; 4] =
     ["CHECKING", "UNCHECKED", "PREPARING", "APPROVALS_SYNCING"];
 
 /// REST returns these lowercase, GraphQL uppercase, so compare case-insensitively.
-pub fn is_transient_merge_status(raw: &str) -> bool {
+pub(crate) fn is_transient_merge_status(raw: &str) -> bool {
     let upper = raw.to_uppercase();
     TRANSIENT_MERGE_STATUSES.contains(&upper.as_str())
 }
@@ -247,7 +247,7 @@ pub fn is_transient_merge_status(raw: &str) -> bool {
 /// Your approval is still needed only if you *can* approve, have not already,
 /// and the MR is not already satisfied. The final term stops the UI nagging
 /// about MRs that need nothing.
-pub fn derive_awaiting_you(can_approve: bool, you_approved: bool, approved: bool) -> bool {
+pub(crate) fn derive_awaiting_you(can_approve: bool, you_approved: bool, approved: bool) -> bool {
     can_approve && !you_approved && !approved
 }
 
@@ -276,7 +276,7 @@ fn pending_icons(s: &ApprovalState, icon: &str) -> String {
 }
 
 /// First-match-wins cascade. See the precedence flowchart in the design spec.
-pub fn approval_cell(
+pub(crate) fn approval_cell(
     state: Option<&ApprovalState>,
     is_github: bool,
     icons: &crate::config::Icons,
@@ -333,7 +333,7 @@ pub fn approval_cell(
 /// First-match-wins cascade. Conflict outranks rebase because it is the more
 /// blocking state and the only one the user cannot fix from the TUI. Known
 /// state outranks `computing`.
-pub fn mergeable_cell(
+pub(crate) fn mergeable_cell(
     state: Option<&MergeabilityState>,
     icons: &crate::config::Icons,
 ) -> (String, MergeTone) {
@@ -359,7 +359,7 @@ pub fn mergeable_cell(
 /// stringifies this via `.to_string()` before handing it to the table's sort
 /// comparator, whose `u64` fast path then orders rows by state rather than
 /// alphabetically by label.
-pub fn approval_sort_key(state: Option<&ApprovalState>, icons: &crate::config::Icons) -> u8 {
+pub(crate) fn approval_sort_key(state: Option<&ApprovalState>, icons: &crate::config::Icons) -> u8 {
     match approval_cell(state, false, icons).1 {
         ApprovalTone::ChangesRequested => 0,
         ApprovalTone::Pending => 1,
@@ -370,7 +370,7 @@ pub fn approval_sort_key(state: Option<&ApprovalState>, icons: &crate::config::I
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RebaseGate {
+pub(crate) enum RebaseGate {
     Allowed,
     /// Rebase cannot resolve a conflict — that needs local work.
     ResolveLocally,
@@ -380,7 +380,7 @@ pub enum RebaseGate {
 /// Whether `R` should act, refuse, or no-op, so the action matches what the
 /// Mergeable column shows. Kept pure and separate from the handler so the
 /// decision is unit-testable.
-pub fn rebase_gate(state: Option<&MergeabilityState>) -> RebaseGate {
+pub(crate) fn rebase_gate(state: Option<&MergeabilityState>) -> RebaseGate {
     match state {
         Some(s) if s.conflicts => RebaseGate::ResolveLocally,
         Some(s) if s.needs_rebase => RebaseGate::Allowed,
@@ -388,7 +388,10 @@ pub fn rebase_gate(state: Option<&MergeabilityState>) -> RebaseGate {
     }
 }
 
-pub fn mergeable_sort_key(state: Option<&MergeabilityState>, icons: &crate::config::Icons) -> u8 {
+pub(crate) fn mergeable_sort_key(
+    state: Option<&MergeabilityState>,
+    icons: &crate::config::Icons,
+) -> u8 {
     match mergeable_cell(state, icons).1 {
         MergeTone::Conflict => 0,
         MergeTone::Rebase => 1,
@@ -399,7 +402,7 @@ pub fn mergeable_sort_key(state: Option<&MergeabilityState>, icons: &crate::conf
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadsTone {
+pub(crate) enum ThreadsTone {
     Blocking,
     Clean,
 }
@@ -418,7 +421,7 @@ pub enum ThreadsTone {
 /// threads while still blocking. So `(false, Some(0))` collapses into the
 /// same wording as `(false, None)` rather than rendering the self-contradictory
 /// "0 open, blocking merge".
-pub fn threads_line_text(
+pub(crate) fn threads_line_text(
     resolved: Option<bool>,
     count: Option<usize>,
     icons: &crate::config::Icons,
@@ -453,7 +456,7 @@ pub fn threads_line_text(
 /// Each flag occupies its own slot, so `DRAFT` and the flag never displace one
 /// another. Flags append in a fixed order so the cell is stable across
 /// refreshes; later flags must be added to the end, not interleaved.
-pub fn status_flags(
+pub(crate) fn status_flags(
     blocking_discussions_resolved: Option<bool>,
     icons: &crate::config::Icons,
 ) -> String {
@@ -469,7 +472,7 @@ pub fn status_flags(
 /// Filter values for the Status column. Returns more than one value when an MR
 /// carries a flag, so the flag is filterable without the base word losing its
 /// own filter value.
-pub fn status_filter_values(
+pub(crate) fn status_filter_values(
     draft: bool,
     blocking_discussions_resolved: Option<bool>,
 ) -> Vec<String> {

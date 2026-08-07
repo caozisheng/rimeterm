@@ -14,7 +14,7 @@ use crate::git_helpers::get_current_branch;
 /// offline session would show real cached Approval/Mergeable values next to
 /// a uniformly `—` Workflow column, which reads as "could not determine"
 /// when the data to determine it was sitting right there.
-pub fn derive_workflow(mrs: &mut [crate::domain::mr::MergeRequest]) {
+pub(crate) fn derive_workflow(mrs: &mut [crate::domain::mr::MergeRequest]) {
     for mr in mrs.iter_mut() {
         let ap = mr.approval.as_ref();
         let assignees: Vec<String> = mr.assignees.iter().map(|a| a.username.clone()).collect();
@@ -96,7 +96,7 @@ mod tests {
     }
 }
 
-pub fn spawn_fetch_repo_attributes(
+pub(crate) fn spawn_fetch_repo_attributes(
     client: &domain::client::GitlabClient,
     project_context: &str,
     tx: tokio::sync::mpsc::UnboundedSender<Event>,
@@ -114,7 +114,7 @@ pub fn spawn_fetch_repo_attributes(
     });
 }
 
-pub fn spawn_refresh_active_tab(
+pub(crate) fn spawn_refresh_active_tab(
     client: &domain::client::GitlabClient,
     project_context: &str,
     tab: app::Tab,

@@ -53,7 +53,7 @@ pub struct DeploymentUser {
     pub username: String,
 }
 
-pub async fn list_environments(
+pub(crate) async fn list_environments(
     client: &GitlabClient,
     project_path: &str,
 ) -> Result<Vec<Environment>> {
@@ -63,7 +63,7 @@ pub async fn list_environments(
         .await
 }
 
-pub async fn list_deployments(
+pub(crate) async fn list_deployments(
     client: &GitlabClient,
     project_path: &str,
     environment: Option<&str>,

@@ -1451,7 +1451,7 @@ toggle_wrap = "w"
     }
 }
 
-pub fn all_theme_presets() -> Vec<String> {
+pub(crate) fn all_theme_presets() -> Vec<String> {
     let mut presets: Vec<String> = BUNDLED_THEMES
         .iter()
         .map(|(name, _)| name.to_string())

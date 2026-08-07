@@ -20,14 +20,17 @@ pub struct Milestone {
     pub created_at: String,
 }
 
-pub async fn list_milestones(client: &GitlabClient, project_path: &str) -> Result<Vec<Milestone>> {
+pub(crate) async fn list_milestones(
+    client: &GitlabClient,
+    project_path: &str,
+) -> Result<Vec<Milestone>> {
     client
         .backend
         .list_milestones(project_path, client.page_size)
         .await
 }
 
-pub async fn list_milestone_issues(
+pub(crate) async fn list_milestone_issues(
     client: &GitlabClient,
     project_path: &str,
     milestone_iid: u64,
@@ -38,7 +41,7 @@ pub async fn list_milestone_issues(
         .await
 }
 
-pub async fn update_milestone_state(
+pub(crate) async fn update_milestone_state(
     client: &GitlabClient,
     project_path: &str,
     milestone_iid: u64,
@@ -50,7 +53,7 @@ pub async fn update_milestone_state(
         .await
 }
 
-pub async fn update_milestone(
+pub(crate) async fn update_milestone(
     client: &GitlabClient,
     project_path: &str,
     milestone_iid: u64,
@@ -72,7 +75,7 @@ pub async fn update_milestone(
         .await
 }
 
-pub async fn delete_milestone(
+pub(crate) async fn delete_milestone(
     client: &GitlabClient,
     project_path: &str,
     milestone_iid: u64,

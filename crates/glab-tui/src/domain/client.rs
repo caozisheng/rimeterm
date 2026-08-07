@@ -626,7 +626,7 @@ impl std::fmt::Debug for GitlabClient {
     }
 }
 
-pub async fn get_project_context(root: impl AsRef<std::path::Path>) -> Result<String> {
+pub(crate) async fn get_project_context(root: impl AsRef<std::path::Path>) -> Result<String> {
     let root = root.as_ref();
     let output = std::process::Command::new("git")
         .args(["remote", "get-url", "origin"])
