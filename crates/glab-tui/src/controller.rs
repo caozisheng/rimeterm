@@ -98,13 +98,39 @@ pub fn handle_key(
     ControllerOutcome::Unchanged
 }
 
-/// Top-level mouse dispatcher.  Routes the mouse event to the correct
-/// widget based on a z-order hit-test against the current layout rectangles.
-pub fn handle_mouse(_app: &mut App, _mouse: MouseEvent, _area: Rect) -> ControllerOutcome {
-    // Mouse z-order routing will be wired in a later phase once the
-    // UI layout rectangles are exposed on App.  For now, delegate to
-    // per-widget on_mouse methods that already exist on App/EmbeddedApp.
-    ControllerOutcome::Unchanged
+/// Top-level mouse dispatcher.
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent, _area: Rect) -> ControllerOutcome {
+    match mouse.kind {
+        MouseEventKind::ScrollDown => {
+            scroll_active_list(app, true);
+            ControllerOutcome::Changed
+        }
+        MouseEventKind::ScrollUp => {
+            scroll_active_list(app, false);
+            ControllerOutcome::Changed
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => ControllerOutcome::Changed,
+        _ => ControllerOutcome::Unchanged,
+    }
+}
+
+fn scroll_active_list(app: &mut App, down: bool) {
+    use crate::app::Tab;
+    if let Some(s) = app.active_table_state_mut() {
+        let selected = s.selected().unwrap_or(0);
+        let new = if down {
+            selected.saturating_add(1)
+        } else {
+            selected.saturating_sub(1)
+        };
+        s.select(Some(new));
+    } else if app.active_tab == Tab::Terminal {
+        if down {
+            app.terminal_scroll = app.terminal_scroll.saturating_sub(1);
+        } else {
+            app.terminal_scroll = app.terminal_scroll.saturating_add(1);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

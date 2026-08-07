@@ -233,7 +233,16 @@ impl EmbeddedApp {
         };
         let outcome =
             controller::handle_key(app, key, self.event_tx.clone(), &mut self.last_refresh);
-        Self::translate(outcome)
+        if outcome != ControllerOutcome::Unchanged {
+            return Self::translate(outcome);
+        }
+        // Overlays didn't consume it — route to the async tab handler.
+        let tx = self.event_tx.clone();
+        let handle = self.handle.clone();
+        tokio::task::block_in_place(|| {
+            handle.block_on(crate::handlers::tabs::handle_active_tab_key(app, &key, tx))
+        });
+        EmbeddedOutcome::Changed
     }
 
     /// Forward a mouse event.  `area` is the rect this view occupies.
