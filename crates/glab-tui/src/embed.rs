@@ -185,6 +185,9 @@ pub struct EmbeddedApp {
     handle: tokio::runtime::Handle,
     event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Event>>,
+    /// Pending client + project context set by start_load and consumed
+    /// by poll_background when transitioning to Ready.
+    pending_client: Option<(crate::domain::client::GitlabClient, String)>,
     visible: bool,
     next_refresh: Option<Instant>,
     refresh_interval: Option<Duration>,
@@ -200,7 +203,6 @@ impl EmbeddedApp {
     pub fn new(options: EmbeddedOptions, handle: tokio::runtime::Handle) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-
         let now = Instant::now();
         let next_refresh = options.refresh.map(|d| now + d);
 
@@ -212,6 +214,7 @@ impl EmbeddedApp {
             handle,
             event_tx,
             event_rx: Some(event_rx),
+            pending_client: None,
             visible: true,
             next_refresh,
             refresh_interval: options.refresh,
@@ -268,6 +271,21 @@ impl EmbeddedApp {
                 continue;
             }
             self.apply_event(tc.event);
+            changed = true;
+        }
+
+        // Drain events from fetch handlers (event_rx).
+        let pending_events: Vec<Event> = if let Some(rx) = &mut self.event_rx {
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            events
+        } else {
+            Vec::new()
+        };
+        for event in pending_events {
+            self.apply_event(event);
             changed = true;
         }
 
@@ -467,34 +485,72 @@ impl EmbeddedApp {
     fn start_load(&mut self) {
         let generation_id = self.generation;
         let tx = self.tx.clone();
+        let root = self.options.workspace_root.clone();
+        let handle = self.handle.clone();
         let now = Instant::now();
         self.last_refresh = now;
         self.next_refresh = self.refresh_interval.map(|d| now + d);
+        let event_tx = self.event_tx.clone();
 
-        // Spawn a task that sends a Tick to signal load initiation.
-        // In a real integration the host's backend populates event data;
-        // here we signal that loading started.
-        self.handle.spawn(async move {
+        handle.spawn(async move {
+            // 1. Detect project context from the workspace root.
+            let project_context = match crate::domain::client::get_project_context(&root).await {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    let _ = tx.send(TaggedCompletion {
+                        generation: generation_id,
+                        event: Event::FetchFailed(
+                            Tab::Issues,
+                            format!("Failed to detect project: {}", e),
+                        ),
+                    });
+                    return;
+                }
+            };
+
+            // 2. Create backend client bound to this root.
+            let client = match crate::domain::client::GitlabClient::new(&root).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(TaggedCompletion {
+                        generation: generation_id,
+                        event: Event::FetchFailed(
+                            Tab::Issues,
+                            format!("Failed to create backend: {}", e),
+                        ),
+                    });
+                    return;
+                }
+            };
+
+            // 3. Signal backend alive (triggers Detecting→Ready).
             let _ = tx.send(TaggedCompletion {
                 generation: generation_id,
-                event: Event::Tick,
+                event: Event::RepoAttributesFetched {
+                    labels: Vec::new(),
+                    members: Vec::new(),
+                },
             });
+
+            // 4. Spawn initial data fetches for the default tab.
+            crate::fetch::spawn_refresh_active_tab(
+                &client,
+                &project_context,
+                Tab::Issues,
+                event_tx.clone(),
+            );
+            crate::fetch::spawn_fetch_repo_attributes(&client, &project_context, event_tx);
         });
     }
 
     fn apply_event(&mut self, event: Event) {
-        // In Detecting state, the first event determines the shell outcome.
         if matches!(self.shell, AppShell::Detecting) {
             match &event {
                 Event::FetchFailed(_tab, msg) => {
-                    // Try to parse the message as a setup problem via
-                    // known error patterns.
                     let problem = Self::detect_setup_problem(msg);
                     if let Some(p) = problem {
                         self.shell = AppShell::Setup(p);
                     } else {
-                        // Unknown failure while detecting — promote to
-                        // Ready with the error message shown.
                         let mut app = App::new();
                         if let Some(tab) = self.options.initial_tab {
                             app.active_tab = tab;
@@ -505,18 +561,37 @@ impl EmbeddedApp {
                     return;
                 }
                 _ => {
-                    // Any non-failure event → backend is alive → Ready.
                     let mut app = App::new();
                     if let Some(tab) = self.options.initial_tab {
                         app.active_tab = tab;
                     }
+                    // Try to create a GitlabClient for this workspace.
+                    let root = self.options.workspace_root.clone();
+                    let handle = self.handle.clone();
+                    let tx = self.event_tx.clone();
+                    let generation_id = self.generation;
+                    handle.spawn(async move {
+                        if let Ok(client) = crate::domain::client::GitlabClient::new(&root).await {
+                            if let Ok(ctx) = crate::domain::client::get_project_context(&root).await
+                            {
+                                let _ = tx.send(Event::RepoAttributesFetched {
+                                    labels: Vec::new(),
+                                    members: Vec::new(),
+                                });
+                                crate::fetch::spawn_refresh_active_tab(
+                                    &client,
+                                    &ctx,
+                                    Tab::Issues,
+                                    tx.clone(),
+                                );
+                            }
+                        }
+                    });
                     self.shell = AppShell::Ready(app);
-                    // Fall through to apply the event to the new app.
                 }
             }
         }
 
-        // Now apply to the inner app (Ready or Offline).
         let app = match &mut self.shell {
             AppShell::Ready(app) | AppShell::Offline(app, _) => app,
             _ => return,
@@ -528,7 +603,6 @@ impl EmbeddedApp {
             }
             Event::IssuesFetched(issues) => {
                 app.issues.items = issues;
-                // Successful fetch in Offline → promote back to Ready.
                 self.promote_to_ready_if_offline();
             }
             Event::MrsFetched(mrs) => {
@@ -556,19 +630,17 @@ impl EmbeddedApp {
                 self.promote_to_ready_if_offline();
             }
             Event::FetchFailed(_tab, msg) => {
-                // Transition Ready → Offline, keeping cached data.
                 if matches!(self.shell, AppShell::Ready(_)) {
-                    if let AppShell::Ready(app) = std::mem::replace(
-                        &mut self.shell,
-                        AppShell::Detecting, // placeholder
-                    ) {
+                    if let AppShell::Ready(app) =
+                        std::mem::replace(&mut self.shell, AppShell::Detecting)
+                    {
                         self.shell = AppShell::Offline(app, msg);
                     }
                 } else if let AppShell::Offline(_, ref mut err) = self.shell {
                     *err = msg;
                 }
             }
-            _ => { /* other events handled as needed */ }
+            _ => {}
         }
     }
 
@@ -675,6 +747,7 @@ mod tests {
             handle,
             event_tx,
             event_rx: Some(event_rx),
+            pending_client: None,
             visible: true,
             next_refresh: None,
             refresh_interval: None,
@@ -715,6 +788,7 @@ mod tests {
             handle,
             event_tx,
             event_rx: Some(event_rx),
+            pending_client: None,
             visible: true,
             next_refresh: None,
             refresh_interval: None,
