@@ -185,9 +185,11 @@ pub struct EmbeddedApp {
     handle: tokio::runtime::Handle,
     event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Event>>,
-    /// Pending client + project context set by start_load and consumed
-    /// by poll_background when transitioning to Ready.
-    pending_client: Option<(crate::domain::client::GitlabClient, String)>,
+    /// Pending client + project context created by start_load in a
+    /// background task; consumed by poll_background when transitioning
+    /// Detecting → Ready to install onto the App.
+    pending_client:
+        std::sync::Arc<parking_lot::Mutex<Option<(crate::domain::client::GitlabClient, String)>>>,
     visible: bool,
     next_refresh: Option<Instant>,
     refresh_interval: Option<Duration>,
@@ -214,7 +216,7 @@ impl EmbeddedApp {
             handle,
             event_tx,
             event_rx: Some(event_rx),
-            pending_client: None,
+            pending_client: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             visible: true,
             next_refresh,
             refresh_interval: options.refresh,
@@ -491,7 +493,7 @@ impl EmbeddedApp {
         self.last_refresh = now;
         self.next_refresh = self.refresh_interval.map(|d| now + d);
         let event_tx = self.event_tx.clone();
-
+        let pending_client = self.pending_client.clone();
         handle.spawn(async move {
             // 0. Detect git host from remote URL.
             let remote_output = tokio::process::Command::new("git")
@@ -553,6 +555,8 @@ impl EmbeddedApp {
                     return;
                 }
             };
+            // Store client + ctx for apply_event to install onto App.
+            *pending_client.lock() = Some((client.clone(), project_context.clone()));
 
             // 3. Signal backend alive (triggers Detecting→Ready).
             let _ = tx.send(TaggedCompletion {
@@ -596,23 +600,10 @@ impl EmbeddedApp {
                     if let Some(tab) = self.options.initial_tab {
                         app.active_tab = tab;
                     }
-                    // Create backend client synchronously so App can
-                    // refresh tabs immediately.
-                    let root = self.options.workspace_root.clone();
-                    let handle = self.handle.clone();
-                    let event_tx = self.event_tx.clone();
-                    let result = tokio::task::block_in_place(|| {
-                        handle.block_on(async {
-                            let client =
-                                crate::domain::client::GitlabClient::new(&root).await.ok()?;
-                            let ctx = crate::domain::client::get_project_context(&root)
-                                .await
-                                .ok()?;
-                            Some((client, ctx))
-                        })
-                    });
-                    if let Some((client, ctx)) = result {
+                    // Consume the client that start_load prepared for us.
+                    if let Some((client, ctx)) = self.pending_client.lock().take() {
                         app.project_context = ctx;
+                        app.tx = Some(self.event_tx.clone());
                         app.gitlab_client = Some(client);
                     }
                     self.shell = AppShell::Ready(app);
@@ -775,7 +766,7 @@ mod tests {
             handle,
             event_tx,
             event_rx: Some(event_rx),
-            pending_client: None,
+            pending_client: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             visible: true,
             next_refresh: None,
             refresh_interval: None,
@@ -816,7 +807,7 @@ mod tests {
             handle,
             event_tx,
             event_rx: Some(event_rx),
-            pending_client: None,
+            pending_client: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             visible: true,
             next_refresh: None,
             refresh_interval: None,
