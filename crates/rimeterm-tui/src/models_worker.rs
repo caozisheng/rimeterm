@@ -58,6 +58,19 @@ impl ModelsWorker {
         }
         out
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_channels() -> (Self, Sender<ModelsResponse>) {
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        (
+            Self {
+                request_tx,
+                response_rx,
+            },
+            response_tx,
+        )
+    }
 }
 
 fn run(req_rx: Receiver<ModelsRequest>, resp_tx: Sender<ModelsResponse>) {

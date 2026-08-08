@@ -1037,7 +1037,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, pane: &ModelsPane) {
             if let Some(hint) = &pane.hint {
                 (hint.clone(), Color::Yellow)
             } else if let Some(error) = &pane.snapshot.last_error {
-                (format!("error: {error}"), Color::Red)
+                (
+                    format!("error: {error} · press r refresh to retry"),
+                    Color::Red,
+                )
             } else {
                 (
                     "h/l focus  j/k nav  / search  s/S sort  1-6 filter  r refresh".into(),
@@ -1223,6 +1226,60 @@ mod tests {
         assert_eq!(restored.search_query, "claude");
         assert_eq!(restored.sort_key, SortKey::Context);
         assert_eq!(restored.sort_order, SortOrder::Ascending);
+    }
+
+    #[test]
+    fn fetch_error_keeps_last_snapshot_and_hints_refresh() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let json = r#"{
+          "openai":{"id":"openai","name":"OpenAI","models":{
+            "gpt":{"id":"gpt","name":"GPT","cost":{"input":2,"output":8}}
+          }}
+        }"#;
+        let mut pane = ModelsPane::new();
+        pane.snapshot = Snapshot::from_providers(&serde_json::from_str(json).unwrap());
+        pane.sync_selection();
+        let (worker, response_tx) = ModelsWorker::test_channels();
+        pane.worker = worker;
+        pane.requested_generation = 2;
+        pane.applied_generation = 1;
+        pane.fetching = true;
+        response_tx
+            .send(ModelsResponse::Fetch {
+                generation: 2,
+                result: Err("timed out reaching models.dev".into()),
+            })
+            .unwrap();
+
+        assert!(pane.poll_background());
+        assert_eq!(pane.snapshot.model_count, 1);
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 44)).unwrap();
+        terminal
+            .draw(|frame| {
+                pane.render(
+                    frame.area(),
+                    frame,
+                    &PaneRenderCtx {
+                        focused: true,
+                        title_override: None,
+                        focus_color: Color::Cyan,
+                    },
+                );
+            })
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("timed out reaching models.dev"), "{text}");
+        assert!(text.contains("r refresh"), "{text}");
+        assert!(text.contains("GPT"), "{text}");
     }
 
     #[test]

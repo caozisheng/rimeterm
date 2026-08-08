@@ -51,7 +51,6 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         let blank = super::density_blank_lines(app.prefs.density);
         let counts = group_counts(groups);
-        let last = visible.len().saturating_sub(1);
         let mut last_group: Option<&GroupKey> = None;
         for (i, (&abs, gk)) in visible.iter().zip(groups.iter()).enumerate() {
             if !matches!(gk, GroupKey::None) && last_group != Some(gk) {
@@ -77,9 +76,6 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
                 cursor_line = Some(lines.len());
             }
             lines.push(task_row::build_line(task, opts, &theme));
-            if matches!(gk, GroupKey::None) && i != last {
-                push_blanks(&mut lines, blank);
-            }
         }
     }
 
@@ -263,5 +259,44 @@ fn due_bucket_color(theme: &Theme, b: ListDueBucket) -> Color {
 fn push_blanks(lines: &mut Vec<Line>, n: usize) {
     for _ in 0..n {
         lines.push(Line::raw(" "));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::Sort;
+    use crate::app::test_support::build_app;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn file_sort_keeps_tasks_on_adjacent_rows() {
+        let mut app = build_app("first task\nsecond task\n");
+        app.prefs.sort = Sort::File;
+        app.prefs.density = crate::app::Density::Comfortable;
+        app.recompute_visible();
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, frame.area(), &mut app))
+            .unwrap();
+
+        let rows: Vec<String> = (0..10)
+            .map(|y| {
+                (0..80)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let first = rows
+            .iter()
+            .position(|row| row.contains("first task"))
+            .unwrap();
+        let second = rows
+            .iter()
+            .position(|row| row.contains("second task"))
+            .unwrap();
+        assert_eq!(second, first + 1);
     }
 }
