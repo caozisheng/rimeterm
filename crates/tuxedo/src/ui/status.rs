@@ -38,30 +38,42 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         mode_label = format!("{mode_label} · {f}").into();
     }
 
-    let hint = if matches!(app.view, View::Archive) && app.mode == Mode::Normal {
-        "j/k · dd restore · a back to list · q quit"
+    let hint: std::borrow::Cow<'static, str> = if matches!(app.view, View::Archive)
+        && app.mode == Mode::Normal
+    {
+        "j/k · dd restore · a back to list · q quit".into()
     } else {
         match app.mode {
             Mode::Insert => match app.draft.input_mode() {
                 DialogInputMode::Normal => {
-                    "h/l navigate · w/b/e word · i/a insert · Enter save · Esc cancel"
+                    "h/l navigate · w/b/e word · i/a insert · Enter save · Esc cancel".into()
                 }
-                DialogInputMode::Insert => "Enter save · Esc normal",
+                DialogInputMode::Insert => "Enter save · Esc normal".into(),
             },
-            Mode::Visual => "space toggle · x complete · dd archive · Esc cancel",
-            Mode::Help => "? close help",
-            Mode::Settings => "Esc back",
-            Mode::PromptProject => "type +project name · Enter save · Esc cancel",
-            Mode::PromptContext => "type @context name · Enter toggle · Esc cancel",
-            Mode::PickProject => "j/k or ↑↓ cycle projects · Enter keep · Esc clear",
-            Mode::PickContext => "j/k or ↑↓ cycle contexts · Enter keep · Esc clear",
-            Mode::PickSavedFilter => "j/k or ↑↓ cycle filters · Enter keep · Esc revert",
-            Mode::PromptSaveFilter => "type a filter name · Enter save · Esc cancel",
-            Mode::CommandPalette => "type to filter · Enter run · Esc cancel",
-            Mode::Share => "scan the QR · any key dismisses",
-            Mode::Welcome => "c create ./todo.txt · s open sample · q quit",
+            Mode::Visual => "space toggle · x complete · dd archive · Esc cancel".into(),
+            Mode::Help => "? close help".into(),
+            Mode::Settings => "Esc back".into(),
+            Mode::PromptProject => "type +project name · Enter save · Esc cancel".into(),
+            Mode::PromptContext => "type @context name · Enter toggle · Esc cancel".into(),
+            Mode::PickProject => "j/k or ↑↓ cycle projects · Enter keep · Esc clear".into(),
+            Mode::PickContext => "j/k or ↑↓ cycle contexts · Enter keep · Esc clear".into(),
+            Mode::PickSavedFilter => "j/k or ↑↓ cycle filters · Enter keep · Esc revert".into(),
+            Mode::PromptSaveFilter => "type a filter name · Enter save · Esc cancel".into(),
+            Mode::CommandPalette => "type to filter · Enter run · Esc cancel".into(),
+            Mode::Share => "scan the QR · any key dismisses".into(),
+            Mode::Welcome => "c create ./todo.txt · s open sample · q quit".into(),
             _ => {
-                "j/k · n new · x done · dd archive · a archived · / search · ? help · u undo · q quit"
+                // Normal mode: prepend the host-supplied embedded hint
+                // (rimeterm's `TodoPane` sets it to advertise Ctrl+J)
+                // so the shortcut is visible even on narrow terminals
+                // where the standard hints get truncated by the
+                // middle-area layout. Standalone tuxedo leaves it None
+                // and pays no allocation.
+                let base = "j/k · n new · x done · dd archive · a archived · / search · ? help · u undo · q quit";
+                match app.embedded_hint {
+                    Some(extra) => format!("{extra} · {base}").into(),
+                    None => base.into(),
+                }
             }
         }
     };

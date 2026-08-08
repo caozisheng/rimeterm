@@ -294,6 +294,185 @@ pub(crate) fn spinner_glyph(elapsed: std::time::Duration) -> &'static str {
     SPINNER_FRAMES[idx]
 }
 
+/// A dispatched todo task waiting to be typed into a freshly spawned
+/// agent's stdin. Populated by the Ctrl+J → picker flow from the
+/// [`TodoPane`]: once the agent binary is spawned, the cleaned prompt
+/// lives here until [`App::drain_pending_dispatches`] writes the
+/// text to the child's stdin and drops the entry.
+///
+/// **The trailing Enter is deliberately NOT sent.** The user reviews
+/// the prefilled prompt in the agent's input widget and presses Enter
+/// themselves to submit. This is a design decision — the dispatch
+/// pre-loads the prompt; the user confirms. It also sidesteps
+/// bracketed-paste quirks in TUI agents (Claude Code, codex, gemini)
+/// where an auto-appended `\r` would be swallowed as paste content
+/// rather than acting as submit.
+///
+/// Tracked as a `Vec` (capped at [`PENDING_DISPATCH_MAX`]) — not an
+/// `Option` — so multiple in-flight dispatches (v2 multi-select, batch
+/// scripts) don't need a refactor.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingDispatch {
+    pub pane_id: PaneId,
+    pub text: String,
+    pub started: Instant,
+}
+
+/// Hard cap on queued dispatches. Excess entries are dropped oldest-first
+/// with a `warn!` — protects against a pathological automation stream.
+pub(crate) const PENDING_DISPATCH_MAX: usize = 32;
+
+/// Fallback deadline after which a dispatch's prompt is written even if
+/// the child hasn't printed anything. Small enough (`< 1 s`) that the
+/// user perceives it as "instant"; large enough that a slow-booting
+/// claude/codex has almost always painted its intro banner first.
+pub(crate) const PENDING_DISPATCH_FALLBACK: std::time::Duration =
+    std::time::Duration::from_millis(750);
+
+/// Transient state carried from a Ctrl+J key press through the picker
+/// modal to the `agents.dispatch.<id>` intent. Populated by
+/// [`App::try_dispatch_todo_to_agent`] once the workspace gate and git
+/// branch creation both succeed; consumed by
+/// [`App::run_context_intent`] when the user picks an agent.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingDispatchState {
+    /// Cleaned prompt (`tuxedo::todo::body_only(raw)`) queued for
+    /// stdin injection once the agent's PTY is ready.
+    pub text: String,
+    /// Working directory the agent tab spawns in — the workspace root
+    /// keyed off the task's `+project` tag in `project.txt`.
+    pub cwd: PathBuf,
+    /// Matched project tag, appended to the tab label
+    /// (`Claude Code  [rimeterm]`) so cross-workspace tabs stay
+    /// distinguishable at a glance.
+    pub project: String,
+}
+
+/// Turn a description into a git-branch-safe slug: lowercase, non-
+/// alphanumerics collapse into `-`, runs of `-` collapse to one, trim
+/// leading/trailing `-`, cap at 32 chars. Empty input → empty string;
+/// callers upstream handle that by omitting the slug segment.
+pub(crate) fn branch_slug(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last_dash = true; // suppress leading `-`
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    // Cap and trim in one pass.
+    let trimmed: String = out.trim_end_matches('-').chars().take(32).collect();
+    trimmed.trim_end_matches('-').to_string()
+}
+
+/// Compose the branch name for a dispatched todo: `task/<slug>-<ts>`,
+/// or `task/<ts>` when the slug is empty. `ts` = local time
+/// `%Y%m%d-%H%M%S`; second granularity is enough for interactive use.
+pub(crate) fn timestamped_branch_name(text: &str, now: chrono::DateTime<chrono::Local>) -> String {
+    let ts = now.format("%Y%m%d-%H%M%S").to_string();
+    let slug = branch_slug(text);
+    if slug.is_empty() {
+        format!("task/{ts}")
+    } else {
+        format!("task/{slug}-{ts}")
+    }
+}
+
+/// Classification result of the Ctrl+J project-map gate. Pure so tests
+/// can exhaustively drive every branch without spinning up an [`App`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DispatchGate {
+    /// Project resolved to a workspace root; `project` is the matched
+    /// tag (preserving the caller's case for label display), `cwd` is
+    /// the routed absolute path.
+    Route { project: String, cwd: PathBuf },
+    /// No mapping in `project.txt`, but the current workspace's name
+    /// matches one of the task's projects. Caller records the mapping
+    /// then routes to `cwd = current workspace root`.
+    Learn { project: String, cwd: PathBuf },
+    /// Nothing matched — show the wrong-workspace modal listing the
+    /// task's projects and the current workspace name.
+    Reject {
+        projects: Vec<String>,
+        current_ws: String,
+    },
+}
+
+/// Pure classifier for the Ctrl+J dispatch gate. See [`DispatchGate`]
+/// for the four possible outcomes.
+///
+/// Precedence:
+/// 1. First `+project` whose lowercased key resolves in `map` to an
+///    existing directory → `Route`.
+/// 2. Otherwise, first `+project` whose name case-insensitively equals
+///    the current workspace's basename → `Learn`.
+/// 3. Otherwise → `Reject`.
+pub(crate) fn classify_dispatch(
+    map: &rimeterm_config::project_map::ProjectMap,
+    projects: &[String],
+    active_root: &std::path::Path,
+) -> DispatchGate {
+    for project in projects {
+        if let Some(path) = map.get(project) {
+            if path.is_dir() {
+                return DispatchGate::Route {
+                    project: project.clone(),
+                    cwd: path.to_path_buf(),
+                };
+            }
+        }
+    }
+    let ws_name = active_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if !ws_name.is_empty() {
+        for project in projects {
+            if project.eq_ignore_ascii_case(ws_name) {
+                return DispatchGate::Learn {
+                    project: project.clone(),
+                    cwd: active_root.to_path_buf(),
+                };
+            }
+        }
+    }
+    DispatchGate::Reject {
+        projects: projects.to_vec(),
+        current_ws: ws_name.to_string(),
+    }
+}
+
+/// Run `git -C <cwd> checkout -b <branch>` synchronously and return
+/// `Ok(())` on success or the stderr text (or a status-code fallback)
+/// on failure. Shelling out — rather than driving `gix` — is
+/// deliberate: `git checkout -b` handles unborn HEAD, existing-branch
+/// collisions, worktrees, and index locks the way the user expects
+/// with no per-edge-case code on our side.
+///
+/// Runs on the caller's thread (~50 ms for a healthy repo). The
+/// existing PendingSpawn spinner covers the pause.
+pub(crate) fn checkout_new_branch(cwd: &std::path::Path, branch: &str) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["checkout", "-b", branch])
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        format!("git exited with {}", output.status)
+    } else {
+        stderr
+    })
+}
+
 /// Decide whether the boot-progress spinner has done its job. Split from
 /// `App::expire_pending_spawn` so every branch is unit-testable without
 /// spawning a PTY. The classification rules — in order of precedence:
@@ -788,6 +967,23 @@ pub struct App {
     /// Cleared when the target pane produces first output or after
     /// `PENDING_SPAWN_TIMEOUT`.
     pending_spawn: Option<PendingSpawn>,
+    /// State carried between a Ctrl+J in the todo pane and the picker's
+    /// `agents.dispatch.<id>` intent. `Some` for as long as the picker
+    /// modal is open on that flow; cleared on pick (consumed) or on any
+    /// close path (Esc, click-out, unrelated picker pick).
+    ///
+    /// `text` is the cleaned prompt (`tuxedo::todo::body_only`) waiting
+    /// to be typed into the freshly spawned agent's stdin. `cwd` is
+    /// the target workspace root the agent tab spawns in (from
+    /// `~/.rimeterm/tuxedo/project.txt`). `project` is the matched
+    /// project name, appended to the tab label so cross-workspace tabs
+    /// are visually distinct.
+    pending_dispatch: Option<PendingDispatchState>,
+    /// Dispatched todo prompts waiting for their target agent tab to
+    /// print a first byte. Drained each tick by
+    /// [`Self::drain_pending_dispatches`]; capped at
+    /// [`PENDING_DISPATCH_MAX`].
+    pending_dispatches: Vec<PendingDispatch>,
     /// Reverse map from agent PaneId → static registry id (`omp` / `codex`
     /// / `claude` / `pi`). Populated on spawn, consumed by
     /// `persist_agents_state` to write the on-disk file.
@@ -1093,7 +1289,7 @@ impl App {
                 "Files",
                 file_manager_pane_id,
             ),
-            LeftTabCatalogEntry::new("todo", "Todo", todo_pane_id),
+            LeftTabCatalogEntry::new("todo", "Tuxedo", todo_pane_id),
             LeftTabCatalogEntry::new("fr", "Fast Resume", fr_pane_id),
         ];
         let left_bottom_catalog: Vec<LeftTabCatalogEntry> = vec![
@@ -1269,6 +1465,8 @@ impl App {
             hovered_ui: None,
             last_status_bar_hits: StatusBarHits::default(),
             pending_spawn: None,
+            pending_dispatch: None,
+            pending_dispatches: Vec::new(),
             pane_agent_id: startup_agent_ids.into_iter().collect(),
             left_top_catalog,
             left_bottom_catalog,
@@ -1317,6 +1515,9 @@ impl App {
                 self.needs_redraw = true;
             }
             if self.expire_pending_spawn() {
+                self.needs_redraw = true;
+            }
+            if self.drain_pending_dispatches() {
                 self.needs_redraw = true;
             }
 
@@ -2192,6 +2393,7 @@ impl App {
         };
         if !point_in_rect(col, row, popup) {
             self.picker_state.close();
+            self.pending_dispatch = None;
             let _ = self.redraw_tx.send(());
             return;
         }
@@ -2293,6 +2495,9 @@ impl App {
             match crate::picker::handle_key(&mut self.picker_state, key) {
                 crate::picker::PickerOutcome::Run(action) => {
                     self.run_picker_action(action);
+                }
+                crate::picker::PickerOutcome::Closed => {
+                    self.pending_dispatch = None;
                 }
                 _ => {}
             }
@@ -3075,6 +3280,122 @@ impl App {
         self.picker_state.open_with(AGENT_PICKER_TITLE, entries);
     }
 
+    /// Populate and open the "dispatch this todo to an agent" picker.
+    /// Called by [`Self::try_dispatch_todo_to_agent`] after the
+    /// project-map gate has passed and the git branch is in place;
+    /// all the routing state (`text` / `cwd` / `project`) already
+    /// lives on `self.pending_dispatch`, so this only builds the
+    /// entry list and opens the picker anchored inside the todo pane.
+    fn open_agent_dispatch_picker(&mut self, anchor: Rect) {
+        let entries: Vec<crate::picker::PickerEntry> = rimeterm_pty::agent_registry::detect_all()
+            .into_iter()
+            .map(|a| {
+                if a.is_available() {
+                    crate::picker::PickerEntry::intent(a.label, format!("agents.dispatch.{}", a.id))
+                } else {
+                    crate::picker::PickerEntry::disabled(a.label, "(not installed)")
+                }
+            })
+            .collect();
+        self.picker_state.open_with_anchor(
+            "Run task in agent…",
+            entries,
+            crate::picker::PickerAnchor::CenteredOn(anchor),
+        );
+    }
+
+    /// Show a small modal ("dialog") when a Ctrl+J dispatch was
+    /// rejected because none of the task's `+project` tags map to any
+    /// known workspace AND none matches the current workspace name.
+    /// The user's only path forward is to switch workspace and press
+    /// Ctrl+J again.
+    ///
+    /// Reuses [`PickerState`] with disabled body rows for the message
+    /// and a single enabled `[Dismiss]` row so Enter/Esc both close.
+    fn open_wrong_workspace_dialog(&mut self, projects: &[String], current_ws: &str) {
+        let required = projects
+            .iter()
+            .map(|p| format!("+{p}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (required_line, retry_line) = if projects.len() == 1 {
+            (
+                format!("Task requires workspace `{required}`"),
+                format!("Switch to `{required}` and press Ctrl+J again."),
+            )
+        } else {
+            (
+                format!("Task requires one of: {required}"),
+                "Switch to one of those workspaces and press Ctrl+J again.".to_string(),
+            )
+        };
+        let current_line = if current_ws.is_empty() {
+            "Current workspace has no name.".to_string()
+        } else {
+            format!("Current workspace: `{current_ws}`")
+        };
+        let entries = vec![
+            crate::picker::PickerEntry::disabled(required_line, ""),
+            crate::picker::PickerEntry::disabled(current_line, ""),
+            crate::picker::PickerEntry::disabled("", ""),
+            crate::picker::PickerEntry::disabled(retry_line, ""),
+            crate::picker::PickerEntry::intent("[ Dismiss ]", "dispatch.cancel"),
+        ];
+        self.picker_state
+            .open_with("⛔ Workspace mismatch", entries);
+    }
+
+    /// Entry point for the Ctrl+J → agent flow. Runs the pure
+    /// [`classify_dispatch`] gate against `~/.rimeterm/tuxedo/project.txt`,
+    /// then on `Route` / `Learn` performs the side-effects (map
+    /// persistence, git branch creation, dispatch-state stash, picker
+    /// open); on `Reject` opens the wrong-workspace modal.
+    fn try_dispatch_todo_to_agent(&mut self, raw: String, projects: Vec<String>, anchor: Rect) {
+        let mut map = rimeterm_config::project_map::ProjectMap::load_or_default();
+        let gate = classify_dispatch(&map, &projects, &self.active_root);
+        let (project, cwd) = match gate {
+            DispatchGate::Route { project, cwd } => (project, cwd),
+            DispatchGate::Learn { project, cwd } => {
+                map.insert(&project, cwd.clone());
+                if let Err(error) = map.save() {
+                    warn!(
+                        ?error,
+                        "failed to persist project.txt after auto-learn; \
+                         dispatch continues in-memory"
+                    );
+                }
+                (project, cwd)
+            }
+            DispatchGate::Reject {
+                projects,
+                current_ws,
+            } => {
+                self.open_wrong_workspace_dialog(&projects, &current_ws);
+                return;
+            }
+        };
+        let cleaned = tuxedo::todo::body_only(&raw);
+        if cleaned.trim().is_empty() {
+            self.set_hint("⛔ Ctrl+J: task has no content after stripping tags".to_string());
+            return;
+        }
+        let branch = timestamped_branch_name(&cleaned, chrono::Local::now());
+        if let Err(error) = checkout_new_branch(&cwd, &branch) {
+            self.set_hint(format!(
+                "⛔ Ctrl+J: git branch failed in `{}`: {}",
+                cwd.display(),
+                error
+            ));
+            return;
+        }
+        self.pending_dispatch = Some(PendingDispatchState {
+            text: cleaned,
+            cwd,
+            project,
+        });
+        self.open_agent_dispatch_picker(anchor);
+    }
+
     /// Dispatch whatever the picker just returned. Command actions go
     /// through the CommandRegistry; Intent actions carry a string tag we
     /// parse here (`tab.close:<gid>:<idx>`, `tab.activate:<gid>:<idx>`,
@@ -3115,6 +3436,60 @@ impl App {
         // The registered `agents.pick.<id>` Command survives for IPC
         // consumers (rimectl / MCP), where the closure runs on a
         // spawn_blocking task and the ack channel works fine.
+        // `agents.dispatch.<agent_id>` — dispatched from the todo pane's
+        // Ctrl+J flow. Same spawn path as `agents.pick.<id>`, plus a
+        // queued injection of the todo's raw text once the agent's PTY
+        // has produced output (or the 750 ms fallback expires).
+        if let Some(agent_id) = intent.strip_prefix("agents.dispatch.") {
+            let Some(state) = self.pending_dispatch.take() else {
+                warn!(
+                    agent_id,
+                    "agents.dispatch fired without pending dispatch state; ignoring"
+                );
+                return;
+            };
+            let PendingDispatchState { text, cwd, project } = state;
+            let spec_opt = rimeterm_pty::agent_registry::AGENT_REGISTRY
+                .iter()
+                .find(|s| s.id == agent_id);
+            let Some(spec) = spec_opt else {
+                self.set_hint(format!("⛔ unknown agent id `{}`", agent_id));
+                return;
+            };
+            let label = format!("{}  [{}]", spec.label, project);
+            match self.new_agent_tab_in_cwd(BUILTIN_AGENTS, spec, cwd, Some(&project)) {
+                Ok(pane_id) => {
+                    self.pending_spawn = Some(PendingSpawn {
+                        label: label.clone(),
+                        pane_id,
+                        started: Instant::now(),
+                    });
+                    if self.pending_dispatches.len() >= PENDING_DISPATCH_MAX {
+                        warn!(
+                            "pending_dispatches at cap ({}); dropping oldest",
+                            PENDING_DISPATCH_MAX
+                        );
+                        self.pending_dispatches.remove(0);
+                    }
+                    self.pending_dispatches.push(PendingDispatch {
+                        pane_id,
+                        text,
+                        started: Instant::now(),
+                    });
+                    let _ = self.redraw_tx.send(());
+                }
+                Err(e) => {
+                    self.set_hint(format!("⛔ open {}: {}", label, e));
+                }
+            }
+            return;
+        }
+        if intent == "dispatch.cancel" {
+            // Modal Dismiss row — pending_dispatch was already cleared
+            // when the picker closed (Run outcome), so nothing else to
+            // do beyond the close itself.
+            return;
+        }
         if let Some(agent_id) = intent.strip_prefix("agents.pick.") {
             let spec_opt = rimeterm_pty::agent_registry::AGENT_REGISTRY
                 .iter()
@@ -4006,6 +4381,13 @@ impl App {
         while let Ok(action) = self.todo_action_rx.try_recv() {
             match action {
                 TodoAction::ExitRequested => self.activate_tab(BUILTIN_FILES, 0),
+                TodoAction::DispatchToAgent {
+                    raw,
+                    projects,
+                    anchor,
+                } => {
+                    self.try_dispatch_todo_to_agent(raw, projects, anchor);
+                }
             }
             self.needs_redraw = true;
         }
@@ -4153,14 +4535,32 @@ impl App {
         Ok(new_id)
     }
 
-    /// Spawn a fresh agent tab in `gid`. Static `AgentSpec` comes from
-    /// [`rimeterm_pty::agent_registry`] via `parse_open_args`. Reuses
-    /// [`build_agent_pane`] so PTY / placeholder routing is identical to
-    /// the pre-configured `[agents.tabs]` path.
+    /// Spawn a fresh agent tab in `gid`, defaulting cwd to
+    /// [`Self::agent_spawn_cwd`] (== `self.active_root`). Historical
+    /// entry point used by the agent picker and IPC — keeps a bare
+    /// `spec` signature. New callers that need to override the cwd
+    /// (Ctrl+J cross-workspace dispatch) should reach for
+    /// [`Self::new_agent_tab_in_cwd`] instead.
     fn new_agent_tab_in(
         &mut self,
         gid: TabGroupId,
         spec: &'static rimeterm_pty::agent_registry::AgentSpec,
+    ) -> Result<PaneId> {
+        let cwd = self.agent_spawn_cwd();
+        self.new_agent_tab_in_cwd(gid, spec, cwd, None)
+    }
+
+    /// Cwd-override variant of [`Self::new_agent_tab_in`]. `label_suffix`
+    /// is appended to `spec.label` as `<label>  [<suffix>]` so
+    /// cross-workspace agent tabs (Ctrl+J with a `+project` that
+    /// resolves elsewhere) stay visually distinct from same-workspace
+    /// tabs. Pass `None` for the historical no-suffix behaviour.
+    fn new_agent_tab_in_cwd(
+        &mut self,
+        gid: TabGroupId,
+        spec: &'static rimeterm_pty::agent_registry::AgentSpec,
+        cwd: PathBuf,
+        label_suffix: Option<&str>,
     ) -> Result<PaneId> {
         let group = self
             .tree
@@ -4180,11 +4580,14 @@ impl App {
         // everything build_agent_pane needs.
         let external_spec = rimeterm_config::AgentSpec {
             id: spec.id.to_string(),
-            label: spec.label.to_string(),
+            label: match label_suffix {
+                Some(suffix) => format!("{}  [{}]", spec.label, suffix),
+                None => spec.label.to_string(),
+            },
             command: spec.argv.iter().map(|s| s.to_string()).collect(),
             install_hint: Some(spec.install_hint.to_string()),
         };
-        let spawn_cwd = self.agent_spawn_cwd();
+        let spawn_cwd = cwd;
         let new_id = build_agent_pane(
             &mut self.panes,
             &self.session_writes,
@@ -4590,6 +4993,53 @@ impl App {
         } else {
             false
         }
+    }
+
+    /// Drain queued Ctrl+J dispatches, injecting the todo's raw text
+    /// into each target agent's stdin once the child is ready. "Ready"
+    /// means (a) any non-whitespace char in the visible grid — the
+    /// agent has painted its prompt — or (b) [`PENDING_DISPATCH_FALLBACK`]
+    /// elapsed since spawn. Panes that vanished before firing (killed
+    /// tab, crashed child) are dropped silently.
+    ///
+    /// Returns `true` when any entry was fired or dropped — the caller
+    /// promotes `needs_redraw` so the spinner clears and the injected
+    /// text paints on the next frame.
+    fn drain_pending_dispatches(&mut self) -> bool {
+        if self.pending_dispatches.is_empty() {
+            return false;
+        }
+        // Split-borrow: `self.session_writes` and `self.pending_dispatches`
+        // are disjoint fields, so `retain` can mutate the vec while the
+        // sessions guard lives.
+        let sessions = self.session_writes.lock();
+        let before = self.pending_dispatches.len();
+        self.pending_dispatches.retain(|d| {
+            let Some(session) = sessions.get(&d.pane_id) else {
+                // Pane / session gone — nothing to inject into.
+                return false;
+            };
+            let elapsed = d.started.elapsed();
+            let has_output = session
+                .grid_contents(None)
+                .chars()
+                .any(|c| !c.is_whitespace());
+            if !has_output && elapsed < PENDING_DISPATCH_FALLBACK {
+                return true;
+            }
+            // Write only the prompt text — no trailing `\r`. The user
+            // presses Enter themselves to submit (see the module-level
+            // doc on [`PendingDispatch`]).
+            if let Err(error) = session.write(d.text.as_bytes()) {
+                warn!(
+                    pane_id = ?d.pane_id,
+                    ?error,
+                    "failed to write dispatched todo text to agent stdin"
+                );
+            }
+            false
+        });
+        before != self.pending_dispatches.len()
     }
 
     /// Force any throttled PTY resizes to apply immediately. Called on
@@ -7214,7 +7664,7 @@ mod tests {
         let fr = PaneId(53);
         let catalog = vec![
             LeftTabCatalogEntry::new("files", "Files", files),
-            LeftTabCatalogEntry::new("todo", "Todo", todo),
+            LeftTabCatalogEntry::new("todo", "Tuxedo", todo),
             LeftTabCatalogEntry::new("fr", "Fast Resume", fr),
         ];
         let mut group = build_files_group(vec![files, todo, fr]);
@@ -8811,5 +9261,146 @@ mod tests {
         });
         assert_eq!(restored, Ok((vec![1, 2], Some("later"))));
         assert_eq!(attempts, vec![1, 2, 3]);
+    }
+
+    // --- Ctrl+J dispatch helpers ---------------------------------
+
+    /// Cross-platform absolute path helper for the classify tests.
+    fn abs(p: &str) -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from(format!("C:\\test{}", p.replace('/', "\\")))
+        } else {
+            std::path::PathBuf::from(p)
+        }
+    }
+
+    #[test]
+    fn branch_slug_collapses_non_alphanumerics_and_caps_length() {
+        assert_eq!(
+            branch_slug("Ship v2 +release @home"),
+            "ship-v2-release-home"
+        );
+        assert_eq!(
+            branch_slug("   leading and trailing   "),
+            "leading-and-trailing"
+        );
+        assert_eq!(branch_slug("a--b---c"), "a-b-c");
+        assert_eq!(branch_slug("!!!"), "");
+        assert_eq!(branch_slug(""), "");
+        // 40-char input caps at 32 and trims trailing dash.
+        let s = branch_slug("abcdefghij klmnopqrst uvwxyzabcd efghi");
+        assert!(s.len() <= 32, "len {} > 32", s.len());
+        assert!(!s.ends_with('-'), "trailing dash: {s:?}");
+    }
+
+    #[test]
+    fn timestamped_branch_name_prefixes_task_and_uses_slug() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 8, 15, 4, 5)
+            .unwrap();
+        assert_eq!(
+            timestamped_branch_name("Ship v2", now),
+            "task/ship-v2-20260808-150405"
+        );
+        assert_eq!(timestamped_branch_name("!!!", now), "task/20260808-150405");
+    }
+
+    #[test]
+    fn classify_dispatch_routes_when_map_has_existing_dir() {
+        // Use a real temp dir so `path.is_dir()` returns true.
+        let dir = tempfile::tempdir().unwrap();
+        let mut map = rimeterm_config::project_map::ProjectMap::new();
+        map.insert("rimeterm", dir.path().to_path_buf());
+        let gate = classify_dispatch(
+            &map,
+            &["rimeterm".to_string()],
+            std::path::Path::new(&abs("/somewhere-else")),
+        );
+        match gate {
+            DispatchGate::Route { project, cwd } => {
+                assert_eq!(project, "rimeterm");
+                assert_eq!(cwd, dir.path());
+            }
+            other => panic!("expected Route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_dispatch_ignores_map_entry_pointing_at_missing_path() {
+        let mut map = rimeterm_config::project_map::ProjectMap::new();
+        map.insert("ghost", abs("/does-not-exist-xyz-987654"));
+        // Current workspace also does NOT match, so we fall through to
+        // Reject rather than Route/Learn.
+        let gate = classify_dispatch(
+            &map,
+            &["ghost".to_string()],
+            std::path::Path::new(&abs("/some-other")),
+        );
+        assert!(matches!(gate, DispatchGate::Reject { .. }));
+    }
+
+    #[test]
+    fn classify_dispatch_learns_from_current_workspace_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // The tempdir's basename varies; write a nested dir whose name
+        // we control so the classifier's file_name() lookup matches.
+        let ws = dir.path().join("rimeterm");
+        std::fs::create_dir_all(&ws).unwrap();
+        let empty = rimeterm_config::project_map::ProjectMap::new();
+        let gate = classify_dispatch(&empty, &["Rimeterm".to_string()], &ws);
+        match gate {
+            DispatchGate::Learn { project, cwd } => {
+                // Case is preserved from the task's tag, not the
+                // workspace basename — the label reads what the user
+                // typed, the map still keys case-insensitively.
+                assert_eq!(project, "Rimeterm");
+                assert_eq!(cwd, ws);
+            }
+            other => panic!("expected Learn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_dispatch_rejects_when_no_project_matches_and_map_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("otherws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let empty = rimeterm_config::project_map::ProjectMap::new();
+        let gate = classify_dispatch(
+            &empty,
+            &["someproject".to_string(), "another".to_string()],
+            &ws,
+        );
+        match gate {
+            DispatchGate::Reject {
+                projects,
+                current_ws,
+            } => {
+                assert_eq!(
+                    projects,
+                    vec!["someproject".to_string(), "another".to_string()]
+                );
+                assert_eq!(current_ws, "otherws");
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_dispatch_prefers_map_route_over_workspace_learn() {
+        // Both match — Route wins per the precedence in the doc.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("rimeterm");
+        std::fs::create_dir_all(&ws).unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        let mut map = rimeterm_config::project_map::ProjectMap::new();
+        map.insert("rimeterm", target.clone());
+        let gate = classify_dispatch(&map, &["rimeterm".to_string()], &ws);
+        match gate {
+            DispatchGate::Route { cwd, .. } => assert_eq!(cwd, target),
+            other => panic!("expected Route, got {other:?}"),
+        }
     }
 }

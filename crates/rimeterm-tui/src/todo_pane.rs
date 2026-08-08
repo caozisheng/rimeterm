@@ -1,6 +1,6 @@
 //! Native adapter for the embedded Tuxedo todo.txt application.
 
-use crossterm::event::{KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -14,9 +14,22 @@ use tokio::sync::mpsc;
 use tuxedo::embed::{EmbeddedApp, EmbeddedFeatures, EmbeddedOutcome};
 use tuxedo::theme::Theme as TuxedoTheme;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TodoAction {
     ExitRequested,
+    /// User pressed Ctrl+J on a task row. The App runs the project-map
+    /// gate (`~/.rimeterm/tuxedo/project.txt`) against `projects`, and
+    /// on pass it opens the agent picker anchored inside `anchor` and
+    /// eventually injects the cleaned form of `raw`
+    /// (`tuxedo::todo::body_only`) into the spawned agent's stdin.
+    ///
+    /// `raw` is the todo.txt line verbatim — App owns cleanup so the
+    /// pane doesn't need to know which tuxedo helper to call.
+    DispatchToAgent {
+        raw: String,
+        projects: Vec<String>,
+        anchor: Rect,
+    },
 }
 
 enum TodoState {
@@ -32,6 +45,12 @@ pub struct TodoPane {
     theme: rimeterm_markdown::Theme,
     next_poll: Instant,
     state: TodoState,
+    /// Last outer rect passed to `render`. Used by `on_key` to anchor the
+    /// agent picker inside this pane. `None` before the first render (a
+    /// pre-render key press cannot occur in practice — the pane is drawn
+    /// once per frame before input is polled — but we default to a zero
+    /// rect and let App fall back to `Centered` if it ever does).
+    last_outer_area: Option<Rect>,
 }
 
 impl TodoPane {
@@ -61,6 +80,7 @@ impl TodoPane {
             theme,
             next_poll: Instant::now(),
             state,
+            last_outer_area: None,
         }
     }
 
@@ -130,7 +150,7 @@ fn load_embedded(todo_path: &Path, archive_path: &Path) -> TodoState {
             return TodoState::Error(format!("failed to read {}: {error}", todo_path.display()));
         }
     };
-    TodoState::Ready(EmbeddedApp::with_features(
+    let mut app = EmbeddedApp::with_features(
         todo_path.to_path_buf(),
         archive_path.to_path_buf(),
         body,
@@ -138,7 +158,14 @@ fn load_embedded(todo_path: &Path, archive_path: &Path) -> TodoState {
             clipboard: true,
             ..EmbeddedFeatures::default()
         },
-    ))
+    );
+    // Advertise the host-only Ctrl+J shortcut in tuxedo's Normal-mode
+    // status hint. The prompt is prefilled in the target agent's input
+    // widget on dispatch; the user reviews and presses Enter to submit
+    // — that "confirm" leg needs a discoverable hint so users know the
+    // shortcut exists.
+    app.app_mut().embedded_hint = Some("Ctrl+J → agent (Enter to run)");
+    TodoState::Ready(app)
 }
 
 fn map_theme(theme: rimeterm_markdown::Theme) -> TuxedoTheme {
@@ -187,7 +214,7 @@ impl PaneProvider for TodoPane {
     }
 
     fn title(&self) -> &str {
-        "todo"
+        "Tuxedo"
     }
 
     fn caps(&self) -> PaneCaps {
@@ -200,6 +227,7 @@ impl PaneProvider for TodoPane {
         frame: &mut Frame<'_>,
         ctx: &PaneRenderCtx<'_>,
     ) -> RenderOutcome {
+        self.last_outer_area = Some(area);
         match &mut self.state {
             TodoState::Ready(app) => {
                 let border_style = if ctx.focused {
@@ -210,7 +238,7 @@ impl PaneProvider for TodoPane {
                         .add_modifier(Modifier::DIM)
                 };
                 let block = Block::default()
-                    .title(" Todo ")
+                    .title(" Tuxedo ")
                     .borders(Borders::ALL)
                     .border_style(border_style);
                 let inner = block.inner(area);
@@ -249,6 +277,34 @@ impl PaneProvider for TodoPane {
         let TodoState::Ready(app) = &mut self.state else {
             return false;
         };
+        // Intercept Ctrl+J BEFORE forwarding to tuxedo. tuxedo binds
+        // `Char('j')` (any modifier) to CursorDown, so a bare forward
+        // would still move the cursor even with CONTROL held. We only
+        // trigger dispatch when CONTROL is present and ALT/SHIFT are
+        // not — tightest match so future modifier chords (e.g. a
+        // hypothetical Ctrl+Alt+J) stay free.
+        if key.code == KeyCode::Char('j')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            let Some(task) = app.app().cur_task() else {
+                // No task under the cursor (empty list, empty archive
+                // view, filter matched nothing). Consume the key so it
+                // doesn't fall through to tuxedo's CursorDown (which
+                // is a no-op here anyway) and stay silent — no toast
+                // for an obviously-empty situation.
+                return true;
+            };
+            let raw = task.raw.clone();
+            let projects = task.projects.clone();
+            let anchor = self.last_outer_area.unwrap_or_default();
+            let _ = self.action_tx.send(TodoAction::DispatchToAgent {
+                raw,
+                projects,
+                anchor,
+            });
+            return true;
+        }
         if app.handle_key(key) == EmbeddedOutcome::ExitRequested {
             let _ = self.action_tx.send(TodoAction::ExitRequested);
         }
@@ -325,7 +381,53 @@ mod tests {
         let top: String = (0..40)
             .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
             .collect();
-        assert!(top.starts_with("┌ Todo "), "unexpected top border: {top:?}");
+        assert!(
+            top.starts_with("┌ Tuxedo "),
+            "unexpected top border: {top:?}"
+        );
+    }
+
+    #[test]
+    fn hint_bar_advertises_ctrl_j_shortcut() {
+        // Regression guard: rimeterm's TodoPane must inject a hint
+        // into tuxedo's Normal-mode status bar so the Ctrl+J → agent
+        // dispatch shortcut is discoverable from inside the pane.
+        // Standalone tuxedo doesn't own this binding; only the
+        // embedded host advertises it.
+        let (todo, done) = fixture("hint-bar");
+        std::fs::create_dir_all(todo.parent().unwrap()).unwrap();
+        std::fs::write(&todo, "one task\n").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pane = TodoPane::with_paths(tx, rimeterm_markdown::Theme::Default, todo, done);
+        // 120x30 gives the status bar comfortable room so the hint
+        // isn't truncated by the middle-area layout.
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                pane.render(
+                    frame.area(),
+                    frame,
+                    &PaneRenderCtx {
+                        focused: true,
+                        title_override: None,
+                        focus_color: Color::Reset,
+                    },
+                );
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..30 {
+            for x in 0..120 {
+                rendered.push_str(buf[(x, y)].symbol());
+            }
+            rendered.push('\n');
+        }
+        assert!(
+            rendered.contains("Ctrl+J"),
+            "status bar must advertise Ctrl+J; rendered =\n{rendered}"
+        );
     }
 
     use super::*;
@@ -365,6 +467,75 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(TodoAction::ExitRequested));
     }
 
+    #[test]
+    fn ctrl_j_on_task_emits_dispatch_action() {
+        let (todo, done) = fixture("ctrl-j-dispatch");
+        std::fs::create_dir_all(todo.parent().unwrap()).unwrap();
+        std::fs::write(&todo, "wire up new feature +work @home\nsecond task\n").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut pane = TodoPane::with_paths(tx, rimeterm_markdown::Theme::Default, todo, done);
+        // Render once so `last_outer_area` is populated. Ctrl+J before
+        // any render works too (falls back to Rect::default()) but the
+        // realistic path goes through render first.
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                pane.render(
+                    frame.area(),
+                    frame,
+                    &PaneRenderCtx {
+                        focused: true,
+                        title_override: None,
+                        focus_color: Color::Reset,
+                    },
+                );
+            })
+            .unwrap();
+
+        assert!(pane.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL,)));
+        match rx.try_recv() {
+            Ok(TodoAction::DispatchToAgent {
+                raw,
+                projects,
+                anchor,
+            }) => {
+                assert_eq!(raw, "wire up new feature +work @home");
+                assert_eq!(projects, vec!["work".to_string()]);
+                assert_eq!(anchor.width, 40);
+                assert_eq!(anchor.height, 6);
+            }
+            other => panic!("expected DispatchToAgent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_j_does_not_emit_dispatch() {
+        // Regression guard: bare `j` MUST fall through to tuxedo's
+        // CursorDown, never fire dispatch. This protects the primary
+        // vim binding after the Ctrl+J intercept was added.
+        let (todo, done) = fixture("plain-j-passthrough");
+        std::fs::create_dir_all(todo.parent().unwrap()).unwrap();
+        std::fs::write(&todo, "one\ntwo\n").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut pane = TodoPane::with_paths(tx, rimeterm_markdown::Theme::Default, todo, done);
+
+        assert!(pane.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)));
+        assert!(rx.try_recv().is_err(), "plain j must not emit a TodoAction",);
+    }
+
+    #[test]
+    fn ctrl_j_on_empty_list_swallows_key_without_emitting() {
+        let (todo, done) = fixture("ctrl-j-empty");
+        // No file created — tuxedo loads an empty todo list.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut pane = TodoPane::with_paths(tx, rimeterm_markdown::Theme::Default, todo, done);
+
+        assert!(pane.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL,)));
+        assert!(
+            rx.try_recv().is_err(),
+            "Ctrl+J on empty list must not emit an action",
+        );
+    }
     #[test]
     fn theme_mapping_uses_rimeterm_palette_roles() {
         let source = rimeterm_markdown::Palette::from_theme(rimeterm_markdown::Theme::Dracula);

@@ -20,6 +20,7 @@ pub mod left_tabs_state;
 pub mod memory_state;
 pub mod migrate;
 pub mod paths;
+pub mod project_map;
 pub mod session_state;
 
 #[doc(hidden)]

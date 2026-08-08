@@ -167,6 +167,13 @@ pub struct App {
     /// can restore it.
     theme_pick_orig: usize,
     pub week_start: WeekStart,
+    /// Extra hint text appended to the Normal-mode status bar when
+    /// `Some`. Reserved for embedding hosts (rimeterm's `TodoPane`
+    /// injects `" · Ctrl+J → agent"` here so the todo → agent
+    /// dispatch shortcut is discoverable from inside the pane).
+    /// `None` in standalone tuxedo — the binary doesn't own that
+    /// keybinding.
+    pub embedded_hint: Option<&'static str>,
 }
 
 impl App {
@@ -236,6 +243,7 @@ impl App {
             pending_editor_path: None,
             theme_pick_orig: 0,
             week_start: WeekStart::Sunday,
+            embedded_hint: None,
         };
         app.recompute_visible();
         app

@@ -1266,7 +1266,7 @@ mod tests {
         );
         let labels = [
             ("files", "Files"),
-            ("todo", "Todo"),
+            ("todo", "Tuxedo"),
             ("fr", "Fast Resume"),
             ("git", "Git"),
             ("glab", "Glab"),
