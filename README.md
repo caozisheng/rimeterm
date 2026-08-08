@@ -9,11 +9,11 @@
 One screen, four zones on a 2×2 grid. Every zone is a tab strip you can reorder, hide, or hot-swap.
 
 ```
-┌──────────────────────────────────────────────────┬──────────┐
-│  files · todo · fr                               │  agents  │
-├──────────────────────────────────────────────────┼──────────┤
-│  git · sysmon · agtop · models · stock · zones   │  shells  │
-└──────────────────────────────────────────────────┴──────────┘
+┌─────────────────────────────────────────────────────────┬──────────┐
+│  files · todo · fr                                      │  agents  │
+├─────────────────────────────────────────────────────────┼──────────┤
+│  git · glab · sysmon · agtop · models · stock · zones   │  shells  │
+└─────────────────────────────────────────────────────────┴──────────┘
 ```
 
 ### Left column
@@ -22,6 +22,7 @@ One screen, four zones on a 2×2 grid. Every zone is a tab strip you can reorder
 - **todo** — embedded [Tuxedo](https://github.com/webstonehq/tuxedo) todo.txt manager. Global, not per-workspace — see [Global Todo](#global-todo).
 - **fr** — Fast Resume fuzzy search over coding-agent session history with live preview. `Ctrl+R` resumes the selected session in a fresh agent tab.
 - **git** — in-process `gix` snapshot: working-tree changes + serie-style commit graph, tree-sitter diff highlighting.
+- **glab** — in-process GitLab / GitHub view backed by the `glab` / `gh` CLI: issues, MRs/PRs, pipelines, notifications, milestones, and more.
 - **sysmon** — CPU / memory / disks / network. Optional GPU (NVML) and Docker (bollard) behind feature flags.
 - **agtop** — process monitor for detected coding-agent CLIs; session enrichment + chip header + detail popup.
 - **models** — browses the [models.dev](https://models.dev) catalog.
