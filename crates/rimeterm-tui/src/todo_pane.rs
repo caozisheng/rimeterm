@@ -3,6 +3,8 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Block, Borders};
 use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
 use std::any::Any;
 use std::io;
@@ -196,14 +198,31 @@ impl PaneProvider for TodoPane {
         &mut self,
         area: Rect,
         frame: &mut Frame<'_>,
-        _ctx: &PaneRenderCtx<'_>,
+        ctx: &PaneRenderCtx<'_>,
     ) -> RenderOutcome {
         match &mut self.state {
-            TodoState::Ready(app) => app.render(frame, area, &map_theme(self.theme)),
+            TodoState::Ready(app) => {
+                let border_style = if ctx.focused {
+                    Style::default().fg(ctx.focus_color)
+                } else {
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM)
+                };
+                let block = Block::default()
+                    .title(" Todo ")
+                    .borders(Borders::ALL)
+                    .border_style(border_style);
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                if inner.height == 0 || inner.width == 0 {
+                    return RenderOutcome::default();
+                }
+                app.render(frame, inner, &map_theme(self.theme));
+            }
             TodoState::Error(message) => {
-                use ratatui::style::Style;
                 use ratatui::text::{Line, Text};
-                use ratatui::widgets::{Block, Borders, Paragraph};
+                use ratatui::widgets::Paragraph;
 
                 let palette = rimeterm_markdown::Palette::from_theme(self.theme);
                 let block = Block::default()
@@ -278,6 +297,37 @@ impl PaneProvider for TodoPane {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
+
+    #[test]
+    fn ready_pane_draws_titled_outer_border() {
+        let (todo, done) = fixture("render-border");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pane = TodoPane::with_paths(tx, rimeterm_markdown::Theme::Default, todo, done);
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                pane.render(
+                    frame.area(),
+                    frame,
+                    &PaneRenderCtx {
+                        focused: false,
+                        title_override: None,
+                        focus_color: Color::Reset,
+                    },
+                );
+            })
+            .unwrap();
+
+        let top: String = (0..40)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(top.starts_with("┌ Todo "), "unexpected top border: {top:?}");
+    }
+
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
