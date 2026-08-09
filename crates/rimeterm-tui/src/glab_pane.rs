@@ -55,6 +55,10 @@ impl GlabPane {
         self.app.set_config(config);
     }
 
+    pub fn take_status_message(&mut self) -> Option<String> {
+        self.app.take_status_message()
+    }
+
     /// Whether the embedded controller signalled an exit intent.
     pub fn exit_requested(&self) -> bool {
         self.exit_requested

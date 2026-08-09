@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use rimeterm_config::memory_state::{
-    ActiveTabsState, MemoryPolicy, MemoryState, PaneState, UiState, memory_policy_file,
-    ui_state_file,
+    ActiveTabsState, MemoryPolicy, MemoryState, PaneState, UiState, WorkspaceLayoutMode,
+    memory_policy_file, ui_state_file,
 };
 
 #[test]
@@ -25,6 +25,28 @@ fn memory_policy_defaults_every_stable_category_on() {
     assert!(policy.models);
     assert!(policy.stock);
     assert!(policy.zones);
+}
+
+#[test]
+fn ui_state_without_layout_mode_defaults_to_landscape() {
+    let state: UiState = toml::from_str("").expect("empty legacy state");
+
+    assert_eq!(state.workspace_layout, WorkspaceLayoutMode::Landscape);
+}
+
+#[test]
+fn disabled_layout_memory_resets_vertical_to_landscape() {
+    let mut policy = MemoryPolicy::default();
+    policy.workspace_layout = false;
+    let state = UiState {
+        workspace_layout: WorkspaceLayoutMode::Vertical,
+        ..UiState::default()
+    };
+
+    assert_eq!(
+        state.filtered_by(&policy).workspace_layout,
+        WorkspaceLayoutMode::Landscape
+    );
 }
 
 #[test]

@@ -36,6 +36,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use rimeterm_config::Config;
+use rimeterm_config::memory_state::WorkspaceLayoutMode;
 use rimeterm_core::app_menu::AppMenu;
 use rimeterm_core::command::{Command, CommandRegistry};
 use rimeterm_core::event::EventBus;
@@ -43,8 +44,8 @@ use rimeterm_core::focus::FocusManager;
 use rimeterm_core::layout::{LayoutNode, LayoutTree};
 use rimeterm_core::pane::{PaneId, PaneProvider, PaneRenderCtx};
 use rimeterm_core::tabs::{
-    BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_GIT, BUILTIN_SHELLS, MembersPolicy, PaneKind, TabGroup,
-    TabGroupId,
+    BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_GIT, BUILTIN_SHELLS, BUILTIN_TOOLS, MembersPolicy,
+    PaneKind, TabGroup, TabGroupId,
 };
 use rimeterm_pty::{ShellChoice, detect_default_shell};
 use tokio::sync::mpsc;
@@ -85,11 +86,12 @@ struct ActionFlags {
     shells_close: AtomicBool,
     tab_next: AtomicBool,
     tab_prev: AtomicBool,
-    tab_goto: AtomicUsize,       // 1..=9 = goto; 0 = idle.
-    focus_dir: AtomicUsize,      // 1=left 2=right 3=up 4=down; 0 = idle.
-    focus_quadrant: AtomicUsize, // 1..=3 (3-zone layout); 0 = idle.
+    tab_goto: AtomicUsize,
+    focus_dir: AtomicUsize,
+    focus_quadrant: AtomicUsize,
     settings: AtomicBool,
     resize_toggle: AtomicBool,
+    layout_toggle: AtomicBool,
     acknowledgement: AtomicBool,
     upgrade: AtomicBool,
     viewer_open: AtomicBool,
@@ -97,10 +99,6 @@ struct ActionFlags {
     viewer_open_with_system: AtomicBool,
     viewer_reveal: AtomicBool,
     theme_cycle: AtomicBool,
-    /// F5-driven pane reload. When the files group is focused the
-    /// [`FileManagerPane`] reloads both explorer columns; when the git
-    /// group is focused the app surfaces a "git pane pending" hint
-    /// until the native GitPane lands (see `native-file-git` design).
     pane_reload: AtomicBool,
 }
 
@@ -540,6 +538,10 @@ pub(crate) enum HoveredUi {
     MenuOpener,
     /// `[×]` in the status bar — click fires `app.quit`.
     QuitButton,
+    /// Landscape segment in the status bar.
+    LayoutLandscape,
+    /// Vertical segment in the status bar.
+    LayoutVertical,
     /// A tab label — click activates it. `gid`/`idx` are indexes into
     /// the group's members().
     TabActivate { gid: TabGroupId, idx: usize },
@@ -706,6 +708,125 @@ fn restore_named_active_tab(
         let _ = group.goto(index);
     }
 }
+fn vertical_lower_members(files: &[PaneId], git: &[PaneId], shells: &[PaneId]) -> Vec<PaneId> {
+    files.iter().chain(git).chain(shells).copied().collect()
+}
+
+#[derive(Clone, Debug)]
+struct LandscapeTabsState {
+    files: Vec<PaneId>,
+    files_active: usize,
+    git: Vec<PaneId>,
+    git_active: usize,
+    agents: Vec<PaneId>,
+    agents_active: usize,
+    shells: Vec<PaneId>,
+    shells_active: usize,
+    tools_active: Option<PaneId>,
+}
+
+fn build_landscape_tree(state: &LandscapeTabsState) -> anyhow::Result<LayoutTree> {
+    let mut files = TabGroup::new(
+        BUILTIN_FILES,
+        state.files.clone(),
+        MembersPolicy::Fixed,
+        PaneKind::Files,
+    );
+    let mut git = TabGroup::new(
+        BUILTIN_GIT,
+        state.git.clone(),
+        MembersPolicy::Fixed,
+        PaneKind::Files,
+    );
+    let mut agents = TabGroup::new(
+        BUILTIN_AGENTS,
+        state.agents.clone(),
+        MembersPolicy::Open { max: 16 },
+        PaneKind::AgentChat,
+    );
+    let mut shells = TabGroup::new(
+        BUILTIN_SHELLS,
+        state.shells.clone(),
+        MembersPolicy::Open { max: 16 },
+        PaneKind::Shell,
+    );
+    let _ = files.goto(state.files_active.min(files.len() - 1));
+    let _ = git.goto(state.git_active.min(git.len() - 1));
+    let _ = agents.goto(state.agents_active.min(agents.len() - 1));
+    let _ = shells.goto(state.shells_active.min(shells.len() - 1));
+    LayoutTree::new(LayoutNode::split(
+        Direction::Horizontal,
+        vec![0.35, 0.65],
+        vec![
+            LayoutNode::split(
+                Direction::Vertical,
+                vec![0.5, 0.5],
+                vec![LayoutNode::tabs(files), LayoutNode::tabs(git)],
+            ),
+            LayoutNode::split(
+                Direction::Vertical,
+                vec![0.55, 0.45],
+                vec![LayoutNode::tabs(agents), LayoutNode::tabs(shells)],
+            ),
+        ],
+    ))
+    .map_err(|error| anyhow!("landscape layout tree: {error}"))
+}
+
+fn build_vertical_tree_from_state(state: &LandscapeTabsState) -> anyhow::Result<LayoutTree> {
+    let mut agents = TabGroup::new(
+        BUILTIN_AGENTS,
+        state.agents.clone(),
+        MembersPolicy::Open { max: 16 },
+        PaneKind::AgentChat,
+    );
+    let _ = agents.goto(state.agents_active.min(agents.len() - 1));
+    let lower_members = vertical_lower_members(&state.files, &state.git, &state.shells);
+    let mut lower = TabGroup::new(
+        BUILTIN_TOOLS,
+        lower_members,
+        MembersPolicy::Open { max: 32 },
+        PaneKind::Files,
+    );
+    let preferred = state
+        .tools_active
+        .or_else(|| state.files.get(state.files_active).copied())
+        .and_then(|pane| lower.members().iter().position(|member| *member == pane))
+        .unwrap_or(0);
+    let _ = lower.goto(preferred);
+    LayoutTree::new(LayoutNode::split(
+        Direction::Vertical,
+        vec![0.55, 0.45],
+        vec![LayoutNode::tabs(agents), LayoutNode::tabs(lower)],
+    ))
+    .map_err(|error| anyhow!("vertical layout tree: {error}"))
+}
+
+fn active_index_after_member_update(active: Option<PaneId>, members: &[PaneId]) -> usize {
+    active
+        .and_then(|pane| members.iter().position(|member| *member == pane))
+        .unwrap_or(0)
+}
+
+fn rebuild_vertical_tree_preserving_ratios(
+    state: &LandscapeTabsState,
+    current: &LayoutTree,
+) -> anyhow::Result<LayoutTree> {
+    let ratios = snapshot_all_ratios(current);
+    let mut tree = build_vertical_tree_from_state(state)?;
+    apply_ratio_snapshot(&mut tree, &ratios);
+    Ok(tree)
+}
+fn replacement_focus_for_hidden_pane(
+    tree: &LayoutTree,
+    group_id: TabGroupId,
+    focused: PaneId,
+) -> Option<PaneId> {
+    let group = tree.find_tab_group(group_id)?;
+    (!group.members().contains(&focused))
+        .then(|| group.active_pane())
+        .flatten()
+}
 
 fn migrate_legacy_workspace_state(
     workspace_root: &std::path::Path,
@@ -788,11 +909,13 @@ pub struct App {
     shell_short: String,
     menu: AppMenu,
     menu_state: MenuState,
+    focus: FocusManager,
     palette_state: PaletteState,
     picker_state: crate::picker::PickerState,
     commands: std::sync::Arc<CommandRegistry>,
     event_bus: EventBus,
-    focus: FocusManager,
+    layout_mode: WorkspaceLayoutMode,
+    landscape_tabs: LandscapeTabsState,
     tree: LayoutTree,
     panes: PaneRegistry,
     redraw_tx: mpsc::UnboundedSender<()>,
@@ -1336,29 +1459,22 @@ impl App {
             let _ = shells.goto(active.shells.min(shells.len().saturating_sub(1)));
         }
 
-        // Layout (§C24 4-zone): root Horizontal split, each column
-        // Vertical. Left column stacks files (top) over git (bottom);
-        // right column stacks agents (top) over shells (bottom).
-        // Root ratio 0.35/0.65 keeps the pre-refactor column widths;
-        // both inner columns default to 0.5/0.5 so users see a fair
-        // split until they drag a divider.
-        let root = LayoutNode::split(
-            Direction::Horizontal,
-            vec![0.35, 0.65],
-            vec![
-                LayoutNode::split(
-                    Direction::Vertical,
-                    vec![0.5, 0.5],
-                    vec![LayoutNode::tabs(files), LayoutNode::tabs(git)],
-                ),
-                LayoutNode::split(
-                    Direction::Vertical,
-                    vec![0.55, 0.45],
-                    vec![LayoutNode::tabs(agents), LayoutNode::tabs(shells)],
-                ),
-            ],
-        );
-        let mut tree = LayoutTree::new(root).map_err(|e| anyhow!("layout tree: {e}"))?;
+        let landscape_tabs = LandscapeTabsState {
+            files: files.members().to_vec(),
+            files_active: files.active_index(),
+            git: git.members().to_vec(),
+            git_active: git.active_index(),
+            agents: agents.members().to_vec(),
+            agents_active: agents.active_index(),
+            shells: shells.members().to_vec(),
+            shells_active: shells.active_index(),
+            tools_active: files.active_pane(),
+        };
+        let layout_mode = memory.ui.workspace_layout;
+        let mut tree = match layout_mode {
+            WorkspaceLayoutMode::Landscape => build_landscape_tree(&landscape_tabs)?,
+            WorkspaceLayoutMode::Vertical => build_vertical_tree_from_state(&landscape_tabs)?,
+        };
         let default_ratios = snapshot_all_ratios(&tree);
 
         if let Some(splits) = memory.ui.pane_sizes.clone() {
@@ -1369,11 +1485,21 @@ impl App {
         }
 
         let mut focus = FocusManager::new(event_bus.clone());
-        let initial_pane = tree
-            .find_tab_group(BUILTIN_FILES)
-            .and_then(TabGroup::active_pane)
-            .unwrap_or(file_manager_pane_id);
-        focus.set_focus(initial_pane, Some(BUILTIN_FILES));
+        let (initial_pane, initial_group) = match layout_mode {
+            WorkspaceLayoutMode::Landscape => (
+                tree.find_tab_group(BUILTIN_FILES)
+                    .and_then(TabGroup::active_pane)
+                    .unwrap_or(file_manager_pane_id),
+                BUILTIN_FILES,
+            ),
+            WorkspaceLayoutMode::Vertical => (
+                tree.find_tab_group(BUILTIN_TOOLS)
+                    .and_then(TabGroup::active_pane)
+                    .unwrap_or(file_manager_pane_id),
+                BUILTIN_TOOLS,
+            ),
+        };
+        focus.set_focus(initial_pane, Some(initial_group));
 
         let flags = Arc::new(ActionFlags::default());
         let snapshot = Arc::new(parking_lot::RwLock::new(WorkspaceSnapshot::default()));
@@ -1413,6 +1539,8 @@ impl App {
             commands: std::sync::Arc::new(commands),
             event_bus,
             focus,
+            layout_mode,
+            landscape_tabs,
             tree,
             panes,
             redraw_tx,
@@ -1560,6 +1688,10 @@ impl App {
                         self.needs_redraw = true;
                     }
                 }
+            }
+
+            if self.drain_glab_status_message() {
+                self.needs_redraw = true;
             }
 
             if self.needs_redraw {
@@ -2159,51 +2291,71 @@ impl App {
             .collect();
         state.normalize(&top_ids, &bottom_ids);
 
+        let active_files = self
+            .tree
+            .find_tab_group(if self.layout_mode == WorkspaceLayoutMode::Landscape {
+                BUILTIN_FILES
+            } else {
+                BUILTIN_TOOLS
+            })
+            .and_then(TabGroup::active_pane)
+            .filter(|pane| self.landscape_tabs.files.contains(pane));
+        let active_git = self
+            .tree
+            .find_tab_group(if self.layout_mode == WorkspaceLayoutMode::Landscape {
+                BUILTIN_GIT
+            } else {
+                BUILTIN_TOOLS
+            })
+            .and_then(TabGroup::active_pane)
+            .filter(|pane| self.landscape_tabs.git.contains(pane));
+
         let top_members = resolve_left_group_members(&self.left_top_catalog, &state.top);
         let bottom_members = resolve_left_group_members(&self.left_bottom_catalog, &state.bottom);
 
-        let visible_top: std::collections::HashSet<PaneId> = top_members.iter().copied().collect();
-        let visible_bottom: std::collections::HashSet<PaneId> =
-            bottom_members.iter().copied().collect();
-
-        if let Some(group) = self.tree.find_tab_group_mut(BUILTIN_FILES) {
-            if let Err(e) = group.set_members(top_members, Some(0)) {
-                warn!(error = %e, "left-top set_members failed");
-                self.set_hint(format!("left-top update failed: {e}"));
+        self.landscape_tabs.files = top_members.clone();
+        self.landscape_tabs.git = bottom_members.clone();
+        self.landscape_tabs.files_active =
+            active_index_after_member_update(active_files, &self.landscape_tabs.files);
+        self.landscape_tabs.git_active =
+            active_index_after_member_update(active_git, &self.landscape_tabs.git);
+        if self.layout_mode == WorkspaceLayoutMode::Landscape {
+            if let Some(group) = self.tree.find_tab_group_mut(BUILTIN_FILES)
+                && let Err(error) =
+                    group.set_members(top_members, Some(self.landscape_tabs.files_active))
+            {
+                self.set_hint(format!("left-top update failed: {error}"));
                 return;
             }
-        }
-        if let Some(group) = self.tree.find_tab_group_mut(BUILTIN_GIT) {
-            if let Err(e) = group.set_members(bottom_members, Some(0)) {
-                warn!(error = %e, "left-bottom set_members failed");
-                self.set_hint(format!("left-bottom update failed: {e}"));
+            if let Some(group) = self.tree.find_tab_group_mut(BUILTIN_GIT)
+                && let Err(error) =
+                    group.set_members(bottom_members, Some(self.landscape_tabs.git_active))
+            {
+                self.set_hint(format!("left-bottom update failed: {error}"));
                 return;
             }
+        } else {
+            let tree =
+                match rebuild_vertical_tree_preserving_ratios(&self.landscape_tabs, &self.tree) {
+                    Ok(tree) => tree,
+                    Err(error) => {
+                        self.set_hint(format!("vertical tools update failed: {error}"));
+                        return;
+                    }
+                };
+            self.tree = tree;
         }
 
-        // If the focused pane just got hidden, hand focus back to the
-        // group's now-active anchor so the caret doesn't strand on an
-        // invisible pane.
-        let focused_pane = self.focus.focused_pane();
-        let focused_group = self.focus.focused_group();
-        if let (Some(pane), Some(group_id)) = (focused_pane, focused_group) {
-            let hidden = matches!(group_id, BUILTIN_FILES if !visible_top.contains(&pane))
-                || matches!(group_id, BUILTIN_GIT if !visible_bottom.contains(&pane));
-            if hidden {
-                if let Some(new_active) = self
-                    .tree
-                    .find_tab_group(group_id)
-                    .and_then(|g| g.active_pane())
-                {
-                    self.focus.set_focus(new_active, Some(group_id));
-                }
-            }
+        if let (Some(pane), Some(group_id)) =
+            (self.focus.focused_pane(), self.focus.focused_group())
+            && let Some(new_active) = replacement_focus_for_hidden_pane(&self.tree, group_id, pane)
+        {
+            self.focus.set_focus(new_active, Some(group_id));
         }
 
         self.left_tabs_state = state;
         // Keep the Settings overlay's copy in step so a second mutation
-        // doesn't undo the first (its cached state would otherwise be
-        // stale after normalize/anchor pinning).
+        // doesn't undo the first.
         let labels = self
             .left_top_catalog
             .iter()
@@ -2215,6 +2367,116 @@ impl App {
         self.persist_left_tabs_state();
         self.needs_redraw = true;
         let _ = self.redraw_tx.send(());
+    }
+
+    fn set_layout_mode(&mut self, mode: WorkspaceLayoutMode) {
+        if self.layout_mode == mode {
+            return;
+        }
+        let focused = self.focus.focused_pane();
+        let next_tree = match mode {
+            WorkspaceLayoutMode::Landscape => build_landscape_tree(&self.landscape_tabs),
+            WorkspaceLayoutMode::Vertical => build_vertical_tree_from_state(&self.landscape_tabs),
+        };
+        let Ok(tree) = next_tree else {
+            self.set_hint("layout switch failed".into());
+            return;
+        };
+        self.tree = tree;
+        self.layout_mode = mode;
+        self.default_ratios = snapshot_all_ratios(&self.tree);
+        let owner = focused.and_then(|pane| {
+            self.tree.tab_groups().into_iter().find_map(|group| {
+                group
+                    .members()
+                    .contains(&pane)
+                    .then_some((pane, group.id()))
+            })
+        });
+        let (pane, group) = owner.unwrap_or_else(|| {
+            let group = if mode == WorkspaceLayoutMode::Vertical {
+                BUILTIN_TOOLS
+            } else {
+                BUILTIN_FILES
+            };
+            let pane = self
+                .tree
+                .find_tab_group(group)
+                .and_then(TabGroup::active_pane)
+                .expect("layout groups are non-empty");
+            (pane, group)
+        });
+        if let Some(owner) = self.tree.find_tab_group_mut(group)
+            && let Some(index) = owner.members().iter().position(|member| *member == pane)
+        {
+            let _ = owner.goto(index);
+        }
+        self.focus.set_focus(pane, Some(group));
+        self.remembered_ui.workspace_layout = if self.memory_policy.workspace_layout {
+            mode
+        } else {
+            WorkspaceLayoutMode::Landscape
+        };
+        self.save_remembered_ui();
+        self.needs_redraw = true;
+        let _ = self.redraw_tx.send(());
+    }
+
+    fn toggle_layout_mode(&mut self) {
+        let next = match self.layout_mode {
+            WorkspaceLayoutMode::Landscape => WorkspaceLayoutMode::Vertical,
+            WorkspaceLayoutMode::Vertical => WorkspaceLayoutMode::Landscape,
+        };
+        self.set_layout_mode(next);
+    }
+
+    fn sync_preserved_active_pane(&mut self, gid: TabGroupId, pane_id: PaneId) {
+        let update = |members: &[PaneId], active: &mut usize| {
+            if let Some(index) = members.iter().position(|member| *member == pane_id) {
+                *active = index;
+                true
+            } else {
+                false
+            }
+        };
+        if gid == BUILTIN_TOOLS {
+            self.landscape_tabs.tools_active = Some(pane_id);
+        }
+        if gid == BUILTIN_AGENTS {
+            let _ = update(
+                &self.landscape_tabs.agents,
+                &mut self.landscape_tabs.agents_active,
+            );
+        } else if gid == BUILTIN_FILES {
+            let _ = update(
+                &self.landscape_tabs.files,
+                &mut self.landscape_tabs.files_active,
+            );
+        } else if gid == BUILTIN_GIT {
+            let _ = update(
+                &self.landscape_tabs.git,
+                &mut self.landscape_tabs.git_active,
+            );
+        } else if gid == BUILTIN_SHELLS {
+            let _ = update(
+                &self.landscape_tabs.shells,
+                &mut self.landscape_tabs.shells_active,
+            );
+        } else if gid == BUILTIN_TOOLS
+            && !update(
+                &self.landscape_tabs.files,
+                &mut self.landscape_tabs.files_active,
+            )
+            && !update(
+                &self.landscape_tabs.git,
+                &mut self.landscape_tabs.git_active,
+            )
+        {
+            let _ = update(
+                &self.landscape_tabs.shells,
+                &mut self.landscape_tabs.shells_active,
+            );
+        }
     }
 
     /// Flush the current left-tabs state to disk. Non-fatal on error —
@@ -2233,18 +2495,21 @@ impl App {
     fn persist_active_tabs(&mut self) {
         self.remembered_ui.active_tabs = self.memory_policy.active_tabs.then(|| {
             rimeterm_config::memory_state::ActiveTabsState {
-                files: self.active_left_tab_id(BUILTIN_FILES, &self.left_top_catalog),
-                git: self.active_left_tab_id(BUILTIN_GIT, &self.left_bottom_catalog),
-                agents: self
-                    .tree
-                    .find_tab_group(BUILTIN_AGENTS)
-                    .map_or(0, TabGroup::active_index),
-                shells: self
-                    .tree
-                    .find_tab_group(BUILTIN_SHELLS)
-                    .map_or(0, TabGroup::active_index),
+                files: self.active_left_tab_id_from_state(
+                    &self.landscape_tabs.files,
+                    self.landscape_tabs.files_active,
+                    &self.left_top_catalog,
+                ),
+                git: self.active_left_tab_id_from_state(
+                    &self.landscape_tabs.git,
+                    self.landscape_tabs.git_active,
+                    &self.left_bottom_catalog,
+                ),
+                agents: self.landscape_tabs.agents_active,
+                shells: self.landscape_tabs.shells_active,
             }
         });
+        self.save_remembered_ui();
     }
 
     /// Apply a new app-wide theme (§C v0.1: the same
@@ -2257,7 +2522,6 @@ impl App {
     /// `SettingsState` and the F9 picker. Persistence to disk is
     /// future work — runtime state resets to the config value on
     /// restart.
-
     fn set_markdown_theme(&mut self, theme: rimeterm_markdown::Theme) {
         self.viewer_markdown_theme = theme;
         for id in self
@@ -2593,10 +2857,14 @@ impl App {
             }
             _ => {}
         }
-        let big = key
+        let step_cells = if key
             .modifiers
-            .contains(crossterm::event::KeyModifiers::SHIFT);
-        let step_cells: i32 = if big { 5 } else { 1 };
+            .contains(crossterm::event::KeyModifiers::SHIFT)
+        {
+            5
+        } else {
+            1
+        };
         let (target, sign) = match key.code {
             KeyCode::Char('h') | KeyCode::Char('H') => (ResizeTarget::Horizontal, -1),
             KeyCode::Char('l') | KeyCode::Char('L') => (ResizeTarget::Horizontal, 1),
@@ -2611,18 +2879,27 @@ impl App {
         let Some(gid) = self.focus.focused_group() else {
             return;
         };
-        let Some((path, boundary, parent_extent, adjust_sign)) =
+        let mapping = if self.layout_mode == WorkspaceLayoutMode::Vertical {
+            match (gid, target) {
+                (BUILTIN_AGENTS, ResizeTarget::Vertical) => {
+                    Some((rimeterm_core::layout::SplitPath::root(), 0, 0, 1.0))
+                }
+                (BUILTIN_TOOLS, ResizeTarget::Vertical) => {
+                    Some((rimeterm_core::layout::SplitPath::root(), 0, 0, -1.0))
+                }
+                _ => None,
+            }
+        } else {
             resize_target_for_group(gid, target)
-        else {
+        };
+        let Some((path, boundary, parent_extent, adjust_sign)) = mapping else {
             return;
         };
-        // Convert cells → ratio in the *current* parent extent. We resolve the
-        // parent split's rect using the cached pane area.
         let parent_rect = split_parent_rect(&self.tree, self.last_pane_area, &path);
         let extent = parent_rect
-            .map(|r| match target {
-                ResizeTarget::Horizontal => r.width,
-                ResizeTarget::Vertical => r.height,
+            .map(|rect| match target {
+                ResizeTarget::Horizontal => rect.width,
+                ResizeTarget::Vertical => rect.height,
             })
             .unwrap_or(parent_extent);
         if extent == 0 {
@@ -2941,6 +3218,22 @@ impl App {
                     return;
                 }
             }
+            if self
+                .last_status_bar_hits
+                .landscape
+                .is_some_and(|rect| point_in_rect(m.column, m.row, rect))
+            {
+                self.set_layout_mode(WorkspaceLayoutMode::Landscape);
+                return;
+            }
+            if self
+                .last_status_bar_hits
+                .vertical
+                .is_some_and(|rect| point_in_rect(m.column, m.row, rect))
+            {
+                self.set_layout_mode(WorkspaceLayoutMode::Vertical);
+                return;
+            }
             if let Some(r) = self.last_status_bar_hits.quit {
                 if point_in_rect(m.column, m.row, r) {
                     // Same signal `Ctrl+Q` uses — the run loop polls
@@ -3154,67 +3447,74 @@ impl App {
     /// have their own hover slot (`hovered_divider`) to avoid a two-way
     /// dependency between the two paint pipelines.
     fn find_hovered_ui(&self, col: u16, row: u16) -> Option<HoveredUi> {
-        if let Some(r) = self.last_status_bar_hits.menu {
-            if point_in_rect(col, row, r) {
-                return Some(HoveredUi::MenuOpener);
-            }
+        if self
+            .last_status_bar_hits
+            .menu
+            .is_some_and(|rect| point_in_rect(col, row, rect))
+        {
+            return Some(HoveredUi::MenuOpener);
         }
-        if let Some(r) = self.last_status_bar_hits.quit {
-            if point_in_rect(col, row, r) {
-                return Some(HoveredUi::QuitButton);
-            }
+        if self
+            .last_status_bar_hits
+            .landscape
+            .is_some_and(|rect| point_in_rect(col, row, rect))
+        {
+            return Some(HoveredUi::LayoutLandscape);
+        }
+        if self
+            .last_status_bar_hits
+            .vertical
+            .is_some_and(|rect| point_in_rect(col, row, rect))
+        {
+            return Some(HoveredUi::LayoutVertical);
+        }
+        if self
+            .last_status_bar_hits
+            .quit
+            .is_some_and(|rect| point_in_rect(col, row, rect))
+        {
+            return Some(HoveredUi::QuitButton);
         }
         for (gid, hits) in &self.last_tab_strips {
             if !point_in_rect(col, row, hits.rect) {
                 continue;
             }
-            for (idx, r) in &hits.closes {
-                if point_in_rect(col, row, *r) {
+            for (idx, rect) in &hits.closes {
+                if point_in_rect(col, row, *rect) {
                     return Some(HoveredUi::TabClose {
                         gid: *gid,
                         idx: *idx,
                     });
                 }
             }
-            for (idx, r) in &hits.tabs {
-                if point_in_rect(col, row, *r) {
+            for (idx, rect) in &hits.tabs {
+                if point_in_rect(col, row, *rect) {
                     return Some(HoveredUi::TabActivate {
                         gid: *gid,
                         idx: *idx,
                     });
                 }
             }
-            if let Some(plus) = hits.plus {
-                if point_in_rect(col, row, plus) {
-                    return Some(HoveredUi::TabPlus { gid: *gid });
-                }
+            if hits.plus.is_some_and(|rect| point_in_rect(col, row, rect)) {
+                return Some(HoveredUi::TabPlus { gid: *gid });
             }
         }
         None
     }
 
-    /// Close whichever tab the user clicked `×` on. Delegates to
-    /// `close_pane_by_id` so Open-group last-member protection kicks
-    /// in identically for every tab kind. (§C24: the viewer is a
-    /// modal overlay now, not a tab, so no special-case is needed
-    /// here — the overlay dismisses via its own `[×]` in
-    /// `close_viewer_overlay`.)
     fn close_tab_at(&mut self, gid: TabGroupId, idx: usize) {
         let Some(pane_id) = self
             .tree
             .find_tab_group(gid)
-            .and_then(|g| g.members().get(idx).copied())
+            .and_then(|group| group.members().get(idx).copied())
         else {
             return;
         };
-        if let Err(e) = self.close_pane_by_id(pane_id) {
-            self.set_hint(format!("⛔ {}", e));
+        if let Err(error) = self.close_pane_by_id(pane_id) {
+            self.set_hint(format!("⛔ {error}"));
         }
     }
 
-    /// Activate tab `idx` inside `gid` and move keyboard focus to its
-    /// active pane. Silent no-op if the group or index is stale (racing
-    /// with a `pane.close` from IPC, say).
     fn activate_tab(&mut self, gid: TabGroupId, idx: usize) {
         let pane_id = match self.tree.find_tab_group_mut(gid) {
             Some(group) => {
@@ -3226,24 +3526,20 @@ impl App {
             None => return,
         };
         if let Some(pane_id) = pane_id {
+            self.sync_preserved_active_pane(gid, pane_id);
             self.focus.set_focus(pane_id, Some(gid));
         }
         self.persist_active_tabs();
     }
 
-    /// Dispatch the `[+]` affordance for `gid`. shells → spawn a new shell
-    /// immediately (there's only one choice). agents → open the picker
-    /// modal populated with `AGENT_REGISTRY` entries; each row fires the
-    /// corresponding `agents.pick.<id>` command on Enter.
     fn new_tab_in(&mut self, gid: TabGroupId) {
-        if gid == BUILTIN_SHELLS {
-            if let Err(e) = self.new_shell_tab_in(gid) {
-                self.set_hint(format!("⛔ {}", e));
+        if gid == BUILTIN_SHELLS || gid == BUILTIN_TOOLS {
+            if let Err(error) = self.new_shell_tab_in(gid) {
+                self.set_hint(format!("⛔ {error}"));
             }
         } else if gid == BUILTIN_AGENTS {
             self.open_agent_picker();
         }
-        // Fixed groups (files/sysmon) have no plus rect in the first place.
     }
 
     /// Populate and open the agent picker. Each entry maps to one of the
@@ -3740,6 +4036,8 @@ impl App {
             .unwrap_or("(workspace)");
         let status_hover = match self.hovered_ui {
             Some(HoveredUi::MenuOpener) => StatusBarHover::Menu,
+            Some(HoveredUi::LayoutLandscape) => StatusBarHover::Landscape,
+            Some(HoveredUi::LayoutVertical) => StatusBarHover::Vertical,
             Some(HoveredUi::QuitButton) => StatusBarHover::Quit,
             _ => StatusBarHover::None,
         };
@@ -3759,6 +4057,7 @@ impl App {
             frame.buffer_mut(),
             ws_label,
             &self.shell_short,
+            self.layout_mode,
             status_hover,
             key_hint,
         );
@@ -3782,8 +4081,13 @@ impl App {
         // Compute the rect for each *tab group cell*, then split off a 1-row
         // tab strip inside each cell. This is simpler than tracking tab strips
         // as separate layout nodes and keeps the LayoutTree pure.
-        let group_ids = [BUILTIN_FILES, BUILTIN_GIT, BUILTIN_AGENTS, BUILTIN_SHELLS];
-        for gid in group_ids {
+        let group_ids: &[TabGroupId] = match self.layout_mode {
+            WorkspaceLayoutMode::Landscape => {
+                &[BUILTIN_FILES, BUILTIN_GIT, BUILTIN_AGENTS, BUILTIN_SHELLS]
+            }
+            WorkspaceLayoutMode::Vertical => &[BUILTIN_AGENTS, BUILTIN_TOOLS],
+        };
+        for &gid in group_ids {
             let Some(cell) = group_cell_rect(&self.tree, vertical[1], gid) else {
                 continue;
             };
@@ -3812,7 +4116,10 @@ impl App {
                 let closable: Vec<bool> = group
                     .members()
                     .iter()
-                    .map(|id| !self.pinned_pane_ids.contains(id))
+                    .map(|id| {
+                        !self.pinned_pane_ids.contains(id)
+                            && (gid != BUILTIN_TOOLS || self.landscape_tabs.shells.contains(id))
+                    })
                     .collect();
                 let hits = crate::tab_strip::hit_rects(strip_rect, group, &titles, &closable);
                 self.last_tab_strips.push((gid, hits));
@@ -3849,17 +4156,18 @@ impl App {
             }
         }
 
-        // §C24: the viewer overlay covers the ENTIRE left column
-        // (files+git stacked). We paint it AFTER the group loop so
-        // it lands on top of yazi and gitui with edges aligned to
-        // the outer left column rect.
         if self.viewer.is_open() {
-            let left_col_rect = split_parent_rect(
-                &self.tree,
-                vertical[1],
-                &rimeterm_core::layout::SplitPath::root().push(0),
-            );
-            if let Some(rect) = left_col_rect {
+            let overlay_rect = match self.layout_mode {
+                WorkspaceLayoutMode::Landscape => split_parent_rect(
+                    &self.tree,
+                    vertical[1],
+                    &rimeterm_core::layout::SplitPath::root().push(0),
+                ),
+                WorkspaceLayoutMode::Vertical => {
+                    group_cell_rect(&self.tree, vertical[1], BUILTIN_TOOLS)
+                }
+            };
+            if let Some(rect) = overlay_rect {
                 let viewer_focused = self.viewer_owns_caret();
                 viewer::render_into_pane(
                     &mut self.viewer,
@@ -3869,8 +4177,6 @@ impl App {
                     self.viewer_markdown_theme,
                     viewer_focused,
                 );
-                // The pane below the border is what mouse events route to.
-                // Match render_into_pane's inner rect: one cell inset all around.
                 if rect.width >= 2 && rect.height >= 2 {
                     self.last_viewer_rect = Some(Rect {
                         x: rect.x + 1,
@@ -4216,6 +4522,9 @@ impl App {
         if f.tab_next.swap(false, Ordering::Relaxed) {
             self.tab_step(true);
         }
+        if f.layout_toggle.swap(false, Ordering::Relaxed) {
+            self.toggle_layout_mode();
+        }
         if f.tab_prev.swap(false, Ordering::Relaxed) {
             self.tab_step(false);
         }
@@ -4308,15 +4617,17 @@ impl App {
         let Some(gid) = self.focus.focused_group() else {
             return;
         };
-        if let Some(group) = self.tree.find_tab_group_mut(gid) {
+        let pane = self.tree.find_tab_group_mut(gid).and_then(|group| {
             if forward {
                 group.next();
             } else {
                 group.prev();
             }
-            if let Some(id) = group.active_pane() {
-                self.focus.set_focus(id, Some(gid));
-            }
+            group.active_pane()
+        });
+        if let Some(pane) = pane {
+            self.sync_preserved_active_pane(gid, pane);
+            self.focus.set_focus(pane, Some(gid));
         }
         self.persist_active_tabs();
     }
@@ -4325,24 +4636,30 @@ impl App {
         let Some(gid) = self.focus.focused_group() else {
             return;
         };
-        if let Some(group) = self.tree.find_tab_group_mut(gid) {
-            if group.goto(idx).is_ok() {
-                if let Some(id) = group.active_pane() {
-                    self.focus.set_focus(id, Some(gid));
-                }
-            } else {
-                self.set_hint(format!("no tab {} in {}", idx + 1, gid));
-            }
+        let pane = self
+            .tree
+            .find_tab_group_mut(gid)
+            .and_then(|group| group.goto(idx).ok().and_then(|()| group.active_pane()));
+        if let Some(pane) = pane {
+            self.sync_preserved_active_pane(gid, pane);
+            self.focus.set_focus(pane, Some(gid));
         }
         self.persist_active_tabs();
     }
 
     fn focus_direction(&mut self, dir: usize) {
-        // dir: 1=left 2=right 3=up 4=down
         let current = self.focus.focused_group();
-        let target = current.and_then(|g| neighbor_group(g, dir));
-        if let Some(gid) = target {
-            self.focus_group(gid);
+        let target = if self.layout_mode == WorkspaceLayoutMode::Vertical {
+            match (current, dir) {
+                (Some(BUILTIN_AGENTS), 4) => Some(BUILTIN_TOOLS),
+                (Some(BUILTIN_TOOLS), 3) => Some(BUILTIN_AGENTS),
+                _ => None,
+            }
+        } else {
+            current.and_then(|group| neighbor_group(group, dir))
+        };
+        if let Some(group) = target {
+            self.focus_group(group);
         }
     }
 
@@ -4478,7 +4795,10 @@ impl App {
             .find_tab_group_mut(BUILTIN_AGENTS)
             .expect("agents group checked above");
         remove_agent_picker_placeholder(group, &mut self.panes);
+        self.landscape_tabs.agents = group.members().to_vec();
+        self.landscape_tabs.agents_active = group.active_index();
         self.focus.set_focus(new_id, Some(BUILTIN_AGENTS));
+        self.persist_agents_state();
         Ok(new_id)
     }
 
@@ -4486,29 +4806,15 @@ impl App {
     /// `PaneId` so IPC callers can address it. Used by both `Ctrl+T`
     /// (focused group) and `workspace.pane.open` (currently only shells;
     /// agents will need their own kind in the M4 milestone).
-    fn new_shell_tab_in(&mut self, gid: TabGroupId) -> Result<PaneId> {
-        // Only shells accepts new tabs (spec §19.10.10). Return the policy
-        // error verbatim so the status bar shows the reason.
-        let group = self
-            .tree
-            .find_tab_group(gid)
-            .ok_or_else(|| anyhow!("group {} missing", gid))?;
-        match group.policy() {
-            MembersPolicy::Fixed => return Err(anyhow!("{} is fixed; cannot add tabs", gid)),
-            MembersPolicy::Open { .. } => {}
+    fn new_shell_tab_in(&mut self, _gid: TabGroupId) -> Result<PaneId> {
+        if self.landscape_tabs.shells.len() >= 16 {
+            return Err(anyhow!("shells group is full (max = 16)"));
         }
-        if group.kind() != PaneKind::Shell {
-            // For now the only Open kind we can spawn is Shell (agents will
-            // land in later milestones).
-            return Err(anyhow!("Ctrl+T not yet supported for {}", gid));
-        }
-
-        let next_num = next_shell_number(group.members(), &self.panes);
-        let display = format!("shell-{}", next_num);
+        let next_num = next_shell_number(&self.landscape_tabs.shells, &self.panes);
         let spawn = spawn_shell(
             &self.shell_choice,
             self.workspace_root.clone(),
-            display,
+            format!("shell-{next_num}"),
             80,
             24,
             self.redraw_tx.clone(),
@@ -4519,18 +4825,31 @@ impl App {
             .lock()
             .insert(new_id, spawn.pane.session().clone());
         self.panes.insert(Box::new(spawn.pane));
-        // §19.14.4: newly-spawned shells inherit the same right-click
-        // paste policy as startup ones. Config is source of truth.
         if let Some(pane) = self.panes.get_mut(new_id) {
             pane.set_right_click_paste(self.config.mouse.right_click_paste);
             pane.set_scrollback_enabled(true);
         }
-
-        let group = self.tree.find_tab_group_mut(gid).expect("group present");
-        group
-            .try_add(new_id, PaneKind::Shell)
-            .map_err(|e| anyhow!("policy rejected new tab: {e}"))?;
-        self.focus.set_focus(new_id, Some(gid));
+        self.landscape_tabs.shells.push(new_id);
+        self.landscape_tabs.shells_active = self.landscape_tabs.shells.len() - 1;
+        let prior_ratios = snapshot_all_ratios(&self.tree);
+        self.tree = match self.layout_mode {
+            WorkspaceLayoutMode::Landscape => build_landscape_tree(&self.landscape_tabs)?,
+            WorkspaceLayoutMode::Vertical => build_vertical_tree_from_state(&self.landscape_tabs)?,
+        };
+        apply_ratio_snapshot(&mut self.tree, &prior_ratios);
+        let focus_group = if self.layout_mode == WorkspaceLayoutMode::Vertical {
+            BUILTIN_TOOLS
+        } else {
+            BUILTIN_SHELLS
+        };
+        if self.layout_mode == WorkspaceLayoutMode::Vertical
+            && let Some(group) = self.tree.find_tab_group_mut(BUILTIN_TOOLS)
+            && let Some(index) = group.members().iter().position(|member| *member == new_id)
+        {
+            let _ = group.goto(index);
+        }
+        self.landscape_tabs.tools_active = Some(new_id);
+        self.focus.set_focus(new_id, Some(focus_group));
         self.persist_ui_state();
         Ok(new_id)
     }
@@ -4633,26 +4952,66 @@ impl App {
             }
         }
         self.focus.set_focus(new_id, Some(gid));
+        if let Some(group) = self.tree.find_tab_group(BUILTIN_AGENTS) {
+            self.landscape_tabs.agents = group.members().to_vec();
+            self.landscape_tabs.agents_active = group.active_index();
+        }
         self.persist_agents_state();
         Ok(new_id)
     }
 
     fn close_current_shell_tab(&mut self) -> Result<()> {
-        let gid = self
+        let pane_id = self
             .focus
-            .focused_group()
-            .ok_or_else(|| anyhow!("no focused group"))?;
-        let group = self
-            .tree
-            .find_tab_group(gid)
-            .ok_or_else(|| anyhow!("group {} missing", gid))?;
-        let idx = group.active_index();
-        self.close_tab_in_group(gid, idx)?;
+            .focused_pane()
+            .ok_or_else(|| anyhow!("no focused pane"))?;
+        if !self.landscape_tabs.shells.contains(&pane_id) {
+            return Err(anyhow!("focused tab is not a shell"));
+        }
+        self.close_shell_pane(pane_id)
+    }
+
+    fn close_shell_pane(&mut self, pane_id: PaneId) -> Result<()> {
+        if self.landscape_tabs.shells.len() == 1 {
+            return Err(anyhow!("shells has only one member — refusing to close"));
+        }
+        let index = self
+            .landscape_tabs
+            .shells
+            .iter()
+            .position(|member| *member == pane_id)
+            .ok_or_else(|| anyhow!("pane {} is not a shell", pane_id.0))?;
+        self.landscape_tabs.shells.remove(index);
+        self.landscape_tabs.shells_active = self
+            .landscape_tabs
+            .shells_active
+            .min(self.landscape_tabs.shells.len() - 1);
+        self.drop_pane_and_session(pane_id);
+        let prior_ratios = snapshot_all_ratios(&self.tree);
+        self.tree = match self.layout_mode {
+            WorkspaceLayoutMode::Landscape => build_landscape_tree(&self.landscape_tabs)?,
+            WorkspaceLayoutMode::Vertical => build_vertical_tree_from_state(&self.landscape_tabs)?,
+        };
+        apply_ratio_snapshot(&mut self.tree, &prior_ratios);
+        let next = self.landscape_tabs.shells[self.landscape_tabs.shells_active];
+        let group = if self.layout_mode == WorkspaceLayoutMode::Vertical {
+            BUILTIN_TOOLS
+        } else {
+            BUILTIN_SHELLS
+        };
+        if self.layout_mode == WorkspaceLayoutMode::Vertical
+            && let Some(tools) = self.tree.find_tab_group_mut(BUILTIN_TOOLS)
+            && let Some(index) = tools.members().iter().position(|member| *member == next)
+        {
+            let _ = tools.goto(index);
+        }
+        self.landscape_tabs.tools_active = Some(next);
+        self.focus.set_focus(next, Some(group));
+        self.persist_ui_state();
         Ok(())
     }
 
-    /// Drop a pane AND kill any PTY session tracked for it. This is the
-    /// path every teardown must go through when the pane owns a
+    /// Drop a pane and kill any tracked PTY session.
     /// subprocess (PtyPane instances) — plain [`drop_pane`] only frees
     /// the trait object, which for a `Session`-backed pane just drops
     /// one Arc-clone of the child handle. The background reaper task
@@ -4675,18 +5034,20 @@ impl App {
     }
 
     /// Close whichever tab holds `pane_id`. IPC entry point; walks every
-    /// `TabGroup` to find the owner. Fails if the owning group is
-    /// [`MembersPolicy::Fixed`] or if it would leave the group empty.
     fn close_pane_by_id(&mut self, pane_id: PaneId) -> Result<()> {
+        if self.landscape_tabs.shells.contains(&pane_id) {
+            return self.close_shell_pane(pane_id);
+        }
         let (gid, idx) = self
             .tree
             .tab_groups()
             .iter()
-            .find_map(|g| {
-                g.members()
+            .find_map(|group| {
+                group
+                    .members()
                     .iter()
-                    .position(|m| *m == pane_id)
-                    .map(|i| (g.id(), i))
+                    .position(|member| *member == pane_id)
+                    .map(|index| (group.id(), index))
             })
             .ok_or_else(|| anyhow!("pane {} not in any tab group", pane_id.0))?;
         self.close_tab_in_group(gid, idx)
@@ -4698,33 +5059,34 @@ impl App {
         let group = self
             .tree
             .find_tab_group_mut(gid)
-            .ok_or_else(|| anyhow!("group {} missing", gid))?;
-        match group.policy() {
-            MembersPolicy::Fixed => return Err(anyhow!("{} is fixed; cannot close tabs", gid)),
-            MembersPolicy::Open { .. } => {}
+            .ok_or_else(|| anyhow!("group {gid} missing"))?;
+        if matches!(group.policy(), MembersPolicy::Fixed) {
+            return Err(anyhow!("{gid} is fixed; cannot close tabs"));
         }
-        // §19.10.1 addendum: reject a close on a pinned pane (bottom).
-        // The mouse path never surfaces the `×` affordance, so this
-        // is the belt-and-braces guard for Ctrl+W / IPC `pane.close`.
-        if let Some(pane_id) = group.members().get(idx).copied() {
-            if self.pinned_pane_ids.contains(&pane_id) {
-                return Err(anyhow!(
-                    "tab is pinned in {}; cannot close (see §19.10.1)",
-                    gid
-                ));
-            }
+        if let Some(pane_id) = group.members().get(idx).copied()
+            && self.pinned_pane_ids.contains(&pane_id)
+        {
+            return Err(anyhow!("tab is pinned in {gid}; cannot close"));
         }
-        let removed = group.try_close(idx, false).map_err(|e| anyhow!("{e}"))?;
+        let removed = group
+            .try_close(idx, false)
+            .map_err(|error| anyhow!("{error}"))?;
+        let next_active = group.active_pane();
         self.drop_pane_and_session(removed);
-        // Clean the reverse lookup + persist if we just changed the
-        // agents quadrant. Persisting is idempotent + cheap (single
-        // TOML file, few bytes) so we do it unconditionally on any
-        // agents-group mutation rather than trying to gate it further.
         let was_agent = self.pane_agent_id.remove(&removed).is_some();
-        if let Some(group) = self.tree.find_tab_group(gid) {
-            if let Some(id) = group.active_pane() {
-                self.focus.set_focus(id, Some(gid));
-            }
+        if was_agent {
+            self.landscape_tabs.agents.retain(|pane| *pane != removed);
+            self.landscape_tabs.agents_active = next_active
+                .and_then(|pane| {
+                    self.landscape_tabs
+                        .agents
+                        .iter()
+                        .position(|member| *member == pane)
+                })
+                .unwrap_or(0);
+        }
+        if let Some(pane_id) = next_active {
+            self.focus.set_focus(pane_id, Some(gid));
         }
         if was_agent || gid == BUILTIN_AGENTS {
             self.persist_agents_state();
@@ -4871,14 +5233,32 @@ impl App {
             .collect();
         let mut dirty = false;
         for id in ids {
-            if let Some(pane) = self.panes.get_mut(id) {
-                if pane.poll_background() {
-                    dirty = true;
-                }
+            if let Some(pane) = self.panes.get_mut(id)
+                && pane.poll_background()
+            {
+                dirty = true;
             }
         }
+        dirty |= self.drain_glab_status_message();
         self.sync_from_file_manager();
         dirty
+    }
+
+    fn drain_glab_status_message(&mut self) -> bool {
+        let Some(glab_id) = self.catalog_pane_id("glab") else {
+            return false;
+        };
+        let message = self
+            .panes
+            .get_mut(glab_id)
+            .and_then(|pane| pane.as_any_mut())
+            .and_then(|any| any.downcast_mut::<GlabPane>())
+            .and_then(GlabPane::take_status_message);
+        let Some(message) = message else {
+            return false;
+        };
+        self.set_hint(message);
+        true
     }
 
     /// Forward the file manager's current directory + highlight to the
@@ -5224,6 +5604,11 @@ impl App {
     }
 
     fn persist_ui_state(&mut self) {
+        self.remembered_ui.workspace_layout = if self.memory_policy.workspace_layout {
+            self.layout_mode
+        } else {
+            WorkspaceLayoutMode::Landscape
+        };
         self.remembered_ui.last_workspace = self
             .memory_policy
             .last_workspace
@@ -5238,35 +5623,31 @@ impl App {
             .then(|| self.left_tabs_state.clone());
         self.remembered_ui.active_tabs = self.memory_policy.active_tabs.then(|| {
             rimeterm_config::memory_state::ActiveTabsState {
-                files: self.active_left_tab_id(BUILTIN_FILES, &self.left_top_catalog),
-                git: self.active_left_tab_id(BUILTIN_GIT, &self.left_bottom_catalog),
-                agents: self
-                    .tree
-                    .find_tab_group(BUILTIN_AGENTS)
-                    .map_or(0, TabGroup::active_index),
-                shells: self
-                    .tree
-                    .find_tab_group(BUILTIN_SHELLS)
-                    .map_or(0, TabGroup::active_index),
+                files: self.active_left_tab_id_from_state(
+                    &self.landscape_tabs.files,
+                    self.landscape_tabs.files_active,
+                    &self.left_top_catalog,
+                ),
+                git: self.active_left_tab_id_from_state(
+                    &self.landscape_tabs.git,
+                    self.landscape_tabs.git_active,
+                    &self.left_bottom_catalog,
+                ),
+                agents: self.landscape_tabs.agents_active,
+                shells: self.landscape_tabs.shells_active,
             }
         });
         self.remembered_ui.agent_tabs = self.memory_policy.agent_tabs.then(|| {
-            self.tree
-                .find_tab_group(BUILTIN_AGENTS)
-                .map(|group| {
-                    group
-                        .members()
-                        .iter()
-                        .filter_map(|pane| self.pane_agent_id.get(pane).map(|id| id.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default()
+            self.landscape_tabs
+                .agents
+                .iter()
+                .filter_map(|pane| self.pane_agent_id.get(pane).map(|id| id.to_string()))
+                .collect()
         });
-        self.remembered_ui.shell_tabs = self.memory_policy.shell_tabs.then(|| {
-            self.tree
-                .find_tab_group(BUILTIN_SHELLS)
-                .map_or(1, TabGroup::len)
-        });
+        self.remembered_ui.shell_tabs = self
+            .memory_policy
+            .shell_tabs
+            .then_some(self.landscape_tabs.shells.len());
         self.remembered_ui.files = self
             .memory_policy
             .files
@@ -5325,15 +5706,16 @@ impl App {
         self.save_remembered_ui();
     }
 
-    fn active_left_tab_id(
+    fn active_left_tab_id_from_state(
         &self,
-        group_id: TabGroupId,
+        members: &[PaneId],
+        active: usize,
         catalog: &[LeftTabCatalogEntry],
     ) -> Option<String> {
-        let active = self.tree.find_tab_group(group_id)?.active_pane()?;
+        let pane = members.get(active)?;
         catalog
             .iter()
-            .find(|entry| entry.pane == active)
+            .find(|entry| entry.pane == *pane)
             .map(|entry| entry.id.to_string())
     }
 
@@ -5929,6 +6311,13 @@ fn register_commands(
         "Reveal viewer file in system file manager",
         "Open the file's containing folder in the OS file manager",
         flags.viewer_reveal
+    );
+    flag_cmd!(
+        cmds,
+        "workspace.layout.toggle",
+        "Toggle workspace layout",
+        "Ctrl+Alt+L",
+        flags.layout_toggle
     );
     flag_cmd!(
         cmds,
@@ -7241,49 +7630,35 @@ pub(crate) fn tab_strip_hover_for(
     }
 }
 
-/// Resolve the current-frame hover overlay: the seam rect + axis to
-/// paint, or `None` to skip the overlay entirely.
-///
-/// Returns `None` when either:
-/// - `dragging` is true (drag itself is the affordance; painting the
-///   stale hover during drag pollutes cells the seam has already
-///   moved away from), or
-/// - the tracked hover key isn't in `dividers` anymore (rare — happens
-///   right after a layout mutation like `workspace.layout.reset`).
-///
-/// Pure so we can unit-test the "no paint during drag" and "re-lookup
-/// fresh rect" invariants without a live App / PTY.
-pub(crate) fn live_hover_overlay(
+/// Resolve the current-frame hover overlay from the live divider geometry.
+fn live_hover_overlay(
     dragging: bool,
     hovered: Option<&HoveredDivider>,
     dividers: &[rimeterm_core::layout::Divider],
-) -> Option<(Rect, ratatui::layout::Direction)> {
+) -> Option<(Rect, Direction)> {
     if dragging {
         return None;
     }
     let hovered = hovered?;
     dividers
         .iter()
-        .find(|d| d.path == hovered.path && d.boundary == hovered.boundary)
-        .map(|d| (d.visual.rect, hovered.axis))
+        .find(|divider| divider.path == hovered.path && divider.boundary == hovered.boundary)
+        .map(|divider| (divider.visual.rect, hovered.axis))
 }
 
-/// Parse the string form of a `TabGroupId` back to a static id. Called
-/// from `run_context_intent` to decode `tab.close:shells:2` style tags.
 fn parse_group_id(s: &str) -> Option<TabGroupId> {
     match s {
         "files" => Some(BUILTIN_FILES),
         "git" => Some(BUILTIN_GIT),
         "agents" => Some(BUILTIN_AGENTS),
         "shells" => Some(BUILTIN_SHELLS),
+        "tools" => Some(BUILTIN_TOOLS),
         _ => None,
     }
 }
 
-/// Append the group-specific "new" entry (context menu builder helper).
-/// Fixed groups get a disabled row explaining why.
 fn push_group_new_entry(entries: &mut Vec<crate::picker::PickerEntry>, gid: TabGroupId) {
-    if gid == BUILTIN_SHELLS {
+    if gid == BUILTIN_SHELLS || gid == BUILTIN_TOOLS {
         entries.push(crate::picker::PickerEntry::intent(
             "New shell tab",
             "shells.new",
@@ -7295,7 +7670,7 @@ fn push_group_new_entry(entries: &mut Vec<crate::picker::PickerEntry>, gid: TabG
         ));
     } else {
         entries.push(crate::picker::PickerEntry::disabled(
-            "New tab",
+            "New tab unavailable",
             "(fixed group)",
         ));
     }
@@ -7373,6 +7748,15 @@ fn snapshot_all_ratios(tree: &LayoutTree) -> Vec<(rimeterm_core::layout::SplitPa
         &mut out,
     );
     out
+}
+
+fn apply_ratio_snapshot(
+    tree: &mut LayoutTree,
+    ratios: &[(rimeterm_core::layout::SplitPath, Vec<f32>)],
+) {
+    for (path, values) in ratios {
+        let _ = tree.set_ratios(path, values.clone());
+    }
 }
 
 fn walk_snapshot(
@@ -7606,7 +7990,6 @@ fn should_route_pane_mouse(kind: MouseEventKind, hit: PaneId, focused: Option<Pa
 /// Decide whether an incoming key should dismiss the currently-open viewer.
 /// Bare `Left` and `Esc` close it unless an agents/shells PTY owns the key.
 /// Modified keys always fall through to global bindings or the focused pane.
-
 fn should_dismiss_viewer_overlay(
     key: KeyEvent,
     overlay_open: bool,
@@ -7689,6 +8072,120 @@ mod tests {
         restore_named_active_tab(&mut group, Some("hidden"), &catalog);
 
         assert_eq!(group.active_pane(), Some(files));
+    }
+
+    #[test]
+    fn vertical_lower_members_order_tools_before_shells() {
+        let files = vec![PaneId(1), PaneId(2), PaneId(3)];
+        let git = vec![PaneId(4), PaneId(5), PaneId(6)];
+        let shells = vec![PaneId(7), PaneId(8)];
+
+        assert_eq!(
+            vertical_lower_members(&files, &git, &shells),
+            vec![
+                PaneId(1),
+                PaneId(2),
+                PaneId(3),
+                PaneId(4),
+                PaneId(5),
+                PaneId(6),
+                PaneId(7),
+                PaneId(8),
+            ]
+        );
+    }
+
+    #[test]
+    fn vertical_tree_splits_agents_above_tools_at_fifty_five_percent() {
+        let state = LandscapeTabsState {
+            files: vec![PaneId(12)],
+            files_active: 0,
+            git: vec![PaneId(13)],
+            git_active: 0,
+            agents: vec![PaneId(11)],
+            agents_active: 0,
+            shells: vec![PaneId(14)],
+            shells_active: 0,
+            tools_active: Some(PaneId(12)),
+        };
+        let tree = build_vertical_tree_from_state(&state).expect("vertical tree");
+
+        assert_eq!(
+            tree.compute_rects(Rect::new(0, 0, 100, 100)),
+            vec![
+                (PaneId(11), Rect::new(0, 0, 100, 55)),
+                (PaneId(12), Rect::new(0, 55, 100, 45)),
+            ]
+        );
+    }
+
+    #[test]
+    fn vertical_hidden_tool_focus_moves_to_the_active_tool() {
+        let focused = PaneId(22);
+        let active = PaneId(21);
+        let state = LandscapeTabsState {
+            files: vec![active],
+            files_active: 0,
+            git: vec![PaneId(23)],
+            git_active: 0,
+            agents: vec![PaneId(20)],
+            agents_active: 0,
+            shells: vec![PaneId(24)],
+            shells_active: 0,
+            tools_active: Some(active),
+        };
+        let tree = build_vertical_tree_from_state(&state).expect("vertical tree");
+
+        assert_eq!(
+            replacement_focus_for_hidden_pane(&tree, BUILTIN_TOOLS, focused),
+            Some(active)
+        );
+        assert_eq!(
+            replacement_focus_for_hidden_pane(&tree, BUILTIN_TOOLS, active),
+            None
+        );
+    }
+
+    #[test]
+    fn member_update_preserves_active_pane_or_falls_back_to_first() {
+        let first = PaneId(31);
+        let active = PaneId(32);
+        let replacement = PaneId(33);
+
+        assert_eq!(
+            active_index_after_member_update(Some(active), &[first, active]),
+            1
+        );
+        assert_eq!(
+            active_index_after_member_update(Some(active), &[first, replacement]),
+            0
+        );
+    }
+
+    #[test]
+    fn vertical_member_rebuild_preserves_split_ratio() {
+        let state = LandscapeTabsState {
+            files: vec![PaneId(41)],
+            files_active: 0,
+            git: vec![PaneId(42)],
+            git_active: 0,
+            agents: vec![PaneId(40)],
+            agents_active: 0,
+            shells: vec![PaneId(43)],
+            shells_active: 0,
+            tools_active: Some(PaneId(41)),
+        };
+        let mut tree = build_vertical_tree_from_state(&state).expect("vertical tree");
+        tree.set_ratios(&rimeterm_core::layout::SplitPath::root(), vec![0.7, 0.3])
+            .unwrap();
+
+        let rebuilt =
+            rebuild_vertical_tree_preserving_ratios(&state, &tree).expect("rebuilt vertical tree");
+
+        assert_eq!(
+            snapshot_all_ratios(&rebuilt),
+            vec![(rimeterm_core::layout::SplitPath::root(), vec![0.7, 0.3])]
+        );
     }
 
     #[test]

@@ -83,6 +83,12 @@ impl Keymap {
         {
             return KeymapOutcome::Run("app.resize.toggle");
         }
+        if matches!(key.code, KeyCode::Char('l') | KeyCode::Char('L'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::ALT)
+        {
+            return KeymapOutcome::Run("workspace.layout.toggle");
+        }
         // Tab cycling — accept both bindings so at least one works on every
         // terminal setup. Ctrl+PageUp/Down come through even on terminals
         // that swallow the Alt modifier on `[` / `]`.
@@ -334,6 +340,17 @@ mod tests {
                 KeyModifiers::CONTROL | KeyModifiers::ALT
             )),
             KeymapOutcome::Run("app.resize.toggle")
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_l_toggles_workspace_layout() {
+        assert_eq!(
+            Keymap::dispatch(key(
+                KeyCode::Char('l'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )),
+            KeymapOutcome::Run("workspace.layout.toggle")
         );
     }
 

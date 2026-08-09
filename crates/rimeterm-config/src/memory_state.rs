@@ -16,6 +16,15 @@ fn default_true() -> bool {
     true
 }
 
+/// Workspace pane arrangement selected in the top status bar.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceLayoutMode {
+    #[default]
+    Landscape,
+    Vertical,
+}
+
 /// User-controlled categories shown in Settings > Memory.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, default)]
@@ -26,6 +35,8 @@ pub struct MemoryPolicy {
     pub pane_sizes: bool,
     #[serde(default = "default_true")]
     pub tab_layout: bool,
+    #[serde(default = "default_true")]
+    pub workspace_layout: bool,
     #[serde(default = "default_true")]
     pub active_tabs: bool,
     #[serde(default = "default_true")]
@@ -61,6 +72,7 @@ impl Default for MemoryPolicy {
             pane_sizes: true,
             tab_layout: true,
             active_tabs: true,
+            workspace_layout: true,
             agent_tabs: true,
             shell_tabs: true,
             files: true,
@@ -104,6 +116,7 @@ pub struct PaneState {
 pub struct UiState {
     pub last_workspace: Option<PathBuf>,
     pub pane_sizes: Option<BTreeMap<String, Vec<f32>>>,
+    pub workspace_layout: WorkspaceLayoutMode,
     pub tab_layout: Option<LeftTabsState>,
     pub active_tabs: Option<ActiveTabsState>,
     pub agent_tabs: Option<Vec<String>>,
@@ -131,6 +144,9 @@ impl UiState {
         }
         if !policy.tab_layout {
             self.tab_layout = None;
+        }
+        if !policy.workspace_layout {
+            self.workspace_layout = WorkspaceLayoutMode::default();
         }
         if !policy.active_tabs {
             self.active_tabs = None;

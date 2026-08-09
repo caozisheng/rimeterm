@@ -1,18 +1,13 @@
 //! Top status bar (row 0) rendering.
 //!
-//! Left slot:  `≡ rimeterm` — clickable main-menu opener.
-//! Middle:     workspace label + branch (v0.1 stub).
-//! Right slot: `shell: <name>` + a clickable `[×]` quit button.
-//!
-//! Both interactive glyphs (`≡` and `[×]`) get a hover style so the user
-//! knows they can click them — terminals can't swap the OS cursor into a
-//! pointing hand, so we compensate visually (same idea as the divider
-//! hover paint, see `App::hovered_ui`).
+//! The right side orders `shell: <name>`, the layout segmented toggle, and
+//! the quit button. Interactive controls use reversed hover/selection styles.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Paragraph, Widget};
+use rimeterm_config::memory_state::WorkspaceLayoutMode;
 
 /// Which interactive glyph in the status bar is under the mouse pointer
 /// right now. `None` = the pointer is elsewhere. Callers must recompute
@@ -22,27 +17,25 @@ use ratatui::widgets::{Paragraph, Widget};
 pub enum StatusBarHover {
     None,
     Menu,
+    Landscape,
+    Vertical,
     Quit,
 }
 
-/// Rects the mouse layer needs so `on_mouse` can route clicks back into
-/// the right command (`app.menu.toggle`, `app.quit`). Populated by
-/// [`render`] and cached on `App::last_status_bar_hits`.
+/// Rects used by the app mouse router for status-bar controls.
 #[derive(Debug, Clone, Default)]
 pub struct StatusBarHits {
-    /// `≡ rimeterm` label rect. `None` when the terminal is too narrow
-    /// to fit even the label (rare).
     pub menu: Option<Rect>,
-    /// `[×]` quit-button rect. `None` when the terminal is too narrow
-    /// to fit it after workspace + shell (rare).
+    pub landscape: Option<Rect>,
+    pub vertical: Option<Rect>,
     pub quit: Option<Rect>,
 }
 
-/// Widths (cells) for the fixed side columns. Tuned so the labels
-/// don't overflow on 80-column terminals — everything else flexes.
-const MENU_WIDTH: u16 = 12; // " ≡ rimeterm"
-const QUIT_WIDTH: u16 = 4; //  " [×]"
-const SHELL_WIDTH: u16 = 18; // "shell: pwsh 7    "
+const MENU_WIDTH: u16 = 12;
+const QUIT_WIDTH: u16 = 4;
+const SHELL_WIDTH: u16 = 18;
+const LAYOUT_LANDSCAPE_WIDTH: u16 = 11;
+const LAYOUT_VERTICAL_WIDTH: u16 = 10;
 
 /// Draw the status bar into `area`. The caller reserves a 1-row rect.
 ///
@@ -59,19 +52,10 @@ pub fn render(
     buf: &mut Buffer,
     workspace_label: &str,
     shell_short: &str,
+    layout_mode: WorkspaceLayoutMode,
     hover: StatusBarHover,
     key_hint: Option<&str>,
 ) -> StatusBarHits {
-    // Five slots: menu | workspace (flex) | key-hint (fixed, opt) | shell | quit.
-    // When the terminal shrinks below the sum of the fixed widths, `Layout` will
-    // truncate the trailing slots — we surface `None` for anything that
-    // came out zero-width so the mouse layer can't hit a phantom rect.
-    // The key-hint column collapses to `Length(0)` when nothing to
-    // show so the workspace flex reclaims every cell.
-    //
-    // Chip width = ` <hint> ` = unicode_width + 2. We use `chars().count()`
-    // as a cheap proxy for display width; all the hints we ship
-    // (ASCII + `·`) are single-cell so this stays tight.
     let hint_col_width = key_hint
         .map(|s| (s.chars().count() as u16).saturating_add(2))
         .unwrap_or(0);
@@ -82,54 +66,78 @@ pub fn render(
             Constraint::Min(0),
             Constraint::Length(hint_col_width),
             Constraint::Length(SHELL_WIDTH),
+            Constraint::Length(LAYOUT_LANDSCAPE_WIDTH),
+            Constraint::Length(LAYOUT_VERTICAL_WIDTH),
             Constraint::Length(QUIT_WIDTH),
         ])
         .split(area);
 
-    // ≡ menu opener. Bold by default (design §19.13.1: "hover 变粗").
-    // Reverse on hover so it clearly reads as clickable even against
-    // dark backgrounds where bold alone is hard to spot.
-    let mut menu_style = Style::default();
-    if matches!(hover, StatusBarHover::Menu) {
-        menu_style = menu_style.add_modifier(Modifier::REVERSED);
-    }
+    let menu_style = if matches!(hover, StatusBarHover::Menu) {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
     Paragraph::new(" ≡ rimeterm")
         .style(menu_style)
         .render(cols[0], buf);
-
-    Paragraph::new(format!("workspace: {}", workspace_label)).render(cols[1], buf);
-
-    // Optional context-scoped key hint. Cyan so it reads as an
-    // affordance without competing with the destructive-red quit
-    // button. Rendered only when both a hint text and a non-zero
-    // column exist (protects against `Layout` clamping the fixed
-    // slot on a narrow terminal).
-    if let Some(text) = key_hint {
-        if cols[2].width > 0 {
-            Paragraph::new(format!(" {} ", text))
-                .style(Style::default().fg(Color::Cyan))
-                .render(cols[2], buf);
-        }
+    Paragraph::new(format!("workspace: {workspace_label}")).render(cols[1], buf);
+    if let Some(text) = key_hint
+        && cols[2].width > 0
+    {
+        Paragraph::new(format!(" {text} "))
+            .style(Style::default().fg(Color::Cyan))
+            .render(cols[2], buf);
     }
-
-    Paragraph::new(format!("shell: {}", shell_short))
+    Paragraph::new(format!("shell: {shell_short}"))
         .style(Style::default().add_modifier(Modifier::DIM))
         .render(cols[3], buf);
 
-    // Quit button. Red so it's unambiguous as a "close app" affordance;
-    // reversed on hover for the same visibility reason as the menu.
-    let mut quit_style = Style::default().fg(Color::LightRed);
-    if matches!(hover, StatusBarHover::Quit) {
-        quit_style = quit_style.add_modifier(Modifier::REVERSED);
-    }
+    render_layout_segment(
+        cols[4],
+        buf,
+        " LANDSCAPE ",
+        layout_mode == WorkspaceLayoutMode::Landscape,
+        matches!(hover, StatusBarHover::Landscape),
+    );
+    render_layout_segment(
+        cols[5],
+        buf,
+        " VERTICAL ",
+        layout_mode == WorkspaceLayoutMode::Vertical,
+        matches!(hover, StatusBarHover::Vertical),
+    );
+
+    let quit_style = if matches!(hover, StatusBarHover::Quit) {
+        Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().fg(Color::LightRed)
+    };
     Paragraph::new(" [×]")
         .style(quit_style)
-        .render(cols[4], buf);
+        .render(cols[6], buf);
 
     StatusBarHits {
         menu: rect_if_nonzero(cols[0]),
-        quit: rect_if_nonzero(cols[4]),
+        landscape: rect_if_nonzero(cols[4]),
+        vertical: rect_if_nonzero(cols[5]),
+        quit: rect_if_nonzero(cols[6]),
     }
+}
+
+fn render_layout_segment(area: Rect, buf: &mut Buffer, label: &str, selected: bool, hovered: bool) {
+    let mut style = if selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    if hovered && !selected {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    Paragraph::new(label).style(style).render(area, buf);
 }
 
 fn rect_if_nonzero(r: Rect) -> Option<Rect> {
@@ -146,13 +154,18 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
-    fn render_to_string(area: Rect, key_hint: Option<&str>) -> String {
+    fn render_to_string(
+        area: Rect,
+        key_hint: Option<&str>,
+        layout_mode: WorkspaceLayoutMode,
+    ) -> String {
         let mut buf = Buffer::empty(area);
         render(
             area,
             &mut buf,
             "myproj",
             "pwsh",
+            layout_mode,
             StatusBarHover::None,
             key_hint,
         );
@@ -167,7 +180,11 @@ mod tests {
 
     #[test]
     fn key_hint_none_gives_workspace_the_full_flex_slot() {
-        let s = render_to_string(Rect::new(0, 0, 80, 1), None);
+        let s = render_to_string(
+            Rect::new(0, 0, 100, 1),
+            None,
+            WorkspaceLayoutMode::Landscape,
+        );
         assert!(s.contains("workspace: myproj"));
         assert!(s.contains("shell: pwsh"));
         assert!(s.contains("[×]"));
@@ -177,7 +194,11 @@ mod tests {
 
     #[test]
     fn key_hint_paints_between_workspace_and_shell() {
-        let s = render_to_string(Rect::new(0, 0, 80, 1), Some("F9 menu"));
+        let s = render_to_string(
+            Rect::new(0, 0, 100, 1),
+            Some("F9 menu"),
+            WorkspaceLayoutMode::Landscape,
+        );
         assert!(s.contains("workspace: myproj"));
         assert!(s.contains("F9 menu"));
         assert!(s.contains("shell: pwsh"));
@@ -189,6 +210,41 @@ mod tests {
     }
 
     #[test]
+    fn vertical_segment_is_selected_in_vertical_mode() {
+        let area = Rect::new(0, 0, 100, 1);
+        let mut buf = Buffer::empty(area);
+        let hits = render(
+            area,
+            &mut buf,
+            "myproj",
+            "pwsh",
+            WorkspaceLayoutMode::Vertical,
+            StatusBarHover::None,
+            None,
+        );
+        let vertical = hits.vertical.expect("vertical hit");
+
+        assert!(
+            buf[(vertical.x + 1, vertical.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+    #[test]
+    fn layout_toggle_renders_between_shell_and_quit() {
+        let s = render_to_string(Rect::new(0, 0, 100, 1), None, WorkspaceLayoutMode::Vertical);
+
+        let shell = s.find("shell:").expect("shell label");
+        let landscape = s.find("LANDSCAPE").expect("landscape segment");
+        let vertical = s.find("VERTICAL").expect("vertical segment");
+        let quit = s.find("[×]").expect("quit button");
+        assert!(
+            shell < landscape && landscape < vertical && vertical < quit,
+            "{s:?}"
+        );
+    }
+
+    #[test]
     fn hit_rects_align_with_menu_and_quit_slots() {
         let area = Rect::new(0, 0, 80, 1);
         let mut buf = Buffer::empty(area);
@@ -197,6 +253,7 @@ mod tests {
             &mut buf,
             "myproj",
             "pwsh",
+            WorkspaceLayoutMode::Landscape,
             StatusBarHover::None,
             Some("F9 menu"),
         );
@@ -207,6 +264,25 @@ mod tests {
         assert_eq!(menu.width, MENU_WIDTH);
         assert_eq!(quit.x + quit.width, area.width);
         assert_eq!(quit.width, QUIT_WIDTH);
+    }
+
+    #[test]
+    fn layout_segments_have_distinct_hit_rects() {
+        let area = Rect::new(0, 0, 100, 1);
+        let mut buf = Buffer::empty(area);
+        let hits = render(
+            area,
+            &mut buf,
+            "myproj",
+            "pwsh",
+            WorkspaceLayoutMode::Landscape,
+            StatusBarHover::None,
+            None,
+        );
+
+        let landscape = hits.landscape.expect("landscape hit");
+        let vertical = hits.vertical.expect("vertical hit");
+        assert_eq!(landscape.x + landscape.width, vertical.x);
     }
 
     #[test]
@@ -221,12 +297,16 @@ mod tests {
             &mut buf,
             "myproj",
             "pwsh",
+            WorkspaceLayoutMode::Landscape,
             StatusBarHover::None,
             Some("F9 menu"),
         );
         // Either populated with a nonzero rect or None — never a
         // phantom zero-width rect.
-        for r in [hits.menu, hits.quit].into_iter().flatten() {
+        for r in [hits.menu, hits.landscape, hits.vertical, hits.quit]
+            .into_iter()
+            .flatten()
+        {
             assert!(r.width > 0);
         }
     }

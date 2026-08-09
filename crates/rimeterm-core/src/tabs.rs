@@ -28,6 +28,8 @@ pub const BUILTIN_GIT: TabGroupId = TabGroupId::from_static("git");
 pub const BUILTIN_SYSMON: TabGroupId = TabGroupId::from_static("sysmon");
 pub const BUILTIN_AGENTS: TabGroupId = TabGroupId::from_static("agents");
 pub const BUILTIN_SHELLS: TabGroupId = TabGroupId::from_static("shells");
+/// Unified lower tool group used by the vertical workspace layout.
+pub const BUILTIN_TOOLS: TabGroupId = TabGroupId::from_static("tools");
 
 impl std::fmt::Display for TabGroupId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -302,6 +304,10 @@ mod tests {
 
     fn pid() -> PaneId {
         PaneId::next()
+    }
+    #[test]
+    fn vertical_tools_group_has_stable_id() {
+        assert_eq!(BUILTIN_TOOLS.as_str(), "tools");
     }
 
     #[test]

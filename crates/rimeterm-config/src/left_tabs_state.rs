@@ -113,6 +113,14 @@ fn normalize_group(list: &mut Vec<LeftTab>, catalog: &[&str], anchor: &str) {
     } else if catalog.contains(&anchor) {
         list.insert(0, LeftTab::new(anchor, true));
     }
+    // Glab is the Git companion pane. Keep it directly after the mandatory
+    // Git anchor even when normalizing state saved before Glab existed.
+    if anchor == ANCHOR_BOTTOM
+        && let Some(glab_pos) = list.iter().position(|tab| tab.id == "glab")
+    {
+        let glab = list.remove(glab_pos);
+        list.insert(1, glab);
+    }
 }
 
 fn group_is_default(list: &[LeftTab], catalog: &[&str]) -> bool {
@@ -247,21 +255,22 @@ mod tests {
     }
 
     #[test]
-    fn normalize_appends_newly_known_ids_as_visible() {
+    fn normalize_inserts_new_glab_directly_after_git() {
         let mut state = LeftTabsState {
             top: vec![LeftTab::new("files", true), LeftTab::new("todo", false)],
             bottom: vec![LeftTab::new("git", true), LeftTab::new("agtop", false)],
         };
         state.normalize(TOP, BOTTOM);
+
         // `fr` is new-since-upgrade for the top group.
         assert_eq!(state.top.last().unwrap().id, "fr");
         assert!(state.top.last().unwrap().visible);
-        // Bottom keeps user ordering and gets the remaining ids appended
-        // in catalog order.
+        // Glab is anchored beside Git even when upgrading persisted state
+        // that predates the Glab pane. Other user ordering stays intact.
         let bottom_ids: Vec<&str> = state.bottom.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(
             bottom_ids,
-            vec!["git", "agtop", "glab", "sysmon", "models", "stock"]
+            vec!["git", "glab", "agtop", "sysmon", "models", "stock"]
         );
     }
 

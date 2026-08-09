@@ -197,6 +197,8 @@ pub struct EmbeddedApp {
     next_refresh: Option<Instant>,
     refresh_interval: Option<Duration>,
     last_refresh: Instant,
+    /// One-shot message for an embedding host's status bar.
+    host_status_message: Option<String>,
     options: EmbeddedOptions,
 }
 
@@ -223,6 +225,7 @@ impl EmbeddedApp {
             visible: true,
             next_refresh,
             refresh_interval: options.refresh,
+            host_status_message: None,
             last_refresh: now,
             options,
         };
@@ -332,11 +335,7 @@ impl EmbeddedApp {
                     .wrap(ratatui::widgets::Wrap { trim: false });
                 frame.render_widget(text, inner);
             }
-            AppShell::Ready(app) => {
-                ui::draw_in(frame, area, app);
-            }
-            AppShell::Offline(app, err) => {
-                app.error_message = Some(err.clone());
+            AppShell::Ready(app) | AppShell::Offline(app, _) => {
                 ui::draw_in(frame, area, app);
             }
         }
@@ -359,6 +358,22 @@ impl EmbeddedApp {
                 self.next_refresh = Some(Instant::now() + interval);
             }
         }
+    }
+
+    /// Take the newest printable message for the embedding host's status bar.
+    /// Messages produced directly by key handlers are drained from the inner
+    /// app so the embedded pane does not paint a competing toast.
+    pub fn take_status_message(&mut self) -> Option<String> {
+        self.host_status_message.take().or_else(|| {
+            let app = match &mut self.shell {
+                AppShell::Ready(app) | AppShell::Offline(app, _) => app,
+                _ => return None,
+            };
+            app.status_message.take().or_else(|| {
+                app.error_message_at = None;
+                app.error_message.take()
+            })
+        })
     }
 
     // -- Workspace management -----------------------------------------------
@@ -643,8 +658,6 @@ impl EmbeddedApp {
                     members: Vec::new(),
                 },
             });
-
-            // 4. Spawn initial data fetches for the default tab.
             crate::fetch::spawn_refresh_active_tab(
                 &client,
                 &project_context,
@@ -660,6 +673,7 @@ impl EmbeddedApp {
             match &event {
                 Event::FetchFailed(_tab, msg) => {
                     tracing::warn!(msg, "glab: Detecting→Setup (FetchFailed)");
+                    self.host_status_message = Some(msg.clone());
                     let problem = Self::detect_setup_problem(msg);
                     self.shell = AppShell::Setup(problem);
                     return;
@@ -718,7 +732,29 @@ impl EmbeddedApp {
                 app.milestones.items = milestones;
                 self.promote_to_ready_if_offline();
             }
+            Event::CommandStarted(message) => {
+                self.host_status_message = Some(message);
+            }
+            Event::CommandCompleted(_, Ok(())) => {
+                self.host_status_message = Some("Command completed".into());
+            }
+            Event::CommandCompleted(_, Err(message)) => {
+                self.host_status_message = Some(message);
+            }
+            Event::TerminalCommandLogged {
+                timestamp,
+                command,
+                status,
+            } => {
+                app.terminal_commands.push(crate::app::TerminalCommand {
+                    timestamp,
+                    command: command.clone(),
+                    status: status.clone(),
+                });
+                self.host_status_message = Some(format!("{command}: {status}"));
+            }
             Event::FetchFailed(_tab, msg) => {
+                self.host_status_message = Some(msg.clone());
                 if matches!(self.shell, AppShell::Ready(_)) {
                     if let AppShell::Ready(app) =
                         std::mem::replace(&mut self.shell, AppShell::Detecting)
@@ -845,6 +881,7 @@ mod tests {
             next_refresh: None,
             refresh_interval: None,
             last_refresh: Instant::now(),
+            host_status_message: None,
             options: opts,
         };
 
@@ -887,6 +924,7 @@ mod tests {
             next_refresh: None,
             refresh_interval: None,
             last_refresh: Instant::now(),
+            host_status_message: None,
             options: opts,
         };
 
@@ -1020,6 +1058,11 @@ mod tests {
             matches!(app.shell(), AppShell::Setup(_)),
             "CLI-missing failure in Detecting should transition to Setup"
         );
+
+        assert_eq!(
+            app.take_status_message().as_deref(),
+            Some("glab is not installed")
+        );
     }
 
     #[test]
@@ -1039,5 +1082,53 @@ mod tests {
             matches!(app.shell(), AppShell::Ready(_)),
             "successful event in Detecting should transition to Ready"
         );
+    }
+
+    #[test]
+    fn command_events_are_exposed_once_to_the_host_status_bar() {
+        let (mut app, tx) = test_app();
+        let generation = app.generation();
+        tx.send(TaggedCompletion {
+            generation,
+            event: Event::CommandStarted("Fetching diff".into()),
+        })
+        .unwrap();
+
+        assert!(app.poll_background());
+        assert_eq!(app.take_status_message().as_deref(), Some("Fetching diff"));
+        assert_eq!(app.take_status_message(), None);
+
+        tx.send(TaggedCompletion {
+            generation,
+            event: Event::CommandCompleted(Tab::Issues, Err("permission denied".into())),
+        })
+        .unwrap();
+
+        assert!(app.poll_background());
+        assert_eq!(
+            app.take_status_message().as_deref(),
+            Some("permission denied")
+        );
+    }
+
+    #[test]
+    fn terminal_command_log_is_recorded_and_exposed_to_the_host() {
+        let (mut app, tx) = test_app();
+        tx.send(TaggedCompletion {
+            generation: app.generation(),
+            event: Event::TerminalCommandLogged {
+                timestamp: "12:34:56".into(),
+                command: "glab issue close 42".into(),
+                status: "Success".into(),
+            },
+        })
+        .unwrap();
+
+        assert!(app.poll_background());
+        assert_eq!(
+            app.take_status_message().as_deref(),
+            Some("glab issue close 42: Success")
+        );
+        assert_eq!(app.app().unwrap().terminal_commands.len(), 1);
     }
 }
