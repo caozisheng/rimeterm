@@ -148,35 +148,46 @@ fn run(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
-
-    use parking_lot::Mutex;
 
     use super::run_concurrent;
 
     #[test]
-    fn run_concurrent_overlaps_independent_jobs() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
+    fn run_concurrent_starts_all_jobs_before_any_job_completes() {
+        let started = Arc::new((Mutex::new(0usize), Condvar::new()));
         let completed = Arc::new(Mutex::new(Vec::new()));
         run_concurrent(0..3, {
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
+            let started = Arc::clone(&started);
             let completed = Arc::clone(&completed);
             move |job| {
-                let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(concurrent, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(25));
-                active.fetch_sub(1, Ordering::SeqCst);
-                completed.lock().push(job);
+                let (count, all_started) = &*started;
+                let mut count = count
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *count += 1;
+                all_started.notify_all();
+                let (count, timeout) = all_started
+                    .wait_timeout_while(count, Duration::from_secs(5), |count| *count < 3)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(
+                    !timeout.timed_out() && *count == 3,
+                    "all jobs must start concurrently before any job completes"
+                );
+                drop(count);
+                completed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(job);
             }
         });
 
         assert_eq!(
-            (peak.load(Ordering::SeqCst), completed.lock().len()),
-            (3, 3)
+            completed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            3
         );
     }
 }
