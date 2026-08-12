@@ -106,6 +106,8 @@ pub struct SettingsState {
     /// Populated by [`Self::refresh`] on open. Empty if the host has
     /// no shells at all (extremely unusual).
     pub shells: Vec<ShellChoice>,
+    /// Platform-specific hints from the loaded application config.
+    pub shell_hints: Vec<String>,
     pub busy: Option<String>,
     /// C22.6: theme currently applied in the markdown viewer, shown as
     /// the highlighted row when the Viewer tab is active. Callers seed
@@ -152,6 +154,7 @@ impl Default for SettingsState {
             cursor: 0,
             agents: Vec::new(),
             shells: Vec::new(),
+            shell_hints: Vec::new(),
             busy: None,
             markdown_theme: rimeterm_markdown::Theme::default(),
             current_shell: ShellChoice::None,
@@ -185,7 +188,19 @@ impl SettingsState {
     /// matching what's actually spawning new shells. Called from
     /// `App::open_settings_overlay` right after `open()`.
     pub fn set_current_shell(&mut self, shell: ShellChoice) {
+        if shell != ShellChoice::None
+            && !self
+                .shells
+                .iter()
+                .any(|candidate| candidate.path() == shell.path())
+        {
+            self.shells.push(shell.clone());
+        }
         self.current_shell = shell;
+    }
+
+    pub fn set_shell_hints(&mut self, hints: Vec<String>) {
+        self.shell_hints = hints;
     }
 
     pub fn close(&mut self) {
@@ -195,16 +210,19 @@ impl SettingsState {
 
     pub fn refresh(&mut self) {
         self.agents = rimeterm_pty::agent_registry::detect_all();
-        // Same hint list App uses to build its own initial choice, so
-        // the picker rows always contain the currently-active shell.
-        let hints: &[String] = if cfg!(windows) {
-            &rimeterm_config::CoreConfig::default().shell_win
-        } else {
-            &rimeterm_config::CoreConfig::default().shell_unix
-        };
-        self.shells = rimeterm_pty::detect_all_shells(hints);
+        self.refresh_shells();
         self.integration_installed = crate::shell_integration::probe();
         self.cursor = self.cursor.min(self.row_count().saturating_sub(1));
+    }
+
+    fn refresh_shells(&mut self) {
+        self.shells = rimeterm_pty::detect_all_shells(&self.shell_hints);
+        if let Some(path) = self.current_shell.path()
+            && path.is_file()
+            && !self.shells.iter().any(|shell| shell.path() == Some(path))
+        {
+            self.shells.push(self.current_shell.clone());
+        }
     }
 
     /// Reflect the outcome of an install / uninstall action so the
@@ -1165,6 +1183,39 @@ mod tests {
             .position(|t| *t == rimeterm_markdown::Theme::GruvboxDark)
             .unwrap();
         assert_eq!(state.cursor, expected);
+    }
+
+    #[test]
+    fn shell_tab_enter_returns_selected_executable() {
+        let selected = ShellChoice::Unix(std::path::PathBuf::from("nu"));
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Shell;
+        state.shells = vec![selected.clone()];
+
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter)),
+            Some(SettingsAction::SetShell(selected))
+        );
+    }
+
+    #[test]
+    fn configured_shell_hints_drive_refresh() {
+        let mut state = SettingsState::default();
+
+        state.set_shell_hints(vec!["definitely-not-a-default-shell".into()]);
+
+        assert_eq!(state.shell_hints, vec!["definitely-not-a-default-shell"]);
+    }
+
+    #[test]
+    fn current_shell_remains_visible_when_not_on_path() {
+        let current = ShellChoice::Unix(std::path::PathBuf::from("/opt/custom/nu"));
+        let mut state = SettingsState::default();
+
+        state.set_current_shell(current.clone());
+
+        assert!(state.shells.contains(&current));
     }
 
     #[test]

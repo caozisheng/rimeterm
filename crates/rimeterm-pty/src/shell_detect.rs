@@ -1,20 +1,29 @@
 //! Shell auto-detection per §6.2.1 of the design doc.
 //!
-//! Order on Windows:
-//! 1. `pwsh.exe` on PATH with `$PSVersionTable.PSVersion.Major >= 7`
-//! 2. pwsh 7 at default install paths (user forgot to add PATH)
-//! 3. Windows PowerShell 5.1 (`powershell.exe`)
-//! 4. `cmd.exe`
-//!
-//! On Unix: fish → bash → sh.
-//!
-//! v0.1 does NOT probe `$PSVersionTable` (needs a spawn + read + parse — round
-//! trip we can't afford at startup). Instead we accept `pwsh.exe` on PATH and
-//! trust it is v7+; if it isn't the user can override in config.
+//! Windows probes PowerShell, cmd, then other commonly installed shells.
+//! Unix prefers modern interactive shells before POSIX fallbacks.
 
 use std::path::PathBuf;
 
 use tracing::debug;
+
+#[cfg(windows)]
+const COMMON_SHELLS: &[&str] = &[
+    "pwsh",
+    "powershell",
+    "cmd",
+    "nu",
+    "bash",
+    "fish",
+    "zsh",
+    "xonsh",
+    "elvish",
+];
+
+#[cfg(unix)]
+const COMMON_SHELLS: &[&str] = &[
+    "fish", "zsh", "bash", "nu", "xonsh", "elvish", "dash", "ksh", "tcsh", "sh",
+];
 
 /// Resolved default shell for the current OS.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,39 +80,29 @@ impl ShellChoice {
 /// `hints` is the platform-relevant slice of `[core].shell_win` or `shell_unix`;
 /// first entry that resolves via `which` wins.
 pub fn detect_default_shell(hints: &[String]) -> ShellChoice {
-    // 1. Config hints (verbatim in probe order).
     for hint in hints {
-        if let Ok(p) = which::which(hint) {
-            debug!(hint, path = %p.display(), "shell resolved from config hint");
-            return classify(hint, p);
+        if let Some(choice) = resolve_shell(hint) {
+            debug!(hint, path = %choice.path().expect("resolved shell has path").display(), "shell resolved from config hint");
+            return choice;
         }
     }
 
-    // 2. Platform-specific fallbacks: pwsh install paths on Windows, `sh` on Unix.
     #[cfg(windows)]
-    for cand in [
+    for candidate in [
         r"C:\Program Files\PowerShell\7\pwsh.exe",
         r"C:\Program Files (x86)\PowerShell\7\pwsh.exe",
     ] {
-        let p = std::path::PathBuf::from(cand);
-        if p.exists() {
-            debug!(path = %p.display(), "pwsh 7 found at default install path");
-            return ShellChoice::Pwsh7(p);
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            debug!(path = %path.display(), "pwsh 7 found at default install path");
+            return ShellChoice::Pwsh7(path);
         }
     }
 
-    #[cfg(windows)]
-    if let Ok(p) = which::which("powershell.exe") {
-        return ShellChoice::WinPs51(p);
-    }
-    #[cfg(windows)]
-    if let Ok(p) = which::which("cmd.exe") {
-        return ShellChoice::Cmd(p);
-    }
-
-    #[cfg(unix)]
-    if let Ok(p) = which::which("sh") {
-        return ShellChoice::Unix(p);
+    for candidate in COMMON_SHELLS {
+        if let Some(choice) = resolve_shell(candidate) {
+            return choice;
+        }
     }
 
     ShellChoice::None
@@ -118,67 +117,75 @@ pub fn detect_default_shell(hints: &[String]) -> ShellChoice {
 /// Unix) are appended. Duplicates (same resolved path) are dropped so
 /// a hint like `["pwsh", "pwsh.exe"]` doesn't show up twice.
 pub fn detect_all_shells(hints: &[String]) -> Vec<ShellChoice> {
-    let mut out: Vec<ShellChoice> = Vec::new();
-    let mut seen: Vec<PathBuf> = Vec::new();
-    let mut push = |choice: ShellChoice| {
-        if let Some(p) = choice.path() {
-            let owned = p.to_path_buf();
-            if seen.iter().any(|s| s == &owned) {
-                return;
-            }
-            seen.push(owned);
-        }
-        out.push(choice);
-    };
+    let mut out = Vec::new();
 
-    for hint in hints {
-        if let Ok(p) = which::which(hint) {
-            push(classify(hint, p));
+    for hint in hints
+        .iter()
+        .map(String::as_str)
+        .chain(COMMON_SHELLS.iter().copied())
+    {
+        if let Some(choice) = resolve_shell(hint) {
+            push_unique(&mut out, choice);
         }
     }
 
     #[cfg(windows)]
-    {
-        for cand in [
-            r"C:\Program Files\PowerShell\7\pwsh.exe",
-            r"C:\Program Files (x86)\PowerShell\7\pwsh.exe",
-        ] {
-            let p = PathBuf::from(cand);
-            if p.exists() {
-                push(ShellChoice::Pwsh7(p));
-            }
-        }
-        if let Ok(p) = which::which("powershell.exe") {
-            push(ShellChoice::WinPs51(p));
-        }
-        if let Ok(p) = which::which("cmd.exe") {
-            push(ShellChoice::Cmd(p));
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        for cand in ["fish", "zsh", "bash", "dash", "sh"] {
-            if let Ok(p) = which::which(cand) {
-                push(classify(cand, p));
-            }
+    for candidate in [
+        r"C:\Program Files\PowerShell\7\pwsh.exe",
+        r"C:\Program Files (x86)\PowerShell\7\pwsh.exe",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            push_unique(&mut out, ShellChoice::Pwsh7(path));
         }
     }
 
     out
 }
 
-fn classify(hint: &str, resolved: PathBuf) -> ShellChoice {
-    let stem = std::path::Path::new(hint)
+fn resolve_shell(hint: &str) -> Option<ShellChoice> {
+    which::which(hint).ok().map(classify_path)
+}
+
+pub fn classify_path(path: PathBuf) -> ShellChoice {
+    let stem = path
         .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(hint)
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
         .to_ascii_lowercase();
     match stem.as_str() {
-        "pwsh" => ShellChoice::Pwsh7(resolved),
-        "powershell" => ShellChoice::WinPs51(resolved),
-        "cmd" => ShellChoice::Cmd(resolved),
-        _ => ShellChoice::Unix(resolved),
+        "pwsh" => ShellChoice::Pwsh7(path),
+        "powershell" => ShellChoice::WinPs51(path),
+        "cmd" => ShellChoice::Cmd(path),
+        _ => ShellChoice::Unix(path),
+    }
+}
+
+pub fn prefer_saved_shell(saved: Option<&std::path::Path>, fallback: ShellChoice) -> ShellChoice {
+    saved
+        .filter(|path| path.is_file())
+        .map(|path| classify_path(path.to_path_buf()))
+        .unwrap_or(fallback)
+}
+
+fn push_unique(shells: &mut Vec<ShellChoice>, choice: ShellChoice) {
+    let Some(path) = choice.path() else {
+        return;
+    };
+    let duplicate = shells.iter().filter_map(ShellChoice::path).any(|existing| {
+        #[cfg(windows)]
+        {
+            existing
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&path.to_string_lossy())
+        }
+        #[cfg(not(windows))]
+        {
+            existing == path
+        }
+    });
+    if !duplicate {
+        shells.push(choice);
     }
 }
 
@@ -186,6 +193,33 @@ fn classify(hint: &str, resolved: PathBuf) -> ShellChoice {
 mod tests {
     use super::*;
 
+    #[test]
+    fn common_shells_include_modern_cross_platform_choices() {
+        assert!(COMMON_SHELLS.contains(&"nu"));
+        assert!(COMMON_SHELLS.contains(&"xonsh"));
+        assert!(COMMON_SHELLS.contains(&"elvish"));
+    }
+
+    #[test]
+    fn classification_uses_resolved_executable_name() {
+        assert_eq!(
+            classify_path(PathBuf::from(r"C:\Tools\pwsh.exe")),
+            ShellChoice::Pwsh7(PathBuf::from(r"C:\Tools\pwsh.exe"))
+        );
+    }
+
+    #[test]
+    fn stale_preference_falls_back_to_detected_shell() {
+        let fallback = ShellChoice::Unix(PathBuf::from("fallback"));
+
+        assert_eq!(
+            prefer_saved_shell(
+                Some(std::path::Path::new("missing-shell")),
+                fallback.clone()
+            ),
+            fallback
+        );
+    }
     #[test]
     fn empty_hints_do_not_crash() {
         let _ = detect_default_shell(&[]);

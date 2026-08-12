@@ -68,6 +68,14 @@ pub fn data_dir() -> Option<PathBuf> {
     home().map(|d| d.join("data"))
 }
 
+pub fn shell_preference_file() -> Option<PathBuf> {
+    home().map(|root| shell_preference_file_in(&root))
+}
+
+pub fn shell_preference_file_in(rimeterm_home: &std::path::Path) -> PathBuf {
+    rimeterm_home.join("data").join("shell.toml")
+}
+
 /// Global stock watchlist. It follows the user rather than the active
 /// workspace, like the Todo store.
 pub fn stock_watchlist_file() -> Option<PathBuf> {

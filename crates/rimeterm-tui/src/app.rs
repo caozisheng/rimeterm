@@ -47,7 +47,7 @@ use rimeterm_core::tabs::{
     BUILTIN_AGENTS, BUILTIN_FILES, BUILTIN_GIT, BUILTIN_SHELLS, BUILTIN_TOOLS, MembersPolicy,
     PaneKind, TabGroup, TabGroupId,
 };
-use rimeterm_pty::{ShellChoice, detect_default_shell};
+use rimeterm_pty::{ShellChoice, detect_default_shell, prefer_saved_shell};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use unicode_width::UnicodeWidthStr;
@@ -1219,7 +1219,7 @@ impl App {
             migrate_legacy_workspace_state(&workspace_root, &mut memory);
         }
         let shell_choice = pick_shell(&config)?;
-        let shell_short: String = shell_choice.short_name().into();
+        let shell_short = shell_status_label(&shell_choice);
         info!(
             shell = shell_short.as_str(),
             path = %shell_choice.path().unwrap().display(),
@@ -2186,6 +2186,12 @@ impl App {
     /// the app menu). Refreshes tool/agent detection and seeds the
     /// Viewer tab's cursor with the currently-applied markdown theme.
     fn open_settings_overlay(&mut self) {
+        let shell_hints = if cfg!(windows) {
+            self.config.core.shell_win.clone()
+        } else {
+            self.config.core.shell_unix.clone()
+        };
+        self.settings_state.set_shell_hints(shell_hints);
         self.settings_state.open();
         self.settings_state
             .set_markdown_theme(self.viewer_markdown_theme);
@@ -2227,10 +2233,20 @@ impl App {
                 let _ = self.redraw_tx.send(());
             }
             SettingsAction::SetShell(shell) => {
+                let Some(preference_path) = rimeterm_config::paths::shell_preference_file() else {
+                    self.set_hint("shell selection not saved: RimeTerm home unavailable".into());
+                    return;
+                };
+                if let Err(error) = persist_shell_choice(&preference_path, &shell) {
+                    warn!(error = %error, "failed to persist shell selection");
+                    self.set_hint(format!("shell selection save failed: {error}"));
+                    return;
+                }
                 let label = shell.display_label();
+                self.shell_short = shell_status_label(&shell);
                 self.shell_choice = shell.clone();
                 self.settings_state.set_current_shell(shell);
-                self.set_hint(format!("shell → {label} (applies to new shell tabs)"));
+                self.set_hint(format!("shell → {label} (new shell tabs only)"));
                 let _ = self.redraw_tx.send(());
             }
             SettingsAction::InstallContextMenu => {
@@ -6029,15 +6045,32 @@ fn pick_shell(config: &Config) -> Result<ShellChoice> {
     } else {
         &config.core.shell_unix
     };
-    let choice = detect_default_shell(hints);
+    let fallback = detect_default_shell(hints);
+    let preference = rimeterm_config::paths::shell_preference_file()
+        .and_then(|path| {
+            rimeterm_config::shell_preference::ShellPreference::load_or_default(&path).ok()
+        })
+        .unwrap_or_default();
+    let choice = prefer_saved_shell(preference.path.as_deref(), fallback);
     if choice == ShellChoice::None {
-        Err(anyhow!(
-            "no shell found; tried hints={:?}",
-            hints.iter().collect::<Vec<_>>()
-        ))
+        Err(anyhow!("no shell found; tried hints={:?}", hints))
     } else {
         Ok(choice)
     }
+}
+
+fn shell_status_label(shell: &ShellChoice) -> String {
+    shell.display_label()
+}
+
+fn persist_shell_choice(
+    preference_path: &std::path::Path,
+    shell: &ShellChoice,
+) -> Result<(), rimeterm_config::shell_preference::ShellPreferenceError> {
+    let preference = rimeterm_config::shell_preference::ShellPreference {
+        path: shell.path().map(std::path::Path::to_path_buf),
+    };
+    preference.save_to(preference_path)
 }
 
 /// Insert either a real spawned external PTY (if `spec.command[0]` is on
@@ -9311,6 +9344,28 @@ mod tests {
         use rimeterm_markdown::Theme;
         assert_eq!(parse_markdown_theme("no-such-theme"), Theme::Default);
         assert_eq!(parse_markdown_theme(""), Theme::Default);
+    }
+
+    #[test]
+    fn persist_shell_choice_writes_selected_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let preference_path = dir.path().join("shell.toml");
+        let executable = std::env::current_exe().unwrap();
+        let selected = rimeterm_pty::classify_path(executable.clone());
+
+        persist_shell_choice(&preference_path, &selected).unwrap();
+
+        let saved =
+            rimeterm_config::shell_preference::ShellPreference::load_or_default(&preference_path)
+                .unwrap();
+        assert_eq!(saved.path, Some(executable));
+    }
+
+    #[test]
+    fn selected_shell_updates_status_label() {
+        let selected = ShellChoice::Unix(std::path::PathBuf::from("nu"));
+
+        assert_eq!(shell_status_label(&selected), "nu");
     }
 
     fn selection(path: &str) -> viewer::SelectionSnapshot {

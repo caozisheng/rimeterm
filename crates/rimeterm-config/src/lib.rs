@@ -22,6 +22,7 @@ pub mod migrate;
 pub mod paths;
 pub mod project_map;
 pub mod session_state;
+pub mod shell_preference;
 
 #[doc(hidden)]
 pub mod test_util;

@@ -614,6 +614,61 @@ mod trim_tests {
 }
 
 #[cfg(test)]
+mod shell_spawn_smoke_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn detected_shell_program_reaches_pty_grid() {
+        let hints = if cfg!(windows) {
+            vec![
+                "pwsh".to_string(),
+                "powershell".to_string(),
+                "cmd".to_string(),
+            ]
+        } else {
+            vec!["fish".to_string(), "bash".to_string(), "sh".to_string()]
+        };
+        let shell = crate::detect_default_shell(&hints);
+        let program = shell.path().unwrap().to_path_buf();
+        let args = match shell {
+            crate::ShellChoice::Pwsh7(_) | crate::ShellChoice::WinPs51(_) => vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                "Write-Output rimeterm-shell-smoke".into(),
+            ],
+            crate::ShellChoice::Cmd(_) => {
+                vec!["/D".into(), "/C".into(), "echo rimeterm-shell-smoke".into()]
+            }
+            crate::ShellChoice::Unix(_) => {
+                vec!["-c".into(), "echo rimeterm-shell-smoke".into()]
+            }
+            crate::ShellChoice::None => unreachable!(),
+        };
+        let (session, _events) = Session::spawn(SessionConfig {
+            program,
+            args,
+            cwd: None,
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+            backend: PtyBackend::Native,
+        })
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if session.grid_contents(None).contains("rimeterm-shell-smoke") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
 mod term_to_string_tests {
     use super::*;
     use alacritty_terminal::event::VoidListener;
