@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use rimeterm_pty::{PtyBackend, Session, SessionConfig};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::app::RedrawSender;
 use crate::pty_pane::PtyPane;
 
 pub struct ExternalSpawn {
@@ -28,7 +29,7 @@ pub fn spawn_external(
     display_name: String,
     initial_cols: u16,
     initial_rows: u16,
-    redraw: UnboundedSender<()>,
+    redraw: RedrawSender,
     osc_tx: UnboundedSender<(rimeterm_core::pane::PaneId, String)>,
     // C21.5: tool identity so `default_env` can inject the config
     // sandbox env (`YAZI_CONFIG_HOME`, `XDG_CONFIG_HOME`/`APPDATA`,
@@ -108,7 +109,7 @@ pub fn spawn_agent(
     display_name: String,
     initial_cols: u16,
     initial_rows: u16,
-    redraw: UnboundedSender<()>,
+    redraw: RedrawSender,
     osc_tx: UnboundedSender<(rimeterm_core::pane::PaneId, String)>,
 ) -> Result<ExternalSpawn> {
     spawn_external(

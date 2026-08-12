@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use rimeterm_pty::{PtyBackend, Session, SessionConfig, ShellChoice};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::app::RedrawSender;
 use crate::pty_pane::PtyPane;
 
 /// Result of a successful spawn: the pane and nothing else (the session's
@@ -23,7 +24,7 @@ pub fn spawn_shell(
     display_name: String,
     initial_cols: u16,
     initial_rows: u16,
-    redraw: UnboundedSender<()>,
+    redraw: RedrawSender,
     osc_tx: UnboundedSender<(rimeterm_core::pane::PaneId, String)>,
 ) -> Result<ShellSpawn> {
     let program = shell

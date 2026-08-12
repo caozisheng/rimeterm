@@ -91,6 +91,10 @@ pub struct PtyPane {
     /// active-selection mouse drag also raises alacritty damage via
     /// the cursor position update, so we rarely miss a real change.
     last_selection_active: bool,
+    last_cursor_row: u16,
+    last_cursor_col: u16,
+    last_hide_cursor: bool,
+    last_history_size: usize,
 }
 
 impl PtyPane {
@@ -115,6 +119,10 @@ impl PtyPane {
             last_display_offset: 0,
             last_focused: false,
             last_selection_active: false,
+            last_cursor_row: 0,
+            last_cursor_col: 0,
+            last_hide_cursor: true,
+            last_history_size: 0,
         }
     }
 
@@ -358,61 +366,32 @@ impl PaneProvider for PtyPane {
         // Cheap poll — no-op when nothing is pending.
         self.tick_resize(Instant::now());
 
-        // P0-2 damage query. Runs under the term lock (short critical
-        // section — one `mem::replace` + a comparison + an iterator
-        // rewind). `reset_damage` clears the marker so the NEXT
-        // render's `damage()` reflects only changes made after this
-        // point.
-        let (
-            has_damage,
-            vt_cursor_row,
-            vt_cursor_col,
-            vt_hide_cursor,
-            history_size,
-            display_offset,
-        ) = self.session.with_term_mut(|term| {
-            let has_damage = match term.damage() {
-                alacritty_terminal::term::TermDamage::Full => true,
-                // Iterator is lazy — checking `next()` on it once
-                // is enough to decide "any damage vs none".
-                alacritty_terminal::term::TermDamage::Partial(mut it) => it.next().is_some(),
-            };
-            term.reset_damage();
-            let display_offset = term.grid().display_offset();
-            let history_size = term.total_lines().saturating_sub(term.screen_lines());
-            let point = term.grid().cursor.point;
-            let hide = !term.mode().contains(TermMode::SHOW_CURSOR) || display_offset > 0;
-            let r = point.line.0.max(0) as u16;
-            let c = point.column.0 as u16;
-            (has_damage, r, c, hide, history_size, display_offset)
-        });
-
-        // Cache invalidation. We take the slow path whenever anything
-        // we track has changed since the last frame — being coarse
-        // here is fine: the visible symptom of an over-invalidation is
-        // "we did the work anyway", not a rendering bug.
         let selection_active_now = self.selection.is_active();
-        let scroll_changed = display_offset != self.last_display_offset;
-        let focus_changed = ctx.focused != self.last_focused;
-        let selection_changed = selection_active_now != self.last_selection_active;
-        let need_slow_path = has_damage
-            || area_changed
-            || focus_changed
-            || selection_changed
-            || scroll_changed
-            // If selection is still live, its extent may have moved
-            // without alacritty seeing anything (mouse drag inside our
-            // overlay never touches the grid). Repaint each frame while
-            // active; releasing the selection lands us back on the fast
-            // path within one frame.
-            || selection_active_now
-            || self.last_render.is_none();
+        let session_dirty = self.session.take_render_dirty();
+        let refresh_term =
+            needs_term_refresh(session_dirty, area_changed, self.last_render.is_some());
 
-        if need_slow_path {
-            // Full grid blit. Same code as the pre-P0-2 renderer: walk
-            // alacritty's `display_iter()`, skip wide-char spacers, hand
-            // each cell to ratatui via `set_char` + `set_style`.
-            self.session.with_term(|term| {
+        let mut vt_cursor_row = self.last_cursor_row;
+        let mut vt_cursor_col = self.last_cursor_col;
+        let mut vt_hide_cursor = self.last_hide_cursor;
+        let mut history_size = self.last_history_size;
+        let mut display_offset = self.last_display_offset;
+
+        if refresh_term {
+            (
+                vt_cursor_row,
+                vt_cursor_col,
+                vt_hide_cursor,
+                history_size,
+                display_offset,
+            ) = self.session.with_term_mut(|term| {
+                term.reset_damage();
+                let display_offset = term.grid().display_offset();
+                let history_size = term.total_lines().saturating_sub(term.screen_lines());
+                let point = term.grid().cursor.point;
+                let hide = !term.mode().contains(TermMode::SHOW_CURSOR) || display_offset > 0;
+                let cursor_row = point.line.0.max(0) as u16;
+                let cursor_col = point.column.0 as u16;
                 let inner_cols = inner.width as usize;
                 let inner_rows = inner.height as usize;
                 for indexed in term.grid().display_iter() {
@@ -430,19 +409,18 @@ impl PaneProvider for PtyPane {
                     {
                         continue;
                     }
-                    let cell_x = inner.x + col as u16;
-                    let cell_y = inner.y + row_u as u16;
-                    let target = &mut buf[(cell_x, cell_y)];
+                    let target = &mut buf[(inner.x + col as u16, inner.y + row_u as u16)];
                     let ch = indexed.cell.c;
                     target.set_char(if ch == '\0' { ' ' } else { ch });
                     target.set_style(alac_cell_style(indexed.cell));
                 }
+                (cursor_row, cursor_col, hide, history_size, display_offset)
             });
+
+            if inner.width > 0 && inner.height > 0 {
+                self.last_render = Some(snapshot_inner(buf, inner));
+            }
         } else if let Some(snap) = &self.last_render {
-            // Fast path: cell-clone from cache. No lock, no per-cell
-            // style translation. This is the wire-through that makes
-            // 4 idle panes cost ~4 memcpys per frame instead of 4
-            // full display_iter walks with a mutex acquisition each.
             blit_buffer_at(snap, buf, (inner.x, inner.y));
         }
 
@@ -488,21 +466,9 @@ impl PaneProvider for PtyPane {
             self.scrollbar_drag = false;
         }
 
-        // Snapshot the inner region for the next frame's fast path.
-        // We only snapshot when we actually took the slow path — the
-        // fast path already re-established the cache-consistent state.
-        // Skipping the snapshot when selection is active spares us the
-        // memcpy: those frames will re-slow-path anyway (see
-        // `selection_active_now` in the guard above).
-        if need_slow_path && !selection_active_now && inner.width > 0 && inner.height > 0 {
-            self.last_render = Some(snapshot_inner(buf, inner));
-        } else if selection_active_now {
-            // Don't cache mid-selection frames — the overlay is baked
-            // into `buf` and would poison the cache once selection
-            // clears (we'd blit a highlighted region back with no
-            // active selection to overwrite it).
-            self.last_render = None;
-        }
+        // `last_render` always stores the raw grid before selection,
+        // scrollbar, and cursor overlays. Those transient layers can change
+        // without touching the terminal and are reapplied below every frame.
 
         // C25.1 cursor: focused pane hands the alacritty cursor
         // position back to App as `RenderOutcome.cursor` so ratatui
@@ -525,6 +491,10 @@ impl PaneProvider for PtyPane {
             target.set_style(style);
         }
         self.last_display_offset = display_offset;
+        self.last_cursor_row = vt_cursor_row;
+        self.last_cursor_col = vt_cursor_col;
+        self.last_hide_cursor = vt_hide_cursor;
+        self.last_history_size = history_size;
         self.last_focused = ctx.focused;
         self.last_selection_active = selection_active_now;
 
@@ -819,6 +789,9 @@ pub(crate) fn decide_forward_pure(
     }
     mouse_passthrough || child_wants_mouse
 }
+fn needs_term_refresh(session_dirty: bool, area_changed: bool, has_cache: bool) -> bool {
+    session_dirty || area_changed || !has_cache
+}
 
 /// Translate an alacritty [`Cell`] into a ratatui [`Style`].
 ///
@@ -834,6 +807,7 @@ fn alac_cell_style(cell: &Cell) -> Style {
     if let Some(bg) = alac_color(cell.bg, false) {
         style = style.bg(bg);
     }
+
     let f = cell.flags;
     if f.contains(Flags::BOLD) {
         style = style.add_modifier(Modifier::BOLD);
@@ -1420,6 +1394,14 @@ mod p0_2_tests {
             }
         }
         b
+    }
+
+    #[test]
+    fn idle_cached_pane_does_not_refresh_terminal_state() {
+        assert!(!needs_term_refresh(false, false, true));
+        assert!(needs_term_refresh(true, false, true));
+        assert!(needs_term_refresh(false, true, true));
+        assert!(needs_term_refresh(false, false, false));
     }
 
     #[test]

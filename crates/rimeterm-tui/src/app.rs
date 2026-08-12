@@ -75,6 +75,49 @@ use crate::viewer::{
     self, SelectionSnapshot, SourceMeta, ViewerCompletion, ViewerKind, ViewerOverlayState,
 };
 
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Coalesced wake-up channel. A producer that finds a redraw already queued
+/// succeeds without adding another item, so sustained PTY output cannot grow
+/// an unbounded queue or trap the UI thread in a drain loop.
+#[derive(Clone)]
+pub struct RedrawSender(mpsc::Sender<()>);
+
+pub(crate) struct RedrawReceiver(mpsc::Receiver<()>);
+
+fn new_redraw_channel() -> (RedrawSender, RedrawReceiver) {
+    let (tx, rx) = mpsc::channel(1);
+    (RedrawSender(tx), RedrawReceiver(rx))
+}
+
+#[cfg(test)]
+fn request_redraw(tx: &RedrawSender) {
+    let _ = tx.send(());
+}
+
+fn frame_due(needs_redraw: bool, since_last_draw: Duration) -> bool {
+    needs_redraw && since_last_draw >= FRAME_INTERVAL
+}
+
+impl RedrawSender {
+    pub(crate) fn send(&self, (): ()) -> Result<(), ()> {
+        match self.0.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(())) => Err(()),
+        }
+    }
+}
+
+impl RedrawReceiver {
+    async fn recv(&mut self) -> Option<()> {
+        self.0.recv().await
+    }
+
+    fn try_recv(&mut self) -> Result<(), mpsc::error::TryRecvError> {
+        self.0.try_recv()
+    }
+}
+
 /// Pending command actions the app main loop resolves outside command bodies.
 #[derive(Debug, Default)]
 struct ActionFlags {
@@ -918,7 +961,7 @@ pub struct App {
     landscape_tabs: LandscapeTabsState,
     tree: LayoutTree,
     panes: PaneRegistry,
-    redraw_tx: mpsc::UnboundedSender<()>,
+    redraw_tx: RedrawSender,
     /// True while the user is in keyboard Resize mode (§19.12.3). Global keys
     /// are re-routed until Esc/Enter exits.
     resize_mode: bool,
@@ -929,7 +972,7 @@ pub struct App {
     /// share write access without holding App mutably.
     session_writes:
         Arc<parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>>,
-    redraw_rx: mpsc::UnboundedReceiver<()>,
+    redraw_rx: RedrawReceiver,
     /// C18-D: PTY forwarders push `(origin, raw JSON payload)` here every
     /// time an OSC 1337 rimeterm escape completes on a child's stdout.
     /// The main loop drains this in `select!`, parses via
@@ -1183,7 +1226,7 @@ impl App {
             "shell selected"
         );
 
-        let (redraw_tx, redraw_rx) = mpsc::unbounded_channel();
+        let (redraw_tx, redraw_rx) = new_redraw_channel();
         // C18-D: OSC 1337 rimeterm bridge. Every PTY forwarder gets a
         // clone of `osc_tx`; the App main loop drains `osc_rx` and
         // dispatches decoded payloads to `event_bus`.
@@ -1627,6 +1670,8 @@ impl App {
                 f.set_cursor_position((x, y));
             }
         })?;
+        self.needs_redraw = false;
+        let mut last_draw = Instant::now();
 
         loop {
             if self.should_quit || self.flags.quit.load(Ordering::Relaxed) {
@@ -1650,7 +1695,13 @@ impl App {
             }
 
             self.drain_todo_actions();
+            let idle_wait = if self.needs_redraw {
+                FRAME_INTERVAL.saturating_sub(last_draw.elapsed())
+            } else {
+                Duration::from_millis(16)
+            };
             tokio::select! {
+                biased;
                 Some(evt) = input.next() => {
                     self.needs_redraw = true;
                     match evt {
@@ -1660,8 +1711,7 @@ impl App {
                         _ => {}
                     }
                 }
-                Some(_) = self.redraw_rx.recv() => {
-                    while self.redraw_rx.try_recv().is_ok() {}
+                Some(_) = self.redraw_rx.recv(), if !self.needs_redraw => {
                     self.needs_redraw = true;
                 }
                 Some(event) = self.osc_rx.recv() => {
@@ -1683,7 +1733,7 @@ impl App {
                     }
                     self.needs_redraw = true;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(16)) => {
+                _ = tokio::time::sleep(idle_wait) => {
                     if self.pending_spawn.is_some() {
                         self.needs_redraw = true;
                     }
@@ -1694,7 +1744,11 @@ impl App {
                 self.needs_redraw = true;
             }
 
-            if self.needs_redraw {
+            let now = Instant::now();
+            if frame_due(self.needs_redraw, now.duration_since(last_draw)) {
+                // Consume the pulse this frame is about to represent. Output
+                // arriving while draw runs remains queued for the next frame.
+                let _ = self.redraw_rx.try_recv();
                 guard.terminal.draw(|f| {
                     let cursor = self.draw(f.area(), f);
                     if let Some((x, y)) = cursor {
@@ -1702,6 +1756,7 @@ impl App {
                     }
                 })?;
                 self.needs_redraw = false;
+                last_draw = now;
             }
         }
         if let Some(tx) = ipc_shutdown {
@@ -5996,7 +6051,7 @@ fn build_external_pane(
     session_writes: &parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
     spec: &rimeterm_config::ExternalToolSpec,
     workspace_root: &std::path::Path,
-    redraw: mpsc::UnboundedSender<()>,
+    redraw: RedrawSender,
     osc_tx: mpsc::UnboundedSender<(PaneId, String)>,
     icon: &str,
     color: Color,
@@ -6114,7 +6169,7 @@ fn build_agent_pane(
     session_writes: &parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
     spec: &rimeterm_config::AgentSpec,
     workspace_root: &std::path::Path,
-    redraw: mpsc::UnboundedSender<()>,
+    redraw: RedrawSender,
     osc_tx: mpsc::UnboundedSender<(PaneId, String)>,
 ) -> Result<PaneId> {
     build_external_pane(
@@ -6214,7 +6269,7 @@ fn register_commands(
         parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
     >,
     pending_mutations: Arc<parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>>,
-    redraw_tx: mpsc::UnboundedSender<()>,
+    redraw_tx: RedrawSender,
 ) -> Result<()> {
     let register = |cmds: &mut CommandRegistry, cmd: Command| -> Result<()> {
         cmds.register(cmd).map_err(|e| anyhow!("{e}"))
@@ -9118,7 +9173,7 @@ mod tests {
         > = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let pending: Arc<parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>> =
             Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
-        let (redraw_tx, _redraw_rx) = mpsc::unbounded_channel();
+        let (redraw_tx, _redraw_rx) = new_redraw_channel();
         let mut cmds = CommandRegistry::new();
         register_commands(
             &mut cmds,
@@ -9467,7 +9522,7 @@ mod tests {
         > = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let snap: Arc<parking_lot::RwLock<WorkspaceSnapshot>> =
             Arc::new(parking_lot::RwLock::new(WorkspaceSnapshot::default()));
-        let (redraw_tx, _redraw_rx) = mpsc::unbounded_channel();
+        let (redraw_tx, _redraw_rx) = new_redraw_channel();
         register_commands(
             &mut cmds,
             Arc::clone(&flags),
@@ -9493,6 +9548,27 @@ mod tests {
             crate::keymap::Keymap::dispatch(ev),
             crate::keymap::KeymapOutcome::Run("workspace.pane.reload"),
         );
+    }
+
+    // --- PTY backpressure / frame pacing regression tests ------------
+
+    #[test]
+    fn redraw_channel_coalesces_a_sustained_output_burst() {
+        let (tx, mut rx) = new_redraw_channel();
+
+        request_redraw(&tx);
+        request_redraw(&tx);
+        request_redraw(&tx);
+
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert!(rx.try_recv().is_err(), "only one redraw pulse may queue");
+    }
+
+    #[test]
+    fn dirty_frames_wait_for_the_frame_budget() {
+        assert!(!frame_due(true, Duration::from_millis(32)));
+        assert!(frame_due(true, Duration::from_millis(33)));
+        assert!(!frame_due(false, Duration::from_secs(1)));
     }
 
     // --- P0-1 gated-redraw regression tests ---------------------------

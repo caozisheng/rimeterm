@@ -16,6 +16,7 @@
 use parking_lot::Mutex;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -29,6 +30,43 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::osc_bridge::OscScanner;
+const PARSE_CHUNK_BYTES: usize = 1024;
+
+fn parse_chunks(bytes: &[u8]) -> std::slice::Chunks<'_, u8> {
+    bytes.chunks(PARSE_CHUNK_BYTES)
+}
+
+#[derive(Clone, Default)]
+struct RenderDirty(Arc<AtomicBool>);
+
+impl RenderDirty {
+    fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn take(&self) -> bool {
+        self.0.swap(false, Ordering::AcqRel)
+    }
+}
+
+#[derive(Clone)]
+struct ViewportAtBottom(Arc<AtomicBool>);
+
+impl Default for ViewportAtBottom {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+}
+
+impl ViewportAtBottom {
+    fn get(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn set(&self, at_bottom: bool) {
+        self.0.store(at_bottom, Ordering::Release);
+    }
+}
 
 /// Which PTY backend to request. On Windows we hardcode ConPTY (§6.2 table).
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -144,6 +182,8 @@ pub struct Session {
     killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     term: Arc<Mutex<Term<Listener>>>,
+    render_dirty: RenderDirty,
+    viewport_at_bottom: ViewportAtBottom,
     /// Writer end for stdin. `None` after the child exits.
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     /// Notification channel for `SessionOutput::*`.
@@ -238,11 +278,19 @@ impl Session {
         // apps refuse to draw until those responses arrive).
         let writer_shared: Arc<Mutex<Option<Box<dyn Write + Send>>>> =
             Arc::new(Mutex::new(Some(writer)));
+        let render_dirty = RenderDirty::default();
+        let viewport_at_bottom = ViewportAtBottom::default();
+        let dirty_for_reader = render_dirty.clone();
         let writer_for_reader = Arc::clone(&writer_shared);
         tokio::task::spawn_blocking(move || {
-            read_loop(reader, term_reader, events_tx_reader, writer_for_reader)
+            read_loop(
+                reader,
+                term_reader,
+                events_tx_reader,
+                writer_for_reader,
+                dirty_for_reader,
+            )
         });
-
         // Reap the child in a background task so we don't zombie it.
         let child_reaper = Arc::clone(&child);
         let events_tx_reaper = events_tx.clone();
@@ -264,7 +312,9 @@ impl Session {
                 killer: Arc::new(Mutex::new(killer)),
                 master,
                 term,
+                render_dirty,
                 writer: writer_shared,
+                viewport_at_bottom,
                 events_tx,
             },
             events_rx,
@@ -290,6 +340,7 @@ impl Session {
             screen_lines: rows as usize,
         };
         self.term.lock().resize(dims);
+        self.render_dirty.mark();
         self.master
             .lock()
             .resize(PtySize {
@@ -327,12 +378,24 @@ impl Session {
     /// Move the terminal viewport by `lines` relative to the live bottom.
     /// Positive values move into older history; negative values move toward live output.
     pub fn scroll_lines(&self, lines: i32) {
-        scroll_term_lines(&mut self.term.lock(), lines);
+        if lines == 0 {
+            return;
+        }
+        let mut term = self.term.lock();
+        scroll_term_lines(&mut term, lines);
+        self.viewport_at_bottom
+            .set(term.grid().display_offset() == 0);
+        self.render_dirty.mark();
     }
 
     /// Set the terminal viewport offset, where zero is the live bottom.
     pub fn scroll_to_offset(&self, offset: usize) {
+        if offset == 0 && self.viewport_at_bottom.get() {
+            return;
+        }
         scroll_term_to_offset(&mut self.term.lock(), offset);
+        self.viewport_at_bottom.set(offset == 0);
+        self.render_dirty.mark();
     }
 
     /// Snapshot the metrics needed to render and position a scrollbar.
@@ -360,12 +423,19 @@ impl Session {
         let mut term = self.term.lock();
         let mut processor: Processor = Processor::new();
         processor.advance(&mut *term, bytes);
+        self.render_dirty.mark();
     }
 
     /// Rendered dimensions of the grid — cols, rows. Useful when a caller
     /// wants to know how large a `rows` request can safely be.
     pub fn grid_size(&self) -> (u16, u16) {
         self.with_term(|t| (t.columns() as u16, t.screen_lines() as u16))
+    }
+
+    /// Consume the session's render-dirty flag. Reader output and local grid
+    /// mutations set this flag; idle panes return false without locking the grid.
+    pub fn take_render_dirty(&self) -> bool {
+        self.render_dirty.take()
     }
 
     /// Best-effort kill for shutdown / respawn (`drop_pane_and_session`).
@@ -457,6 +527,54 @@ pub fn trim_to_last_rows(full: &str, rows: Option<u16>) -> String {
         lines = lines.split_off(lines.len() - want);
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod render_dirty_tests {
+    use super::{RenderDirty, ViewportAtBottom};
+
+    #[test]
+    fn dirty_flag_is_shared_and_consumed_once() {
+        let dirty = RenderDirty::default();
+        let clone = dirty.clone();
+
+        dirty.mark();
+
+        assert!(clone.take());
+        assert!(!dirty.take());
+    }
+
+    #[test]
+    fn dirty_flag_starts_clean() {
+        assert!(!RenderDirty::default().take());
+    }
+
+    #[test]
+    fn viewport_bottom_state_is_shared_between_clones() {
+        let state = ViewportAtBottom::default();
+        let clone = state.clone();
+
+        assert!(state.get());
+        clone.set(false);
+        assert!(!state.get());
+    }
+}
+#[cfg(test)]
+mod parse_chunk_tests {
+    use super::parse_chunks;
+
+    #[test]
+    fn parser_chunks_bound_each_lock_section_and_preserve_bytes() {
+        let input = vec![b'x'; 2500];
+        let chunks: Vec<&[u8]> = parse_chunks(&input).collect();
+
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+            input.len()
+        );
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 1024));
+        assert_eq!(chunks.concat(), input);
+    }
 }
 
 #[cfg(test)]
@@ -710,6 +828,7 @@ fn read_loop(
     term: Arc<Mutex<Term<Listener>>>,
     tx: mpsc::UnboundedSender<SessionOutput>,
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+    dirty: RenderDirty,
 ) {
     // 8 KiB matches ConPTY internal ring size on modern Windows.
     let mut buf = [0u8; 8192];
@@ -729,10 +848,14 @@ fn read_loop(
             }
             Ok(n) => {
                 let slice = &buf[..n];
-                {
+                for chunk in parse_chunks(slice) {
                     let mut t = term.lock();
-                    processor.advance(&mut *t, slice);
+                    processor.advance(&mut *t, chunk);
+                    // Hand the grid directly to a waiting renderer instead of
+                    // immediately reacquiring it for the next parse chunk.
+                    parking_lot::MutexGuard::unlock_fair(t);
                 }
+                dirty.mark();
                 // Terminal-capability queries: many TUI apps (Ink / React
                 // in oh-my-pi, ncurses, prompt-toolkit) block on these
                 // before drawing. alacritty's Handler impl doesn't
