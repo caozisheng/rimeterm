@@ -148,12 +148,14 @@ fn resolve_shell(hint: &str) -> Option<ShellChoice> {
 }
 
 pub fn classify_path(path: PathBuf) -> ShellChoice {
-    let stem = path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match stem.as_str() {
+    // Keep classification independent of the host parsing the path. This is
+    // useful for persisted Windows paths and makes the classifier's contract
+    // about the executable name rather than PathBuf's native separators.
+    let path_text = path.to_string_lossy();
+    let name = path_text.rsplit(['\\', '/']).next().unwrap_or_default();
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    match stem {
         "pwsh" => ShellChoice::Pwsh7(path),
         "powershell" => ShellChoice::WinPs51(path),
         "cmd" => ShellChoice::Cmd(path),
@@ -205,6 +207,14 @@ mod tests {
         assert_eq!(
             classify_path(PathBuf::from(r"C:\Tools\pwsh.exe")),
             ShellChoice::Pwsh7(PathBuf::from(r"C:\Tools\pwsh.exe"))
+        );
+    }
+
+    #[test]
+    fn classification_strips_mixed_case_windows_extension() {
+        assert_eq!(
+            classify_path(PathBuf::from(r"C:\Tools\PwSh.Exe")),
+            ShellChoice::Pwsh7(PathBuf::from(r"C:\Tools\PwSh.Exe"))
         );
     }
 
