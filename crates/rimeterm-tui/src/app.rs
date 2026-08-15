@@ -716,6 +716,17 @@ impl LeftTabCatalogEntry {
     }
 }
 
+fn find_catalog_pane_id(
+    top: &[LeftTabCatalogEntry],
+    bottom: &[LeftTabCatalogEntry],
+    stable_id: &str,
+) -> Option<PaneId> {
+    top.iter()
+        .chain(bottom)
+        .find(|entry| entry.id == stable_id)
+        .map(|entry| entry.pane)
+}
+
 /// Compute the visible member list for a group given its catalog and
 /// the persisted visibility state. Order follows `state`; the anchor
 /// is guaranteed to be present (state.normalize enforces it) so the
@@ -5392,20 +5403,14 @@ impl App {
                 }
             }
         }
-        if let Some(glab_id) = self
-            .left_top_catalog
-            .iter()
-            .find(|entry| entry.id == "glab")
-            .map(|entry| entry.pane)
+        if workspace_changed
+            && let Some(glab_id) = self.catalog_pane_id("glab")
+            && let Some(pane) = self.panes.get_mut(glab_id)
+            && let Some(glab) = pane
+                .as_any_mut()
+                .and_then(|any| any.downcast_mut::<crate::glab_pane::GlabPane>())
         {
-            if let Some(pane) = self.panes.get_mut(glab_id) {
-                if let Some(glab) = pane
-                    .as_any_mut()
-                    .and_then(|any| any.downcast_mut::<crate::glab_pane::GlabPane>())
-                {
-                    glab.refresh_for(&resolved);
-                }
-            }
+            glab.refresh_for(&resolved);
         }
     }
     /// Clear the boot-progress spinner if either the target pane has
@@ -5815,11 +5820,7 @@ impl App {
     }
 
     fn catalog_pane_id(&self, stable_id: &str) -> Option<PaneId> {
-        self.left_top_catalog
-            .iter()
-            .chain(self.left_bottom_catalog.iter())
-            .find(|entry| entry.id == stable_id)
-            .map(|entry| entry.pane)
+        find_catalog_pane_id(&self.left_top_catalog, &self.left_bottom_catalog, stable_id)
     }
 
     fn save_remembered_ui(&self) {
@@ -8308,6 +8309,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".git")).unwrap();
         assert_eq!(resolve_workspace_root(root.path()), root.path());
+    }
+
+    #[test]
+    fn catalog_lookup_finds_glab_in_bottom_group() {
+        let top = [LeftTabCatalogEntry::new("files", "Files", PaneId(1))];
+        let bottom = [LeftTabCatalogEntry::new("glab", "Glab", PaneId(2))];
+
+        assert_eq!(find_catalog_pane_id(&top, &bottom, "glab"), Some(PaneId(2)));
     }
 
     #[test]
