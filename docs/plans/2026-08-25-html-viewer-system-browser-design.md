@@ -68,13 +68,11 @@ flowchart LR
 
 ## Browser Handoff
 
-Reuse the existing platform-launching boundary rather than adding a browser crate or local HTTP server.
+Use `webbrowser` for the HTML-only handoff. The current generic `spawn_external` path follows the operating system's file association; an `.html` file can therefore open in an editor rather than a browser. Its Windows `cmd /C start` branch also crosses a command-shell parsing boundary. `webbrowser` resolves the configured browser explicitly, converts local paths to encoded `file://` URLs, suppresses GUI child output, and supports Windows, macOS, and Linux without embedding a browser engine.
 
-- Windows: invoke the shell URL association without opening a console window.
-- macOS: use Launch Services through `open`.
-- Linux: use `xdg-open`.
+Declare `webbrowser` with default features disabled; do not enable its `hardened` feature because this feature intentionally requires local `file://` URLs. Use `url::Url::from_file_path` at the rimeterm boundary so conversion errors and encoded-path behavior are testable before the handoff.
 
-The handoff should use an absolute local-file URL so spaces, non-ASCII characters, `#`, `%`, and other path characters are encoded as URL data instead of being interpreted as URL syntax. The implementation should use a well-tested URL conversion API rather than hand-written percent encoding.
+The handoff remains fire-and-forget. The generic `spawn_external` implementation stays responsible for `viewer.open-with-system` and `viewer.reveal`; HTML browser opening is a distinct operation because it promises a browser rather than an arbitrary registered application.
 
 This design deliberately does not start a localhost HTTP server. A server would add port allocation, shutdown, directory exposure, path traversal, and origin-semantics concerns without being required for local HTML viewing.
 
@@ -119,7 +117,7 @@ Behavioral smoke check:
 Expected implementation scope:
 
 - `crates/rimeterm-tui/src/viewer.rs`: opening-target classification and focused tests.
-- `crates/rimeterm-tui/src/app.rs`: route the browser target, reuse/refine platform launch code, and add routing/error tests.
-- Dependency manifests only if a URL conversion dependency is not already available transitively and must be declared directly.
+- `crates/rimeterm-tui/src/app.rs`: route the browser target, keep the existing generic platform launch path, and add routing/error tests.
+- `Cargo.toml`, `Cargo.lock`, and `crates/rimeterm-tui/Cargo.toml`: declare `url` and `webbrowser` directly; `url` is already present in the lockfile through `fast-resume`, while `webbrowser` is new.
 
 No embedded browser, HTML parser, DOM renderer, local server, browser automation, or remote URL support is included.
