@@ -1957,8 +1957,8 @@ impl App {
                 return;
             }
         };
-        let source = match viewer::classify_source(&selection.path, meta) {
-            Ok(Some(source)) => source,
+        let target = match viewer::classify_open_target(&selection.path, meta) {
+            Ok(Some(target)) => target,
             Ok(None) => {
                 self.set_hint("viewer: unsupported file type".into());
                 return;
@@ -1969,31 +1969,42 @@ impl App {
             }
         };
 
-        // Dedup: if the overlay is already showing this exact path,
-        // do nothing rather than reload from scratch. Path equality
-        // is sufficient because `classify_source` never rewrites the
-        // path and Yazi hands us absolute paths.
-        if self
-            .viewer
-            .snapshot()
-            .is_some_and(|s| s.path == source.path)
+        // Dedup terminal-overlay targets before opening. Browser targets are
+        // always handed off because the user may intentionally reopen them.
+        if let viewer::ViewerOpenTarget::Overlay(source) = &target
+            && self
+                .viewer
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.path == source.path)
         {
             let _ = self.redraw_tx.send(());
             return;
         }
 
-        // BUG-2 followup: no cached "invoked from left column" flag —
-        // `viewer_owns_caret()` derives the same signal from live
-        // focus state every read, so Alt+HJKL between panes while
-        // the viewer is open now correctly hands the OS caret to the
-        // freshly-focused pane and its blinking resumes.
-
-        // `return_focus` is used by `close_viewer_overlay` to land
-        // the caret back where it started. Prefer the exact pane
-        // that had focus so a follow-up close returns cleanly.
+        // `return_focus` is only consumed by overlay targets. Browser
+        // handoff leaves the viewer and live focus state untouched.
         let return_focus = self.focus.focused_pane();
-
-        let snap_gen = self.viewer.open_snapshot(source.clone(), return_focus);
+        let (source, snap_gen) = match apply_viewer_open_target(
+            &mut self.viewer,
+            target,
+            return_focus,
+            open_html_in_browser,
+        ) {
+            Ok(Some(overlay)) => overlay,
+            Ok(None) => {
+                self.set_hint(format!(
+                    "viewer: open in browser → {}",
+                    selection.path.display()
+                ));
+                let _ = self.redraw_tx.send(());
+                return;
+            }
+            Err(err) => {
+                self.set_hint(html_browser_error_hint(err));
+                let _ = self.redraw_tx.send(());
+                return;
+            }
+        };
 
         let tx = self.viewer_completion_tx.clone();
         // The completion channel keys off (pane_id, generation). Now
@@ -5898,6 +5909,56 @@ impl App {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum HtmlBrowserOpenError {
+    Url(String),
+    Launch(String),
+}
+
+fn html_browser_error_hint(err: HtmlBrowserOpenError) -> String {
+    match err {
+        HtmlBrowserOpenError::Url(reason) => {
+            format!("viewer: cannot build browser URL: {reason}")
+        }
+        HtmlBrowserOpenError::Launch(reason) => {
+            format!("viewer: open in browser failed: {reason}")
+        }
+    }
+}
+
+fn html_file_url(path: &std::path::Path) -> Result<url::Url, HtmlBrowserOpenError> {
+    let path =
+        std::fs::canonicalize(path).map_err(|err| HtmlBrowserOpenError::Url(err.to_string()))?;
+    url::Url::from_file_path(&path)
+        .map_err(|()| HtmlBrowserOpenError::Url(path.display().to_string()))
+}
+
+fn open_html_in_browser(path: &std::path::Path) -> Result<(), HtmlBrowserOpenError> {
+    let url = html_file_url(path)?;
+    webbrowser::open(url.as_str()).map_err(|err| HtmlBrowserOpenError::Launch(err.to_string()))
+}
+
+fn apply_viewer_open_target<F, E>(
+    state: &mut ViewerOverlayState,
+    target: viewer::ViewerOpenTarget,
+    return_focus: viewer::ReturnFocus,
+    open_browser: F,
+) -> Result<Option<(viewer::ViewerSource, viewer::Generation)>, E>
+where
+    F: FnOnce(&std::path::Path) -> Result<(), E>,
+{
+    match target {
+        viewer::ViewerOpenTarget::SystemBrowser(path) => {
+            open_browser(&path)?;
+            Ok(None)
+        }
+        viewer::ViewerOpenTarget::Overlay(source) => {
+            let generation = state.open_snapshot(source.clone(), return_focus);
+            Ok(Some((source, generation)))
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 enum ExternalAction {
     OpenWithSystem,
@@ -8103,6 +8164,105 @@ fn should_dismiss_viewer_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_handoff_keeps_closed_overlay_state_unchanged() {
+        let mut state = ViewerOverlayState::default();
+        let before_generation = state.generation();
+        let before_focus = state.return_focus();
+        let mut opened = None;
+
+        let result = apply_viewer_open_target(
+            &mut state,
+            viewer::ViewerOpenTarget::SystemBrowser(PathBuf::from("index.html")),
+            Some(PaneId(9)),
+            |path| {
+                opened = Some(path.to_path_buf());
+                Ok::<(), String>(())
+            },
+        )
+        .expect("browser handoff");
+
+        assert!(result.is_none());
+        assert_eq!(opened, Some(PathBuf::from("index.html")));
+        assert!(!state.is_open());
+        assert_eq!(state.generation(), before_generation);
+        assert_eq!(state.return_focus(), before_focus);
+    }
+
+    #[test]
+    fn html_handoff_keeps_existing_overlay_snapshot_unchanged() {
+        let mut state = ViewerOverlayState::default();
+        let source = viewer::ViewerSource {
+            path: PathBuf::from("README.md"),
+            kind: ViewerKind::Markdown,
+        };
+        state.open_snapshot(source.clone(), Some(PaneId(7)));
+        let before_generation = state.generation();
+
+        let result = apply_viewer_open_target(
+            &mut state,
+            viewer::ViewerOpenTarget::SystemBrowser(PathBuf::from("index.html")),
+            Some(PaneId(9)),
+            |_| Ok::<(), String>(()),
+        )
+        .expect("browser handoff");
+
+        assert!(result.is_none());
+        assert_eq!(state.snapshot(), Some(&source));
+
+        assert_eq!(state.generation(), before_generation);
+        assert_eq!(state.return_focus(), Some(PaneId(7)));
+    }
+    #[test]
+    fn html_file_url_encodes_special_characters_and_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("页面 #100%.html");
+        std::fs::write(&path, "<!doctype html>").expect("write fixture");
+
+        let url = html_file_url(&path).expect("file URL");
+        let canonical = std::fs::canonicalize(&path).expect("canonical fixture");
+
+        assert_eq!(url.scheme(), "file");
+        assert_eq!(url.fragment(), None);
+        assert_eq!(
+            std::fs::canonicalize(url.to_file_path().expect("URL path"))
+                .expect("canonical URL path"),
+            canonical,
+        );
+        assert!(url.as_str().contains("%23"), "URL: {url}");
+        assert!(url.as_str().contains("%25"), "URL: {url}");
+    }
+
+    #[test]
+    fn html_handoff_propagates_browser_failure_without_state_change() {
+        let mut state = ViewerOverlayState::default();
+        let before_generation = state.generation();
+
+        let err = apply_viewer_open_target(
+            &mut state,
+            viewer::ViewerOpenTarget::SystemBrowser(PathBuf::from("index.html")),
+            None,
+            |_| Err::<(), String>("browser unavailable".into()),
+        )
+        .expect_err("browser failure");
+
+        assert_eq!(err, "browser unavailable");
+        assert!(!state.is_open());
+        assert_eq!(state.generation(), before_generation);
+    }
+
+    #[test]
+    fn html_browser_error_hints_distinguish_url_and_launch_failures() {
+        assert_eq!(
+            html_browser_error_hint(HtmlBrowserOpenError::Url("bad path".into())),
+            "viewer: cannot build browser URL: bad path",
+        );
+        assert_eq!(
+            html_browser_error_hint(HtmlBrowserOpenError::Launch("no browser".into())),
+            "viewer: open in browser failed: no browser",
+        );
+    }
 
     #[test]
     fn clicking_viewer_restores_left_column_ownership_after_right_pane_focus() {

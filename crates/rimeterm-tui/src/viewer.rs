@@ -70,6 +70,15 @@ pub struct ViewerSource {
     pub kind: ViewerKind,
 }
 
+/// How a supported file should be opened.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ViewerOpenTarget {
+    /// Render the file in the existing terminal overlay.
+    Overlay(ViewerSource),
+    /// Hand the local file to the system default browser.
+    SystemBrowser(PathBuf),
+}
+
 /// The last file-manager selection captured for the Alt+V viewer.
 /// `Alt+V` copies this into a snapshot when the file-manager pane emits
 /// a `KernelEvent::FileSelected`.
@@ -99,6 +108,23 @@ pub enum ClassifyError {
 pub struct SourceMeta {
     pub is_regular_file: bool,
     pub len: u64,
+}
+
+/// Classify a file for either the terminal overlay or the system browser.
+pub fn classify_open_target(
+    path: &Path,
+    meta: SourceMeta,
+) -> Result<Option<ViewerOpenTarget>, ClassifyError> {
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return Ok(None);
+    };
+    if HTML_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
+        if !meta.is_regular_file {
+            return Err(ClassifyError::NotRegularFile);
+        }
+        return Ok(Some(ViewerOpenTarget::SystemBrowser(path.to_path_buf())));
+    }
+    classify_source(path, meta).map(|source| source.map(ViewerOpenTarget::Overlay))
 }
 
 /// Pure classifier: extension → kind, size caps, regular-file check.
@@ -133,6 +159,8 @@ pub fn classify_source(
     }))
 }
 
+/// HTML files are handed to the system browser rather than rendered in the TUI.
+const HTML_EXTS: &[&str] = &["html", "htm"];
 /// The supported markdown extensions (§19.11.2).
 const MARKDOWN_EXTS: &[&str] = &["md", "markdown"];
 /// The supported image extensions (§19.11.2). `svg` is deliberately
@@ -2034,6 +2062,53 @@ mod tests {
         }
     }
 
+    mod classify_open_target {
+        use super::*;
+
+        #[test]
+        fn html_extensions_select_system_browser_case_insensitively() {
+            for name in ["index.html", "INDEX.HTML", "report.htm", "REPORT.HTM"] {
+                assert_eq!(
+                    classify_open_target(Path::new(name), regular(1024)).unwrap(),
+                    Some(ViewerOpenTarget::SystemBrowser(PathBuf::from(name))),
+                );
+            }
+        }
+
+        #[test]
+        fn html_non_regular_file_is_rejected() {
+            let err = classify_open_target(
+                Path::new("index.html"),
+                SourceMeta {
+                    is_regular_file: false,
+                    len: 0,
+                },
+            )
+            .expect_err("non-regular HTML rejected");
+
+            assert_eq!(err, ClassifyError::NotRegularFile);
+        }
+
+        #[test]
+        fn existing_renderable_extensions_select_overlay() {
+            for (name, kind) in [
+                ("README.md", ViewerKind::Markdown),
+                ("logo.png", ViewerKind::Image),
+                ("main.rs", ViewerKind::Code),
+            ] {
+                let target = classify_open_target(Path::new(name), regular(1024))
+                    .unwrap()
+                    .expect("supported");
+                assert_eq!(
+                    target,
+                    ViewerOpenTarget::Overlay(ViewerSource {
+                        path: PathBuf::from(name),
+                        kind,
+                    }),
+                );
+            }
+        }
+    }
     mod classify_source {
         use super::*;
 

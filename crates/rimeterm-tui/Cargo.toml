@@ -36,6 +36,8 @@ anyhow = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 semver = "1"
 sha2 = "0.10"
+url = { workspace = true }
+webbrowser = { workspace = true }
 # C20 viewer overlay
 tui-markdown = { workspace = true }
 rimeterm-markdown = { workspace = true }

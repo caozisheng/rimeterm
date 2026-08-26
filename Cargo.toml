@@ -41,6 +41,8 @@ tuxedo          = { path = "crates/tuxedo" }
 fast-resume      = { path = "crates/fast-resume" }
 
 rimeterm-ipc    = { path = "crates/rimeterm-ipc",    version = "0.2" }
+url           = "2.5"
+webbrowser    = { version = "1.2", default-features = false }
 # third-party
 tokio         = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "time"] }
 tokio-stream  = { version = "0.1", features = ["sync"] }
