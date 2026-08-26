@@ -139,6 +139,7 @@ pub fn enrich_omp(live: &[LiveAgentRef<'_>], now_ms: u64) -> HashMap<u32, Sessio
                 &out.stop_reason,
                 out.in_flight_tasks > 0,
                 out.in_flight_tools > 0,
+                out.has_agent_activity,
             );
 
             let summary = SessionSummary {
@@ -367,6 +368,7 @@ struct AnalysisOut {
     /// the provider's authoritative bill. Zero when the transcript
     /// hasn't produced any assistant turns yet.
     cost_provider: f64,
+    has_agent_activity: bool,
 }
 
 fn analyse(records: &[Value]) -> AnalysisOut {
@@ -392,6 +394,7 @@ fn analyse(records: &[Value]) -> AnalysisOut {
             .unwrap_or("");
 
         if role == "assistant" {
+            out.has_agent_activity = true;
             if let Some(m) = msg.and_then(|m| m.get("model")).and_then(|v| v.as_str()) {
                 out.model = Some(m.to_string());
             }
@@ -639,24 +642,28 @@ fn classify_state(
     stop_reason: &Option<String>,
     has_in_flight_task: bool,
     has_in_flight_tool: bool,
+    has_agent_activity: bool,
 ) -> SessionState {
+    let completed = matches!(
+        stop_reason.as_deref(),
+        Some("endTurn") | Some("stopSequence") | Some("end_turn") | Some("stop_sequence")
+    );
+    if completed && !has_in_flight_task && !has_in_flight_tool {
+        return SessionState::Completed;
+    }
     if is_live && has_in_flight_task {
         return SessionState::Spawning;
     }
-    if is_live && (age_ms < BUSY_WINDOW_MS || has_in_flight_tool) {
+    if is_live && ((has_agent_activity && age_ms < BUSY_WINDOW_MS) || has_in_flight_tool) {
         return SessionState::Busy;
     }
-    if is_live && age_ms < ACTIVE_WINDOW_MS {
+    if is_live && has_agent_activity && age_ms < ACTIVE_WINDOW_MS {
         return SessionState::Active;
     }
     if is_live {
         return SessionState::Idle;
     }
-    if matches!(
-        stop_reason.as_deref(),
-        // omp emits camelCase: "endTurn" / "toolUse" / "stopSequence".
-        Some("endTurn") | Some("stopSequence") | Some("end_turn") | Some("stop_sequence")
-    ) {
+    if completed {
         return SessionState::Completed;
     }
     if age_ms < RECENT_WINDOW_MS {
@@ -863,11 +870,18 @@ mod tests {
     #[test]
     fn classify_state_maps_endturn_to_completed() {
         assert_eq!(
-            classify_state(false, 60_000, &Some("endTurn".into()), false, false),
+            classify_state(false, 60_000, &Some("endTurn".into()), false, false, true),
             SessionState::Completed
         );
         assert_eq!(
-            classify_state(false, 60_000, &Some("stopSequence".into()), false, false),
+            classify_state(
+                false,
+                60_000,
+                &Some("stopSequence".into()),
+                false,
+                false,
+                true
+            ),
             SessionState::Completed
         );
     }
@@ -1051,5 +1065,20 @@ mod tests {
         assert_eq!(summary.tokens_cache_read, 2000);
         assert_eq!(summary.tokens_cache_write, 10);
         assert_eq!(summary.cost_provider, Some(0.11));
+    }
+
+    #[test]
+    fn classify_state_keeps_empty_live_session_idle() {
+        assert_eq!(
+            classify_state(true, 1_000, &None, false, false, false),
+            SessionState::Idle
+        );
+    }
+    #[test]
+    fn classify_state_marks_live_end_turn_as_completed() {
+        assert_eq!(
+            classify_state(true, 60_000, &Some("endTurn".into()), false, false, true),
+            SessionState::Completed
+        );
     }
 }

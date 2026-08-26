@@ -5,6 +5,7 @@
 
 pub mod acknowledgement;
 pub mod agent_factory;
+pub mod agent_monitor;
 pub mod agtop_matchers;
 pub mod agtop_model;
 pub mod agtop_omp;
@@ -27,6 +28,7 @@ pub mod models_pane;
 pub mod models_worker;
 pub mod palette;
 pub mod pane_registry;
+pub mod pet_pane;
 pub mod picker;
 pub mod placeholder_pane;
 pub mod pty_pane;

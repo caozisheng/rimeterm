@@ -251,6 +251,17 @@ and per-zone markers in-process. The stack:
 - [chrono-tz](https://github.com/chronotope/chrono-tz) — MIT / Apache-2.0.
   DST-aware IANA zone lookups.
 
+## Desktop pet
+
+`PetPane` embeds a Tamagotchi-style lifecycle and braille sprites in-process.
+
+- [tama96](https://github.com/siegerts/tama96) — MIT. `tama-core`
+  state/actions/engine/evolution/characters and `tama-tui` braille sprite
+  encoding were ported from v0.1.14 at commit
+  `b4fd018e49a2361c11bbbd39f428ee2402b98bef`. RimeTerm adds native pane
+  integration, global persistence, multi-instance ownership, and bounded
+  main-agent status auras.
+
 ## Terminal / TUI design lineage
 
 - [zellij](https://github.com/zellij-org/zellij) and

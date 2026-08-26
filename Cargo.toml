@@ -13,12 +13,13 @@ members = [
     "crates/rimeterm-models",
     "crates/rimeterm-stock",
     "crates/rimeterm-zones",
+    "crates/rimeterm-pet",
     "crates/tuxedo",
     "crates/glab-tui",
 ]
 
 [workspace.package]
-version = "0.2.40"
+version = "0.2.41"
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
@@ -36,6 +37,7 @@ rimeterm-markdown = { path = "crates/rimeterm-markdown", version = "0.2" }
 rimeterm-models = { path = "crates/rimeterm-models", version = "0.2" }
 rimeterm-stock  = { path = "crates/rimeterm-stock",  version = "0.2" }
 rimeterm-zones  = { path = "crates/rimeterm-zones",  version = "0.2" }
+rimeterm-pet    = { path = "crates/rimeterm-pet",    version = "0.2" }
 glab-tui        = { path = "crates/glab-tui" }
 tuxedo          = { path = "crates/tuxedo" }
 fast-resume      = { path = "crates/fast-resume" }

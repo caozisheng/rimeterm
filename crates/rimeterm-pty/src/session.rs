@@ -168,6 +168,7 @@ type Listener = alacritty_terminal::event::VoidListener;
 #[allow(dead_code)] // events_tx clones are kept for future subscribers
 pub struct Session {
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    root_pid: Option<u32>,
     /// Independent killer handle cloned off the child at spawn time.
     ///
     /// The reaper task holds `child`'s mutex inside a blocking
@@ -257,6 +258,7 @@ impl Session {
             &dims,
             alacritty_terminal::event::VoidListener,
         )));
+        let root_pid = child.process_id();
         let killer = child.clone_killer();
         let child = Arc::new(Mutex::new(child));
         let master = Arc::new(Mutex::new(pair.master));
@@ -309,6 +311,7 @@ impl Session {
         Ok((
             Self {
                 child,
+                root_pid,
                 killer: Arc::new(Mutex::new(killer)),
                 master,
                 term,
@@ -319,6 +322,11 @@ impl Session {
             },
             events_rx,
         ))
+    }
+
+    /// Return the OS pid of the process launched directly in this PTY.
+    pub fn root_pid(&self) -> Option<u32> {
+        self.root_pid
     }
 
     /// Send raw bytes to the child. Silent no-op after the child exited.

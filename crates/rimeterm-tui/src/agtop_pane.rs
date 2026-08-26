@@ -37,7 +37,6 @@
 //! [`Snapshot`]: crate::agtop_model::Snapshot
 
 use std::any::Any;
-use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use humansize::{DECIMAL, format_size};
@@ -50,15 +49,10 @@ use ratatui::{
 };
 use rimeterm_core::pane::{PaneCaps, PaneId, PaneProvider, PaneRenderCtx, RenderOutcome};
 
-use crate::agtop_model::{
-    AgentInfo, AgentStatus, AgentView, AgtopRequest, AgtopResponse, Snapshot, SortKey, SortOrder,
-};
+use crate::agent_monitor::SharedAgentSnapshot;
+use crate::agtop_model::{AgentInfo, AgentStatus, AgentView, Snapshot, SortKey, SortOrder};
 use crate::agtop_pricing::{CostBasis, format_cost};
-use crate::agtop_worker::AgtopWorker;
 
-/// Poll cadence. 1500 ms matches upstream `agtop`'s default
-/// `--interval`.
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(1500);
 const KEY_HINTS: &str =
     " j/k move · Enter details · / filter · c/m/t/$ sort · Tab order · r refresh ";
 
@@ -83,13 +77,8 @@ enum Modal {
 pub struct AgtopPane {
     id: PaneId,
     title: String,
-    worker: AgtopWorker,
-    snapshot: Snapshot,
-    /// Monotonic counter; bumped before every request so a late
-    /// reply from a slow scan doesn't overwrite a fresher snapshot.
-    requested_generation: u64,
-    applied_generation: u64,
-    last_request: Instant,
+    snapshot: SharedAgentSnapshot,
+    last_snapshot_ms: u64,
     sort_key: SortKey,
     sort_order: SortOrder,
     filter: Option<String>,
@@ -101,20 +90,13 @@ pub struct AgtopPane {
 }
 
 impl AgtopPane {
-    pub fn new() -> Self {
-        let worker = AgtopWorker::spawn();
-        let requested_generation = 1;
-        worker.send(AgtopRequest::Snapshot {
-            generation: requested_generation,
-        });
+    pub fn new(snapshot: SharedAgentSnapshot) -> Self {
+        let last_snapshot_ms = snapshot.read().sampled_at_ms;
         Self {
             id: PaneId::next(),
             title: "agtop".to_owned(),
-            worker,
-            snapshot: Snapshot::empty(),
-            requested_generation,
-            applied_generation: 0,
-            last_request: Instant::now(),
+            snapshot,
+            last_snapshot_ms,
             sort_key: SortKey::Smart,
             sort_order: SortOrder::Descending,
             filter: None,
@@ -124,21 +106,20 @@ impl AgtopPane {
         }
     }
 
+    #[cfg(test)]
+    fn new_for_test() -> Self {
+        Self::new(std::sync::Arc::new(parking_lot::RwLock::new(
+            Snapshot::empty(),
+        )))
+    }
+
     fn agent_view(&self) -> AgentView {
         AgentView::from_snapshot(
-            &self.snapshot,
+            &self.snapshot.read(),
             self.sort_key,
             self.sort_order,
             self.filter.as_deref(),
         )
-    }
-
-    fn request_snapshot(&mut self) {
-        self.requested_generation = self.requested_generation.saturating_add(1);
-        self.worker.send(AgtopRequest::Snapshot {
-            generation: self.requested_generation,
-        });
-        self.last_request = Instant::now();
     }
 
     fn set_sort(&mut self, key: SortKey) {
@@ -219,7 +200,9 @@ impl AgtopPane {
 
 impl Default for AgtopPane {
     fn default() -> Self {
-        Self::new()
+        Self::new(std::sync::Arc::new(parking_lot::RwLock::new(
+            Snapshot::empty(),
+        )))
     }
 }
 
@@ -260,7 +243,10 @@ impl PaneProvider for AgtopPane {
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM)
         };
-        let title = format_title(&self.snapshot, self.sort_key, self.sort_order);
+        let title = {
+            let snapshot = self.snapshot.read();
+            format_title(&snapshot, self.sort_key, self.sort_order)
+        };
         let block = Block::default()
             .title(title)
             .title_bottom(Line::styled(KEY_HINTS, border_style))
@@ -302,7 +288,8 @@ impl PaneProvider for AgtopPane {
         let footer_rect = if has_footer { Some(split[idx]) } else { None };
 
         if let Some(rect) = chips_rect {
-            render_chip_strip(frame, rect, &self.snapshot);
+            let snapshot = self.snapshot.read();
+            render_chip_strip(frame, rect, &snapshot);
         }
 
         let view = self.agent_view();
@@ -379,38 +366,20 @@ impl PaneProvider for AgtopPane {
     }
 
     fn reload(&mut self) {
-        self.request_snapshot();
-        self.set_hint("↻ refreshing");
+        self.set_hint("refreshing via shared monitor");
     }
 
     fn poll_background(&mut self) -> bool {
-        let mut changed = false;
-
-        // Fire the NEXT tick before draining so a slow reply doesn't
-        // stack pending requests.
-        if self.last_request.elapsed() >= SAMPLE_INTERVAL {
-            self.request_snapshot();
+        let sampled_at_ms = self.snapshot.read().sampled_at_ms;
+        if sampled_at_ms == self.last_snapshot_ms {
+            return false;
         }
-
-        for response in self.worker.drain() {
-            let AgtopResponse::Snapshot {
-                generation,
-                snapshot,
-            } = response;
-            if generation < self.applied_generation {
-                continue; // stale
-            }
-            self.applied_generation = generation;
-            self.snapshot = snapshot;
-            // Keep the cursor in-bounds if processes exited between
-            // samples.
-            let view = self.agent_view();
-            if self.cursor >= view.rows.len() {
-                self.cursor = view.rows.len().saturating_sub(1);
-            }
-            changed = true;
+        self.last_snapshot_ms = sampled_at_ms;
+        let view = self.agent_view();
+        if self.cursor >= view.rows.len() {
+            self.cursor = view.rows.len().saturating_sub(1);
         }
-        changed
+        true
     }
 }
 
@@ -502,8 +471,7 @@ fn on_key_default(pane: &mut AgtopPane, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Char('r') | KeyCode::F(5) => {
-            pane.request_snapshot();
-            pane.set_hint("↻ refreshing");
+            pane.set_hint("refreshing via shared monitor");
             true
         }
         _ => false,
@@ -1374,6 +1342,7 @@ mod tests {
     use crate::agtop_model::HISTORY_CAP;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::time::Instant;
 
     fn ctx() -> PaneRenderCtx<'static> {
         PaneRenderCtx {
@@ -1433,7 +1402,7 @@ mod tests {
             .filter(|a| a.cost_basis == CostBasis::Api)
             .map(|a| a.cost_usd)
             .sum();
-        pane.snapshot = Snapshot {
+        *pane.snapshot.write() = Snapshot {
             agents,
             total_cpu,
             total_rss,
@@ -1462,7 +1431,7 @@ mod tests {
 
     #[test]
     fn new_pane_has_default_state() {
-        let pane = AgtopPane::new();
+        let pane = AgtopPane::new_for_test();
         assert_eq!(pane.title, "agtop");
         assert_eq!(pane.sort_key, SortKey::Smart);
         assert_eq!(pane.sort_order, SortOrder::Descending);
@@ -1471,7 +1440,7 @@ mod tests {
 
     #[test]
     fn render_with_no_agents_shows_empty_state_hint() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
         terminal
             .draw(|frame| {
@@ -1485,7 +1454,7 @@ mod tests {
 
     #[test]
     fn render_shows_primary_key_hints_on_bottom_border() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
         terminal
             .draw(|frame| {
@@ -1506,7 +1475,7 @@ mod tests {
 
     #[test]
     fn render_with_agents_shows_labels_and_tokens() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         let mut a = agent("claude", 111, 25.0, 128 * 1024 * 1024, 3660);
         a.tokens_total = 5_842_100;
         a.model = Some("claude-opus-4-7".into());
@@ -1537,7 +1506,7 @@ mod tests {
 
     #[test]
     fn tab_flips_sort_order() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         assert_eq!(pane.sort_order, SortOrder::Descending);
         assert!(pane.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
         assert_eq!(pane.sort_order, SortOrder::Ascending);
@@ -1547,21 +1516,21 @@ mod tests {
 
     #[test]
     fn m_selects_memory_sort() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         assert!(pane.on_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)));
         assert_eq!(pane.sort_key, SortKey::Memory);
     }
 
     #[test]
     fn t_selects_tokens_sort() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         assert!(pane.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)));
         assert_eq!(pane.sort_key, SortKey::Tokens);
     }
 
     #[test]
     fn capital_s_selects_smart_sort() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         // Move off smart first so we can verify the toggle sets it.
         pane.set_sort(SortKey::Cpu);
         assert!(pane.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE)));
@@ -1570,7 +1539,7 @@ mod tests {
 
     #[test]
     fn same_sort_key_second_press_flips_direction() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         // Cpu isn't default anymore — first press sets Cpu / Desc,
         // second press flips direction.
         assert!(pane.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)));
@@ -1582,14 +1551,14 @@ mod tests {
 
     #[test]
     fn slash_opens_filter_modal() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         assert!(pane.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)));
         assert!(matches!(pane.modal, Modal::Filter { .. }));
     }
 
     #[test]
     fn filter_edit_commits_on_enter_clears_on_esc() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         pane.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         for c in "claude".chars() {
             pane.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
@@ -1606,7 +1575,7 @@ mod tests {
 
     #[test]
     fn enter_opens_detail_when_row_exists() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         seed_snapshot(&mut pane, vec![agent("claude", 42, 5.0, 0, 0)]);
         pane.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match pane.modal {
@@ -1620,14 +1589,14 @@ mod tests {
 
     #[test]
     fn enter_ignored_when_no_rows() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         pane.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(pane.modal, Modal::None));
     }
 
     #[test]
     fn detail_scroll_j_advances_esc_closes() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         seed_snapshot(&mut pane, vec![agent("claude", 42, 5.0, 0, 0)]);
         pane.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         pane.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -1642,7 +1611,7 @@ mod tests {
 
     #[test]
     fn cursor_j_and_k_navigate_within_bounds() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         seed_snapshot(
             &mut pane,
             vec![
@@ -1669,7 +1638,7 @@ mod tests {
 
     #[test]
     fn control_modified_keys_pass_through() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         assert!(!pane.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL)));
         assert!(matches!(pane.modal, Modal::None));
     }
@@ -1732,7 +1701,7 @@ mod tests {
 
     #[test]
     fn dangerous_row_renders_marker() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         let mut a = agent("claude", 42, 1.0, 1024, 60);
         a.dangerous = true;
         a.dangerous_flag = "--yolo".into();
@@ -1750,7 +1719,7 @@ mod tests {
 
     #[test]
     fn detail_popup_shows_model_and_cost() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         let mut a = agent("claude", 42, 1.0, 1024, 60);
         a.model = Some("claude-sonnet-4-7".into());
         a.cost_basis = CostBasis::Api;
@@ -1785,7 +1754,7 @@ mod tests {
 
     #[test]
     fn detail_popup_shows_recent_activity() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         let mut a = agent("claude", 42, 1.0, 1024, 60);
         a.model = Some("claude-sonnet-4-7".into());
         a.recent_activity = vec![
@@ -1810,7 +1779,7 @@ mod tests {
 
     #[test]
     fn chip_strip_renders_busy_cost_tokens_when_present() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         let mut a = agent("claude", 42, 12.0, 128 * 1024 * 1024, 60);
         a.status = AgentStatus::Busy;
         a.tokens_total = 5_800_000;
@@ -1847,7 +1816,7 @@ mod tests {
 
     #[test]
     fn chip_strip_hides_zero_valued_chips() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         let a = agent("claude", 1, 0.0, 1024, 60);
         seed_snapshot(&mut pane, vec![a]);
 
@@ -1873,7 +1842,7 @@ mod tests {
 
     #[test]
     fn dollar_key_sorts_by_cost() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         assert!(pane.on_key(KeyEvent::new(KeyCode::Char('$'), KeyModifiers::NONE)));
         assert_eq!(pane.sort_key, SortKey::Cost);
         assert_eq!(pane.sort_order, SortOrder::Descending);
@@ -1885,12 +1854,12 @@ mod tests {
 
     #[test]
     fn stable_state_round_trips_cost_sort_key() {
-        let mut source = AgtopPane::new();
+        let mut source = AgtopPane::new_for_test();
         source.sort_key = SortKey::Cost;
         source.sort_order = SortOrder::Descending;
         let state = source.snapshot_state();
 
-        let mut restored = AgtopPane::new();
+        let mut restored = AgtopPane::new_for_test();
         restored.restore_state(&state);
 
         assert_eq!(restored.sort_key, SortKey::Cost);
@@ -1899,7 +1868,7 @@ mod tests {
 
     #[test]
     fn table_renders_cost_column_for_api_agent() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         let mut a = agent("claude", 1, 0.0, 128 * 1024 * 1024, 60);
         a.cost_usd = 4.21;
         a.cost_basis = CostBasis::Api;
@@ -1927,7 +1896,7 @@ mod tests {
 
     #[test]
     fn table_renders_dash_for_zero_cost_row() {
-        let mut pane = AgtopPane::new();
+        let mut pane = AgtopPane::new_for_test();
         // Zero-cost agent (Unknown basis, `—` placeholder).
         let a = agent("claude", 1, 0.0, 128 * 1024 * 1024, 60);
         seed_snapshot(&mut pane, vec![a]);
@@ -1953,14 +1922,14 @@ mod tests {
     }
     #[test]
     fn stable_state_round_trips_without_cursor_or_detail() {
-        let mut source = AgtopPane::new();
+        let mut source = AgtopPane::new_for_test();
         source.sort_key = SortKey::Tokens;
         source.sort_order = SortOrder::Ascending;
         source.filter = Some("claude".into());
         source.cursor = 4;
         let state = source.snapshot_state();
 
-        let mut restored = AgtopPane::new();
+        let mut restored = AgtopPane::new_for_test();
         restored.restore_state(&state);
 
         assert_eq!(restored.sort_key, SortKey::Tokens);

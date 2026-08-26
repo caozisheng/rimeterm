@@ -2799,14 +2799,10 @@ mod markdown_tests {
 
     #[test]
     fn layout_produces_placement_with_picker() {
-        // With a picker (synthesised via `Picker::from_fontsize` for
-        // hermetic tests — a real one comes from `from_query_stdio`
-        // and needs a TTY), a supported mermaid block should surface
-        // as a `MermaidPlacement` — NOT as sentinel lines. `start_row`
-        // is anchored inside the flattened `Text`; `row_height` matches
-        // the reserved blank stripe count so scroll math stays honest.
-        let picker =
-            ratatui_image::picker::Picker::from_fontsize(ratatui_image::FontSize::new(10, 20));
+        // Use the non-deprecated deterministic Halfblocks picker for the
+        // hermetic test; a real terminal picker comes from
+        // `Picker::from_query_stdio` during App startup.
+        let picker = ratatui_image::picker::Picker::halfblocks();
         let (text, placements) = markdown_blocks_to_layout(
             "```mermaid\ngraph LR\nA-->B\n```\n",
             rimeterm_markdown::Theme::Default,

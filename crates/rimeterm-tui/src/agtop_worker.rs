@@ -245,13 +245,8 @@ impl Sampler {
         // parent — drop it and keep the launcher. Different label
         // OR different cwd (`bash` → `claude` in a subshell) keeps
         // both rows because they're independent logical sessions.
-        let raw = dedupe_child_workers(raw);
-
-        // Phase 2 — enrich rows from session transcripts. Claude +
-        // oh-my-pi enrichers run in parallel; results merge per pid,
-        // with oh-my-pi's provider-computed cost preferred over the
-        // pricing-table estimate when present.
-        let live: Vec<LiveAgentRef<'_>> = raw
+        let enrichment_raw = logical_agents_for_enrichment(&raw);
+        let live: Vec<LiveAgentRef<'_>> = enrichment_raw
             .iter()
             .map(|r| LiveAgentRef {
                 pid: r.pid,
@@ -263,18 +258,16 @@ impl Sampler {
         let now_ms = now_ms();
         let claude_sessions = enrich_claude(&live, now_ms);
         let omp_sessions = crate::agtop_omp::enrich_omp(&live, now_ms);
-        // Merge: omp wins on conflict (its cost is authoritative).
         let mut sessions_by_pid = claude_sessions;
         for (pid, summary) in omp_sessions {
             sessions_by_pid.insert(pid, summary);
         }
+        let (raw, fold_into) = dedupe_child_workers_with_map(raw);
+        promote_child_sessions(&fold_into, &mut sessions_by_pid);
 
         // Phase 3 — refresh caches (plugins host-wide; skills per-cwd).
         self.refresh_plugin_cache();
         self.refresh_skills_cache(&raw);
-
-        // Phase 4 — resolve parent-process names via sysinfo lookup.
-        // Done after the walk so `System::process(Pid)` sees a fully
         // refreshed table.
         let ppid_names: HashMap<u32, String> = self.resolve_ppid_names(&raw);
 
@@ -601,9 +594,19 @@ struct RawAgent {
 /// - Same `cwd` required: a launcher whose worker `cd`d elsewhere
 ///   still counts as a separate session because the JSONL it maps
 ///   to lives under a different encoded dir.
-fn dedupe_child_workers(mut raw: Vec<RawAgent>) -> Vec<RawAgent> {
+#[cfg(test)]
+fn dedupe_child_workers(raw: Vec<RawAgent>) -> Vec<RawAgent> {
+    dedupe_child_workers_with_map(raw).0
+}
+
+fn logical_agents_for_enrichment(raw: &[RawAgent]) -> Vec<RawAgent> {
+    dedupe_child_workers_with_map(raw.to_vec()).0
+}
+
+fn dedupe_child_workers_with_map(mut raw: Vec<RawAgent>) -> (Vec<RawAgent>, HashMap<u32, u32>) {
     if raw.len() < 2 {
-        return raw;
+        let map = raw.iter().map(|agent| (agent.pid, agent.pid)).collect();
+        return (raw, map);
     }
 
     // Snapshot label + cwd + ppid before we start mutating — the
@@ -678,7 +681,25 @@ fn dedupe_child_workers(mut raw: Vec<RawAgent>) -> Vec<RawAgent> {
             r.rss = r.rss.saturating_add(*rss_add);
         }
     }
-    raw
+    (raw, fold_into)
+}
+
+fn promote_child_sessions(
+    fold_into: &HashMap<u32, u32>,
+    sessions: &mut HashMap<u32, SessionSummary>,
+) {
+    let child_summaries: Vec<(u32, u32, SessionSummary)> = sessions
+        .iter()
+        .filter_map(|(child_pid, summary)| {
+            let anchor = *fold_into.get(child_pid)?;
+            (anchor != *child_pid).then(|| (*child_pid, anchor, summary.clone()))
+        })
+        .collect();
+
+    for (child_pid, anchor, child) in child_summaries {
+        sessions.insert(anchor, child);
+        sessions.remove(&child_pid);
+    }
 }
 
 fn push_ring(ring: &mut Vec<f64>, sample: f64, cap: usize) {
@@ -906,6 +927,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn omp_enrichment_uses_one_logical_process_per_launcher_tree() {
+        let launcher = raw(42, 1, "omp", r"C:\work");
+        let child = raw(43, 42, "omp", r"C:\work");
+        let logical = logical_agents_for_enrichment(&[launcher, child]);
+
+        assert_eq!(
+            logical.iter().map(|agent| agent.pid).collect::<Vec<_>>(),
+            vec![42]
+        );
+    }
+    #[test]
+    fn dedupe_reports_child_to_launcher_anchor() {
+        let launcher = raw(42, 1, "omp", r"C:\work");
+        let child = raw(43, 42, "omp", r"C:\work");
+        let (_survivors, fold_into) = dedupe_child_workers_with_map(vec![launcher, child]);
+        assert_eq!(fold_into.get(&43), Some(&42));
+    }
+
+    #[test]
+    fn child_omp_summary_promotes_to_launcher() {
+        let fold_into = HashMap::from([(42, 42), (43, 42)]);
+        let mut summaries = HashMap::from([(
+            43,
+            SessionSummary {
+                state: crate::agtop_session::SessionState::Busy,
+                session_id: "omp-session".into(),
+                ..SessionSummary::default()
+            },
+        )]);
+
+        promote_child_sessions(&fold_into, &mut summaries);
+
+        assert_eq!(
+            summaries.get(&42).map(|summary| summary.state),
+            Some(crate::agtop_session::SessionState::Busy)
+        );
+    }
     #[test]
     fn dedupe_drops_worker_child_of_launcher() {
         // Real Windows shape: omp.exe launcher spawns a bun worker

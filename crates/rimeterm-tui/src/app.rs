@@ -52,6 +52,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use unicode_width::UnicodeWidthStr;
 
+use crate::agent_monitor::{
+    AgentMonitor, MainAgentPhase, MainAgentSignal, SharedMainAgentSignal, resolve_main_phase,
+};
 use crate::file_manager_pane::FileManagerPane;
 use crate::fr_pane::{FrAction, FrPane};
 use crate::glab_pane::GlabPane;
@@ -65,6 +68,7 @@ use crate::palette::{
     popup_rect as palette_rect, render as render_palette,
 };
 use crate::pane_registry::PaneRegistry;
+use crate::pet_pane::PetPane;
 use crate::placeholder_pane::PlaceholderPane;
 use crate::shell_factory::spawn_shell;
 use crate::status_bar::{StatusBarHits, StatusBarHover, render as render_status_bar};
@@ -1165,6 +1169,9 @@ pub struct App {
     /// / `claude` / `pi`). Populated on spawn, consumed by
     /// `persist_agents_state` to write the on-disk file.
     pane_agent_id: std::collections::HashMap<PaneId, &'static str>,
+    pane_agent_pid: std::collections::HashMap<PaneId, u32>,
+    agent_monitor: AgentMonitor,
+    main_agent_signal: SharedMainAgentSignal,
     /// Stable id → PaneId catalog for tabs eligible in the left-top
     /// (`files`) group. Fixed at startup; drives the Settings overlay
     /// visibility + reorder panel and the `set_members` rewrite on
@@ -1317,6 +1324,7 @@ impl App {
         }
         let git_pane_id = git_pane.id();
         panes.insert(Box::new(git_pane));
+        let mut startup_agent_pids: Vec<(PaneId, u32)> = Vec::new();
         pinned_pane_ids.insert(git_pane_id);
         let mut git_members = vec![git_pane_id];
 
@@ -1331,6 +1339,13 @@ impl App {
                 redraw_tx.clone(),
                 osc_tx.clone(),
             )?;
+            if let Some(pid) = session_writes
+                .lock()
+                .get(&id)
+                .and_then(rimeterm_pty::Session::root_pid)
+            {
+                startup_agent_pids.push((id, pid));
+            }
             if let Some(pane) = panes.get_mut(id) {
                 pane.set_right_click_paste(config.mouse.right_click_paste);
                 pane.set_scrollback_enabled(true);
@@ -1361,6 +1376,13 @@ impl App {
                     osc_tx.clone(),
                 ) {
                     Ok(pane_id) => {
+                        if let Some(pid) = session_writes
+                            .lock()
+                            .get(&pane_id)
+                            .and_then(rimeterm_pty::Session::root_pid)
+                        {
+                            startup_agent_pids.push((pane_id, pid));
+                        }
                         if let Some(pane) = panes.get_mut(pane_id) {
                             pane.set_right_click_paste(config.mouse.right_click_paste);
                             pane.set_scrollback_enabled(true);
@@ -1388,10 +1410,14 @@ impl App {
         }
         let sysmon_id = sysmon.id();
         panes.insert(Box::new(sysmon));
-        pinned_pane_ids.insert(sysmon_id);
+        let shared_agent_snapshot = Arc::new(parking_lot::RwLock::new(
+            crate::agtop_model::Snapshot::empty(),
+        ));
+        let agent_monitor = AgentMonitor::new(Arc::clone(&shared_agent_snapshot));
+        let main_agent_signal = Arc::new(parking_lot::RwLock::new(MainAgentSignal::default()));
+        let mut agtop = crate::agtop_pane::AgtopPane::new(shared_agent_snapshot);
         git_members.push(sysmon_id);
 
-        let mut agtop = crate::agtop_pane::AgtopPane::new();
         if let Some(state) = memory.ui.agtop.as_ref() {
             agtop.restore_state(state);
         }
@@ -1427,6 +1453,16 @@ impl App {
             zones.restore_state(state);
         }
         let zones_id = zones.id();
+
+        let pet_state = rimeterm_config::paths::pet_state_file()
+            .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-pet-state.json"));
+        let pet_lock = rimeterm_config::paths::pet_lock_file()
+            .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-pet.lock"));
+        let pet = PetPane::new(pet_state, pet_lock, Arc::clone(&main_agent_signal));
+        let pet_id = pet.id();
+        panes.insert(Box::new(pet));
+        pinned_pane_ids.insert(pet_id);
+        git_members.push(pet_id);
         panes.insert(Box::new(zones));
         pinned_pane_ids.insert(zones_id);
         git_members.push(zones_id);
@@ -1478,6 +1514,7 @@ impl App {
             LeftTabCatalogEntry::new("glab", "Glab", glab_pane_id),
             LeftTabCatalogEntry::new("sysmon", "Sysmon", sysmon_id),
             LeftTabCatalogEntry::new("agtop", "Agtop", agtop_id),
+            LeftTabCatalogEntry::new("pet", "Pet", pet_id),
             LeftTabCatalogEntry::new("models", "Models", models_id),
             LeftTabCatalogEntry::new("stock", "Stock", stock_id),
             LeftTabCatalogEntry::new("zones", "Zones", zones_id),
@@ -1650,6 +1687,9 @@ impl App {
             pending_dispatch: None,
             pending_dispatches: Vec::new(),
             pane_agent_id: startup_agent_ids.into_iter().collect(),
+            pane_agent_pid: startup_agent_pids.into_iter().collect(),
+            agent_monitor,
+            main_agent_signal,
             left_top_catalog,
             left_bottom_catalog,
             left_tabs_state,
@@ -5015,6 +5055,14 @@ impl App {
             pane.set_scrollback_enabled(true);
         }
         self.pane_agent_id.insert(new_id, spec.id);
+        if let Some(pid) = self
+            .session_writes
+            .lock()
+            .get(&new_id)
+            .and_then(rimeterm_pty::Session::root_pid)
+        {
+            self.pane_agent_pid.insert(new_id, pid);
+        }
 
         // If the group is still holding the picker-placeholder from
         // first-launch, remove it so the new agent tab is the sole (and
@@ -5167,6 +5215,7 @@ impl App {
         let next_active = group.active_pane();
         self.drop_pane_and_session(removed);
         let was_agent = self.pane_agent_id.remove(&removed).is_some();
+        self.pane_agent_pid.remove(&removed);
         if was_agent {
             self.landscape_tabs.agents.retain(|pane| *pane != removed);
             self.landscape_tabs.agents_active = next_active
@@ -5324,7 +5373,8 @@ impl App {
             .iter()
             .flat_map(|g| g.members().iter().copied())
             .collect();
-        let mut dirty = false;
+        let mut dirty = self.agent_monitor.poll();
+        dirty |= self.refresh_main_agent_signal();
         for id in ids {
             if let Some(pane) = self.panes.get_mut(id)
                 && pane.poll_background()
@@ -5335,6 +5385,39 @@ impl App {
         dirty |= self.drain_glab_status_message();
         self.sync_from_file_manager();
         dirty
+    }
+
+    fn refresh_main_agent_signal(&mut self) -> bool {
+        let main_pane = self.tree.find_tab_group(BUILTIN_AGENTS).and_then(|group| {
+            group
+                .members()
+                .iter()
+                .copied()
+                .find(|pane| self.pane_agent_id.contains_key(pane))
+        });
+        let (pane_id, agent_id, phase) = match main_pane {
+            Some(pane_id) => {
+                let agent_id = self
+                    .pane_agent_id
+                    .get(&pane_id)
+                    .copied()
+                    .map(str::to_string);
+                let snapshot = self.agent_monitor.snapshot();
+                let root_pid = self.pane_agent_pid.get(&pane_id).copied();
+                let phase = resolve_main_phase(root_pid, &snapshot, Instant::now());
+                (Some(pane_id), agent_id, phase)
+            }
+            None => (None, None, MainAgentPhase::Unbound),
+        };
+        let mut signal = self.main_agent_signal.write();
+        if signal.pane_id == pane_id && signal.agent_id == agent_id && signal.phase == phase {
+            return false;
+        }
+        signal.pane_id = pane_id;
+        signal.agent_id = agent_id;
+        signal.phase = phase;
+        signal.transition_seq = signal.transition_seq.saturating_add(1);
+        true
     }
 
     fn drain_glab_status_message(&mut self) -> bool {

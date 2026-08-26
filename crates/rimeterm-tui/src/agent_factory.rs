@@ -17,6 +17,7 @@ use crate::pty_pane::PtyPane;
 
 pub struct ExternalSpawn {
     pub pane: PtyPane,
+    pub root_pid: Option<u32>,
 }
 
 /// Alias kept for M3 callers.
@@ -96,6 +97,7 @@ pub fn spawn_external(
     });
 
     Ok(ExternalSpawn {
+        root_pid: session.root_pid(),
         pane: crate::pty_pane::PtyPane::with_id(pane_id, session, display_name),
     })
 }

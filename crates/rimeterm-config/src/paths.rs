@@ -89,6 +89,16 @@ pub fn zones_file() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join("zones").join("zones.toml"))
 }
 
+/// Global virtual-pet state file shared across workspaces.
+pub fn pet_state_file() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("pet").join("state.json"))
+}
+
+/// Owner lock for the global virtual-pet state file.
+pub fn pet_lock_file() -> Option<PathBuf> {
+    data_dir().map(|dir| dir.join("pet").join("pet.lock"))
+}
+
 /// `~/.rimeterm/bin/` — essentials binaries live here (C21.5).
 ///
 /// Populated at first launch by [`crate::essentials::materialize`] from
@@ -497,6 +507,20 @@ mod tests {
             assert_eq!(
                 zones_file(),
                 Some(root.join("data").join("zones").join("zones.toml")),
+            );
+        });
+    }
+
+    #[test]
+    fn pet_files_live_in_global_data_dir() {
+        with_rimeterm_home(|root| {
+            assert_eq!(
+                pet_state_file(),
+                Some(root.join("data").join("pet").join("state.json"))
+            );
+            assert_eq!(
+                pet_lock_file(),
+                Some(root.join("data").join("pet").join("pet.lock"))
             );
         });
     }

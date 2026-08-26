@@ -56,6 +56,7 @@ const WORKSPACE_VERSIONED_CRATES = [
   "rimeterm-ipc",
   "rimeterm-markdown",
   "rimeterm-models",
+  "rimeterm-pet",
   "rimeterm-pty",
   "rimeterm-stock",
   "rimeterm-tui",
