@@ -24,7 +24,7 @@
 //
 // What it touches:
 //   * [workspace.package].version in ./Cargo.toml
-//   * The rimeterm* + rimectl package entries in ./Cargo.lock
+//   * The rimeterm* + rimectl + glab-tui package entries in ./Cargo.lock
 //     (these mirror version.workspace = true and MUST stay in lockstep,
 //     otherwise `cargo build --locked` fails)
 //
@@ -48,6 +48,7 @@ const CARGO_LOCK = resolve(REPO_ROOT, "Cargo.lock");
 // so an accidental `version.workspace = true` in a future independent crate
 // still requires a conscious edit here.
 const WORKSPACE_VERSIONED_CRATES = [
+  "glab-tui",
   "rimeterm",
   "rimectl",
   "rimeterm-config",
@@ -225,12 +226,8 @@ function main() {
   }
 
   const next = resolveTarget(current, args.target);
-  if (next === current) {
-    console.log(`workspace already at ${current}, nothing to do`);
-    process.exit(0);
-  }
 
-  warnMajorBump(current, next);
+  if (next !== current) warnMajorBump(current, next);
 
   const newToml = updateCargoToml(cargoTomlText, next);
   const newLock = updateCargoLock(cargoLockText, next, WORKSPACE_VERSIONED_CRATES);
@@ -245,7 +242,8 @@ function main() {
 
   writeFileSync(CARGO_TOML, newToml);
   writeFileSync(CARGO_LOCK, newLock);
-  console.log(`✓ bumped workspace ${current} -> ${next}`);
+  if (next === current) console.log(`✓ workspace remains at ${current}`);
+  else console.log(`✓ bumped workspace ${current} -> ${next}`);
   console.log(`✓ synced Cargo.lock for ${WORKSPACE_VERSIONED_CRATES.length} crates`);
   console.log("");
   console.log("next:");
