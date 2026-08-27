@@ -5387,6 +5387,7 @@ impl App {
                 pid: agent.pid,
                 label: agent.label.clone(),
                 cwd: agent.cwd.clone(),
+                session_id: agent.session_id.clone(),
             })
             .collect::<Vec<_>>();
         dirty |= self.activity_monitor.poll(&activity_agents);

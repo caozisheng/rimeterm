@@ -22,6 +22,7 @@ pub struct ActivityAgent {
     pub pid: u32,
     pub label: String,
     pub cwd: String,
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,6 +43,29 @@ impl ActivityState {
 #[derive(Clone, Debug, Default)]
 struct ActivitySnapshot {
     by_pid: HashMap<u32, ActivityState>,
+}
+
+struct ActivityCandidate {
+    session_id: String,
+    mtime_ms: u64,
+    state: Option<ActivityState>,
+}
+
+fn select_current_activity<I>(candidates: I, session_id: Option<&str>) -> Option<ActivityState>
+where
+    I: IntoIterator<Item = ActivityCandidate>,
+{
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    if let Some(session_id) = session_id {
+        return candidates
+            .into_iter()
+            .find(|candidate| candidate.session_id == session_id)
+            .and_then(|candidate| candidate.state);
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|candidate| candidate.mtime_ms)
+        .and_then(|candidate| candidate.state)
 }
 
 enum Request {
@@ -128,20 +152,22 @@ fn run(request_rx: Receiver<Request>, response_tx: Sender<ActivitySnapshot>) {
 fn find_omp_activity(agent: &ActivityAgent) -> Option<ActivityState> {
     let root = omp_sessions_root()?;
     let home = user_home()?;
-    let mut best: Option<(u64, ActivityState)> = None;
+    let mut candidates = Vec::new();
     for variant in crate::agtop_omp::encode_cwd_variants(&agent.cwd, &home) {
         let dir = root.join(variant);
         for path in jsonl_files(&dir) {
-            let mtime = file_mtime_ms(&path);
             let records = parse_jsonl(&read_tail(&path));
-            if let Some(state) = parse_omp_activity(&records) {
-                if best.as_ref().is_none_or(|(seen, _)| mtime >= *seen) {
-                    best = Some((mtime, state));
-                }
-            }
+            candidates.push(ActivityCandidate {
+                session_id: path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                mtime_ms: file_mtime_ms(&path),
+                state: parse_omp_activity(&records),
+            });
         }
     }
-    best.map(|(_, state)| state)
+    select_current_activity(candidates, agent.session_id.as_deref())
 }
 
 fn find_claude_activity(agent: &ActivityAgent) -> Option<ActivityState> {
@@ -150,38 +176,41 @@ fn find_claude_activity(agent: &ActivityAgent) -> Option<ActivityState> {
         .join(".claude")
         .join("projects")
         .join(crate::agtop_session::encode_cwd(&agent.cwd));
-    let mut best: Option<(u64, ActivityState)> = None;
+    let mut candidates = Vec::new();
     for path in jsonl_files(&dir) {
-        let mtime = file_mtime_ms(&path);
         let records = parse_jsonl(&read_tail(&path));
-        if let Some(state) = parse_claude_activity(&records) {
-            if best.as_ref().is_none_or(|(seen, _)| mtime >= *seen) {
-                best = Some((mtime, state));
-            }
-        }
+        candidates.push(ActivityCandidate {
+            session_id: path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            mtime_ms: file_mtime_ms(&path),
+            state: parse_claude_activity(&records),
+        });
     }
-    best.map(|(_, state)| state)
+    select_current_activity(candidates, agent.session_id.as_deref())
 }
 
 fn find_codex_activity(agent: &ActivityAgent) -> Option<ActivityState> {
     let home = user_home()?;
     let root = home.join(".codex").join("sessions");
-    let mut best: Option<(u64, ActivityState)> = None;
+    let mut candidates = Vec::new();
     for path in jsonl_files_recursive(&root) {
         let metadata = parse_jsonl(&read_head(&path));
-        let cwd_matches = codex_metadata_matches(&metadata, &agent.cwd);
-        if !cwd_matches {
+        if !codex_metadata_matches(&metadata, &agent.cwd) {
             continue;
         }
         let records = parse_jsonl(&read_tail(&path));
-        let mtime = file_mtime_ms(&path);
-        if let Some(state) = parse_codex_activity(&records)
-            && best.as_ref().is_none_or(|(seen, _)| mtime >= *seen)
-        {
-            best = Some((mtime, state));
-        }
+        candidates.push(ActivityCandidate {
+            session_id: path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            mtime_ms: file_mtime_ms(&path),
+            state: parse_codex_activity(&records),
+        });
     }
-    best.map(|(_, state)| state)
+    select_current_activity(candidates, agent.session_id.as_deref())
 }
 
 fn codex_metadata_matches(records: &[Value], cwd: &str) -> bool {
@@ -562,5 +591,24 @@ mod tests {
         std::fs::write(&path, "x".repeat(ACTIVITY_TAIL_BYTES as usize) + "\n✓")
             .expect("write fixture");
         assert!(read_tail(&path).contains('✓'));
+    }
+
+    #[test]
+    fn current_session_without_activity_does_not_fall_back_to_older_session() {
+        let old = ActivityCandidate {
+            session_id: "old-session".into(),
+            mtime_ms: 10,
+            state: Some(ActivityState::new("bash", "再次构建0.2.5")),
+        };
+        let current = ActivityCandidate {
+            session_id: "current-session".into(),
+            mtime_ms: 20,
+            state: None,
+        };
+
+        assert_eq!(
+            select_current_activity([old, current], Some("current-session")),
+            None
+        );
     }
 }
