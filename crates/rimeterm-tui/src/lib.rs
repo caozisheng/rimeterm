@@ -4,6 +4,7 @@
 //! M1 introduces multi-shell tabs, focus management, and the command palette.
 
 pub mod acknowledgement;
+pub mod activity_monitor;
 pub mod agent_factory;
 pub mod agent_monitor;
 pub mod agtop_matchers;

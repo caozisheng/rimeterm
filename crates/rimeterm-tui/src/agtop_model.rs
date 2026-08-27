@@ -238,6 +238,7 @@ pub struct AgentInfo {
     /// process start time when the agent was invoked with `--resume`.
     pub session_started_ms: u64,
     pub current_tool: Option<String>,
+    pub current_activity: Option<String>,
     pub current_task: Option<String>,
     pub subagents: u32,
     pub in_flight_subagents: Vec<String>,
@@ -475,6 +476,7 @@ mod tests {
             session_id: None,
             session_started_ms: 0,
             current_tool: None,
+            current_activity: None,
             current_task: None,
             subagents: 0,
             in_flight_subagents: Vec::new(),

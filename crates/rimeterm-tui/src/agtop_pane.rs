@@ -1372,6 +1372,7 @@ mod tests {
             session_id: None,
             session_started_ms: 0,
             current_tool: None,
+            current_activity: None,
             current_task: None,
             subagents: 0,
             in_flight_subagents: Vec::new(),

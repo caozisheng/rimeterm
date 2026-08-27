@@ -27,6 +27,8 @@ pub struct MainAgentSignal {
     pub agent_id: Option<String>,
     pub phase: MainAgentPhase,
     pub transition_seq: u64,
+    pub event: Option<String>,
+    pub activity: Option<String>,
 }
 
 impl Default for MainAgentSignal {
@@ -36,6 +38,8 @@ impl Default for MainAgentSignal {
             agent_id: None,
             phase: MainAgentPhase::Unbound,
             transition_seq: 0,
+            event: None,
+            activity: None,
         }
     }
 }
@@ -176,6 +180,40 @@ pub fn resolve_main_phase(
         .unwrap_or(MainAgentPhase::Starting)
 }
 
+pub fn event_for_agent(agent: &AgentInfo) -> Option<String> {
+    Some(semantic_activity(agent.current_tool.as_deref(), Some(agent.status)).to_string())
+}
+
+pub fn semantic_activity(tool: Option<&str>, status: Option<AgentStatus>) -> &'static str {
+    if let Some(tool) = tool {
+        let tool = tool
+            .split_whitespace()
+            .next()
+            .unwrap_or(tool)
+            .to_ascii_lowercase();
+        if matches!(tool.as_str(), "read" | "grep" | "glob" | "search" | "lsp") {
+            return "reading";
+        }
+        if matches!(tool.as_str(), "write" | "edit" | "patch" | "ast_edit") {
+            return "writing";
+        }
+        if matches!(tool.as_str(), "task" | "agent" | "subagent") {
+            return "delegating";
+        }
+        if matches!(tool.as_str(), "browser" | "web" | "web_search" | "fetch") {
+            return "browsing";
+        }
+        return "working";
+    }
+    match status {
+        Some(AgentStatus::Busy | AgentStatus::Active) => "thinking",
+        Some(AgentStatus::Spawning) => "delegating",
+        Some(AgentStatus::Waiting) => "waiting",
+        Some(AgentStatus::Completed) => "done",
+        Some(AgentStatus::Idle | AgentStatus::Stale) | None => "resting",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +239,7 @@ mod tests {
             session_id: None,
             session_started_ms: 0,
             current_tool: None,
+            current_activity: None,
             current_task: None,
             subagents: 0,
             in_flight_subagents: Vec::new(),
@@ -263,8 +302,32 @@ mod tests {
         snapshot.agents = vec![launcher, worker];
 
         let matched = match_main_agent(42, &snapshot).expect("match OMP logical process");
-
         assert_eq!((matched.pid, matched.status), (43, AgentStatus::Busy));
+    }
+
+    #[test]
+    fn main_agent_event_uses_semantic_tool_activity() {
+        let mut info = agent(42);
+        info.current_tool = Some("read app.rs".into());
+        info.current_task = Some("inspect pet".into());
+        info.recent_activity = vec!["fallback".into()];
+
+        assert_eq!(event_for_agent(&info).as_deref(), Some("reading"));
+    }
+}
+
+#[test]
+fn tool_names_map_to_semantic_activities() {
+    for (tool, expected) in [
+        ("read", "reading"),
+        ("grep", "reading"),
+        ("edit", "writing"),
+        ("write", "writing"),
+        ("bash", "working"),
+        ("task", "delegating"),
+        ("browser", "browsing"),
+    ] {
+        assert_eq!(semantic_activity(Some(tool), None), expected);
     }
 }
 

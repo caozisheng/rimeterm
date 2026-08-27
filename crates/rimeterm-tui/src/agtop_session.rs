@@ -232,6 +232,7 @@ pub struct SessionSummary {
     pub state: SessionState,
     pub stop_reason: Option<String>,
     pub current_tool: Option<String>,
+    pub current_activity: Option<String>,
     pub current_task: Option<String>,
     pub in_flight_subagents: Vec<String>,
     pub subagents_count: u32,
@@ -380,6 +381,7 @@ pub fn enrich_claude(live: &[LiveAgentRef<'_>], now_ms: u64) -> HashMap<u32, Ses
                 state,
                 stop_reason: out.stop_reason,
                 current_tool: out.current_tool.map(|s| sanitize(&s)),
+                current_activity: None,
                 current_task: out.last_task.map(|s| sanitize(&s)),
                 in_flight_subagents: out
                     .in_flight_subagents

@@ -139,22 +139,37 @@ impl PetPane {
         }
     }
 
-    fn agent_scene(&self) -> &'static str {
-        match self.main_agent.read().phase {
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Busy) => "typing...",
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Spawning) => {
-                "calling helpers..."
+    fn agent_scene(&self) -> String {
+        let signal = self.main_agent.read();
+        let scene = if let Some(event) = &signal.event {
+            event.clone()
+        } else {
+            match signal.phase {
+                MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Busy)
+                | MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Active) => {
+                    "thinking".into()
+                }
+                MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Spawning) => {
+                    "delegating".into()
+                }
+                MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Waiting) => {
+                    "waiting".into()
+                }
+                MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Completed) => {
+                    "done".into()
+                }
+                MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Idle)
+                | MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Stale) => {
+                    "resting".into()
+                }
+                MainAgentPhase::Starting => "starting".into(),
+                MainAgentPhase::MonitorStale => "status unavailable".into(),
+                MainAgentPhase::Unbound => "alone".into(),
             }
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Active) => "working...",
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Waiting) => {
-                "waiting for input"
-            }
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Completed) => "done!",
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Idle) => "resting",
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Stale) => "away",
-            MainAgentPhase::Starting => "starting...",
-            MainAgentPhase::MonitorStale => "status unavailable",
-            MainAgentPhase::Unbound => "alone",
+        };
+        match &signal.activity {
+            Some(activity) => format!("{scene} · {activity}"),
+            None => scene,
         }
     }
 
@@ -571,6 +586,8 @@ mod tests {
                 agent_id: Some("omp".to_string()),
                 phase: crate::agent_monitor::MainAgentPhase::Observed(AgentStatus::Busy),
                 transition_seq: 1,
+                event: Some("reading".to_string()),
+                activity: Some("Checking Tidy availability".to_string()),
             },
         ));
         let mut pane = PetPane::try_new(
@@ -601,6 +618,64 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("typing"), "{rendered}");
+        assert!(
+            rendered.contains("reading · Checking Tidy availability"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("omp BUSY · Checking Tidy availability"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn agent_event_renders_below_pet_not_in_title() {
+        let signal = std::sync::Arc::new(parking_lot::RwLock::new(
+            crate::agent_monitor::MainAgentSignal {
+                pane_id: None,
+                agent_id: Some("omp".into()),
+                phase: crate::agent_monitor::MainAgentPhase::Observed(
+                    crate::agtop_model::AgentStatus::Busy,
+                ),
+                transition_seq: 1,
+                event: Some("reading".into()),
+                activity: Some("Checking Tidy availability".into()),
+            },
+        ));
+        let directory = tempdir().expect("create fixture directory");
+        let pane = PetPane::try_new(
+            directory.path().join("state.json"),
+            directory.path().join("pet.lock"),
+            signal,
+        )
+        .expect("create pet pane");
+
+        assert_eq!(pane.agent_status(), "omp BUSY");
+        assert_eq!(pane.agent_scene(), "reading · Checking Tidy availability");
+    }
+
+    #[test]
+    fn activity_without_tool_semantic_renders_beside_thinking() {
+        let signal = std::sync::Arc::new(parking_lot::RwLock::new(
+            crate::agent_monitor::MainAgentSignal {
+                pane_id: None,
+                agent_id: Some("omp".into()),
+                phase: crate::agent_monitor::MainAgentPhase::Observed(
+                    crate::agtop_model::AgentStatus::Busy,
+                ),
+                transition_seq: 1,
+                event: None,
+                activity: Some("Checking Tidy availability".into()),
+            },
+        ));
+        let directory = tempdir().expect("create fixture directory");
+        let pane = PetPane::try_new(
+            directory.path().join("state.json"),
+            directory.path().join("pet.lock"),
+            signal,
+        )
+        .expect("create pet pane");
+
+        assert_eq!(pane.agent_scene(), "thinking · Checking Tidy availability");
     }
 }

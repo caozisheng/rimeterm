@@ -152,6 +152,7 @@ pub fn enrich_omp(live: &[LiveAgentRef<'_>], now_ms: u64) -> HashMap<u32, Sessio
                 state,
                 stop_reason: out.stop_reason,
                 current_tool: out.current_tool.map(|s| sanitize(&s)),
+                current_activity: out.current_activity.map(|s| sanitize(&s)),
                 current_task: out.last_task.map(|s| sanitize(&s)),
                 in_flight_subagents: out
                     .in_flight_subagents
@@ -352,6 +353,8 @@ struct AnalysisOut {
     stop_reason: Option<String>,
     last_task: Option<String>,
     current_tool: Option<String>,
+    current_activity: Option<String>,
+    current_tool_id: Option<String>,
     in_flight_tasks: u32,
     in_flight_subagents: Vec<String>,
     in_flight_tools: u32,
@@ -384,6 +387,23 @@ fn analyse(records: &[Value]) -> AnalysisOut {
                 if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
                     out.session_started_ms = dt.timestamp_millis().max(0) as u64;
                 }
+            }
+        }
+        if r.get("customType").and_then(|v| v.as_str()) == Some("tool_execution_start") {
+            if let Some(data) = r.get("data") {
+                out.current_tool = data
+                    .get("toolName")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                out.current_activity = data
+                    .get("intent")
+                    .and_then(|v| v.as_str())
+                    .map(normalize_activity)
+                    .filter(|s| !s.is_empty());
+                out.current_tool_id = data
+                    .get("toolCallId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
             }
         }
 
@@ -472,6 +492,7 @@ fn analyse(records: &[Value]) -> AnalysisOut {
         // `role: "toolResult"`. The tool-call id lives on the result
         // content items as `toolCallId` (camelCase).
         if role == "toolResult" {
+            let mut completed_ids = Vec::new();
             if let Some(arr) = msg
                 .and_then(|m| m.get("content"))
                 .and_then(|v| v.as_array())
@@ -482,14 +503,29 @@ fn analyse(records: &[Value]) -> AnalysisOut {
                         .or_else(|| c.get("toolUseId"))
                         .and_then(|v| v.as_str())
                     {
-                        completed.insert(id.to_string(), ());
+                        completed_ids.push(id.to_string());
                     }
                 }
             }
-            if let Some(id) = r.get("parentToolCallId").and_then(|v| v.as_str()) {
-                completed.insert(id.to_string(), ());
+            if let Some(id) = msg
+                .and_then(|m| m.get("toolCallId"))
+                .or_else(|| r.get("parentToolCallId"))
+                .and_then(|v| v.as_str())
+            {
+                completed_ids.push(id.to_string());
             }
-            out.current_tool = None;
+            for id in &completed_ids {
+                completed.insert(id.clone(), ());
+            }
+            if out
+                .current_tool_id
+                .as_ref()
+                .is_some_and(|current| completed_ids.iter().any(|id| id == current))
+            {
+                out.current_tool = None;
+                out.current_activity = None;
+                out.current_tool_id = None;
+            }
 
             let preview = msg
                 .and_then(|m| m.get("content"))
@@ -542,6 +578,19 @@ fn handle_tool_call(
         return;
     }
     out.current_tool = Some(name.to_string());
+    out.current_tool_id = c.get("id").and_then(|v| v.as_str()).map(str::to_string);
+    out.current_activity = c
+        .get("intent")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            c.get("arguments").and_then(|a| {
+                a.get("i")
+                    .or_else(|| a.get("intent"))
+                    .and_then(|v| v.as_str())
+            })
+        })
+        .map(normalize_activity)
+        .filter(|s| !s.is_empty());
     *out.tool_counts.entry(name.to_string()).or_insert(0) += 1;
 
     // Recent-activity preview — pull a short arg hint from `arguments`
@@ -620,6 +669,10 @@ fn handle_tool_call(
     {
         out.last_task = Some(subj.to_string());
     }
+}
+
+fn normalize_activity(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn push_recent(buf: &mut Vec<String>, line: String) {
@@ -842,6 +895,30 @@ mod tests {
     }
 
     #[test]
+    fn analyse_exposes_current_tool_intent_as_activity() {
+        let call = serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "toolCall",
+                    "id": "toolu_tidy",
+                    "name": "bash",
+                    "intent": "Checking Tidy availability",
+                    "arguments": {"command": "tidy -version"}
+                }]
+            }
+        });
+
+        let out = analyse(&[call]);
+
+        assert_eq!(
+            out.current_activity.as_deref(),
+            Some("Checking Tidy availability")
+        );
+    }
+
+    #[test]
     fn analyse_completes_tool_on_result() {
         let call = serde_json::json!({
             "type": "message",
@@ -859,12 +936,78 @@ mod tests {
             "type": "message",
             "message": {
                 "role": "toolResult",
-                "content": [{"type": "text", "text": "ok", "toolCallId": "toolu_9"}]
+                "toolCallId": "toolu_9",
+                "content": [{"type": "text", "text": "ok"}]
             }
         });
         let out = analyse(&[call, result]);
         assert_eq!(out.in_flight_tools, 0);
         assert!(out.current_tool.is_none());
+        assert!(out.current_activity.is_none());
+    }
+
+    #[test]
+    fn omp_tool_result_clears_matching_started_activity() {
+        let start = serde_json::json!({
+            "type": "custom",
+            "customType": "tool_execution_start",
+            "data": {
+                "toolCallId": "call_tidy",
+                "toolName": "bash",
+                "intent": "Checking Tidy availability"
+            }
+        });
+        let result = serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "call_tidy",
+                "toolName": "bash",
+                "content": [{"type": "text", "text": "not found"}]
+            }
+        });
+
+        let out = analyse(&[start, result]);
+
+        assert!(out.current_tool.is_none());
+        assert!(out.current_activity.is_none());
+    }
+
+    #[test]
+    fn analyse_extracts_intent_from_omp_tool_execution_start() {
+        let start = serde_json::json!({
+            "type": "custom",
+            "customType": "tool_execution_start",
+            "data": {
+                "toolCallId": "call_tidy",
+                "toolName": "bash",
+                "intent": "Checking Tidy availability"
+            }
+        });
+        let call = serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "toolCall",
+                    "id": "call_tidy",
+                    "name": "bash",
+                    "arguments": {
+                        "i": "Checking Tidy availability",
+                        "command": "tidy -version"
+                    }
+                }]
+            }
+        });
+
+        let out = analyse(&[start, call]);
+
+        assert_eq!(out.in_flight_tools, 1);
+        assert_eq!(out.current_tool.as_deref(), Some("bash"));
+        assert_eq!(
+            out.current_activity.as_deref(),
+            Some("Checking Tidy availability")
+        );
     }
 
     #[test]

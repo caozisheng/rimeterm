@@ -52,8 +52,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use unicode_width::UnicodeWidthStr;
 
+use crate::activity_monitor::{ActivityAgent, ActivityMonitor};
 use crate::agent_monitor::{
-    AgentMonitor, MainAgentPhase, MainAgentSignal, SharedMainAgentSignal, resolve_main_phase,
+    AgentMonitor, MainAgentPhase, MainAgentSignal, SharedMainAgentSignal, event_for_agent,
+    match_main_agent, resolve_main_phase,
 };
 use crate::file_manager_pane::FileManagerPane;
 use crate::fr_pane::{FrAction, FrPane};
@@ -1172,6 +1174,7 @@ pub struct App {
     pane_agent_pid: std::collections::HashMap<PaneId, u32>,
     agent_monitor: AgentMonitor,
     main_agent_signal: SharedMainAgentSignal,
+    activity_monitor: ActivityMonitor,
     /// Stable id → PaneId catalog for tabs eligible in the left-top
     /// (`files`) group. Fixed at startup; drives the Settings overlay
     /// visibility + reorder panel and the `set_members` rewrite on
@@ -1414,6 +1417,7 @@ impl App {
             crate::agtop_model::Snapshot::empty(),
         ));
         let agent_monitor = AgentMonitor::new(Arc::clone(&shared_agent_snapshot));
+        let activity_monitor = ActivityMonitor::new();
         let main_agent_signal = Arc::new(parking_lot::RwLock::new(MainAgentSignal::default()));
         let mut agtop = crate::agtop_pane::AgtopPane::new(shared_agent_snapshot);
         git_members.push(sysmon_id);
@@ -1689,6 +1693,7 @@ impl App {
             pane_agent_id: startup_agent_ids.into_iter().collect(),
             pane_agent_pid: startup_agent_pids.into_iter().collect(),
             agent_monitor,
+            activity_monitor,
             main_agent_signal,
             left_top_catalog,
             left_bottom_catalog,
@@ -5374,7 +5379,18 @@ impl App {
             .flat_map(|g| g.members().iter().copied())
             .collect();
         let mut dirty = self.agent_monitor.poll();
-        dirty |= self.refresh_main_agent_signal();
+        let snapshot = self.agent_monitor.snapshot();
+        let activity_agents = snapshot
+            .agents
+            .iter()
+            .map(|agent| ActivityAgent {
+                pid: agent.pid,
+                label: agent.label.clone(),
+                cwd: agent.cwd.clone(),
+            })
+            .collect::<Vec<_>>();
+        dirty |= self.activity_monitor.poll(&activity_agents);
+        dirty |= self.refresh_main_agent_signal(&snapshot);
         for id in ids {
             if let Some(pane) = self.panes.get_mut(id)
                 && pane.poll_background()
@@ -5387,7 +5403,7 @@ impl App {
         dirty
     }
 
-    fn refresh_main_agent_signal(&mut self) -> bool {
+    fn refresh_main_agent_signal(&mut self, snapshot: &crate::agtop_model::Snapshot) -> bool {
         let main_pane = self.tree.find_tab_group(BUILTIN_AGENTS).and_then(|group| {
             group
                 .members()
@@ -5395,27 +5411,48 @@ impl App {
                 .copied()
                 .find(|pane| self.pane_agent_id.contains_key(pane))
         });
-        let (pane_id, agent_id, phase) = match main_pane {
+        let (pane_id, agent_id, phase, event, activity) = match main_pane {
             Some(pane_id) => {
                 let agent_id = self
                     .pane_agent_id
                     .get(&pane_id)
                     .copied()
                     .map(str::to_string);
-                let snapshot = self.agent_monitor.snapshot();
                 let root_pid = self.pane_agent_pid.get(&pane_id).copied();
-                let phase = resolve_main_phase(root_pid, &snapshot, Instant::now());
-                (Some(pane_id), agent_id, phase)
+                let matched = root_pid.and_then(|pid| match_main_agent(pid, snapshot));
+                let phase = resolve_main_phase(root_pid, snapshot, Instant::now());
+                let fast_activity =
+                    matched.and_then(|agent| self.activity_monitor.activity_for(agent.pid));
+                let event = fast_activity
+                    .map(|activity| {
+                        crate::agent_monitor::semantic_activity(
+                            Some(&activity.current_tool),
+                            matched.map(|agent| agent.status),
+                        )
+                        .to_string()
+                    })
+                    .or_else(|| matched.and_then(event_for_agent));
+                let activity = fast_activity
+                    .map(|activity| activity.current_activity.clone())
+                    .or_else(|| matched.and_then(|agent| agent.current_activity.clone()));
+                (Some(pane_id), agent_id, phase, event, activity)
             }
-            None => (None, None, MainAgentPhase::Unbound),
+            None => (None, None, MainAgentPhase::Unbound, None, None),
         };
         let mut signal = self.main_agent_signal.write();
-        if signal.pane_id == pane_id && signal.agent_id == agent_id && signal.phase == phase {
+        if signal.pane_id == pane_id
+            && signal.agent_id == agent_id
+            && signal.phase == phase
+            && signal.event == event
+            && signal.activity == activity
+        {
             return false;
         }
         signal.pane_id = pane_id;
         signal.agent_id = agent_id;
         signal.phase = phase;
+        signal.event = event;
+        signal.activity = activity;
         signal.transition_seq = signal.transition_seq.saturating_add(1);
         true
     }

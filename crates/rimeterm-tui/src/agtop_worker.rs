@@ -421,6 +421,7 @@ impl Sampler {
         let session_id = session.as_ref().map(|s| s.session_id.clone());
         let session_started_ms = session.as_ref().map(|s| s.session_started_ms).unwrap_or(0);
         let current_tool = session.as_ref().and_then(|s| s.current_tool.clone());
+        let current_activity = session.as_ref().and_then(|s| s.current_activity.clone());
         let current_task = session.as_ref().and_then(|s| s.current_task.clone());
         let in_flight_subagents = session
             .as_ref()
@@ -503,6 +504,7 @@ impl Sampler {
             session_id,
             session_started_ms,
             current_tool,
+            current_activity,
             current_task,
             subagents,
             in_flight_subagents,
@@ -963,6 +965,26 @@ mod tests {
         assert_eq!(
             summaries.get(&42).map(|summary| summary.state),
             Some(crate::agtop_session::SessionState::Busy)
+        );
+    }
+
+    #[test]
+    fn build_agent_preserves_current_omp_activity() {
+        let mut sampler = Sampler::new(Vec::new());
+        let agent = sampler.build_agent(
+            raw(42, 1, "omp", r"C:\work"),
+            Some(SessionSummary {
+                current_tool: Some("bash".into()),
+                current_activity: Some("Checking Tidy availability".into()),
+                ..SessionSummary::default()
+            }),
+            &HashMap::new(),
+            0,
+        );
+
+        assert_eq!(
+            agent.current_activity.as_deref(),
+            Some("Checking Tidy availability")
         );
     }
     #[test]
