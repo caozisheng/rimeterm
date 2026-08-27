@@ -2,7 +2,9 @@
 
 **A TUI-native terminal built for coding agents.** Runs inside any modern terminal (Windows Terminal / WezTerm / kitty / iTerm2 / Alacritty) and multiplexes PTY sessions like tmux — with a first-class slot for the agent.
 
-<img width="1899" height="1108" alt="image" src="https://github.com/user-attachments/assets/c00be4a8-4526-495c-87e5-b730269e43e0" />
+
+<img width="1897" height="1102" alt="image" src="https://github.com/user-attachments/assets/b43098dc-56ca-4584-be20-46e47dd84253" />
+
 
 ## Layout
 
