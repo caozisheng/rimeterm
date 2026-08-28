@@ -6915,7 +6915,6 @@ dependencies = [
 [[package]]
 name = "tui-file-explorer"
 version = "1.2.0"
-source = "git+https://github.com/caozisheng/tui-file-explorer.git?rev=fc463b5#fc463b56c58ac3bd0d1aea438bd7cbed460db29b"
 dependencies = [
  "crossterm",
  "image",
@@ -6924,7 +6923,9 @@ dependencies = [
  "ratatui-image",
  "serde",
  "serde_json",
+ "tempfile",
  "tui-slider",
+ "unicode-width",
 ]
 
 [[package]]

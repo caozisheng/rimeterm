@@ -602,4 +602,34 @@ mod tests {
         assert!(restored.app.single_pane);
         assert!(restored.app.show_preview);
     }
+
+    #[test]
+    fn right_arrow_enters_chinese_directory() {
+        let root = tempdir().unwrap();
+        let child = root.path().join("中文目录");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("child.txt"), b"content").unwrap();
+
+        let mut pane = FileManagerPane::new(root.path().to_path_buf(), root.path().to_path_buf());
+        pane.app.left.cursor = pane
+            .app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.path == child)
+            .unwrap();
+
+        assert!(pane.on_key(KeyEvent::new(
+            crossterm::event::KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(pane.active_dir(), child.as_path());
+        assert!(
+            pane.app
+                .left
+                .entries
+                .iter()
+                .any(|entry| entry.name == "child.txt")
+        );
+    }
 }

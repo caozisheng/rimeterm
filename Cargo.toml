@@ -72,7 +72,7 @@ arboard       = { version = "3", default-features = false }
 # C20 viewer overlay (§19.11)
 tui-markdown  = { version = "0.3.8", default-features = false }
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
-tui-file-explorer = { git = "https://github.com/caozisheng/tui-file-explorer.git", rev = "fc463b5", default-features = false }
+tui-file-explorer = { path = "vendor/tui-file-explorer", default-features = false }
 gix           = { version = "=0.86.0", default-features = false, features = ["status", "revision", "blob-diff", "sha1"] }
 gix-diff      = { version = "=0.66.0", default-features = false, features = ["blob", "index", "sha1"] }
 tree-sitter   = "=0.25.10"

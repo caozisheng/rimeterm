@@ -1,0 +1,43 @@
+[package]
+name         = "tui-file-explorer"
+version      = "1.2.0"
+edition      = "2021"
+authors      = ["Sorin Irimies <sorinirimies@gmail.com>"]
+license      = "MIT"
+repository   = "https://github.com/sorinirimies/tui-file-explorer"
+description  = "A self-contained, keyboard-driven file-browser widget for Ratatui"
+categories   = ["command-line-utilities", "filesystem"]
+keywords     = ["tui", "ratatui", "file-explorer", "widget", "terminal"]
+readme       = "README.md"
+autobins     = false
+autoexamples = false
+exclude      = [
+    "target/",
+    ".gitignore",
+    "rules.md",
+    "justfile",
+    "cliff.toml",
+    "scripts/",
+    ".gitea/",
+    "examples/vhs/generated/",
+]
+
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+
+[dependencies]
+ratatui    = "0.30"
+crossterm  = "0.29"
+tui-slider = "0.3.2"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-width = "0.2"
+image         = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+ratatui-image = { version = "11.0", default-features = false, features = ["crossterm", "image-defaults"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+[dev-dependencies]
+tempfile = "3"
+
+
