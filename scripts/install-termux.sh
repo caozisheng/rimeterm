@@ -50,7 +50,7 @@ curl -fsSL -o "$WORK/pkg.tar.gz" "$URL"
 tar xzf "$WORK/pkg.tar.gz" -C "$WORK"
 
 # ─── 4. Install into $PREFIX/bin ─────────────────────────────────────
-DIR=$(find "$WORK" -type d -name 'rimeterm-*' | head -n 1)
+DIR=$(find "$WORK" -mindepth 1 -type d -name "rimeterm-*" | head -n 1)
 install -m 0755 "$DIR/rimeterm" "$PREFIX/bin/rimeterm"
 install -m 0755 "$DIR/rimectl"  "$PREFIX/bin/rimectl"
 
