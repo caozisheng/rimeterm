@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.49"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
@@ -29,21 +29,21 @@ description = "TUI-native terminal built for coding agents."
 
 [workspace.dependencies]
 # workspace-internal
-rimeterm-core   = { path = "crates/rimeterm-core",   version = "0.2" }
-rimeterm-config = { path = "crates/rimeterm-config", version = "0.2" }
-rimeterm-pty    = { path = "crates/rimeterm-pty",    version = "0.2" }
-rimeterm-tui    = { path = "crates/rimeterm-tui",    version = "0.2" }
-rimeterm-markdown = { path = "crates/rimeterm-markdown", version = "0.2" }
-rimeterm-models = { path = "crates/rimeterm-models", version = "0.2" }
-rimeterm-stock  = { path = "crates/rimeterm-stock",  version = "0.2" }
-rimeterm-zones  = { path = "crates/rimeterm-zones",  version = "0.2" }
-rimeterm-pet    = { path = "crates/rimeterm-pet",    version = "0.2" }
-rimeterm-game   = { path = "crates/rimeterm-game",   version = "0.2" }
+rimeterm-core   = { path = "crates/rimeterm-core",   version = "0.3" }
+rimeterm-config = { path = "crates/rimeterm-config", version = "0.3" }
+rimeterm-pty    = { path = "crates/rimeterm-pty",    version = "0.3" }
+rimeterm-tui    = { path = "crates/rimeterm-tui",    version = "0.3" }
+rimeterm-markdown = { path = "crates/rimeterm-markdown", version = "0.3" }
+rimeterm-models = { path = "crates/rimeterm-models", version = "0.3" }
+rimeterm-stock  = { path = "crates/rimeterm-stock",  version = "0.3" }
+rimeterm-zones  = { path = "crates/rimeterm-zones",  version = "0.3" }
+rimeterm-pet    = { path = "crates/rimeterm-pet",    version = "0.3" }
+rimeterm-game   = { path = "crates/rimeterm-game",   version = "0.3" }
 glab-tui        = { path = "crates/glab-tui" }
 tuxedo          = { path = "crates/tuxedo" }
 fast-resume      = { path = "crates/fast-resume" }
 
-rimeterm-ipc    = { path = "crates/rimeterm-ipc",    version = "0.2" }
+rimeterm-ipc    = { path = "crates/rimeterm-ipc",    version = "0.3" }
 url           = "2.5"
 webbrowser    = { version = "1.2", default-features = false }
 # third-party
