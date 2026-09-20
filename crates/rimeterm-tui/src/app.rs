@@ -21,6 +21,7 @@
 //! overlay covering the ENTIRE left column (files+git) rather than a
 //! tab in the files group; it dismisses via `[×]`, bare `←`, `Esc`,
 //! or a second `Alt+V`.
+mod workspace_builder;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -219,6 +220,16 @@ pub(crate) enum PaneMutation {
         path: PathBuf,
         ack: std::sync::mpsc::SyncSender<Result<String, String>>,
     },
+    /// Open or activate a workspace tab. Ack returns `(index, created)`.
+    OpenWorkspace {
+        path: PathBuf,
+        ack: std::sync::mpsc::SyncSender<Result<(usize, bool), String>>,
+    },
+    /// Activate an existing workspace tab by logical index.
+    ActivateWorkspace {
+        index: usize,
+        ack: std::sync::mpsc::SyncSender<Result<usize, String>>,
+    },
 }
 
 /// Title of the placeholder pane that seeds the `agents` group on first
@@ -272,6 +283,8 @@ pub struct WorkspaceSnapshot {
     pub groups: Vec<TabGroupSnapshot>,
     pub workspace_root: String,
     pub shell_short: String,
+    pub workspace_tabs: Vec<String>,
+    pub active_workspace: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -703,6 +716,24 @@ fn resolve_workspace_root(cwd: &std::path::Path) -> PathBuf {
     cwd.to_path_buf()
 }
 
+fn canonical_workspace_path(path: PathBuf) -> PathBuf {
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+    PathBuf::from(rimeterm_config::paths::strip_extended_prefix(
+        canonical.to_string_lossy().as_ref(),
+    ))
+}
+
+fn load_workspace_config(workspace_root: &std::path::Path) -> Result<Config> {
+    let repo_path = rimeterm_config::paths::repo_config_file(workspace_root);
+    if repo_path.exists() {
+        return Config::load_or_default(&repo_path).map_err(Into::into);
+    }
+    if let Some(user_path) = rimeterm_config::paths::config_file() {
+        return Config::load_or_default(&user_path).map_err(Into::into);
+    }
+    Ok(Config::default())
+}
+
 /// Catalog entry for one left-column tab candidate.
 ///
 /// The Settings overlay uses these to show a toggle + reorder row per
@@ -774,7 +805,7 @@ fn vertical_lower_members(files: &[PaneId], git: &[PaneId], shells: &[PaneId]) -
 }
 
 #[derive(Clone, Debug)]
-struct LandscapeTabsState {
+pub(crate) struct LandscapeTabsState {
     files: Vec<PaneId>,
     files_active: usize,
     git: Vec<PaneId>,
@@ -1006,8 +1037,12 @@ pub struct App {
     osc_tx: mpsc::UnboundedSender<(PaneId, String)>,
     /// Native FR pane actions are resolved by App because only App owns tab/PTY state.
     fr_action_rx: mpsc::UnboundedReceiver<FrAction>,
+    /// Sender retained for FR panes created after startup.
+    fr_action_tx: mpsc::UnboundedSender<FrAction>,
     /// Embedded Todo pane requests that require App-owned tab/focus changes.
     todo_action_rx: mpsc::UnboundedReceiver<TodoAction>,
+    /// Sender retained for Todo panes created after startup.
+    todo_action_tx: mpsc::UnboundedSender<TodoAction>,
     /// §C24: The viewer is a single modal overlay (not a tab). Only
     /// one file can be previewed at a time; opening a new one
     /// replaces the previous snapshot. Occupies the entire left
@@ -1036,10 +1071,10 @@ pub struct App {
     /// [`Self::sync_from_file_manager`]; explicit IPC callers pin it
     /// via [`Self::set_active_root`].
     active_root: PathBuf,
-    /// Worker channel: async Markdown/image loaders push completions
-    /// here; main loop drains them into [`ViewerOverlayState`].
-    viewer_completion_tx: mpsc::UnboundedSender<ViewerCompletion>,
-    viewer_completion_rx: mpsc::UnboundedReceiver<ViewerCompletion>,
+    /// Async viewer loads tagged with their originating workspace identity.
+    /// The main loop routes each completion to the active or stashed viewer.
+    viewer_completion_tx: mpsc::UnboundedSender<WorkspaceViewerCompletion>,
+    viewer_completion_rx: mpsc::UnboundedReceiver<WorkspaceViewerCompletion>,
     /// `ratatui-image` picker built once at startup (halfblocks fallback
     /// when the terminal has no graphics protocol). Cloned per protocol
     /// build inside `viewer::render_overlay`.
@@ -1070,6 +1105,12 @@ pub struct App {
     settings_state: crate::settings::SettingsState,
     glab_config: rimeterm_config::glab_config::GlabConfig,
     ack_state: crate::acknowledgement::AckOverlayState,
+    /// Close-confirmation dialog (daemon mode): asks whether to kill the
+    /// sessions or leave them under the daemon when the user quits.
+    exit_dialog: crate::exit_dialog::ExitDialogState,
+    /// Once the exit dialog has resolved (or was bypassed), quit
+    /// proceeds without re-probing — breaks the dialog-reopen loop.
+    exit_confirmed: bool,
     upgrade_state: crate::upgrade::UpgradeState,
     upgrade_tx: mpsc::UnboundedSender<crate::upgrade::WorkerEvent>,
     upgrade_rx: mpsc::UnboundedReceiver<crate::upgrade::WorkerEvent>,
@@ -1180,6 +1221,8 @@ pub struct App {
     agent_monitor: AgentMonitor,
     main_agent_signal: SharedMainAgentSignal,
     activity_monitor: ActivityMonitor,
+    /// Shared source consumed by every workspace's Agtop pane.
+    shared_agent_snapshot: crate::agent_monitor::SharedAgentSnapshot,
     /// Stable id → PaneId catalog for tabs eligible in the left-top
     /// (`files`) group. Fixed at startup; drives the Settings overlay
     /// visibility + reorder panel and the `set_members` rewrite on
@@ -1194,6 +1237,29 @@ pub struct App {
     /// `apply_left_tabs_state` on every mutation and flushed to disk
     /// via `persist_left_tabs_state`.
     left_tabs_state: rimeterm_config::left_tabs_state::LeftTabsState,
+    /// Workspace-tab multiplexing (see
+    /// `docs/plans/2026-09-20-workspace-tab-management.md`).
+    ///
+    /// The **active** workspace's fields live directly on `App` (plain
+    /// `self.tree` / `self.panes` access everywhere else); `ws_stash`
+    /// holds the inactive bundles in logical tab order, with **no slot
+    /// for the active index** (see [`workspace::stash_slot`]).
+    ws_order: Vec<PathBuf>,
+    /// Stable daemon-key instance ids parallel to `ws_order`.
+    ws_instances: Vec<u64>,
+    /// Monotonic allocator persisted even when tabs close; prevents a later
+    /// duplicate from reusing a still-live detached daemon session key.
+    next_ws_instance: u64,
+    active_ws: usize,
+    /// Display titles, parallel to `ws_order` (root folder basename,
+    /// duplicates suffixed ` 2`, ` 3`, …).
+    ws_titles: Vec<String>,
+    ws_stash: Vec<crate::workspace::WorkspaceBundle>,
+    /// Feature toggle persisted in `workspaces.state.toml` (default on).
+    workspace_tabs_enabled: bool,
+    /// Workspace-strip geometry from the last draw, used for mouse routing.
+    last_workspace_strip_hits: Vec<(Rect, crate::workspace_strip::WorkspaceHit)>,
+    hovered_workspace: crate::workspace_strip::WorkspaceHover,
     /// In-progress divider drag. `None` when idle.
     active_drag: Option<DragState>,
     /// Snapshot of default ratios so we can `= / 0` reset.
@@ -1227,6 +1293,18 @@ fn restore_requested_shells<T, E>(
     Ok((restored, None))
 }
 
+struct WorkspaceViewerCompletion {
+    workspace_root: PathBuf,
+    workspace_instance: u64,
+    completion: ViewerCompletion,
+}
+
+struct WorkspaceBuild {
+    bundle: crate::workspace::WorkspaceBundle,
+    agent_ids: Vec<(PaneId, &'static str)>,
+    agent_pids: Vec<(PaneId, u32)>,
+}
+
 impl App {
     /// Build the application for `workspace_root`.
     ///
@@ -1239,11 +1317,31 @@ impl App {
         mut memory: rimeterm_config::memory_state::MemoryState,
         explicit_workspace: bool,
     ) -> Result<Self> {
+        // Existing installs may still carry the pre-workspace-tabs command
+        // (`"rimeterm.exe" "%V"`). Refresh only when both verbs already
+        // exist; never opt an uninstalled user into Explorer integration.
+        if crate::shell_integration::probe() == Some(true)
+            && let Err(error) = crate::shell_integration::install()
+        {
+            warn!(error, "failed to refresh installed Explorer integration");
+        }
         let has_global_ui_state = rimeterm_config::memory_state::default_ui_state_file()
             .is_some_and(|path| path.exists());
         if !has_global_ui_state {
             migrate_legacy_workspace_state(&workspace_root, &mut memory);
         }
+        let persisted_workspaces = rimeterm_config::workspaces_state::load_current();
+        let canonical_launch = canonical_workspace_path(workspace_root.clone());
+        let launch_index = persisted_workspaces
+            .roots
+            .iter()
+            .map(|root| canonical_workspace_path(root.clone()))
+            .position(|root| root == canonical_launch);
+        let launch_instance = crate::workspace::launch_instance(
+            persisted_workspaces.enabled,
+            &persisted_workspaces.instances,
+            launch_index,
+        );
         let shell_choice = pick_shell(&config)?;
         let shell_short = shell_status_label(&shell_choice);
         info!(
@@ -1295,7 +1393,7 @@ impl App {
         panes.insert(Box::new(file_manager_pane));
         pinned_pane_ids.insert(file_manager_pane_id);
         let (todo_action_tx, todo_action_rx) = mpsc::unbounded_channel();
-        let mut todo_pane = TodoPane::new(todo_action_tx, viewer_markdown_theme);
+        let mut todo_pane = TodoPane::new(todo_action_tx.clone(), viewer_markdown_theme);
         if let Some(state) = memory.ui.todo.as_ref() {
             todo_pane.restore_state(state);
         }
@@ -1315,7 +1413,7 @@ impl App {
         pinned_pane_ids.insert(glab_pane_id);
 
         let (fr_action_tx, fr_action_rx) = mpsc::unbounded_channel();
-        let mut fr_pane = FrPane::new(fr_action_tx);
+        let mut fr_pane = FrPane::new(fr_action_tx.clone());
         if let Some(state) = memory.ui.fast_resume.as_ref() {
             fr_pane.restore_state(state);
         }
@@ -1342,7 +1440,10 @@ impl App {
         // first factory call (agents restore) and reused by every later
         // spawn site. Stored on Self for the runtime methods.
         let host = SessionHost::from_config(&config);
-        let key_prefix = crate::sessions::key_prefix(&workspace_root);
+        let mut key_prefix = crate::sessions::key_prefix(&workspace_root);
+        if launch_instance != 0 {
+            key_prefix.push_str(&format!("dup{launch_instance}-"));
+        }
         for spec in &config.agents.tabs {
             let id = build_agent_pane(
                 &host,
@@ -1433,7 +1534,7 @@ impl App {
         let agent_monitor = AgentMonitor::new(Arc::clone(&shared_agent_snapshot));
         let activity_monitor = ActivityMonitor::new();
         let main_agent_signal = Arc::new(parking_lot::RwLock::new(MainAgentSignal::default()));
-        let mut agtop = crate::agtop_pane::AgtopPane::new(shared_agent_snapshot);
+        let mut agtop = crate::agtop_pane::AgtopPane::new(Arc::clone(&shared_agent_snapshot));
         git_members.push(sysmon_id);
 
         if let Some(state) = memory.ui.agtop.as_ref() {
@@ -1635,7 +1736,7 @@ impl App {
             redraw_tx.clone(),
         )?;
         let (viewer_completion_tx, viewer_completion_rx) =
-            mpsc::unbounded_channel::<ViewerCompletion>();
+            mpsc::unbounded_channel::<WorkspaceViewerCompletion>();
         let (upgrade_tx, upgrade_rx) = mpsc::unbounded_channel::<crate::upgrade::WorkerEvent>();
         // Best-effort graphics protocol detection. Query at startup so
         // the terminal capabilities cache is warm before we ever try to
@@ -1643,9 +1744,10 @@ impl App {
         // usable everywhere.
         let viewer_picker = ratatui_image::picker::Picker::from_query_stdio().ok();
 
-        Ok(Self {
+        let ws_root = workspace_root.clone();
+        let mut app = Self {
             active_root: resolved_root,
-            last_file_manager_cwd: Some(workspace_root.clone()),
+            last_file_manager_cwd: Some(ws_root.clone()),
             workspace_root,
             config,
             host,
@@ -1670,7 +1772,9 @@ impl App {
             osc_rx,
             osc_tx,
             fr_action_rx,
+            fr_action_tx,
             todo_action_rx,
+            todo_action_tx,
             viewer: ViewerOverlayState::default(),
             file_manager_pane_id: Some(file_manager_pane_id),
             git_pane_id: Some(git_pane_id),
@@ -1690,7 +1794,9 @@ impl App {
             last_settings_popup_rect: None,
             last_ack_popup_rect: None,
             last_upgrade_popup_rect: None,
+            exit_confirmed: false,
             ack_state: crate::acknowledgement::AckOverlayState::default(),
+            exit_dialog: crate::exit_dialog::ExitDialogState::default(),
             upgrade_state: crate::upgrade::UpgradeState::default(),
             upgrade_tx,
             upgrade_rx,
@@ -1722,15 +1828,112 @@ impl App {
             agent_monitor,
             activity_monitor,
             main_agent_signal,
+            shared_agent_snapshot,
             left_top_catalog,
             left_bottom_catalog,
             left_tabs_state,
+            // Single-workspace seed: the startup workspace occupies the
+            // only tab; the stash is empty and all fields stay inline.
+            ws_order: vec![ws_root.clone()],
+            ws_instances: vec![launch_instance],
+            next_ws_instance: persisted_workspaces.next_instance,
+            active_ws: 0,
+            ws_titles: vec![crate::workspace::workspace_title(&ws_root)],
+            workspace_tabs_enabled: persisted_workspaces.enabled,
+            last_workspace_strip_hits: Vec::new(),
+            hovered_workspace: crate::workspace_strip::WorkspaceHover::None,
+            ws_stash: Vec::new(),
             active_drag: None,
             default_ratios,
             pending_mutations,
             // First frame is always a "redraw" — we haven't drawn yet.
             needs_redraw: true,
-        })
+        };
+        let persisted = persisted_workspaces;
+        if persisted.enabled {
+            let mut desired: Vec<PathBuf> = persisted
+                .roots
+                .into_iter()
+                .map(canonical_workspace_path)
+                .collect();
+            let mut desired_instances = persisted.instances;
+            let current_index = desired
+                .iter()
+                .position(|root| root == &ws_root)
+                .unwrap_or_else(|| {
+                    desired.push(ws_root.clone());
+                    desired_instances.push(0);
+                    desired.len() - 1
+                });
+            if desired.is_empty() {
+                desired.push(ws_root.clone());
+                desired_instances.push(0);
+            }
+
+            let memory = rimeterm_config::memory_state::MemoryState::load().unwrap_or_default();
+            let mut restored_roots = Vec::with_capacity(desired.len());
+            let mut restored_instances = Vec::with_capacity(desired.len());
+            let mut restored_stash = Vec::with_capacity(desired.len().saturating_sub(1));
+            let mut restored_current = 0usize;
+            let mut restored_by_persisted = vec![None; desired.len()];
+            for (index, root) in desired.into_iter().enumerate() {
+                if !root.is_dir() {
+                    warn!(root = %root.display(), "skipping missing workspace restore");
+                    continue;
+                }
+                let instance_id = desired_instances.get(index).copied().unwrap_or(0);
+                if index == current_index {
+                    restored_current = restored_roots.len();
+                    restored_by_persisted[index] = Some(restored_current);
+                    restored_roots.push(root);
+                    restored_instances.push(instance_id);
+                    continue;
+                }
+                let config = match load_workspace_config(&root) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        warn!(root = %root.display(), error = %error, "skipping workspace restore");
+                        continue;
+                    }
+                };
+                match app.build_workspace_bundle(
+                    root.clone(),
+                    config,
+                    memory.clone(),
+                    true,
+                    instance_id,
+                ) {
+                    Ok(build) => {
+                        app.merge_workspace_build_metadata(&build);
+                        let restored_index = restored_roots.len();
+                        restored_by_persisted[index] = Some(restored_index);
+                        restored_roots.push(root);
+                        restored_instances.push(instance_id);
+                        restored_stash.push(build.bundle);
+                    }
+                    Err(error) => {
+                        warn!(root = %root.display(), error = %error, "skipping workspace restore");
+                    }
+                }
+            }
+            app.ws_order = restored_roots;
+            app.ws_instances = restored_instances;
+            app.ws_stash = restored_stash;
+            app.active_ws = restored_current;
+            app.ws_titles = crate::workspace::workspace_titles(&app.ws_order);
+            let target = crate::workspace::restored_active(
+                &restored_by_persisted,
+                persisted.active,
+                app.active_ws,
+            );
+            if target != app.active_ws {
+                app.switch_workspace(target);
+            }
+        }
+        if app.workspace_tabs_enabled {
+            app.persist_workspaces_state();
+        }
+        Ok(app)
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -1764,11 +1967,17 @@ impl App {
         }
         self.needs_redraw = false;
         let mut last_draw = Instant::now();
-
         loop {
             if self.should_quit || self.flags.quit.load(Ordering::Relaxed) {
-                self.shutdown();
-                break;
+                if !self.exit_confirmed && self.try_open_exit_dialog() {
+                    // Swallow the quit: the dialog now owns the decision.
+                    self.should_quit = false;
+                    self.flags.quit.store(false, Ordering::Relaxed);
+                    self.needs_redraw = true;
+                } else {
+                    self.shutdown();
+                    break;
+                }
             }
             self.drain_mutations();
             self.drain_flags();
@@ -2091,10 +2300,10 @@ impl App {
         };
 
         let tx = self.viewer_completion_tx.clone();
-        // The completion channel keys off (pane_id, generation). Now
-        // that the viewer has no pane, seed the field with a zeroed
-        // PaneId — `apply_viewer_completion` ignores it and matches
-        // on generation alone.
+        let workspace_root = self.workspace_root.clone();
+        let workspace_instance = self.ws_instances[self.active_ws];
+        // ViewerOverlayState matches generation/path; the envelope routes to
+        // the exact workspace before that local matching occurs.
         let pane_id = PaneId(0);
         tokio::task::spawn_blocking(move || {
             let payload = match source.kind {
@@ -2102,11 +2311,15 @@ impl App {
                 ViewerKind::Image => viewer::load_image_blocking(&source.path),
                 ViewerKind::Code => viewer::load_code_blocking(&source.path),
             };
-            let _ = tx.send(ViewerCompletion {
-                pane_id,
-                generation: snap_gen,
-                path: source.path,
-                payload,
+            let _ = tx.send(WorkspaceViewerCompletion {
+                workspace_root,
+                workspace_instance,
+                completion: ViewerCompletion {
+                    pane_id,
+                    generation: snap_gen,
+                    path: source.path,
+                    payload,
+                },
             });
         });
         let _ = self.redraw_tx.send(());
@@ -2317,6 +2530,20 @@ impl App {
             .set_memory_policy(self.memory_policy.clone());
         self.settings_state
             .set_glab_config(self.glab_config.clone());
+        // Seed the Sessiond panel: file overrides when set, else the
+        // config-file defaults so the panel opens showing what's live.
+        let state_file = rimeterm_config::sessiond_state::load_current();
+        let sessiond_state = rimeterm_config::sessiond_state::SessiondState {
+            enabled: state_file.enabled.or(Some(self.config.core.sessiond)),
+            grace_secs: state_file
+                .grace_secs
+                .or(match self.config.core.sessiond_grace_secs {
+                    0 => None,
+                    secs => Some(secs),
+                }),
+        };
+        self.settings_state.set_sessiond_state(sessiond_state);
+        self.settings_state.workspace_tabs_enabled = self.workspace_tabs_enabled;
         let _ = self.redraw_tx.send(());
     }
 
@@ -2417,6 +2644,51 @@ impl App {
                 self.glab_config = config;
                 self.apply_glab_config_to_pane();
                 self.set_hint("glab config applied — reloading pane".to_string());
+                let _ = self.redraw_tx.send(());
+            }
+            SettingsAction::SetWorkspaceTabs(enabled) => {
+                self.workspace_tabs_enabled = enabled;
+                self.settings_state.workspace_tabs_enabled = enabled;
+                if let Err(error) = rimeterm_config::workspaces_state::save_enabled_current(enabled)
+                {
+                    warn!(error = %error, "failed to persist workspace tabs toggle");
+                }
+                self.needs_redraw = true;
+                let _ = self.redraw_tx.send(());
+            }
+            SettingsAction::SetSessiond(state) => {
+                // Persist the user-level override file first — startup
+                // (`SessionHost::from_config`) reads it before the app
+                // exists, so the file is the source of truth.
+                if let Err(e) = rimeterm_config::sessiond_state::save_current(&state) {
+                    warn!(error = %e, "failed to persist sessiond state");
+                }
+                // Live-apply to a running daemon: grace changes take
+                // effect immediately (no restart needed).
+                if let crate::sessions::SessionHost::Daemon { endpoint, .. } = &self.host {
+                    let endpoint = endpoint.clone();
+                    let grace = state.grace_secs;
+                    let _ = tokio::runtime::Handle::try_current().map(|handle| {
+                        handle.spawn(async move {
+                            if let Err(e) =
+                                rimeterm_pty::sessiond::client::set_grace(&endpoint, grace).await
+                            {
+                                tracing::debug!(error = %e, "sessiond set_grace skipped");
+                            }
+                        })
+                    });
+                }
+                // Switch the hosting mode for future spawns. Existing
+                // panes keep their session type — switching to Native
+                // leaves the daemon's sessions running until grace.
+                self.host = match state.enabled.unwrap_or(false) {
+                    true => crate::sessions::SessionHost::Daemon {
+                        endpoint: rimeterm_pty::sessiond::default_endpoint(),
+                        grace_secs: state.grace_secs,
+                    },
+                    false => crate::sessions::SessionHost::Native,
+                };
+                self.settings_state.set_sessiond_state(state);
                 let _ = self.redraw_tx.send(());
             }
             SettingsAction::ClearGlabConfig => {
@@ -2664,6 +2936,238 @@ impl App {
         self.save_remembered_ui();
     }
 
+    // --- workspace-tab multiplexing ------------------------------------
+
+    /// Switch the active workspace to logical index `logical` (bounds
+    /// checked; no-op when out of range or already active). The active
+    /// workspace's per-workspace fields swap field-for-field with the
+    /// stashed bundle — no type in the set needs `Default`, and every
+    /// PTY session (native or daemon-attached) stays alive: each
+    /// `Session` owns its connection and merely changes owner.
+    pub(crate) fn switch_workspace(&mut self, logical: usize) {
+        if logical >= self.ws_order.len() || logical == self.active_ws {
+            return;
+        }
+        let old_active = self.active_ws;
+        let slot = crate::workspace::stash_slot(logical, old_active);
+        let mut bundle = self.ws_stash.remove(slot);
+
+        std::mem::swap(&mut self.workspace_root, &mut bundle.workspace_root);
+        std::mem::swap(&mut self.config, &mut bundle.config);
+        std::mem::swap(&mut self.host, &mut bundle.host);
+        std::mem::swap(&mut self.key_prefix, &mut bundle.key_prefix);
+        std::mem::swap(&mut self.shell_choice, &mut bundle.shell_choice);
+        std::mem::swap(&mut self.shell_short, &mut bundle.shell_short);
+        std::mem::swap(&mut self.remembered_ui, &mut bundle.remembered_ui);
+        std::mem::swap(&mut self.layout_mode, &mut bundle.layout_mode);
+        std::mem::swap(&mut self.landscape_tabs, &mut bundle.landscape_tabs);
+        std::mem::swap(&mut self.tree, &mut bundle.tree);
+        std::mem::swap(&mut self.panes, &mut bundle.panes);
+        std::mem::swap(&mut self.focus, &mut bundle.focus);
+        std::mem::swap(&mut self.viewer, &mut bundle.viewer);
+        std::mem::swap(
+            &mut self.file_manager_pane_id,
+            &mut bundle.file_manager_pane_id,
+        );
+        std::mem::swap(&mut self.git_pane_id, &mut bundle.git_pane_id);
+        std::mem::swap(
+            &mut self.last_file_manager_cwd,
+            &mut bundle.last_file_manager_cwd,
+        );
+        std::mem::swap(
+            &mut self.last_file_selection,
+            &mut bundle.last_file_selection,
+        );
+        std::mem::swap(&mut self.active_root, &mut bundle.active_root);
+        std::mem::swap(&mut self.pinned_pane_ids, &mut bundle.pinned_pane_ids);
+        std::mem::swap(&mut self.default_ratios, &mut bundle.default_ratios);
+        std::mem::swap(&mut self.left_top_catalog, &mut bundle.left_top_catalog);
+        std::mem::swap(
+            &mut self.left_bottom_catalog,
+            &mut bundle.left_bottom_catalog,
+        );
+
+        // The restored bundle's left-column groups were built under
+        // `bundle.built_left_tabs` (the snapshot taken at stash time).
+        // If the user-level preference changed globally while this
+        // workspace was inactive, re-apply the live preference to the
+        // restored tree. `apply_left_tabs_state` also re-syncs the
+        // Settings overlay copy.
+        if bundle.built_left_tabs != self.left_tabs_state {
+            let live = self.left_tabs_state.clone();
+            self.apply_left_tabs_state(live);
+        } else {
+            let labels: std::collections::HashMap<String, String> = self
+                .left_top_catalog
+                .iter()
+                .chain(self.left_bottom_catalog.iter())
+                .map(|entry| (entry.id.to_string(), entry.label.to_string()))
+                .collect();
+            self.settings_state
+                .set_left_tabs_state(self.left_tabs_state.clone(), labels);
+        }
+        // The stashed-away workspace was in step with the live
+        // preference at swap time — snapshot it for its next restore.
+        bundle.built_left_tabs = self.left_tabs_state.clone();
+
+        self.ws_stash
+            .insert(crate::workspace::stash_slot(old_active, logical), bundle);
+        self.active_ws = logical;
+
+        self.needs_redraw = true;
+        let _ = self.redraw_tx.send(());
+    }
+    fn cycle_workspace(&mut self, backwards: bool) {
+        if !self.workspace_tabs_enabled || self.ws_order.len() < 2 {
+            return;
+        }
+        let next = if backwards {
+            self.active_ws
+                .checked_sub(1)
+                .unwrap_or(self.ws_order.len() - 1)
+        } else {
+            (self.active_ws + 1) % self.ws_order.len()
+        };
+        self.switch_workspace(next);
+        self.persist_workspaces_state();
+    }
+
+    fn persist_workspaces_state(&self) {
+        let state = rimeterm_config::workspaces_state::WorkspacesState {
+            enabled: self.workspace_tabs_enabled,
+            roots: self.ws_order.clone(),
+            instances: self.ws_instances.clone(),
+            next_instance: self.next_ws_instance,
+            active: crate::workspace::clamp_active(self.active_ws, self.ws_order.len()),
+        };
+        if let Err(error) = rimeterm_config::workspaces_state::save_current(&state) {
+            warn!(error = %error, "failed to persist workspace tabs state");
+        }
+    }
+
+    fn merge_workspace_build_metadata(&mut self, build: &WorkspaceBuild) {
+        self.pane_agent_id.extend(build.agent_ids.iter().copied());
+        self.pane_agent_pid.extend(build.agent_pids.iter().copied());
+    }
+
+    pub(crate) fn open_workspace(&mut self, root: PathBuf) -> Result<(usize, bool)> {
+        if !self.workspace_tabs_enabled {
+            return Err(anyhow!("workspace tab management is disabled"));
+        }
+        let root = canonical_workspace_path(root);
+        if !root.is_dir() {
+            return Err(anyhow!(
+                "workspace root is not a directory: {}",
+                root.display()
+            ));
+        }
+        let (target, append) = crate::workspace::open_target(&self.ws_order, &root);
+        if !append {
+            self.switch_workspace(target);
+            self.persist_workspaces_state();
+            return Ok((target, false));
+        }
+
+        let config = load_workspace_config(&root)?;
+        let memory = rimeterm_config::memory_state::MemoryState::load().unwrap_or_default();
+        let build = self.build_workspace_bundle(root.clone(), config, memory, true, 0)?;
+        self.merge_workspace_build_metadata(&build);
+        self.ws_order.push(root);
+        self.ws_instances.push(0);
+        self.ws_stash.push(build.bundle);
+        self.ws_titles = crate::workspace::workspace_titles(&self.ws_order);
+        self.switch_workspace(target);
+        self.persist_workspaces_state();
+        Ok((target, true))
+    }
+    fn activate_workspace(&mut self, index: usize) -> Result<usize> {
+        if !self.workspace_tabs_enabled {
+            return Err(anyhow!("workspace tab management is disabled"));
+        }
+        if index >= self.ws_order.len() {
+            return Err(anyhow!("workspace index {index} out of range"));
+        }
+        self.switch_workspace(index);
+        self.persist_workspaces_state();
+        Ok(index)
+    }
+
+    pub(crate) fn duplicate_workspace(&mut self) -> Result<()> {
+        self.persist_ui_state();
+        let root = self.workspace_root.clone();
+        let instance_id = crate::workspace::allocate_instance(&mut self.next_ws_instance);
+        let memory = rimeterm_config::memory_state::MemoryState {
+            policy: self.memory_policy.clone(),
+            ui: self.remembered_ui.clone(),
+        };
+        let build = self.build_workspace_bundle(
+            root.clone(),
+            self.config.clone(),
+            memory,
+            true,
+            instance_id,
+        )?;
+        self.merge_workspace_build_metadata(&build);
+        let target = crate::workspace::duplicate_target(self.active_ws, self.ws_order.len());
+        self.ws_order.insert(target, root);
+        self.ws_instances.insert(target, instance_id);
+        self.ws_stash.insert(
+            crate::workspace::stash_slot(target, self.active_ws),
+            build.bundle,
+        );
+        self.ws_titles = crate::workspace::workspace_titles(&self.ws_order);
+        self.switch_workspace(target);
+        self.persist_workspaces_state();
+        Ok(())
+    }
+
+    fn release_workspace_bundle(&mut self, bundle: crate::workspace::WorkspaceBundle) {
+        let pane_ids: Vec<PaneId> = bundle.panes.ids().collect();
+        for pane_id in pane_ids {
+            if let Some(session) = self.session_writes.lock().remove(&pane_id)
+                && !bundle.host.is_daemon()
+            {
+                session.kill();
+            }
+            self.pane_agent_id.remove(&pane_id);
+            self.pane_agent_pid.remove(&pane_id);
+        }
+        self.pending_dispatches
+            .retain(|dispatch| !bundle.panes.contains(dispatch.pane_id));
+    }
+
+    pub(crate) fn close_workspace(&mut self, logical: usize) {
+        if logical >= self.ws_order.len() {
+            return;
+        }
+        if self.ws_order.len() == 1 {
+            self.flags.quit.store(true, Ordering::Relaxed);
+            return;
+        }
+
+        if logical == self.active_ws {
+            let replacement = if logical + 1 < self.ws_order.len() {
+                logical + 1
+            } else {
+                logical - 1
+            };
+            self.switch_workspace(replacement);
+        }
+
+        let slot = crate::workspace::stash_slot(logical, self.active_ws);
+        let bundle = self.ws_stash.remove(slot);
+        self.release_workspace_bundle(bundle);
+        self.ws_order.remove(logical);
+        self.ws_instances.remove(logical);
+        if logical < self.active_ws {
+            self.active_ws -= 1;
+        }
+        self.ws_titles = crate::workspace::workspace_titles(&self.ws_order);
+        self.persist_workspaces_state();
+        self.needs_redraw = true;
+        let _ = self.redraw_tx.send(());
+    }
+
     /// Refresh the remembered active-tab snapshot without blocking the event
     /// loop on disk I/O. Structural mutations and shutdown flush the complete
     /// UI state atomically.
@@ -2782,8 +3286,24 @@ impl App {
         let _ = self.redraw_tx.send(());
     }
 
-    fn apply_viewer_completion(&mut self, completion: ViewerCompletion) {
-        if self.viewer.apply_completion(completion) {
+    fn apply_viewer_completion(&mut self, envelope: WorkspaceViewerCompletion) {
+        let Some(logical) = crate::workspace::workspace_index(
+            &self.ws_order,
+            &self.ws_instances,
+            &envelope.workspace_root,
+            envelope.workspace_instance,
+        ) else {
+            return;
+        };
+        let applied = if logical == self.active_ws {
+            self.viewer.apply_completion(envelope.completion)
+        } else {
+            let slot = crate::workspace::stash_slot(logical, self.active_ws);
+            self.ws_stash[slot]
+                .viewer
+                .apply_completion(envelope.completion)
+        };
+        if applied {
             let _ = self.redraw_tx.send(());
         }
     }
@@ -2903,6 +3423,13 @@ impl App {
             }
             return;
         }
+        if self.exit_dialog.open {
+            if let Some(decision) = self.exit_dialog.handle_key(key) {
+                self.apply_exit_decision(decision);
+            }
+            let _ = self.redraw_tx.send(());
+            return;
+        }
         if self.ack_state.open {
             let page_rows = self
                 .last_ack_popup_rect
@@ -2946,6 +3473,19 @@ impl App {
             {
                 warn!(command = cmd, error = %e, "palette command failed");
             }
+            return;
+        }
+        if self.workspace_tabs_enabled
+            && key.code == crossterm::event::KeyCode::Tab
+            && (key.modifiers == crossterm::event::KeyModifiers::CONTROL
+                || key.modifiers
+                    == (crossterm::event::KeyModifiers::CONTROL
+                        | crossterm::event::KeyModifiers::SHIFT))
+        {
+            self.cycle_workspace(
+                key.modifiers
+                    .contains(crossterm::event::KeyModifiers::SHIFT),
+            );
             return;
         }
         // Viewer's own modal keys only fire once every overlay is
@@ -3187,6 +3727,70 @@ impl App {
             return;
         }
         // --- Active layout drag has the highest priority (C22.6 fix) ---
+        if self.workspace_tabs_enabled {
+            let strip_row = self
+                .last_workspace_strip_hits
+                .first()
+                .map(|(rect, _)| rect.y);
+            let hit = self
+                .last_workspace_strip_hits
+                .iter()
+                .find(|(rect, _)| point_in_rect(m.column, m.row, *rect))
+                .map(|(_, hit)| *hit);
+
+            if matches!(m.kind, MouseEventKind::Moved) {
+                let hover = match hit {
+                    Some(crate::workspace_strip::WorkspaceHit::Tab(index)) => {
+                        crate::workspace_strip::WorkspaceHover::Tab(index)
+                    }
+                    Some(crate::workspace_strip::WorkspaceHit::Close(index)) => {
+                        crate::workspace_strip::WorkspaceHover::Close(index)
+                    }
+                    Some(crate::workspace_strip::WorkspaceHit::New) => {
+                        crate::workspace_strip::WorkspaceHover::New
+                    }
+                    None => crate::workspace_strip::WorkspaceHover::None,
+                };
+                if hover != self.hovered_workspace {
+                    self.hovered_workspace = hover;
+                    self.needs_redraw = true;
+                    let _ = self.redraw_tx.send(());
+                }
+                if strip_row == Some(m.row) {
+                    return;
+                }
+            }
+
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                match hit {
+                    Some(crate::workspace_strip::WorkspaceHit::Tab(index)) => {
+                        self.switch_workspace(index);
+                        self.persist_workspaces_state();
+                        return;
+                    }
+                    Some(crate::workspace_strip::WorkspaceHit::Close(index)) => {
+                        self.close_workspace(index);
+                        return;
+                    }
+                    Some(crate::workspace_strip::WorkspaceHit::New) => {
+                        if let Err(error) = self.duplicate_workspace() {
+                            self.set_hint(format!("duplicate workspace failed: {error}"));
+                        }
+                        return;
+                    }
+                    None => {}
+                }
+            }
+
+            if strip_row == Some(m.row) {
+                match m.kind {
+                    MouseEventKind::ScrollUp => self.cycle_workspace(true),
+                    MouseEventKind::ScrollDown => self.cycle_workspace(false),
+                    _ => {}
+                }
+                return;
+            }
+        }
         //
         // An in-progress divider drag MUST beat the viewer takeover
         // block below: dragging D1 leftward carries the pointer INTO
@@ -4184,14 +4788,40 @@ impl App {
     }
 
     fn draw(&mut self, area: Rect, frame: &mut ratatui::Frame<'_>) -> Option<(u16, u16)> {
+        let strip_visible = self.workspace_tabs_enabled && self.ws_order.len() > 0;
         let vertical = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // status
-                Constraint::Min(1), // pane area (each group's rect gets an internal tab strip row)
-                Constraint::Length(1), // hint bar
-            ])
+            .constraints(if strip_visible {
+                vec![
+                    Constraint::Length(1), // workspace strip
+                    Constraint::Length(1), // status
+                    Constraint::Min(1),    // pane area
+                    Constraint::Length(1), // hint bar
+                ]
+            } else {
+                vec![
+                    Constraint::Length(1), // status
+                    Constraint::Min(1),    // pane area
+                    Constraint::Length(1), // hint bar
+                ]
+            })
             .split(area);
+        let status_row = usize::from(strip_visible);
+        let pane_row = status_row + 1;
+        let hint_row = pane_row + 1;
+        if strip_visible {
+            self.last_workspace_strip_hits =
+                crate::workspace_strip::hit_rects(vertical[0], &self.ws_titles);
+            crate::workspace_strip::render(
+                vertical[0],
+                frame.buffer_mut(),
+                &self.ws_titles,
+                self.active_ws,
+                self.hovered_workspace,
+            );
+        } else {
+            self.last_workspace_strip_hits.clear();
+        }
 
         let ws_label = self
             .active_root
@@ -4217,7 +4847,7 @@ impl App {
             None
         };
         self.last_status_bar_hits = render_status_bar(
-            vertical[0],
+            vertical[status_row],
             frame.buffer_mut(),
             ws_label,
             &self.shell_short,
@@ -4227,8 +4857,8 @@ impl App {
         );
         // Cache current-frame geometry so mouse hit-tests use the same
         // rects the user is looking at.
-        self.last_pane_area = vertical[1];
-        self.last_dividers = self.tree.dividers(vertical[1]);
+        self.last_pane_area = vertical[pane_row];
+        self.last_dividers = self.tree.dividers(vertical[pane_row]);
         self.last_tab_strips.clear();
         self.last_pane_outer_rects.clear();
         self.last_viewer_rect = None;
@@ -4252,7 +4882,7 @@ impl App {
             WorkspaceLayoutMode::Vertical => &[BUILTIN_AGENTS, BUILTIN_TOOLS],
         };
         for &gid in group_ids {
-            let Some(cell) = group_cell_rect(&self.tree, vertical[1], gid) else {
+            let Some(cell) = group_cell_rect(&self.tree, vertical[pane_row], gid) else {
                 continue;
             };
             let inner = Layout::default()
@@ -4324,11 +4954,11 @@ impl App {
             let overlay_rect = match self.layout_mode {
                 WorkspaceLayoutMode::Landscape => split_parent_rect(
                     &self.tree,
-                    vertical[1],
+                    vertical[pane_row],
                     &rimeterm_core::layout::SplitPath::root().push(0),
                 ),
                 WorkspaceLayoutMode::Vertical => {
-                    group_cell_rect(&self.tree, vertical[1], BUILTIN_TOOLS)
+                    group_cell_rect(&self.tree, vertical[pane_row], BUILTIN_TOOLS)
                 }
             };
             if let Some(rect) = overlay_rect {
@@ -4445,8 +5075,7 @@ impl App {
         // Layout math lives in the pure helper `upgrade_chip_layout`
         // so the width bookkeeping (chip glyphs vs. terminal width,
         // 1-cell gap between hint text and chip) is unit-testable
-        // without spinning up a full frame.
-        let hint_bar_rect = vertical[2];
+        let hint_bar_rect = vertical[hint_row];
         let layout = upgrade_chip_layout(hint_bar_rect, self.latest_available.as_ref());
         Paragraph::new(Line::from(hint_text))
             .style(hint_style)
@@ -4497,6 +5126,9 @@ impl App {
             let rect = crate::upgrade::UpgradeState::popup_rect(area);
             self.upgrade_state.render(area, frame.buffer_mut());
             self.last_upgrade_popup_rect = Some(rect);
+        }
+        if self.exit_dialog.open {
+            self.exit_dialog.render(area, frame.buffer_mut());
         }
 
         // Suppress the caret when any overlay owns the input focus.
@@ -4558,6 +5190,14 @@ impl App {
             Str(
                 std::sync::mpsc::SyncSender<Result<String, String>>,
                 Result<String, String>,
+            ),
+            Workspace(
+                std::sync::mpsc::SyncSender<Result<(usize, bool), String>>,
+                Result<(usize, bool), String>,
+            ),
+            Index(
+                std::sync::mpsc::SyncSender<Result<usize, String>>,
+                Result<usize, String>,
             ),
         }
         let mut acks: Vec<Ack> = Vec::with_capacity(batch.len());
@@ -4647,6 +5287,16 @@ impl App {
                     let outcome = self.set_active_root(path);
                     acks.push(Ack::Str(ack, outcome));
                 }
+                PaneMutation::OpenWorkspace { path, ack } => {
+                    let outcome = self.open_workspace(path).map_err(|error| error.to_string());
+                    acks.push(Ack::Workspace(ack, outcome));
+                }
+                PaneMutation::ActivateWorkspace { index, ack } => {
+                    let outcome = self
+                        .activate_workspace(index)
+                        .map_err(|error| error.to_string());
+                    acks.push(Ack::Index(ack, outcome));
+                }
             }
         }
         // Publish the post-mutation state THEN wake the waiting clients;
@@ -4662,6 +5312,12 @@ impl App {
                     let _ = tx.send(r);
                 }
                 Ack::Str(tx, r) => {
+                    let _ = tx.send(r);
+                }
+                Ack::Workspace(tx, r) => {
+                    let _ = tx.send(r);
+                }
+                Ack::Index(tx, r) => {
                     let _ = tx.send(r);
                 }
             }
@@ -5344,6 +6000,8 @@ impl App {
             groups: Vec::new(),
             workspace_root: self.active_root.display().to_string(),
             shell_short: self.shell_short.clone(),
+            workspace_tabs: self.ws_titles.clone(),
+            active_workspace: self.active_ws,
         };
         let sessions = self.session_writes.lock();
         for group in self.tree.tab_groups() {
@@ -5791,15 +6449,81 @@ impl App {
         }
     }
 
+    fn daemon_endpoints(&self) -> Vec<String> {
+        let mut endpoints = Vec::new();
+        if let Some(endpoint) = self.host.daemon_endpoint() {
+            endpoints.push(endpoint.to_owned());
+        }
+        for bundle in &self.ws_stash {
+            if let Some(endpoint) = bundle.host.daemon_endpoint()
+                && !endpoints.iter().any(|known| known == endpoint)
+            {
+                endpoints.push(endpoint.to_owned());
+            }
+        }
+        endpoints
+    }
+
+    /// Intercept a quit request. Returns `true` when the exit dialog was
+    /// opened (quit swallowed, decision deferred to the dialog). Returns
+    /// `false` when quitting should proceed immediately — non-daemon
+    /// mode, no daemon reachable, or no live sessions worth asking about.
+    fn try_open_exit_dialog(&mut self) -> bool {
+        let endpoints = self.daemon_endpoints();
+        let hosts_live = endpoints.iter().any(|endpoint| {
+            match tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(rimeterm_pty::sessiond::client::has_live_sessions(endpoint))
+            }) {
+                Ok(live) => live,
+                Err(error) => {
+                    tracing::debug!(%error, %endpoint, "exit dialog: daemon probe failed");
+                    false
+                }
+            }
+        });
+        if !hosts_live {
+            return false;
+        }
+        self.exit_dialog.open();
+        true
+    }
+
+    /// Apply the dialog's decision. `KeepRunning` detaches (drop handles,
+    /// daemon keeps children — plain shutdown). `KillNow` asks the daemon
+    /// to shut down entirely before we exit.
+    fn apply_exit_decision(&mut self, decision: crate::exit_dialog::ExitDecision) {
+        self.exit_dialog.close();
+        match decision {
+            crate::exit_dialog::ExitDecision::KeepRunning => {
+                self.should_quit = true;
+            }
+            crate::exit_dialog::ExitDecision::KillNow => {
+                self.exit_confirmed = true;
+                for endpoint in self.daemon_endpoints() {
+                    if let Err(error) = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(rimeterm_pty::sessiond::client::request_shutdown(&endpoint))
+                    }) {
+                        tracing::warn!(%error, %endpoint, "exit KillNow: daemon shutdown failed");
+                    }
+                }
+                self.should_quit = true;
+            }
+        }
+    }
+
     fn shutdown(&mut self) {
-        let all: Vec<PaneId> = self
-            .tree
-            .tab_groups()
-            .iter()
-            .flat_map(|g| g.members().iter().copied())
-            .collect();
+        let all: Vec<PaneId> = self.panes.ids().collect();
 
         self.persist_ui_state();
+        // Inactive workspaces own live panes too. Release them before the
+        // active bundle so native children are killed and daemon sessions
+        // detach instead of leaking until process teardown.
+        for bundle in std::mem::take(&mut self.ws_stash) {
+            self.release_workspace_bundle(bundle);
+        }
+
         // Native: kill every hosted child (documented behavior). Daemon:
         // drop the handles without killing — sessions keep running under
         // the daemon and the next launch reattaches under stable keys.
@@ -6816,7 +7540,7 @@ fn register_commands(
     // Live-state reporter: reads the shared WorkspaceSnapshot (refreshed each
     // frame) and returns it as JSON. Ignores args.
     {
-        let snap = snapshot;
+        let snap = Arc::clone(&snapshot);
         let cmd = Command {
             id: "workspace.snapshot",
             title: "Snapshot workspace state",
@@ -6824,6 +7548,79 @@ fn register_commands(
             run: Arc::new(move |_args: &serde_json::Value| {
                 let s = snap.read().clone();
                 serde_json::to_value(&s).map_err(|e| format!("serialize: {e}"))
+            }),
+        };
+        register(cmds, cmd)?;
+    }
+    {
+        let snap = Arc::clone(&snapshot);
+        let cmd = Command {
+            id: "workspace.list",
+            title: "List workspace tabs",
+            description: Some("Return workspace tabs and active index"),
+            run: Arc::new(move |_args: &serde_json::Value| {
+                let state = snap.read();
+                Ok(serde_json::json!({
+                    "tabs": state.workspace_tabs,
+                    "active": state.active_workspace,
+                }))
+            }),
+        };
+        register(cmds, cmd)?;
+    }
+
+    {
+        let queue = Arc::clone(&pending_mutations);
+        let wake = redraw_tx.clone();
+        let cmd = Command {
+            id: "workspace.open",
+            title: "Open or activate workspace tab",
+            description: Some("args: {root: string}"),
+            run: Arc::new(move |args: &serde_json::Value| {
+                let root = args
+                    .get("root")
+                    .and_then(|value| value.as_str())
+                    .filter(|root| !root.is_empty())
+                    .ok_or_else(|| "missing `root` (non-empty string)".to_string())?;
+                let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+                queue.lock().push_back(PaneMutation::OpenWorkspace {
+                    path: PathBuf::from(root),
+                    ack: ack_tx,
+                });
+                let _ = wake.send(());
+                let (index, created) =
+                    ack_rx
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .map_err(|_| "app main loop dropped workspace.open ack".to_string())??;
+                Ok(serde_json::json!({"index": index, "created": created}))
+            }),
+        };
+        register(cmds, cmd)?;
+    }
+
+    {
+        let queue = Arc::clone(&pending_mutations);
+        let wake = redraw_tx.clone();
+        let cmd = Command {
+            id: "workspace.activate",
+            title: "Activate workspace tab",
+            description: Some("args: {index: zero-based u64}"),
+            run: Arc::new(move |args: &serde_json::Value| {
+                let index = args
+                    .get("index")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| "missing `index` (zero-based u64)".to_string())?;
+                let index = usize::try_from(index)
+                    .map_err(|_| "workspace index exceeds usize".to_string())?;
+                let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+                queue
+                    .lock()
+                    .push_back(PaneMutation::ActivateWorkspace { index, ack: ack_tx });
+                let _ = wake.send(());
+                let index = ack_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|_| "app main loop dropped workspace.activate ack".to_string())??;
+                Ok(serde_json::json!({"active": index}))
             }),
         };
         register(cmds, cmd)?;
@@ -9571,6 +10368,34 @@ mod tests {
         assert!(!flags.viewer_open.load(Ordering::Relaxed));
         cmds.run("viewer.open").expect("run");
         assert!(flags.viewer_open.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn workspace_tab_commands_are_registered_and_list_state() {
+        let flags = Arc::new(ActionFlags::default());
+        let snapshot = Arc::new(parking_lot::RwLock::new(WorkspaceSnapshot {
+            workspace_tabs: vec!["alpha".into(), "beta".into()],
+            active_workspace: 1,
+            ..WorkspaceSnapshot::default()
+        }));
+        let sessions: Arc<
+            parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
+        > = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let pending: Arc<parking_lot::Mutex<std::collections::VecDeque<PaneMutation>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
+        let (redraw_tx, _redraw_rx) = new_redraw_channel();
+        let mut cmds = CommandRegistry::new();
+        register_commands(&mut cmds, flags, snapshot, sessions, pending, redraw_tx)
+            .expect("register");
+
+        for id in ["workspace.open", "workspace.list", "workspace.activate"] {
+            assert!(cmds.get(id).is_some(), "missing {id}");
+        }
+        assert_eq!(
+            cmds.run_with("workspace.list", &serde_json::Value::Null)
+                .expect("workspace.list"),
+            serde_json::json!({"tabs": ["alpha", "beta"], "active": 1}),
+        );
     }
 
     // `essentials_reinstall_command_is_registered` retired in C25

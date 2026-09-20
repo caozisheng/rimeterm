@@ -351,12 +351,14 @@ impl Session {
         label: &str,
         kind: &str,
         spec: SpawnSpec,
+        grace_secs: Option<u64>,
         cols: u16,
         rows: u16,
     ) -> Result<(Self, mpsc::UnboundedReceiver<SessionOutput>), SessionError> {
-        let attached = crate::sessiond::client::attach_session(endpoint, key, label, kind, spec)
-            .await
-            .map_err(SessionError::Remote)?;
+        let attached =
+            crate::sessiond::client::attach_session(endpoint, key, label, kind, spec, grace_secs)
+                .await
+                .map_err(SessionError::Remote)?;
         let crate::sessiond::client::Attached {
             welcome,
             reader,

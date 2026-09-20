@@ -46,8 +46,9 @@ pub async fn attach_session(
     label: &str,
     kind: &str,
     spec: SpawnSpec,
+    grace_secs: Option<u64>,
 ) -> Result<Attached> {
-    let conn = ensure_daemon(endpoint)
+    let conn = ensure_daemon_with_grace(endpoint, grace_secs)
         .await
         .with_context(|| format!("sessiond at {endpoint}"))?;
     let (mut reader, mut writer) = conn.into_split();
@@ -77,6 +78,33 @@ pub async fn attach_session(
     }
 }
 
+/// Like [`ensure_daemon`] but passes `--grace-secs` on autostart so a
+/// daemon born from this call hosts detached sessions for the configured
+/// window (or forever with `None`) instead of the built-in default.
+pub async fn ensure_daemon_with_grace(
+    endpoint: &str,
+    grace_secs: Option<u64>,
+) -> Result<SessionConn> {
+    if NO_AUTOSTART.load(std::sync::atomic::Ordering::Relaxed) {
+        // Autostart disabled (tests): plain connect, no spawn, no retry.
+        return connect(endpoint).await;
+    }
+    if let Ok(conn) = connect(endpoint).await {
+        return Ok(conn);
+    }
+    spawn_detached_daemon(endpoint, grace_secs)?;
+    let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
+    loop {
+        if let Ok(conn) = connect(endpoint).await {
+            return Ok(conn);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("daemon did not come up within {DAEMON_START_TIMEOUT:?}");
+        }
+        tokio::time::sleep(DAEMON_POLL_INTERVAL).await;
+    }
+}
+
 /// Connect to the daemon at `endpoint`, starting one when absent.
 ///
 /// The daemon is `current_exe() --sessiond` spawned detached: on Windows
@@ -91,7 +119,7 @@ pub async fn ensure_daemon(endpoint: &str) -> Result<SessionConn> {
     if let Ok(conn) = connect(endpoint).await {
         return Ok(conn);
     }
-    spawn_detached_daemon(endpoint)?;
+    spawn_detached_daemon(endpoint, Some(300))?;
     let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
     loop {
         if let Ok(conn) = connect(endpoint).await {
@@ -104,12 +132,17 @@ pub async fn ensure_daemon(endpoint: &str) -> Result<SessionConn> {
     }
 }
 
-fn spawn_detached_daemon(endpoint: &str) -> Result<()> {
+fn spawn_detached_daemon(endpoint: &str, grace_secs: Option<u64>) -> Result<()> {
     let exe = std::env::current_exe().context("resolving current executable")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--sessiond")
         .arg("--endpoint")
         .arg(endpoint)
+        .arg("--grace-secs")
+        .arg(match grace_secs {
+            None => "never".to_string(),
+            Some(secs) => secs.to_string(),
+        })
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -131,4 +164,49 @@ fn spawn_detached_daemon(endpoint: &str) -> Result<()> {
     cmd.spawn()
         .with_context(|| format!("spawning sessiond for {endpoint}"))?;
     Ok(())
+}
+
+/// Ask a running daemon to shut down now: kill every live session and
+/// exit. Returns after the daemon has acknowledged. Errors when no daemon
+/// is listening (nothing to shut down) or the handshake fails.
+pub async fn request_shutdown(endpoint: &str) -> Result<()> {
+    let mut conn = connect(endpoint).await.context("connecting to sessiond")?;
+    conn.write_frame(&Frame::ClientJson(ClientMsg::Shutdown))
+        .await
+        .context("sending Shutdown")?;
+    match conn.read_frame().await.context("awaiting Ack")? {
+        Some(Frame::DaemonJson(DaemonMsg::Ack)) => Ok(()),
+        other => bail!("unexpected response to Shutdown: {other:?}"),
+    }
+}
+
+/// Adjust the after-last-close grace period of a running daemon, without
+/// restart. `None` = never exit while live sessions exist.
+pub async fn set_grace(endpoint: &str, grace_secs: Option<u64>) -> Result<()> {
+    let mut conn = connect(endpoint).await.context("connecting to sessiond")?;
+    conn.write_frame(&Frame::ClientJson(ClientMsg::SetGrace { secs: grace_secs }))
+        .await
+        .context("sending SetGrace")?;
+    match conn.read_frame().await.context("awaiting Ack")? {
+        Some(Frame::DaemonJson(DaemonMsg::Ack)) => Ok(()),
+        other => bail!("unexpected response to SetGrace: {other:?}"),
+    }
+}
+
+/// Probe whether the daemon at `endpoint` currently hosts any live
+/// sessions. Returns `Ok(false)` when no daemon is listening at all —
+/// callers use this to decide whether the exit dialog is even needed.
+pub async fn has_live_sessions(endpoint: &str) -> Result<bool> {
+    let mut conn = match connect(endpoint).await {
+        Ok(conn) => conn,
+        // No daemon → nothing live.
+        Err(_) => return Ok(false),
+    };
+    conn.write_frame(&Frame::ClientJson(ClientMsg::List))
+        .await
+        .context("sending List")?;
+    match conn.read_frame().await.context("awaiting Sessions")? {
+        Some(Frame::DaemonJson(DaemonMsg::Sessions { sessions })) => Ok(!sessions.is_empty()),
+        other => bail!("unexpected response to List: {other:?}"),
+    }
 }

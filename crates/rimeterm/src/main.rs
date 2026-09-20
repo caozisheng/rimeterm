@@ -40,15 +40,46 @@ fn main() -> Result<()> {
             .and_then(|i| args.get(i + 1))
             .and_then(|v| v.to_str().map(str::to_owned))
             .unwrap_or_else(rimeterm_pty::sessiond::default_endpoint);
+        // `--grace-secs <n|never>`: how long to keep hosting live sessions
+        // after the last client detaches (default 300 = 5 min). "never"
+        // hosts them until the machine shuts down.
+        let grace_secs = args
+            .iter()
+            .position(|a| a == "--grace-secs")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.to_str())
+            .map(|v| match v {
+                "never" | "NEVER" => None,
+                digits => digits.parse::<u64>().ok(),
+            })
+            .unwrap_or(Some(300));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        return runtime
-            .block_on(async move { rimeterm_pty::sessiond::daemon::run(&endpoint).await });
+        return runtime.block_on(async move {
+            rimeterm_pty::sessiond::daemon::run(&endpoint, grace_secs).await
+        });
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let workspace_in_tab = workspace_in_tab_arg(std::env::args_os());
+    if let Some(path) = workspace_in_tab.as_ref()
+        && path.is_dir()
+        && runtime.block_on(try_redirect_workspace(path))
+    {
+        return Ok(());
     }
 
     let memory = load_global_memory();
-    let (workspace_root, explicit_workspace) = resolve_workspace_root(&memory)?;
+    let (workspace_root, explicit_workspace) = if let Some(path) = workspace_in_tab
+        && path.is_dir()
+    {
+        (canonicalize_workspace_root(path), true)
+    } else {
+        resolve_workspace_root(&memory)?
+    };
     let config = load_config(&workspace_root)?;
 
     // C21.5: materialize bundled configs (yazi bridge + all seeds) into
@@ -103,30 +134,48 @@ fn main() -> Result<()> {
         }
     }
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
     runtime.block_on(async move {
         let app = App::new(workspace_root, config, memory, explicit_workspace)?;
         app.run().await
     })
 }
 
+fn workspace_in_tab_arg(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<PathBuf> {
+    let args: Vec<std::ffi::OsString> = args.into_iter().collect();
+    args.iter()
+        .position(|arg| arg == "--workspace-in-tab")
+        .and_then(|index| args.get(index + 1))
+        .map(PathBuf::from)
+}
+
+async fn try_redirect_workspace(path: &std::path::Path) -> bool {
+    if !rimeterm_config::workspaces_state::load_current().enabled {
+        return false;
+    }
+    let Ok(Some(pid)) = rimeterm_ipc::discover_latest_pid().await else {
+        return false;
+    };
+    let root = canonicalize_workspace_root(path.to_path_buf());
+    let request = rimeterm_ipc::Request {
+        cmd: "workspace.open".to_string(),
+        args: serde_json::json!({"root": root.to_string_lossy()}),
+    };
+    rimeterm_ipc::send_once(pid, &request)
+        .await
+        .is_ok_and(|response| response.ok)
+}
+
 /// Pick the workspace root, in priority order:
-/// 1. First positional argument that resolves to an existing
-///    directory. The Windows "Open with rimeterm here" Explorer
-///    context-menu entry — `rimeterm.exe "<folder>"` — depends on
-///    this taking precedence so it lands in the clicked folder even
-///    when Explorer spawns the process with a CWD elsewhere (the
-///    `Directory` verb runs from `%SystemRoot%\System32`). Kept
-///    explicit and first so right-click launches always win.
-/// 2. `last_workspace` enabled in `~/.rimeterm/data/memory.toml` and stored
+/// 1. `--workspace-in-tab <dir>` from Windows Explorer integration.
+///    Redirection is attempted before this function; on IPC failure the
+///    directory becomes the explicit workspace for this process.
+/// 2. First positional directory argument.
+/// 3. `last_workspace` enabled in `~/.rimeterm/data/memory.toml` and stored
 ///    in the shared `~/.rimeterm/data/ui.state.toml`.
-/// 3. The user home directory (`~`). Installed-binary launches
+/// 4. The user home directory (`~`). Installed-binary launches
 ///    (Start Menu / Spotlight / Dock) inherit the install directory
-///    as CWD, which is useless — home is a saner "first launch"
-///    landing pad.
-/// 4. `std::env::current_dir()` as a last-ditch fallback for headless
+///    as CWD, which is useless — home is a saner first-launch landing pad.
+/// 5. `std::env::current_dir()` as a last-ditch fallback for headless
 ///    CI without a resolvable home.
 ///
 /// Non-existent / non-directory candidates fall through to the next
@@ -232,6 +281,28 @@ mod tests {
         .to_string_lossy()
         .into_owned();
         assert!(!rendered.starts_with(r"\\?\"), "got {rendered}");
+    }
+
+    #[test]
+    fn workspace_in_tab_flag_extracts_path() {
+        let path = std::ffi::OsString::from("C:/work/demo");
+        let args = vec![
+            std::ffi::OsString::from("rimeterm"),
+            std::ffi::OsString::from("--workspace-in-tab"),
+            path.clone(),
+        ];
+
+        assert_eq!(workspace_in_tab_arg(args), Some(PathBuf::from(path)));
+    }
+
+    #[test]
+    fn ordinary_positional_is_not_redirect_flag() {
+        let args = vec![
+            std::ffi::OsString::from("rimeterm"),
+            std::ffi::OsString::from("C:/work/demo"),
+        ];
+
+        assert_eq!(workspace_in_tab_arg(args), None);
     }
 }
 

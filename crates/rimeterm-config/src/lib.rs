@@ -22,7 +22,9 @@ pub mod migrate;
 pub mod paths;
 pub mod project_map;
 pub mod session_state;
+pub mod sessiond_state;
 pub mod shell_preference;
+pub mod workspaces_state;
 
 #[doc(hidden)]
 pub mod test_util;
@@ -64,9 +66,15 @@ pub struct CoreConfig {
     /// Host shells / agents / external tools under the session daemon
     /// (`rimeterm --sessiond`) instead of in-process PTYs. When `true`,
     /// closing rimeterm detaches — children keep running and the next
-    /// launch reattaches to them. Default `false` (opt-in; the daemon
-    /// binary and wire protocol are young).
+    /// launch reattaches to them. Default `true` (the Settings modal
+    /// can turn it off per-user, persisted to `sessiond.state.toml`).
     pub sessiond: bool,
+
+    /// How long the session daemon keeps hosting sessions after the last
+    /// client detaches / the last TUI closes before exiting. Default
+    /// 300 (5 minutes). Overridable at runtime from Settings (which
+    /// persists to `sessiond.state.toml`, see `sessiond_state`).
+    pub sessiond_grace_secs: u64,
 }
 
 impl Default for CoreConfig {
@@ -76,7 +84,8 @@ impl Default for CoreConfig {
             shell_win: vec!["pwsh".into(), "powershell".into(), "cmd".into()],
             shell_unix: vec!["fish".into(), "bash".into(), "sh".into()],
             tick_hz: 60,
-            sessiond: false,
+            sessiond: true,
+            sessiond_grace_secs: 300,
         }
     }
 }

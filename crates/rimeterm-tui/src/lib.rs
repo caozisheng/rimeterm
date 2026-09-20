@@ -17,6 +17,7 @@ pub mod agtop_worker;
 pub mod app;
 pub mod clipboard;
 pub mod diff_highlight;
+pub mod exit_dialog;
 pub mod file_manager_pane;
 pub mod fr_pane;
 pub mod game_pane;
@@ -53,6 +54,9 @@ pub mod todo_pane;
 pub mod updater;
 pub mod upgrade;
 pub mod viewer;
+pub mod workspace;
+pub mod workspace_strip;
+
 pub mod zones_pane;
 
 pub use app::App;

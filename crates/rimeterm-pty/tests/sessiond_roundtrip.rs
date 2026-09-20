@@ -65,7 +65,7 @@ async fn spawn_daemon(endpoint: String) -> anyhow::Result<DaemonThread> {
             rt.block_on(async move {
                 // Run until told to stop (or the daemon's own idle-exit).
                 tokio::select! {
-                    _ = daemon::run(&bind_endpoint) => {},
+                    _ = daemon::run(&bind_endpoint, Some(300)) => {},
                     _ = &mut shutdown_rx => {},
                 }
             });
@@ -148,9 +148,16 @@ async fn attach_echo_detach_reattach_persists() {
     let daemon_thread = spawn_daemon(endpoint.clone()).await.expect("daemon up");
 
     // Attach 1: spawn, see the banner.
-    let attached = attach_session(&endpoint, "t1", "label", "shell", echo_spec("HELLO-ONE"))
-        .await
-        .expect("attach 1");
+    let attached = attach_session(
+        &endpoint,
+        "t1",
+        "label",
+        "shell",
+        echo_spec("HELLO-ONE"),
+        Some(300),
+    )
+    .await
+    .expect("attach 1");
     assert_eq!(attached.welcome.cols, 80);
     let mut r1 = attached.reader;
     let mut w1 = attached.writer;
@@ -168,9 +175,16 @@ async fn attach_echo_detach_reattach_persists() {
 
     // Attach 2 to the same key: Welcome reports the same pid, and the
     // replay contains the earlier bytes (ring buffer did its job).
-    let attached2 = attach_session(&endpoint, "t1", "label", "shell", echo_spec("HELLO-TWO"))
-        .await
-        .expect("attach 2");
+    let attached2 = attach_session(
+        &endpoint,
+        "t1",
+        "label",
+        "shell",
+        echo_spec("HELLO-TWO"),
+        Some(300),
+    )
+    .await
+    .expect("attach 2");
     let mut r2 = attached2.reader;
     assert_eq!(
         attached2.welcome.pid, attached.welcome.pid,
@@ -213,9 +227,16 @@ async fn kill_removes_session_from_list() {
     let endpoint = temp_endpoint("kill");
     let _daemon_thread = spawn_daemon(endpoint.clone()).await.expect("daemon up");
 
-    let attached = attach_session(&endpoint, "k1", "label", "shell", echo_spec("KILL-ME"))
-        .await
-        .expect("attach");
+    let attached = attach_session(
+        &endpoint,
+        "k1",
+        "label",
+        "shell",
+        echo_spec("KILL-ME"),
+        Some(300),
+    )
+    .await
+    .expect("attach");
     let mut r = attached.reader;
     let mut w = attached.writer;
     await_output(&mut r, "KILL-ME").await;

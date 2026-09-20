@@ -40,6 +40,11 @@ pub enum SettingsTab {
     /// Glab pane configuration: repository URL override and
     /// authentication token for GitLab/GitHub CLI backends.
     Glab,
+    /// Session daemon (sessiond) controls: enable/disable hosting and
+    /// the after-last-close grace period. Persisted to
+    /// `sessiond.state.toml` (user-level override file), applied live
+    /// to a running daemon where possible.
+    Sessiond,
 }
 
 impl Default for SettingsTab {
@@ -86,6 +91,13 @@ pub enum SettingsAction {
     SetMemoryPolicy(rimeterm_config::memory_state::MemoryPolicy),
     ApplyGlabConfig(rimeterm_config::glab_config::GlabConfig),
     ClearGlabConfig,
+    /// Sessiond toggle + grace preset picked in the Daemon tab. Payload
+    /// is the full resolved view of the state file after the change.
+    /// App applies it to its in-memory host selection, persists the
+    /// override file, and pushes the new grace to a running daemon.
+    SetSessiond(rimeterm_config::sessiond_state::SessiondState),
+    /// Enable or disable top-level workspace tab management.
+    SetWorkspaceTabs(bool),
     Refresh,
     Close,
 }
@@ -144,6 +156,11 @@ pub struct SettingsState {
     pub glab_editing: Option<GlabEditField>,
     /// Text buffer for the field currently being edited.
     pub glab_edit_buffer: String,
+    /// Live copy of the sessiond override state (enabled + grace
+    /// preset), seeded from App on open.
+    pub sessiond_state: rimeterm_config::sessiond_state::SessiondState,
+    /// Whether top-level workspace tab management is enabled.
+    pub workspace_tabs_enabled: bool,
 }
 
 impl Default for SettingsState {
@@ -165,6 +182,8 @@ impl Default for SettingsState {
             glab_config: rimeterm_config::glab_config::GlabConfig::default(),
             glab_editing: None,
             glab_edit_buffer: String::new(),
+            sessiond_state: rimeterm_config::sessiond_state::SessiondState::default(),
+            workspace_tabs_enabled: true,
         }
     }
 }
@@ -257,6 +276,11 @@ impl SettingsState {
         self.glab_edit_buffer.clear();
     }
 
+    /// Seed the sessiond tab with the current override-file view.
+    pub fn set_sessiond_state(&mut self, state: rimeterm_config::sessiond_state::SessiondState) {
+        self.sessiond_state = state;
+    }
+
     fn row_count(&self) -> usize {
         match self.tab {
             SettingsTab::Agents => self.agents.len(),
@@ -275,6 +299,7 @@ impl SettingsState {
             }
             SettingsTab::Memory => MEMORY_LABELS.len(),
             SettingsTab::Glab => GLAB_ROW_COUNT,
+            SettingsTab::Sessiond => SESSIOND_ROW_COUNT,
         }
     }
 
@@ -406,6 +431,23 @@ impl SettingsState {
         if self.tab == SettingsTab::Memory && key.code == KeyCode::Char(' ') {
             return self.toggle_memory_at_cursor();
         }
+        // Sessiond tab: h/l steps the grace preset (matching the render
+        // hint); Space/Enter falls through to selected_action.
+        if self.tab == SettingsTab::Sessiond && key.code == KeyCode::Char(' ') {
+            return self.sessiond_selected_action();
+        }
+        if self.tab == SettingsTab::Sessiond
+            && matches!(key.code, KeyCode::Left | KeyCode::Char('h'))
+            && self.cursor == SESSIOND_ROW_GRACE
+        {
+            return self.sessiond_step_grace(-1);
+        }
+        if self.tab == SettingsTab::Sessiond
+            && matches!(key.code, KeyCode::Right | KeyCode::Char('l'))
+            && self.cursor == SESSIOND_ROW_GRACE
+        {
+            return self.sessiond_step_grace(1);
+        }
         // Glab tab: 'd' clears the field under cursor.
         if self.tab == SettingsTab::Glab && key.code == KeyCode::Char('d') {
             return self.glab_clear_field_at_cursor();
@@ -421,14 +463,16 @@ impl SettingsState {
                     SettingsTab::Tabs => SettingsTab::Integration,
                     SettingsTab::Integration => SettingsTab::Memory,
                     SettingsTab::Memory => SettingsTab::Glab,
-                    SettingsTab::Glab => SettingsTab::Agents,
+                    SettingsTab::Glab => SettingsTab::Sessiond,
+                    SettingsTab::Sessiond => SettingsTab::Agents,
                 };
                 self.reset_cursor_for_tab();
                 None
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.tab = match self.tab {
-                    SettingsTab::Agents => SettingsTab::Glab,
+                    SettingsTab::Agents => SettingsTab::Sessiond,
+                    SettingsTab::Sessiond => SettingsTab::Glab,
                     SettingsTab::Viewer => SettingsTab::Agents,
                     SettingsTab::Shell => SettingsTab::Viewer,
                     SettingsTab::Tabs => SettingsTab::Shell,
@@ -447,7 +491,8 @@ impl SettingsState {
                     SettingsTab::Tabs => SettingsTab::Integration,
                     SettingsTab::Integration => SettingsTab::Memory,
                     SettingsTab::Memory => SettingsTab::Glab,
-                    SettingsTab::Glab => SettingsTab::Agents,
+                    SettingsTab::Glab => SettingsTab::Sessiond,
+                    SettingsTab::Sessiond => SettingsTab::Agents,
                 };
                 self.reset_cursor_for_tab();
                 None
@@ -501,6 +546,62 @@ impl SettingsState {
             }
             SettingsTab::Memory => self.toggle_memory_at_cursor(),
             SettingsTab::Glab => self.glab_selected_action(),
+            SettingsTab::Sessiond => self.sessiond_selected_action(),
+        }
+    }
+
+    // -- Sessiond tab helpers -------------------------------------------------
+
+    /// Effective grace from the state view: explicit value or the
+    /// config-file default (300s).
+    fn sessiond_effective_grace(&self) -> Option<u64> {
+        self.sessiond_state.grace_secs.or(Some(300))
+    }
+
+    /// Label of the effective grace preset.
+    fn sessiond_grace_preset(&self) -> String {
+        let effective = self.sessiond_effective_grace();
+        let preset = SESSIOND_GRACE_PRESETS
+            .iter()
+            .find(|p| **p == effective)
+            .copied()
+            .unwrap_or(Some(300));
+        sessiond_grace_preset_label(preset)
+    }
+
+    /// Step the grace preset: `dir` = -1 (h) or +1 (l), clamped.
+    /// Returns the action carrying the updated state.
+    fn sessiond_step_grace(&mut self, dir: i32) -> Option<SettingsAction> {
+        let effective = self.sessiond_effective_grace();
+        let mut idx = SESSIOND_GRACE_PRESETS
+            .iter()
+            .position(|p| *p == effective)
+            .unwrap_or(3) as i32;
+        idx = (idx + dir).clamp(0, SESSIOND_GRACE_PRESETS.len() as i32 - 1);
+        let mut next = self.sessiond_state.clone();
+        next.grace_secs = SESSIOND_GRACE_PRESETS[idx as usize];
+        self.sessiond_state = next.clone();
+        Some(SettingsAction::SetSessiond(next))
+    }
+
+    /// Toggle workspace tabs / daemon hosting, or step the grace preset.
+    fn sessiond_selected_action(&mut self) -> Option<SettingsAction> {
+        match self.cursor {
+            SESSIOND_ROW_WORKSPACES => {
+                self.workspace_tabs_enabled = !self.workspace_tabs_enabled;
+                Some(SettingsAction::SetWorkspaceTabs(
+                    self.workspace_tabs_enabled,
+                ))
+            }
+            SESSIOND_ROW_ENABLED => {
+                let mut next = self.sessiond_state.clone();
+                let current = next.enabled.unwrap_or(false);
+                next.enabled = Some(!current);
+                self.sessiond_state = next.clone();
+                Some(SettingsAction::SetSessiond(next))
+            }
+            SESSIOND_ROW_GRACE => self.sessiond_step_grace(1),
+            _ => None,
         }
     }
 
@@ -626,6 +727,7 @@ impl SettingsState {
             }
             SettingsTab::Memory => 0,
             SettingsTab::Glab => 0,
+            SettingsTab::Sessiond => 0,
         };
         self.glab_editing = None;
         self.glab_edit_buffer.clear();
@@ -693,6 +795,11 @@ impl SettingsState {
             ),
             Span::raw("  "),
             Span::styled(" Glab ", tab_style(self.tab == SettingsTab::Glab, accent)),
+            Span::raw("  "),
+            Span::styled(
+                " Daemon ",
+                tab_style(self.tab == SettingsTab::Sessiond, accent),
+            ),
             Span::styled(
                 "   [Tab] switch",
                 Style::default().add_modifier(Modifier::DIM),
@@ -937,6 +1044,48 @@ impl SettingsState {
                     Style::default().add_modifier(Modifier::DIM),
                 ));
             }
+            SettingsTab::Sessiond => {
+                lines.push(Line::styled(
+                    " [Space/Enter] toggle daemon hosting · [h/l] step grace · applies immediately",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                let workspace_checkbox = if self.workspace_tabs_enabled {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                lines.push(Line::styled(
+                    format!("  {workspace_checkbox} Workspace tab 管理"),
+                    row_style(self.cursor == SESSIOND_ROW_WORKSPACES),
+                ));
+                let enabled = self
+                    .sessiond_state
+                    .enabled
+                    .unwrap_or(rimeterm_config::CoreConfig::default().sessiond);
+                let checkbox = if enabled { "[x]" } else { "[ ]" };
+                lines.push(Line::styled(
+                    format!("  {checkbox} Host shells/agents in session daemon"),
+                    row_style(self.cursor == SESSIOND_ROW_ENABLED),
+                ));
+                let preset = self.sessiond_grace_preset();
+                lines.push(Line::styled(
+                    format!("  Grace after last close:  {preset}"),
+                    row_style(self.cursor == SESSIOND_ROW_GRACE),
+                ));
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "  Daemon keeps detached sessions alive after the last TUI closes,",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                lines.push(Line::styled(
+                    "  exiting (killing children) once the grace period elapses.",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+                lines.push(Line::styled(
+                    "  Changing this here also updates a running daemon immediately.",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
         }
         if let Some(busy) = &self.busy {
             lines.push(Line::styled(
@@ -979,6 +1128,32 @@ impl SettingsState {
             let text = format!("  {position}. {checkbox} {label:<14}{anchor_note}");
             lines.push(Line::styled(text, row_style(offset + idx == self.cursor)));
         }
+    }
+}
+
+// Sessiond tab rows
+const SESSIOND_ROW_WORKSPACES: usize = 0;
+const SESSIOND_ROW_ENABLED: usize = 1;
+const SESSIOND_ROW_GRACE: usize = 2;
+const SESSIOND_ROW_COUNT: usize = 3;
+
+/// Grace presets (seconds). `None` = never exit while sessions live.
+const SESSIOND_GRACE_PRESETS: [Option<u64>; 7] = [
+    Some(10),
+    Some(30),
+    Some(60),
+    Some(300),
+    Some(900),
+    Some(3600),
+    None,
+];
+
+fn sessiond_grace_preset_label(preset: Option<u64>) -> String {
+    match preset {
+        None => "never".to_string(),
+        Some(secs) if secs % 3600 == 0 => format!("{}h", secs / 3600),
+        Some(secs) if secs % 60 == 0 => format!("{}m", secs / 60),
+        Some(secs) => format!("{secs}s"),
     }
 }
 
@@ -1122,7 +1297,8 @@ mod tests {
 
     #[test]
     fn tab_cycle_visits_every_tab() {
-        // Agents → Viewer → Shell → Tabs → Integration → Memory → Glab → Agents
+        // Agents → Viewer → Shell → Tabs → Integration → Memory → Glab
+        // → Sessiond → Agents
         let mut state = SettingsState::default();
         state.open = true;
         assert_eq!(state.tab, SettingsTab::Agents);
@@ -1139,16 +1315,18 @@ mod tests {
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Glab);
         state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Sessiond);
+        state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Agents);
     }
 
     #[test]
-    fn left_arrow_wraps_from_agents_to_glab() {
+    fn left_arrow_wraps_from_agents_to_sessiond() {
         let mut state = SettingsState::default();
         state.open = true;
         assert_eq!(state.tab, SettingsTab::Agents);
         state.handle_key(key(KeyCode::Char('h')));
-        assert_eq!(state.tab, SettingsTab::Glab);
+        assert_eq!(state.tab, SettingsTab::Sessiond);
     }
 
     #[test]
@@ -1437,9 +1615,10 @@ mod tests {
         state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Glab);
         state.handle_key(key(KeyCode::Tab));
+        assert_eq!(state.tab, SettingsTab::Sessiond);
+        state.handle_key(key(KeyCode::Tab));
         assert_eq!(state.tab, SettingsTab::Agents);
     }
-
     #[test]
     fn memory_panel_has_one_row_per_policy_category() {
         let mut state = SettingsState::default();
@@ -1604,5 +1783,19 @@ mod tests {
         let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Repository"));
         assert!(text.contains("Token"));
+    }
+    #[test]
+    fn sessiond_workspace_tabs_row_toggles_default_on() {
+        let mut state = SettingsState::default();
+        state.open = true;
+        state.tab = SettingsTab::Sessiond;
+        state.cursor = 0;
+
+        assert!(state.workspace_tabs_enabled);
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter)),
+            Some(SettingsAction::SetWorkspaceTabs(false))
+        );
+        assert!(!state.workspace_tabs_enabled);
     }
 }

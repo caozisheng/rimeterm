@@ -46,15 +46,14 @@ use tracing::{debug, info, warn};
 use super::ring::ByteRing;
 use super::transport::{DuplexStream, FrameWriter, Incoming, SessionConn};
 use super::{
-    Attach, ClientMsg, DaemonMsg, Frame, IDLE_EXIT_AFTER, MAX_FRAME_BODY, RING_CAPACITY_BYTES,
-    SessionInfo, SpawnSpec, Welcome,
+    Attach, ClientMsg, DaemonMsg, Frame, GRACE_NEVER, IDLE_EXIT_AFTER, MAX_FRAME_BODY,
+    RING_CAPACITY_BYTES, SessionInfo, SpawnSpec, Welcome, grace_to_atomic,
 };
 use crate::pty_host::{NativePty, open_native_pty};
 use crate::session::{
     Listener, PtyBackend, SessionConfig, new_headless_term, parse_chunks, resize_term,
     respond_to_terminal_queries,
 };
-
 /// Shared daemon state. Locked with a parking_lot mutex; never held across
 /// an `.await`.
 struct Registry {
@@ -120,9 +119,17 @@ impl Registry {
     }
 }
 
-/// Run the daemon until idle-exit. Binds `endpoint`, accepts clients,
-/// hosts sessions. Returns when the daemon decides to shut down.
-pub async fn run(endpoint: &str) -> anyhow::Result<()> {
+/// Run the daemon until it decides to shut down. Binds `endpoint`,
+/// accepts clients, hosts sessions.
+///
+/// `grace_secs` (`None` = never): how long the daemon keeps hosting live
+/// sessions after the last client connection closes, before exiting and
+/// taking the children with it. Zero sessions + zero connections still
+/// exits after [`IDLE_EXIT_AFTER`] regardless of grace.
+pub async fn run(endpoint: &str, grace_secs: Option<u64>) -> anyhow::Result<()> {
+    let grace = Arc::new(std::sync::atomic::AtomicU64::new(grace_to_atomic(
+        grace_secs,
+    )));
     let mut incoming = Incoming::bind(endpoint).await?;
     let registry = Arc::new(Mutex::new(Registry {
         sessions: HashMap::new(),
@@ -130,12 +137,6 @@ pub async fn run(endpoint: &str) -> anyhow::Result<()> {
         next_generation: 0,
         next_conn_id: 0,
     }));
-
-    info!(endpoint = %endpoint, "sessiond listening");
-
-    // Accept on a dedicated task, handing streams over a channel. The
-    // Windows pipe accept is create-instance-then-await-connect; a
-    // cancelled `accept()` future drops the just-created instance, and a
     // client that had already connected to it would strand its bytes —
     // nothing would ever read them. `recv()` below is cancel-safe, so the
     // select loop can be cancelled freely without losing acceptances.
@@ -162,6 +163,7 @@ pub async fn run(endpoint: &str) -> anyhow::Result<()> {
     let mut idle_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut idle_since: Option<std::time::Instant> = None;
+    let shutdown = Arc::new(tokio::sync::Notify::new());
 
     loop {
         tokio::select! {
@@ -170,21 +172,44 @@ pub async fn run(endpoint: &str) -> anyhow::Result<()> {
                 let stream = accepted?;
                 idle_since = None;
                 let registry = Arc::clone(&registry);
-                tokio::spawn(handle_conn(stream, registry));
+                tokio::spawn(handle_conn(
+                    stream,
+                    registry,
+                    Arc::clone(&grace),
+                    Arc::clone(&shutdown),
+                ));
+            }
+            _ = shutdown.notified() => {
+                break;
             }
             _ = idle_tick.tick() => {
                 let (conns, live) = {
                     let reg = registry.lock();
                     (reg.conns, reg.has_live_sessions())
                 };
-                if conns == 0 && !live {
+                if conns > 0 {
+                    idle_since = None;
+                } else if !live {
+                    // Nothing hosted at all — the classic fast idle exit.
                     let since = *idle_since.get_or_insert_with(std::time::Instant::now);
                     if since.elapsed() >= IDLE_EXIT_AFTER {
                         info!("sessiond idle (no conns, no live sessions) — exiting");
                         break;
                     }
                 } else {
-                    idle_since = None;
+                    // Detached but still hosting: honor the grace window
+                    // (None = never exit while a session is alive).
+                    let secs = grace.load(std::sync::atomic::Ordering::Relaxed);
+                    if secs != GRACE_NEVER {
+                        let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= std::time::Duration::from_secs(secs) {
+                            info!(
+                                grace_secs = secs,
+                                "sessiond grace expired (no conns, live sessions) — exiting"
+                            );
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -211,7 +236,12 @@ pub async fn run(endpoint: &str) -> anyhow::Result<()> {
 }
 
 /// Handle one client connection end-to-end.
-async fn handle_conn(stream: Box<dyn DuplexStream>, registry: Arc<Mutex<Registry>>) {
+async fn handle_conn(
+    stream: Box<dyn DuplexStream>,
+    registry: Arc<Mutex<Registry>>,
+    grace: Arc<std::sync::atomic::AtomicU64>,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
     let conn_id = {
         let mut reg = registry.lock();
         reg.conns += 1;
@@ -224,7 +254,7 @@ async fn handle_conn(stream: Box<dyn DuplexStream>, registry: Arc<Mutex<Registry
     let (tx, rx) = mpsc::unbounded_channel::<Frame>();
     let writer_task = tokio::spawn(pump_writer(conn_id, writer, rx));
 
-    let outcome = serve_client(&mut reader, &tx, &registry, conn_id).await;
+    let outcome = serve_client(&mut reader, &tx, &registry, conn_id, &grace).await;
 
     // Detach: remove our broadcast registration FIRST (exact removal by
     // conn id), then drop our sender and await the writer draining what
@@ -241,6 +271,14 @@ async fn handle_conn(stream: Box<dyn DuplexStream>, registry: Arc<Mutex<Registry
     }
     debug!(conn_id, "sessiond conn: writer drained; conns decremented");
     registry.lock().conns -= 1;
+
+    // Shutdown request fully flushed (Ack included): tell the run loop to
+    // exit now. Only after this connection is completely torn down, so
+    // the conns count is consistent when the daemon dies.
+    if outcome.shutdown {
+        info!("sessiond: shutdown requested — exiting");
+        shutdown.notify_waiters();
+    }
 }
 
 /// Per-connection bookkeeping returned by `serve_client` so the detach path
@@ -248,31 +286,28 @@ async fn handle_conn(stream: Box<dyn DuplexStream>, registry: Arc<Mutex<Registry
 struct ConnOutcome {
     session_key: Option<String>,
     /// Identity of this connection's sender inside `LiveSession::attached`.
-    /// Senders are `Sync`-comparable? No — so we tag them at registration.
+    /// Senders have no identity, so the registration is tagged with the
+    /// connection's id at attach time.
     conn_id: u64,
+    /// Set by a `Shutdown` probe: after this connection's Ack has been
+    /// flushed, the daemon should kill everything and exit.
+    shutdown: bool,
 }
-
+/// Per-connection bookkeeping returned by `serve_client` so the detach path
+/// can remove exactly its own sender.
 async fn serve_client(
     reader: &mut super::transport::FrameReader,
     tx: &mpsc::UnboundedSender<Frame>,
     registry: &Arc<Mutex<Registry>>,
     conn_id: u64,
+    grace: &Arc<std::sync::atomic::AtomicU64>,
 ) -> ConnOutcome {
-    // First frame decides the connection's role.
     let first = match reader.read_frame().await {
         Ok(Some(frame)) => frame,
-        Ok(None) => {
-            return ConnOutcome {
-                session_key: None,
-                conn_id,
-            };
-        }
+        Ok(None) => return outcome_none(conn_id),
         Err(e) => {
             warn!(error = %e, "sessiond: malformed first frame");
-            return ConnOutcome {
-                session_key: None,
-                conn_id,
-            };
+            return outcome_none(conn_id);
         }
     };
     debug!(conn_id, "sessiond conn: first frame read");
@@ -280,10 +315,23 @@ async fn serve_client(
         Frame::ClientJson(ClientMsg::List) => {
             let sessions = registry.lock().live_infos();
             let _ = tx.send(Frame::DaemonJson(DaemonMsg::Sessions { sessions }));
+            outcome_none(conn_id)
+        }
+        Frame::ClientJson(ClientMsg::Shutdown) => {
+            // Ack below is queued; the exit trigger fires only after this
+            // connection fully drains (see `handle_conn`).
+            let _ = tx.send(Frame::DaemonJson(DaemonMsg::Ack));
             ConnOutcome {
                 session_key: None,
                 conn_id,
+                shutdown: true,
             }
+        }
+        Frame::ClientJson(ClientMsg::SetGrace { secs }) => {
+            grace.store(grace_to_atomic(secs), std::sync::atomic::Ordering::Relaxed);
+            info!(?secs, "sessiond: grace period updated");
+            let _ = tx.send(Frame::DaemonJson(DaemonMsg::Ack));
+            outcome_none(conn_id)
         }
         Frame::ClientJson(ClientMsg::Attach(attach)) => {
             serve_attached(reader, tx, registry, attach, conn_id).await
@@ -294,13 +342,18 @@ async fn serve_client(
                 "sessiond: expected Attach/List first, got something else"
             );
             let _ = tx.send(Frame::DaemonJson(DaemonMsg::Denied {
-                reason: "expected Attach or List as the first frame".into(),
+                reason: "expected Attach, List, Shutdown or SetGrace as the first frame".into(),
             }));
-            ConnOutcome {
-                session_key: None,
-                conn_id,
-            }
+            outcome_none(conn_id)
         }
+    }
+}
+
+fn outcome_none(conn_id: u64) -> ConnOutcome {
+    ConnOutcome {
+        session_key: None,
+        conn_id,
+        shutdown: false,
     }
 }
 
@@ -360,6 +413,7 @@ async fn serve_attached(
             return ConnOutcome {
                 session_key: None,
                 conn_id: 0,
+                shutdown: false,
             };
         };
         let mut session = match spawn_session(&key, &attach, spec) {
@@ -370,6 +424,7 @@ async fn serve_attached(
                 return ConnOutcome {
                     session_key: None,
                     conn_id: 0,
+                    shutdown: false,
                 };
             }
         };
@@ -436,6 +491,7 @@ async fn serve_attached(
         return ConnOutcome {
             session_key: None,
             conn_id: 0,
+            shutdown: false,
         };
     }
 
@@ -484,6 +540,7 @@ async fn serve_attached(
     ConnOutcome {
         session_key: Some(key),
         conn_id,
+        shutdown: false,
     }
 }
 /// Writer half of one connection: drain outbound frames to the socket.

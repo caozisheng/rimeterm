@@ -56,6 +56,20 @@ pub const MAX_FRAME_BODY: usize = 1024 * 1024;
 /// through the "TUI closed, sessions still running" window.
 pub const IDLE_EXIT_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Sentinel stored in the daemon's grace atomic meaning "never exit".
+/// `u64::MAX` seconds — no wall clock can reach it.
+pub const GRACE_NEVER: u64 = u64::MAX;
+
+/// Clamp a configured grace (seconds; `None` = never) to the atomic
+/// representation. Zero/negative-ish inputs clamp to 1s so a misconfigured
+/// value cannot spin-exit the daemon instantly.
+pub fn grace_to_atomic(secs: Option<u64>) -> u64 {
+    match secs {
+        None => GRACE_NEVER,
+        Some(s) => s.max(1),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Endpoint
 // ---------------------------------------------------------------------------
@@ -188,20 +202,35 @@ pub enum ClientMsg {
     /// List-only probe connection: reply with `DaemonMsg::Sessions`,
     /// then close. Never attaches.
     List,
+    /// Kill every live session and shut the daemon down now. Probe-style
+    /// message: send as the first frame of a short connection, like `List`.
+    Shutdown,
+    /// Adjust the after-last-close grace period without restarting the
+    /// daemon. Probe-style first-frame message, like `List`.
+    SetGrace {
+        /// New grace in seconds; `None` = never idle-exit.
+        secs: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonMsg {
     Welcome(Welcome),
-    Denied { reason: String },
-    Exited { status: u32 },
-    Sessions { sessions: Vec<SessionInfo> },
+    Denied {
+        reason: String,
+    },
+    Exited {
+        status: u32,
+    },
+    Sessions {
+        sessions: Vec<SessionInfo>,
+    },
+    /// Ack for `Shutdown` / `SetGrace`: the daemon confirms the operation
+    /// (the probe connection then closes; for `Shutdown` the whole daemon
+    /// process exits right after).
+    Ack,
 }
-
-// ---------------------------------------------------------------------------
-// Frame codec
-// ---------------------------------------------------------------------------
 
 /// Frame kind byte on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

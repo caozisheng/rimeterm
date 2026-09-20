@@ -60,6 +60,10 @@ pub(crate) fn probe() -> Option<bool> {
     }
 }
 
+fn explorer_command_line(exe: &str) -> String {
+    format!(r#""{exe}" --workspace-in-tab "%V""#)
+}
+
 /// Install the Explorer right-click entry. Idempotent: `reg add /f`
 /// overwrites existing values so re-running is safe. Returns the
 /// exe path that was registered on success (handy for the hint bar).
@@ -80,11 +84,10 @@ pub(crate) fn install() -> Result<std::path::PathBuf, String> {
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     let exe_str = rimeterm_config::paths::strip_extended_prefix(exe.to_string_lossy().as_ref());
 
-    // Explorer substitutes `%V` with the target folder. For the
-    // Directory verb `%V` is the clicked folder; for the Background
-    // verb it's the folder the user right-clicked INSIDE. `main.rs`
-    // then reads argv[1] as the workspace root.
-    let command_line = format!("\"{exe_str}\" \"%V\"");
+    // Explorer substitutes `%V` with the target folder. The explicit
+    // flag lets main.rs redirect into an existing workspace-tab host;
+    // if no host is reachable it falls back to a normal TUI startup.
+    let command_line = explorer_command_line(&exe_str);
 
     for parent in PARENT_KEYS {
         let verb_key = format!(r"HKCU\{parent}\{VERB_KEY}");
@@ -96,7 +99,7 @@ pub(crate) fn install() -> Result<std::path::PathBuf, String> {
         reg_add_value(&verb_key, "Icon", &exe_str)
             .map_err(|e| format!("write {verb_key}\\Icon: {e}"))?;
 
-        // Command: default value = `"exe" "%V"`.
+        // Command: default value = `"exe" --workspace-in-tab "%V"`.
         reg_add_default(&command_key, &command_line)
             .map_err(|e| format!("write {command_key}: {e}"))?;
     }
@@ -221,6 +224,14 @@ mod tests {
         // On CI without registry access it may return None; on any
         // supported platform it returns Some(_).
         let _ = probe();
+    }
+
+    #[test]
+    fn explorer_command_requests_workspace_tab_redirect() {
+        assert_eq!(
+            explorer_command_line(r"C:\Program Files\rimeterm.exe"),
+            r#""C:\Program Files\rimeterm.exe" --workspace-in-tab "%V""#
+        );
     }
 
     #[cfg(not(windows))]

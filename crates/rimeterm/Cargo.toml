@@ -20,6 +20,8 @@ rimeterm-core = { workspace = true }
 rimeterm-config = { workspace = true }
 rimeterm-tui = { workspace = true }
 rimeterm-pty = { workspace = true }
+rimeterm-ipc = { workspace = true }
+serde_json = "1"
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
