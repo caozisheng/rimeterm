@@ -60,6 +60,13 @@ pub struct CoreConfig {
 
     /// Main-loop tick ceiling (Hz). Event-driven redraw, this is only a bound.
     pub tick_hz: u16,
+
+    /// Host shells / agents / external tools under the session daemon
+    /// (`rimeterm --sessiond`) instead of in-process PTYs. When `true`,
+    /// closing rimeterm detaches — children keep running and the next
+    /// launch reattaches to them. Default `false` (opt-in; the daemon
+    /// binary and wire protocol are young).
+    pub sessiond: bool,
 }
 
 impl Default for CoreConfig {
@@ -69,6 +76,7 @@ impl Default for CoreConfig {
             shell_win: vec!["pwsh".into(), "powershell".into(), "cmd".into()],
             shell_unix: vec!["fish".into(), "bash".into(), "sh".into()],
             tick_hz: 60,
+            sessiond: false,
         }
     }
 }

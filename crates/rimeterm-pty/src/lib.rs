@@ -9,8 +9,10 @@
 pub mod agent_detect;
 pub mod agent_registry;
 pub mod osc_bridge;
+pub mod pty_host;
 pub mod resize_throttle;
 pub mod session;
+pub mod sessiond;
 pub mod shell_detect;
 
 pub use agent_detect::{AgentAvailability, ToolAvailability, detect_agent, detect_tool};

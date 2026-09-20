@@ -8,8 +8,9 @@
 
 use std::path::PathBuf;
 
+use crate::sessions::{SessionHost, launch};
 use anyhow::{Context, Result};
-use rimeterm_pty::{PtyBackend, Session, SessionConfig};
+use rimeterm_pty::SessionConfig;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::RedrawSender;
@@ -24,6 +25,8 @@ pub struct ExternalSpawn {
 pub type AgentSpawn = ExternalSpawn;
 
 pub fn spawn_external(
+    host: &SessionHost,
+    key: &str,
     program: PathBuf,
     args: Vec<String>,
     cwd: PathBuf,
@@ -45,11 +48,11 @@ pub fn spawn_external(
         env: rimeterm_config::env::default_env(tool_id),
         cols: initial_cols,
         rows: initial_rows,
-        backend: PtyBackend::Native,
+        backend: rimeterm_pty::PtyBackend::Native,
     };
 
-    let (session, mut rx) =
-        Session::spawn(cfg).with_context(|| format!("spawning `{}`", program.display()))?;
+    let (session, mut rx) = launch(host, key, &display_name, "tool", &cfg)
+        .with_context(|| format!("spawning `{}`", program.display()))?;
 
     // Mint the PaneId up-front so the forwarder can tag OSC events with
     // the origin pane. `PtyPane::with_id` reuses the same id below.
@@ -100,29 +103,4 @@ pub fn spawn_external(
         root_pid: session.root_pid(),
         pane: crate::pty_pane::PtyPane::with_id(pane_id, session, display_name),
     })
-}
-
-/// Alias kept for M3 callers. Forwards to [`spawn_external`] with all
-/// the same params — including the C18-D OSC channel.
-pub fn spawn_agent(
-    program: PathBuf,
-    args: Vec<String>,
-    cwd: PathBuf,
-    display_name: String,
-    initial_cols: u16,
-    initial_rows: u16,
-    redraw: RedrawSender,
-    osc_tx: UnboundedSender<(rimeterm_core::pane::PaneId, String)>,
-) -> Result<ExternalSpawn> {
-    spawn_external(
-        program,
-        args,
-        cwd,
-        display_name,
-        initial_cols,
-        initial_rows,
-        redraw,
-        osc_tx,
-        None, // agents don't get a config sandbox — they run their own
-    )
 }

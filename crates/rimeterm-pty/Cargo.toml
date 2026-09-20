@@ -13,11 +13,19 @@ workspace = true
 rimeterm-core = { workspace = true }
 portable-pty = { workspace = true }
 alacritty_terminal = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net", "fs", "io-util"] }
 bytes = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 which = { workspace = true }
 serde = { workspace = true }
+serde_json = "1"
 parking_lot = "0.12"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }

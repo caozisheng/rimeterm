@@ -72,6 +72,7 @@ use crate::palette::{
 use crate::pane_registry::PaneRegistry;
 use crate::pet_pane::PetPane;
 use crate::placeholder_pane::PlaceholderPane;
+use crate::sessions::SessionHost;
 use crate::shell_factory::spawn_shell;
 use crate::status_bar::{StatusBarHits, StatusBarHover, render as render_status_bar};
 use crate::tab_strip::render as render_tab_strip;
@@ -963,6 +964,10 @@ fn migrate_legacy_workspace_state(
 pub struct App {
     workspace_root: PathBuf,
     config: Config,
+    /// Session-host routing (native vs sessiond) + stable key prefix
+    /// shared by every PTY pane factory.
+    host: SessionHost,
+    key_prefix: String,
     memory_policy: rimeterm_config::memory_state::MemoryPolicy,
     remembered_ui: rimeterm_config::memory_state::UiState,
     shell_choice: ShellChoice,
@@ -1333,8 +1338,15 @@ impl App {
 
         let mut agents_members = Vec::new();
         let mut startup_agent_ids: Vec<(PaneId, &'static str)> = Vec::new();
+        // Session-host routing + stable key prefix, defined before the
+        // first factory call (agents restore) and reused by every later
+        // spawn site. Stored on Self for the runtime methods.
+        let host = SessionHost::from_config(&config);
+        let key_prefix = crate::sessions::key_prefix(&workspace_root);
         for spec in &config.agents.tabs {
             let id = build_agent_pane(
+                &host,
+                &format!("{key_prefix}tool-{}", spec.id),
                 &mut panes,
                 &session_writes,
                 spec,
@@ -1371,6 +1383,8 @@ impl App {
                     install_hint: Some(spec.install_hint.to_string()),
                 };
                 match build_agent_pane(
+                    &host,
+                    &format!("{key_prefix}tool-{}", external_spec.id),
                     &mut panes,
                     &session_writes,
                     &external_spec,
@@ -1482,6 +1496,8 @@ impl App {
         let shell_count = memory.ui.shell_tabs.unwrap_or(1).clamp(1, 16);
         let (shell_spawns, restore_error) = restore_requested_shells(shell_count, |number| {
             spawn_shell(
+                &host,
+                &format!("{key_prefix}shell-{number}"),
                 &shell_choice,
                 workspace_root.clone(),
                 format!("shell-{number}"),
@@ -1632,6 +1648,8 @@ impl App {
             last_file_manager_cwd: Some(workspace_root.clone()),
             workspace_root,
             config,
+            host,
+            key_prefix,
             memory_policy: memory.policy,
             remembered_ui: memory.ui,
             shell_choice,
@@ -4904,7 +4922,17 @@ impl App {
                 return Err(anyhow!("`{probed}` is not installed"));
             }
         };
+        // Resume = fresh instance by design: a unique key means the daemon
+        // spawns a new child even if a same-key session lingers. The pane
+        // id (unique per launch) is the key material.
+        let resume_key = format!(
+            "{}agent-resume-{}",
+            self.key_prefix,
+            rimeterm_core::pane::PaneId::next().0
+        );
         let spawn = crate::agent_factory::spawn_external(
+            &self.host,
+            &resume_key,
             program,
             spec.args,
             spec.cwd,
@@ -4956,6 +4984,8 @@ impl App {
         }
         let next_num = next_shell_number(&self.landscape_tabs.shells, &self.panes);
         let spawn = spawn_shell(
+            &self.host,
+            &format!("{}shell-{next_num}", self.key_prefix),
             &self.shell_choice,
             self.workspace_root.clone(),
             format!("shell-{next_num}"),
@@ -5052,6 +5082,15 @@ impl App {
         };
         let spawn_cwd = cwd;
         let new_id = build_agent_pane(
+            &self.host,
+            // Fresh instance by design — a unique key means the daemon
+            // spawns a new child instead of reattaching a lingering one.
+            &format!(
+                "{}tool-{}-{}",
+                self.key_prefix,
+                spec.id,
+                rimeterm_core::pane::PaneId::next().0
+            ),
             &mut self.panes,
             &self.session_writes,
             &external_spec,
@@ -5761,8 +5800,16 @@ impl App {
             .collect();
 
         self.persist_ui_state();
+        // Native: kill every hosted child (documented behavior). Daemon:
+        // drop the handles without killing — sessions keep running under
+        // the daemon and the next launch reattaches under stable keys.
         for id in all {
-            self.drop_pane_and_session(id);
+            if self.host.is_daemon() {
+                self.panes.remove(id);
+                self.session_writes.lock().remove(&id);
+            } else {
+                self.drop_pane_and_session(id);
+            }
         }
     }
 
@@ -6266,6 +6313,8 @@ fn persist_shell_choice(
 /// monitors are all external binaries. rimeterm does not bundle them.
 /// Missing → placeholder + install hint; present → PTY child.
 fn build_external_pane(
+    host: &SessionHost,
+    key: &str,
     panes: &mut PaneRegistry,
     session_writes: &parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
     spec: &rimeterm_config::ExternalToolSpec,
@@ -6289,6 +6338,8 @@ fn build_external_pane(
         rimeterm_pty::ToolAvailability::Available(program) => {
             let args: Vec<String> = spec.command.iter().skip(1).cloned().collect();
             let spawn = crate::agent_factory::spawn_external(
+                host,
+                key,
                 program,
                 args,
                 workspace_root.to_path_buf(),
@@ -6384,6 +6435,8 @@ fn resolve_managed_program(command: &[String]) -> Option<std::path::PathBuf> {
 
 /// Legacy alias for M3 callers.
 fn build_agent_pane(
+    host: &SessionHost,
+    key: &str,
     panes: &mut PaneRegistry,
     session_writes: &parking_lot::Mutex<std::collections::HashMap<PaneId, rimeterm_pty::Session>>,
     spec: &rimeterm_config::AgentSpec,
@@ -6392,6 +6445,8 @@ fn build_agent_pane(
     osc_tx: mpsc::UnboundedSender<(PaneId, String)>,
 ) -> Result<PaneId> {
     build_external_pane(
+        host,
+        key,
         panes,
         session_writes,
         spec,

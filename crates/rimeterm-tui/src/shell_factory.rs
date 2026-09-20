@@ -7,11 +7,12 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use rimeterm_pty::{PtyBackend, Session, SessionConfig, ShellChoice};
+use rimeterm_pty::{SessionConfig, ShellChoice};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::RedrawSender;
 use crate::pty_pane::PtyPane;
+use crate::sessions::{SessionHost, launch};
 
 /// Result of a successful spawn: the pane and nothing else (the session's
 /// output has been wired directly into the shared redraw signal).
@@ -19,6 +20,8 @@ pub struct ShellSpawn {
     pub pane: PtyPane,
 }
 pub fn spawn_shell(
+    host: &SessionHost,
+    key: &str,
     shell: &ShellChoice,
     cwd: PathBuf,
     display_name: String,
@@ -41,11 +44,11 @@ pub fn spawn_shell(
         env: rimeterm_config::env::default_env(None),
         cols: initial_cols,
         rows: initial_rows,
-        backend: PtyBackend::Native,
+        backend: rimeterm_pty::PtyBackend::Native,
     };
 
-    let (session, mut rx) =
-        Session::spawn(cfg).with_context(|| format!("spawning shell `{}`", program.display()))?;
+    let (session, mut rx) = launch(host, key, &display_name, "shell", &cfg)
+        .with_context(|| format!("spawning shell `{}`", program.display()))?;
 
     // Mint the PaneId up-front so the forwarder can tag OSC events with
     // the origin pane. Downstream `PtyPane::with_id` reuses it — no

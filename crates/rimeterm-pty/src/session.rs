@@ -18,23 +18,22 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::pty_host::NativePty;
+use crate::sessiond::transport::{FrameReader, FrameWriter};
+use crate::sessiond::{ClientMsg, DaemonMsg, Frame, SpawnSpec};
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::vte::ansi::Processor;
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::PtySize;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::osc_bridge::OscScanner;
 const PARSE_CHUNK_BYTES: usize = 1024;
-
-fn parse_chunks(bytes: &[u8]) -> std::slice::Chunks<'_, u8> {
-    bytes.chunks(PARSE_CHUNK_BYTES)
-}
 
 #[derive(Clone, Default)]
 struct RenderDirty(Arc<AtomicBool>);
@@ -107,6 +106,8 @@ pub enum SessionError {
     Io(#[source] std::io::Error),
     #[error("child already exited")]
     AlreadyExited,
+    #[error("session daemon transport: {0}")]
+    Remote(#[source] anyhow::Error),
 }
 
 /// Sent from the reader task up to the pane provider each time the grid
@@ -156,39 +157,98 @@ impl Dimensions for TermDims {
 /// for us to hold it inside an `Arc<Mutex<Term<T>>>`; `VoidListener` is
 /// a bare unit struct and satisfies all of those already. Actually we
 /// use it verbatim.
-type Listener = alacritty_terminal::event::VoidListener;
+pub(crate) type Listener = alacritty_terminal::event::VoidListener;
+
+/// Build a [`Term`] for the daemon's headless query responder —
+/// zero scrollback, only enough grid to track the cursor for DSR-CPR.
+pub(crate) fn new_headless_term(cols: u16, rows: u16) -> Term<Listener> {
+    let dims = TermDims {
+        columns: cols.max(2) as usize,
+        screen_lines: rows.max(1) as usize,
+    };
+    Term::new(
+        TermConfig {
+            scrolling_history: 0,
+            ..TermConfig::default()
+        },
+        &dims,
+        alacritty_terminal::event::VoidListener,
+    )
+}
+
+/// Resize a [`Term`] in place (grid first, then PTY — mirrors
+/// [`Session::resize`] ordering).
+pub(crate) fn resize_term<L: EventListener>(term: &mut Term<L>, cols: u16, rows: u16) {
+    let dims = TermDims {
+        columns: cols.max(2) as usize,
+        screen_lines: rows.max(1) as usize,
+    };
+    term.resize(dims);
+}
+
+/// Chunks of ≤ 1 KiB — the size the alacritty parser likes to see.
+pub(crate) fn parse_chunks(bytes: &[u8]) -> std::slice::Chunks<'_, u8> {
+    bytes.chunks(PARSE_CHUNK_BYTES)
+}
 
 /// A running PTY session. Cheap to clone — internal handles are `Arc`.
 ///
-/// C17 note: `Term<VoidListener>` lives behind a `parking_lot::Mutex`.
-/// alacritty's own event loop uses `FairMutex`, but our access pattern
-/// is read-heavy from the render thread and write-heavy from the single
-/// read task — the base mutex is fine.
+/// Two backends share this type:
+///
+/// - **Native** — the child lives in this process ([`Session::spawn`]).
+/// - **Remote** — the child lives in the session daemon; this session
+///   holds a VT-grid *replica* fed by the daemon's byte stream
+///   ([`Session::attach_remote`]). `with_term` and friends see the same
+///   grid either way; only `write`/`resize`/`kill` route differently.
 #[derive(Clone)]
-#[allow(dead_code)] // events_tx clones are kept for future subscribers
 pub struct Session {
-    child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
-    root_pid: Option<u32>,
-    /// Independent killer handle cloned off the child at spawn time.
-    ///
-    /// The reaper task holds `child`'s mutex inside a blocking
-    /// `wait()` for the child's entire lifetime, so any code path
-    /// that tries to `child.lock().kill()` — the shape `Session::kill`
-    /// used to have — deadlocks against the reaper on interactive
-    /// TUIs (gitui, shells) that never exit on their own.
-    /// `portable_pty::ChildKiller::clone_killer` hands us a separate
-    /// object that talks to the same OS process handle without
-    /// needing exclusive access to the `Child`; storing it here lets
-    /// [`Self::kill`] fire regardless of what the reaper is doing.
-    killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
-    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    inner: Arc<SessionInner>,
+}
+
+struct SessionInner {
+    backend: Backend,
+    /// VT grid. Native: fed by the local read loop. Remote: a replica
+    /// fed by the daemon's broadcast (replay + live bytes).
     term: Arc<Mutex<Term<Listener>>>,
     render_dirty: RenderDirty,
     viewport_at_bottom: ViewportAtBottom,
-    /// Writer end for stdin. `None` after the child exits.
-    writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
-    /// Notification channel for `SessionOutput::*`.
-    events_tx: mpsc::UnboundedSender<SessionOutput>,
+}
+
+enum Backend {
+    Native {
+        root_pid: Option<u32>,
+        /// Independent killer handle cloned off the child at spawn time.
+        ///
+        /// The reaper task holds `child`'s mutex inside a blocking
+        /// `wait()` for the child's entire lifetime, so any code path
+        /// that tries to `child.lock().kill()` — the shape `Session::kill`
+        /// used to have — deadlocks against the reaper on interactive
+        /// TUIs (gitui, shells) that never exit on their own.
+        /// `portable_pty::ChildKiller::clone_killer` hands us a separate
+        /// object that talks to the same OS process handle without
+        /// needing exclusive access to the `Child`; storing it here lets
+        /// [`Session::kill`] fire regardless of what the reaper is doing.
+        killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+        master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+        /// Writer end for stdin. `None` after the child exits.
+        writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+    },
+    Remote {
+        /// Root pid from the daemon's `Welcome`; used by agent monitors.
+        root_pid: Option<u32>,
+        /// stdin writes, bridged to the daemon as `ClientWrite` frames.
+        /// Same `Arc<Mutex<Option<..>>>` shape as native so
+        /// [`Session::write`] is backend-agnostic.
+        writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+        /// Control channel to the socket writer task (Resize / Kill).
+        control: mpsc::UnboundedSender<RemoteControl>,
+    },
+}
+
+/// Out-of-band requests a remote [`Session`] sends its socket writer task.
+pub(crate) enum RemoteControl {
+    Resize { cols: u16, rows: u16 },
+    Kill,
 }
 
 /// Immutable terminal scrollback state for rendering a viewport control.
@@ -206,75 +266,20 @@ impl Session {
     pub fn spawn(
         cfg: SessionConfig,
     ) -> Result<(Self, mpsc::UnboundedReceiver<SessionOutput>), SessionError> {
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                cols: cfg.cols,
-                rows: cfg.rows,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(SessionError::OpenPty)?;
-
-        let mut builder = CommandBuilder::new(cfg.program.clone());
-        for arg in &cfg.args {
-            builder.arg(arg);
-        }
-        if let Some(cwd) = &cfg.cwd {
-            builder.cwd(cwd);
-        }
-        for (k, v) in &cfg.env {
-            builder.env(k, v);
-        }
-
-        let child = pair
-            .slave
-            .spawn_command(builder)
-            .map_err(|source| SessionError::Spawn {
-                program: cfg.program.display().to_string(),
-                source,
-            })?;
-
-        // Slave end is now owned by the child; drop it locally to release resources.
-        drop(pair.slave);
-
-        let writer = pair.master.take_writer().map_err(|e| SessionError::Spawn {
-            program: cfg.program.display().to_string(),
-            source: e,
-        })?;
-
-        // Build the alacritty terminal. Scrollback = 5000 lines (matches
-        // the old vt100 setup); no cursor-blinking events, no OSC52.
-        let term_config = TermConfig {
-            scrolling_history: 5000,
-            ..TermConfig::default()
-        };
-        let dims = TermDims {
-            columns: cfg.cols as usize,
-            screen_lines: cfg.rows as usize,
-        };
-        let term = Arc::new(Mutex::new(Term::new(
-            term_config,
-            &dims,
-            alacritty_terminal::event::VoidListener,
-        )));
-        let root_pid = child.process_id();
-        let killer = child.clone_killer();
-        let child = Arc::new(Mutex::new(child));
-        let master = Arc::new(Mutex::new(pair.master));
-
+        let pty = crate::pty_host::open_native_pty(&cfg)?;
+        let NativePty {
+            child,
+            killer,
+            master,
+            writer,
+            reader,
+            root_pid,
+        } = pty;
+        let reader = reader.expect("fresh reader from open_native_pty");
+        let writer: Box<dyn Write + Send> = writer.lock().take().expect("fresh writer");
+        let term = Arc::new(Mutex::new(new_term_grid(cfg.cols, cfg.rows)));
         let (events_tx, events_rx) = mpsc::unbounded_channel();
 
-        // Spawn blocking reader that pumps bytes into the alacritty parser.
-        let reader = master
-            .lock()
-            .try_clone_reader()
-            .map_err(|e| SessionError::Spawn {
-                program: cfg.program.display().to_string(),
-                source: e,
-            })?;
-        let term_reader = Arc::clone(&term);
-        let events_tx_reader = events_tx.clone();
         // Wrap the writer once here; `read_loop` needs a handle to it so
         // it can respond to CSI DA / DSR queries from the child (Ink / TUI
         // apps refuse to draw until those responses arrive).
@@ -284,6 +289,8 @@ impl Session {
         let viewport_at_bottom = ViewportAtBottom::default();
         let dirty_for_reader = render_dirty.clone();
         let writer_for_reader = Arc::clone(&writer_shared);
+        let term_reader = Arc::clone(&term);
+        let events_tx_reader = events_tx.clone();
         tokio::task::spawn_blocking(move || {
             read_loop(
                 reader,
@@ -310,15 +317,100 @@ impl Session {
 
         Ok((
             Self {
-                child,
-                root_pid,
-                killer: Arc::new(Mutex::new(killer)),
-                master,
-                term,
-                render_dirty,
-                writer: writer_shared,
-                viewport_at_bottom,
-                events_tx,
+                inner: Arc::new(SessionInner {
+                    backend: Backend::Native {
+                        root_pid,
+                        killer,
+                        master,
+                        writer: writer_shared,
+                    },
+                    term,
+                    render_dirty,
+                    viewport_at_bottom,
+                }),
+            },
+            events_rx,
+        ))
+    }
+
+    /// Attach to a daemon-hosted session, spawning it there when unknown.
+    ///
+    /// The returned [`Session`] mirrors [`Self::spawn`]'s contract: a
+    /// receiver streaming `SessionOutput`, a local VT grid *replica* fed
+    /// by the daemon's byte stream (ring replay + live output), and
+    /// `write`/`resize`/`kill` routed over the daemon connection. Closing
+    /// the TUI drops this handle — the child keeps running under the
+    /// daemon until explicitly killed or the daemon idles out.
+    ///
+    /// **Must be called from a tokio runtime worker** — the attach
+    /// handshake and the pump/writer tasks need one. The TUI calls this
+    /// from its main loop; factories bridge with `block_on` when needed.
+    pub async fn attach_remote(
+        endpoint: &str,
+        key: &str,
+        label: &str,
+        kind: &str,
+        spec: SpawnSpec,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<SessionOutput>), SessionError> {
+        let attached = crate::sessiond::client::attach_session(endpoint, key, label, kind, spec)
+            .await
+            .map_err(SessionError::Remote)?;
+        let crate::sessiond::client::Attached {
+            welcome,
+            reader,
+            writer,
+        } = attached;
+
+        // Local replica grid — same shape the native read loop feeds, so
+        // `with_term` sees identical state either way. Ring-replay bytes
+        // (sent between Welcome and live output) arrive as plain
+        // DaemonOutput frames — indistinguishable from live bytes, by
+        // design: the replica replays them through the same parser.
+        let term = Arc::new(Mutex::new(new_term_grid(cols, rows)));
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let render_dirty = RenderDirty::default();
+        let viewport_at_bottom = ViewportAtBottom::default();
+
+        // Attaching to a session whose child already exited: no stream
+        // will follow, so surface the exit immediately like the native
+        // reaper does.
+        if let Some(status) = welcome.exit {
+            let _ = events_tx.send(SessionOutput::Exited { status });
+        }
+
+        // stdin writes → ClientWrite frames; control → Resize / Kill.
+        // Same Arc<Mutex<Option<..>>> writer shape as native so
+        // [`Session::write`] is backend-agnostic.
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (control_tx, control_rx) = mpsc::unbounded_channel::<RemoteControl>();
+        tokio::spawn(remote_writer_task(writer, write_rx, control_rx));
+        let stdin_writer = RemoteStdin::new(write_tx);
+
+        // Grid pump: daemon frames → parser → SessionOutput. The daemon
+        // answers terminal-capability queries itself (headless Term);
+        // this side never responds, so each query is answered exactly
+        // once even with a client attached.
+        tokio::spawn(remote_pump(
+            reader,
+            Arc::clone(&term),
+            events_tx.clone(),
+            render_dirty.clone(),
+        ));
+
+        Ok((
+            Self {
+                inner: Arc::new(SessionInner {
+                    backend: Backend::Remote {
+                        root_pid: welcome.pid,
+                        writer: Arc::new(Mutex::new(Some(Box::new(stdin_writer)))),
+                        control: control_tx,
+                    },
+                    term,
+                    render_dirty,
+                    viewport_at_bottom,
+                }),
             },
             events_rx,
         ))
@@ -326,12 +418,16 @@ impl Session {
 
     /// Return the OS pid of the process launched directly in this PTY.
     pub fn root_pid(&self) -> Option<u32> {
-        self.root_pid
+        match &self.inner.backend {
+            Backend::Native { root_pid, .. } | Backend::Remote { root_pid, .. } => *root_pid,
+        }
     }
 
     /// Send raw bytes to the child. Silent no-op after the child exited.
     pub fn write(&self, bytes: &[u8]) -> Result<(), SessionError> {
-        let mut w = self.writer.lock();
+        let mut w = match &self.inner.backend {
+            Backend::Native { writer, .. } | Backend::Remote { writer, .. } => writer.lock(),
+        };
         let Some(writer) = w.as_mut() else {
             return Err(SessionError::AlreadyExited);
         };
@@ -343,24 +439,28 @@ impl Session {
     /// which is expensive (~200 μs) — caller should throttle (§19.12.6).
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), SessionError> {
         // Update the alacritty grid first so redraw is instant.
-        let dims = TermDims {
-            columns: cols as usize,
-            screen_lines: rows as usize,
-        };
-        self.term.lock().resize(dims);
-        self.render_dirty.mark();
-        self.master
-            .lock()
-            .resize(PtySize {
-                cols,
-                rows,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| SessionError::Spawn {
-                program: "resize".into(),
-                source: e,
-            })?;
+        resize_term(&mut self.inner.term.lock(), cols, rows);
+        self.inner.render_dirty.mark();
+        match &self.inner.backend {
+            // On Windows this ends up in `ResizePseudoConsole`.
+            Backend::Native { master, .. } => master
+                .lock()
+                .resize(PtySize {
+                    cols,
+                    rows,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| SessionError::Spawn {
+                    program: "resize".into(),
+                    source: e,
+                })?,
+            // The daemon resizes its headless query Term and the real PTY;
+            // our replica grid was already resized above.
+            Backend::Remote { control, .. } => {
+                let _ = control.send(RemoteControl::Resize { cols, rows });
+            }
+        }
         Ok(())
     }
 
@@ -368,7 +468,7 @@ impl Session {
     /// the guard for the shortest time possible; the read loop takes the
     /// same mutex.
     pub fn with_term<R>(&self, f: impl FnOnce(&Term<Listener>) -> R) -> R {
-        let t = self.term.lock();
+        let t = self.inner.term.lock();
         f(&t)
     }
 
@@ -379,7 +479,7 @@ impl Session {
     /// possible; the read loop takes the same mutex to feed VTE bytes
     /// through `Processor::advance`.
     pub fn with_term_mut<R>(&self, f: impl FnOnce(&mut Term<Listener>) -> R) -> R {
-        let mut t = self.term.lock();
+        let mut t = self.inner.term.lock();
         f(&mut t)
     }
 
@@ -389,26 +489,27 @@ impl Session {
         if lines == 0 {
             return;
         }
-        let mut term = self.term.lock();
+        let mut term = self.inner.term.lock();
         scroll_term_lines(&mut term, lines);
-        self.viewport_at_bottom
+        self.inner
+            .viewport_at_bottom
             .set(term.grid().display_offset() == 0);
-        self.render_dirty.mark();
+        self.inner.render_dirty.mark();
     }
 
     /// Set the terminal viewport offset, where zero is the live bottom.
     pub fn scroll_to_offset(&self, offset: usize) {
-        if offset == 0 && self.viewport_at_bottom.get() {
+        if offset == 0 && self.inner.viewport_at_bottom.get() {
             return;
         }
-        scroll_term_to_offset(&mut self.term.lock(), offset);
-        self.viewport_at_bottom.set(offset == 0);
-        self.render_dirty.mark();
+        scroll_term_to_offset(&mut self.inner.term.lock(), offset);
+        self.inner.viewport_at_bottom.set(offset == 0);
+        self.inner.render_dirty.mark();
     }
 
     /// Snapshot the metrics needed to render and position a scrollbar.
     pub fn scroll_metrics(&self) -> ScrollMetrics {
-        term_scroll_metrics(&self.term.lock())
+        term_scroll_metrics(&self.inner.term.lock())
     }
 
     /// Snapshot the grid contents as a plain string, optionally trimmed to
@@ -428,10 +529,10 @@ impl Session {
     /// This spins up a throwaway `Processor` per call — fine for the
     /// low-frequency "synthetic banner" use case; not for hot paths.
     pub fn inject_grid_bytes(&self, bytes: &[u8]) {
-        let mut term = self.term.lock();
+        let mut term = self.inner.term.lock();
         let mut processor: Processor = Processor::new();
         processor.advance(&mut *term, bytes);
-        self.render_dirty.mark();
+        self.inner.render_dirty.mark();
     }
 
     /// Rendered dimensions of the grid — cols, rows. Useful when a caller
@@ -443,7 +544,7 @@ impl Session {
     /// Consume the session's render-dirty flag. Reader output and local grid
     /// mutations set this flag; idle panes return false without locking the grid.
     pub fn take_render_dirty(&self) -> bool {
-        self.render_dirty.take()
+        self.inner.render_dirty.take()
     }
 
     /// Mark the session render-dirty without touching the grid. Used by
@@ -451,20 +552,172 @@ impl Session {
     /// (e.g. rimeterm-owned mouse selections anchored in
     /// `Term.selection`) so the next `render` repaints.
     pub fn mark_render_dirty(&self) {
-        self.render_dirty.mark();
+        self.inner.render_dirty.mark();
     }
 
     /// Best-effort kill for shutdown / respawn (`drop_pane_and_session`).
     ///
-    /// Uses the independent killer handle so we never race the reaper
-    /// task that lives inside `child.lock().wait()`. Errors are
-    /// swallowed: killing a process that already exited returns an
-    /// OS-specific "no such process" error which we don't want to log
-    /// noisily, and the reaper will surface any real exit status
-    /// through `SessionOutput::Exited` anyway.
+    /// Native: uses the independent killer handle so we never race the
+    /// reaper task that lives inside `child.lock().wait()`. Remote: sends
+    /// `Kill` to the daemon, which kills the hosted child; the pump then
+    /// sees the daemon's `Exited` frame and the pane renders "[exit N]".
+    /// Errors are swallowed in both arms — killing a process that already
+    /// exited returns an OS-specific "no such process" error which we
+    /// don't want to log noisily.
     pub fn kill(&self) {
-        let mut k = self.killer.lock();
-        let _ = k.kill();
+        match &self.inner.backend {
+            Backend::Native { killer, .. } => {
+                let mut k = killer.lock();
+                let _ = k.kill();
+            }
+            Backend::Remote {
+                control, writer, ..
+            } => {
+                let _ = control.send(RemoteControl::Kill);
+                // Further stdin writes report AlreadyExited, mirroring
+                // native post-exit behavior.
+                *writer.lock() = None;
+            }
+        }
+    }
+}
+
+/// Build the client-visible grid: 5000-line scrollback, same shape for
+/// the native in-process Term and the remote daemon-fed replica, so
+/// `with_term` consumers see identical state either way.
+fn new_term_grid(cols: u16, rows: u16) -> Term<Listener> {
+    let dims = TermDims {
+        columns: cols.max(2) as usize,
+        screen_lines: rows.max(1) as usize,
+    };
+    Term::new(
+        TermConfig {
+            scrolling_history: 5000,
+            ..TermConfig::default()
+        },
+        &dims,
+        alacritty_terminal::event::VoidListener,
+    )
+}
+
+/// `Write` adapter that turns stdin writes into `ClientWrite` frames by
+/// enqueueing on an unbounded channel to the socket writer task. Cheap,
+/// non-blocking, and never splits mid-write from the caller's view.
+struct RemoteStdin {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl RemoteStdin {
+    fn new(tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+        Self { tx }
+    }
+}
+
+impl Write for RemoteStdin {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tx.send(buf.to_vec()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sessiond writer gone")
+        })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Socket writer half of a remote session: drains stdin bytes and control
+/// requests, encoding them as frames. Exits when either channel closes
+/// (session dropped / daemon gone), which detaches cleanly.
+async fn remote_writer_task(
+    mut writer: FrameWriter,
+    mut write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut control_rx: mpsc::UnboundedReceiver<RemoteControl>,
+) {
+    loop {
+        tokio::select! {
+            maybe_bytes = write_rx.recv() => {
+                match maybe_bytes {
+                    Some(bytes) => {
+                        if writer.write_frame(&Frame::ClientWrite(bytes)).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            maybe_control = control_rx.recv() => {
+                match maybe_control {
+                    Some(RemoteControl::Resize { cols, rows }) => {
+                        let frame = Frame::ClientJson(ClientMsg::Resize { cols, rows });
+                        if writer.write_frame(&frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(RemoteControl::Kill) => {
+                        // Best effort — the daemon kills and reports Exited.
+                        let _ = writer
+                            .write_frame(&Frame::ClientJson(ClientMsg::Kill))
+                            .await;
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
+/// Grid pump of a remote session: daemon frames → parser → SessionOutput.
+/// Mirrors the native `read_loop` byte-feed order (parse → dirty → OSC →
+/// Redraw) minus `respond_to_terminal_queries` — the daemon owns query
+/// responses, so a query is never answered twice.
+async fn remote_pump(
+    mut reader: FrameReader,
+    term: Arc<Mutex<Term<Listener>>>,
+    tx: mpsc::UnboundedSender<SessionOutput>,
+    dirty: RenderDirty,
+) {
+    // One Processor per session — parser state (partial escape
+    // sequences) must persist across frames, same as native reads.
+    let mut processor: Processor = Processor::new();
+    let mut osc_scanner = OscScanner::new();
+    loop {
+        match reader.read_frame().await {
+            Ok(Some(Frame::DaemonOutput(bytes))) => {
+                for chunk in parse_chunks(&bytes) {
+                    let mut t = term.lock();
+                    processor.advance(&mut *t, chunk);
+                    // Hand the grid directly to a waiting renderer instead
+                    // of immediately reacquiring it for the next chunk.
+                    parking_lot::MutexGuard::unlock_fair(t);
+                }
+                dirty.mark();
+                for payload in osc_scanner.feed(&bytes) {
+                    if tx.send(SessionOutput::OscRimeterm { payload }).is_err() {
+                        return;
+                    }
+                }
+                if tx.send(SessionOutput::Redraw).is_err() {
+                    return;
+                }
+            }
+            Ok(Some(Frame::DaemonJson(DaemonMsg::Exited { status }))) => {
+                debug!(status, "sessiond session exited");
+                let _ = tx.send(SessionOutput::Exited { status });
+                return;
+            }
+            // Other JSON frames aren't part of the post-attach stream.
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                debug!("sessiond stream ended");
+                return;
+            }
+            Err(e) => {
+                warn!(error = %e, "sessiond pump errored");
+                return;
+            }
+        }
     }
 }
 
@@ -968,7 +1221,7 @@ fn read_loop(
 ///
 /// Any other CSI sequence is left alone; the child either doesn't care or
 /// tolerates silence.
-fn respond_to_terminal_queries(
+pub(crate) fn respond_to_terminal_queries(
     data: &[u8],
     term: &Arc<Mutex<Term<Listener>>>,
     writer: &Arc<Mutex<Option<Box<dyn Write + Send>>>>,

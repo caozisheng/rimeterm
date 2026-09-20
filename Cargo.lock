@@ -5191,13 +5191,16 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "bytes",
+ "libc",
  "parking_lot",
  "portable-pty",
  "rimeterm-core",
  "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "which",
 ]
 

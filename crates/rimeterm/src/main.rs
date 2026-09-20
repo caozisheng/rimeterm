@@ -25,7 +25,27 @@ use rimeterm_tui::App;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
-    init_tracing();
+    // Hidden daemon mode: `rimeterm --sessiond` runs the PTY host daemon
+    // (see rimeterm_pty::sessiond). Checked before anything else so a
+    // detached daemon never touches workspace/config/assets — those belong
+    // to the TUI process. The daemon autostarts itself via this flag.
+    if std::env::args_os().any(|a| a == "--sessiond") {
+        init_tracing();
+        // `--endpoint <path|pipe>` overrides the default (used by tests
+        // and by `sessiond::client::spawn_detached_daemon`).
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        let endpoint = args
+            .iter()
+            .position(|a| a == "--endpoint")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.to_str().map(str::to_owned))
+            .unwrap_or_else(rimeterm_pty::sessiond::default_endpoint);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return runtime
+            .block_on(async move { rimeterm_pty::sessiond::daemon::run(&endpoint).await });
+    }
 
     let memory = load_global_memory();
     let (workspace_root, explicit_workspace) = resolve_workspace_root(&memory)?;
