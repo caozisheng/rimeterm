@@ -294,9 +294,13 @@ pub struct Generation(pub u64);
 /// straight to the nearest checkpoint instead of re-parsing from
 /// the top. 500 chosen so a 10 kloc file has ~20 checkpoints
 /// (~20 KB of `Vec<ParseState>` clones — trivial memory) and each
-/// worst-case scroll re-runs at most 500 lines through syntect
 /// (< 1 ms on modern CPUs, imperceptible in the input loop).
 pub(crate) const CODE_HL_STRIDE: usize = 500;
+
+/// Max terminal rows a mermaid diagram may reserve. Shared by
+/// `derive_mermaid_row_height`'s clamp and the raster budget so the
+/// pixmap we rasterise never exceeds what the overlay can show.
+pub(crate) const MERMAID_MAX_ROWS: u16 = 40;
 
 /// P1-1 cached parser + highlighter snapshot at a line boundary.
 /// Cheap to clone — `ParseState` is one `Vec<StackEntry>` + a
@@ -1456,7 +1460,16 @@ fn markdown_blocks_to_layout(
                 // No picker OR renderer error → sentinel fallback so
                 // the reader still sees the raw diagram source.
                 let placement = picker.zip(font_size).and_then(|(picker, font_size)| {
-                    let raster = rendered.get_or_init(|| render_mermaid_to_image(source));
+                    // Rasterise at the display budget — at most
+                    // `content_width` cells wide and
+                    // `MERMAID_MAX_ROWS` rows tall. Without this a
+                    // large SVG rasterises at natural size (up to
+                    // MAX_TEXTURE_SIZE per side) on the draw thread,
+                    // freezing the UI for the raster + resize cost.
+                    let budget_w = u32::from(content_width).max(1) * u32::from(font_size.0);
+                    let budget_h = u32::from(MERMAID_MAX_ROWS) * u32::from(font_size.1);
+                    let raster = rendered
+                        .get_or_init(|| render_mermaid_to_image(source, budget_w, budget_h));
                     let raster = raster.as_ref().ok()?;
                     let rows = derive_mermaid_row_height(raster, content_width, font_size);
                     // Clone the DynamicImage ONCE at layout time; the
@@ -1520,7 +1533,7 @@ fn derive_mermaid_row_height(
         .checked_div(u64::from(raster.width.max(1)))
         .unwrap_or(0);
     let rows = display_px_h.div_ceil(u64::from(cell_h)) as u16;
-    rows.clamp(3, 40)
+    rows.clamp(3, MERMAID_MAX_ROWS)
 }
 
 /// Paint each [`MermaidPlacement`] on top of the just-drawn paragraph

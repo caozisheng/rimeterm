@@ -29,8 +29,9 @@ fn main() -> Result<()> {
     // (see rimeterm_pty::sessiond). Checked before anything else so a
     // detached daemon never touches workspace/config/assets — those belong
     // to the TUI process. The daemon autostarts itself via this flag.
+    init_tracing();
+    install_panic_hook();
     if std::env::args_os().any(|a| a == "--sessiond") {
-        init_tracing();
         // `--endpoint <path|pipe>` overrides the default (used by tests
         // and by `sessiond::client::spawn_detached_daemon`).
         let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
@@ -303,6 +304,45 @@ mod tests {
         ];
 
         assert_eq!(workspace_in_tab_arg(args), None);
+    }
+}
+
+/// Route panics into the trace log instead of the default stderr dump.
+///
+/// Why: the TUI runs in raw mode on the alternate screen. The default
+/// panic hook writes to stderr, which interleaves garbage bytes with
+/// the rendered frame (the "garbled frozen screen" symptom), and with
+/// `RUST_BACKTRACE=1` dbghelp symbolizes a ~263k-symbol PDB, pinning a
+/// core for minutes while the app appears hung. The hook below writes
+/// the panic to the already-initialized tracing file sink instead —
+/// zero terminal output, near-instant, and the log carries the full
+/// message plus thread name.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        let message = payload_message(info);
+        let thread = std::thread::current();
+        tracing::error!(
+            thread = thread.name().unwrap_or("<unnamed>"),
+            location = %location,
+            panic = %message,
+            "panic"
+        );
+    }));
+}
+
+/// Extract the human-readable message from a `PanicHookInfo` payload
+/// (either `String` or `&'static str`).
+fn payload_message(info: &std::panic::PanicHookInfo<'_>) -> String {
+    if let Some(s) = info.payload().downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = info.payload().downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "non-string panic payload".to_owned()
     }
 }
 

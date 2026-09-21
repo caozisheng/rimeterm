@@ -27,8 +27,9 @@
 //!    system-font enumeration happens once (~hundreds of ms first hit,
 //!    zero after).
 //! 4. **Rasterise** into a [`tiny_skia::Pixmap`] via [`resvg::render`],
-//!    guarded by [`MAX_TEXTURE_SIZE`] to avoid unreasonable pixmap
-//!    allocations on pathological SVGs.
+//!    scaled down to the caller's display budget and never above
+//!    [`MAX_TEXTURE_SIZE`], so pathological SVGs cannot produce
+//!    multi-hundred-MiB pixmaps on the UI thread.
 //! 5. **PNG-encode + decode** through [`image::load_from_memory`] so
 //!    the output is the same [`image::DynamicImage`] type the existing
 //!    viewer image branch feeds to `ratatui-image`.
@@ -98,13 +99,26 @@ pub struct MermaidPixmap {
 /// [`MermaidPixmap`]. Never panics — every failure surface returns a
 /// [`MermaidError`].
 ///
+/// `max_width` / `max_height` bound the raster: the SVG is scaled down
+/// (never up) to fit within both. Pass the *display* budget — viewport
+/// cells × cell pixels — so a pathologically large diagram rasters at
+/// (roughly) the size it will actually be shown, instead of the
+/// absolute [`MAX_TEXTURE_SIZE`] cap which produced multi-hundred-MiB
+/// pixmaps and minutes-long rasterisation for diagrams displayed at a
+/// few dozen terminal rows. [`MAX_TEXTURE_SIZE`] remains the hard
+/// ceiling when a caller passes a larger budget.
+///
 /// The heavy work (font enumeration, SVG parse, raster) happens on the
 /// calling thread; there is no internal parallelism. Callers that
 /// render several diagrams per document should cache the result per
 /// block (e.g. in `DocBlock::Mermaid::rendered`), since re-running the
 /// pipeline for the same source is deterministic but not free
 /// (typically 5–50 ms per diagram on modern hardware).
-pub fn render_mermaid_to_image(source: &str) -> Result<MermaidPixmap, MermaidError> {
+pub fn render_mermaid_to_image(
+    source: &str,
+    max_width: u32,
+    max_height: u32,
+) -> Result<MermaidPixmap, MermaidError> {
     let sanitised = sanitise_source(source);
 
     // catch_unwind because mermaid_rs_renderer 0.2 is known to panic on
@@ -128,7 +142,7 @@ pub fn render_mermaid_to_image(source: &str) -> Result<MermaidPixmap, MermaidErr
         }
     };
 
-    rasterise_svg(&svg)
+    rasterise_svg(&svg, max_width, max_height)
 }
 
 /// Fixes mermaid-JS-only tokens the pure-Rust `mermaid_rs_renderer`
@@ -157,7 +171,15 @@ fn sanitise_source(source: &str) -> String {
 
 /// SVG → raster. Split out so the pipeline can be tested with a
 /// hand-crafted SVG when `mermaid_rs_renderer` output shape drifts.
-fn rasterise_svg(svg: &str) -> Result<MermaidPixmap, MermaidError> {
+///
+/// `max_width` / `max_height` are the caller's display budget (e.g.
+/// viewport cells × cell pixels). The raster is scaled down to fit it
+/// — never up — and never exceeds [`MAX_TEXTURE_SIZE`].
+fn rasterise_svg(
+    svg: &str,
+    max_width: u32,
+    max_height: u32,
+) -> Result<MermaidPixmap, MermaidError> {
     let mut options = usvg::Options::default();
     options.fontdb = fontdb();
 
@@ -169,11 +191,13 @@ fn rasterise_svg(svg: &str) -> Result<MermaidPixmap, MermaidError> {
         return Err(MermaidError::EmptySvg);
     }
 
-    // Clamp so no dimension exceeds MAX_TEXTURE_SIZE. Preserve aspect.
-    // Never scale up (a small diagram stays at natural size).
+    // Clamp to the caller's display budget, never above
+    // MAX_TEXTURE_SIZE, preserve aspect, never scale up.
+    let budget_w = max_width.clamp(1, MAX_TEXTURE_SIZE) as f32;
+    let budget_h = max_height.clamp(1, MAX_TEXTURE_SIZE) as f32;
     let scale = {
-        let scale_w = MAX_TEXTURE_SIZE as f32 / svg_w;
-        let scale_h = MAX_TEXTURE_SIZE as f32 / svg_h;
+        let scale_w = budget_w / svg_w;
+        let scale_h = budget_h / svg_h;
         scale_w.min(scale_h).min(1.0)
     };
     let width = (svg_w * scale).max(1.0) as u32;
@@ -221,8 +245,12 @@ mod tests {
         // The README canonical example. If mermaid_rs_renderer's output
         // shape changes upstream, we want that failure surfaced here
         // rather than as a silent regression in the TUI.
-        let pixmap =
-            render_mermaid_to_image("graph LR\nA[Build] --> B[Test] --> C[Deploy]").expect("ok");
+        let pixmap = render_mermaid_to_image(
+            "graph LR\nA[Build] --> B[Test] --> C[Deploy]",
+            MAX_TEXTURE_SIZE,
+            MAX_TEXTURE_SIZE,
+        )
+        .expect("ok");
         assert!(pixmap.width > 0);
         assert!(pixmap.height > 0);
         assert_eq!(pixmap.image.width(), pixmap.width);
@@ -243,7 +271,7 @@ mod tests {
             "classDiagram\n  class A\n  A <|-- B",
             "stateDiagram-v2\n  [*] --> Running\n  Running --> [*]",
         ] {
-            let out = render_mermaid_to_image(src);
+            let out = render_mermaid_to_image(src, MAX_TEXTURE_SIZE, MAX_TEXTURE_SIZE);
             assert!(out.is_ok(), "keyword rasterise failed: {src:?} → {out:?}");
         }
     }
@@ -276,7 +304,7 @@ mod tests {
         // depending on which layer noticed first. Either is fine — the
         // contract is "never panic, never return an all-zero image".
         let empty = r#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"></svg>"#;
-        let err = rasterise_svg(empty).expect_err("err");
+        let err = rasterise_svg(empty, MAX_TEXTURE_SIZE, MAX_TEXTURE_SIZE).expect_err("err");
         assert!(
             matches!(err, MermaidError::EmptySvg | MermaidError::Rasterize(_)),
             "expected EmptySvg or Rasterize, got {err:?}"
@@ -291,7 +319,7 @@ mod tests {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
                         <rect width="40" height="20" fill="red"/>
                      </svg>"#;
-        let pixmap = rasterise_svg(svg).expect("ok");
+        let pixmap = rasterise_svg(svg, MAX_TEXTURE_SIZE, MAX_TEXTURE_SIZE).expect("ok");
         assert_eq!(pixmap.width, 40);
         assert_eq!(pixmap.height, 20);
         assert_eq!(pixmap.image.width(), 40);
@@ -304,5 +332,32 @@ mod tests {
         // zero-pixel rasters for every diagram in the workspace.
         assert!(MAX_TEXTURE_SIZE >= 1024);
         assert!(MAX_TEXTURE_SIZE <= 16384);
+    }
+
+    #[test]
+    fn display_budget_downscales_huge_svg() {
+        // Regression guard for the draw-thread freeze: a 2000×1000 SVG
+        // displayed at a ~40-row budget must raster small, not at its
+        // natural size. Budget-driven downscale (never upscale) keeps
+        // the pixmap allocation and tiny_skia time bounded by what the
+        // terminal can actually show.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="1000">
+                        <rect width="2000" height="1000" fill="red"/>
+                     </svg>"#;
+        // 120 cols × 10 px cell, 40 rows × 20 px cell.
+        let pixmap = rasterise_svg(svg, 1200, 800).expect("ok");
+        assert!(
+            pixmap.width <= 1200,
+            "width {} exceeds budget",
+            pixmap.width
+        );
+        assert!(
+            pixmap.height <= 800,
+            "height {} exceeds budget",
+            pixmap.height
+        );
+        // Aspect preserved: 2000×1000 → 2:1 ratio must survive.
+        let ratio = pixmap.width as f64 / pixmap.height as f64;
+        assert!((ratio - 2.0).abs() < 0.05, "aspect ratio drifted: {ratio}");
     }
 }

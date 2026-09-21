@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::env;
-use std::io::Cursor;
+use std::io::{Cursor, IsTerminal};
 
 use image::{ImageReader, imageops::FilterType};
 use ratatui::layout::Size;
@@ -55,7 +55,15 @@ impl AgentImages {
 }
 
 fn terminal_picker() -> Picker {
-    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    // Guard: ratatui-image 11.0.6 `from_query_stdio` livelocks at 100%
+    // CPU when stdin is not a TTY (EOF reads spin the reader thread and
+    // the Busy-restarted timeout never fires). Only query a real
+    // terminal; everything else gets the halfblocks fallback.
+    let picker = if std::io::stdin().is_terminal() {
+        Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
+    } else {
+        Picker::halfblocks()
+    };
     let has_reported_cell_size = picker
         .capabilities()
         .iter()

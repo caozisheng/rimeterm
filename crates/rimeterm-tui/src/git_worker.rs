@@ -93,8 +93,25 @@ fn run(rx: Receiver<GitRequest>, tx: Sender<GitResponse>) {
             commit_limit,
         }) = latest_snapshot
         {
+            // gix 0.86 can panic mid-traversal (e.g. non-UTF-8 path
+            // components hit `os_str_into_bstr(...).expect(...)` in
+            // gix-dir's classify). Contain the unwind so the worker
+            // thread survives and later snapshots still work — the
+            // pane shows an empty snapshot for this round instead of
+            // the app losing git support permanently.
             let started = std::time::Instant::now();
-            let snapshot = build_snapshot(generation, &cwd, commit_limit);
+            let snapshot =
+                match std::panic::catch_unwind(|| build_snapshot(generation, &cwd, commit_limit)) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        warn!(
+                            generation,
+                            cwd = %cwd.display(),
+                            "git snapshot build panicked; serving empty snapshot"
+                        );
+                        GitSnapshot::empty(generation)
+                    }
+                };
             debug!(
                 generation,
                 cwd = %cwd.display(),
@@ -115,7 +132,17 @@ fn run(rx: Receiver<GitRequest>, tx: Sender<GitResponse>) {
                 change,
             } = diff_req
             {
-                let diff = build_worktree_diff(generation, &repo_root, &change);
+                // Same containment as build_snapshot: a gix panic in
+                // one diff must not kill the worker thread.
+                let diff = match std::panic::catch_unwind(|| {
+                    build_worktree_diff(generation, &repo_root, &change)
+                }) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        warn!("git worktree diff build panicked; skipping");
+                        continue;
+                    }
+                };
                 if tx.send(GitResponse::Diff(diff)).is_err() {
                     return;
                 }
@@ -128,7 +155,17 @@ fn run(rx: Receiver<GitRequest>, tx: Sender<GitResponse>) {
                 commit_id,
             } = detail_req
             {
-                let detail = build_commit_detail(generation, &repo_root, &commit_id);
+                // Same containment as build_snapshot: a gix panic in
+                // one commit detail must not kill the worker thread.
+                let detail = match std::panic::catch_unwind(|| {
+                    build_commit_detail(generation, &repo_root, &commit_id)
+                }) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        warn!("git commit detail build panicked; skipping");
+                        continue;
+                    }
+                };
                 if tx.send(GitResponse::CommitDetail(detail)).is_err() {
                     return;
                 }

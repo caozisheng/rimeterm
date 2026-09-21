@@ -23,6 +23,7 @@
 //! or a second `Alt+V`.
 mod workspace_builder;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1742,7 +1743,20 @@ impl App {
         // the terminal capabilities cache is warm before we ever try to
         // build an image protocol. Halfblocks fallback keeps the viewer
         // usable everywhere.
-        let viewer_picker = ratatui_image::picker::Picker::from_query_stdio().ok();
+        //
+        // Only query a real terminal. ratatui-image 11.0.6's
+        // `from_query_stdio` livelocks when stdin is not a TTY (pipe,
+        // redirect, closed): the reader thread sees EOF (`read() == 0`),
+        // sends `Busy` forever without consuming a byte, and
+        // `query_with_timeout` restarts its timeout on every `Busy` —
+        // so `App::new` never returns and startup hangs with two
+        // threads spinning at 100% CPU. `IsTerminal` rejects those
+        // invocations up front; terminals are unaffected.
+        let viewer_picker = if std::io::stdin().is_terminal() {
+            ratatui_image::picker::Picker::from_query_stdio().ok()
+        } else {
+            None
+        };
 
         let ws_root = workspace_root.clone();
         let mut app = Self {
