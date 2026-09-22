@@ -11,7 +11,7 @@ pub mod pid_liveness;
 pub mod protocol;
 pub mod server;
 
-pub use client::{discover_latest_pid, send_once};
+pub use client::{discover_latest_pid, send_once, send_to_latest};
 pub use endpoint::{endpoint_display_for_pid, lockfile_dir, lockfile_for_pid};
 pub use pid_liveness::{PidLiveness, probe};
 pub use protocol::{Request, Response, encode_request, encode_response};

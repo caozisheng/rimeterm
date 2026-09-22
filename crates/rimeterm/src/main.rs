@@ -153,15 +153,12 @@ async fn try_redirect_workspace(path: &std::path::Path) -> bool {
     if !rimeterm_config::workspaces_state::load_current().enabled {
         return false;
     }
-    let Ok(Some(pid)) = rimeterm_ipc::discover_latest_pid().await else {
-        return false;
-    };
     let root = canonicalize_workspace_root(path.to_path_buf());
     let request = rimeterm_ipc::Request {
         cmd: "workspace.open".to_string(),
         args: serde_json::json!({"root": root.to_string_lossy()}),
     };
-    rimeterm_ipc::send_once(pid, &request)
+    rimeterm_ipc::send_to_latest(&request)
         .await
         .is_ok_and(|response| response.ok)
 }

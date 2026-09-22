@@ -25,6 +25,7 @@ pub async fn spawn(pid: u32, handler: Handler) -> Result<mpsc::Sender<()>> {
 
     sweep_stale_lockfiles().await;
     write_lockfile(pid).await?;
+    let lockfile = crate::endpoint::lockfile_for_pid(pid);
 
     #[cfg(unix)]
     {
@@ -47,6 +48,11 @@ pub async fn spawn(pid: u32, handler: Handler) -> Result<mpsc::Sender<()>> {
                     _ = shutdown_rx.recv() => {
                         debug!("ipc server shutting down");
                         let _ = tokio::fs::remove_file(&path).await;
+                        // Drop the lockfile too, or its orphan outranks the
+                        // next live server in mtime-ordered discovery.
+                        if let Some(lf) = &lockfile {
+                            let _ = tokio::fs::remove_file(lf).await;
+                        }
                         return;
                     }
                 }
@@ -82,6 +88,12 @@ pub async fn spawn(pid: u32, handler: Handler) -> Result<mpsc::Sender<()>> {
                     }
                     _ = shutdown_rx.recv() => {
                         debug!("ipc server shutting down");
+                        // Named pipes vanish with the process, but the
+                        // lockfile doesn't — remove it or discovery on the
+                        // next run dials a dead pid first.
+                        if let Some(lf) = &lockfile {
+                            let _ = tokio::fs::remove_file(lf).await;
+                        }
                         return;
                     }
                 }
