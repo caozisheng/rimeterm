@@ -6,6 +6,19 @@
 
 <img width="1911" height="1105" alt="image" src="https://github.com/user-attachments/assets/9deb36b1-2667-4436-aa91-160440033606" />
 
+## Features
+
+- **Agent-first** — a dedicated agents column auto-detects coding-agent CLIs (`omp`, `codex`, `claude`, `pi`); a persistent session daemon detaches and reattaches sessions.
+- **All in-process** — file explorer, git (`gix`), GitLab/GitHub, sysmon, agent monitor, todo, and session search run inside the binary; no external TUIs spawned.
+- **tmux-style PTY multiplexing** — scrollback, mouse selection, clipboard, and per-workspace persisted layouts.
+- **Multi-workspace tabs** — switch project roots from the workspace strip; each keeps its own layout, tabs, and active agent.
+- **Rich `Alt+V` viewer** — tree-sitter code highlighting, images, and mermaid diagrams through kitty / Sixel / iTerm2 graphics protocols.
+- **Scriptable via `rimectl`** — every UI command exposed as line-delimited JSON over a named pipe / Unix socket.
+- **Cross-pane workflows** — dispatch todo tasks to an agent, resume past sessions via `fr`, track agent CPU / tokens / cost in `agtop`.
+- **Desktop pet** — mirrors the main agent's status and current tool intent.
+- **Native mouse, 8 themes** — click / drag / scroll everywhere; `Alt+T` cycles palettes.
+- **Cross-platform** — Windows (ConPTY, MSI), Debian/Ubuntu `.deb`, macOS `.dmg`, and Termux builds.
+
 
 
 ## Layout
