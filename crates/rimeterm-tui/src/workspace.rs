@@ -85,19 +85,26 @@ pub(crate) fn workspace_title(root: &std::path::Path) -> String {
 }
 
 /// Derive stable display titles in tab order. Equal basenames are
-/// numbered by occurrence (`name`, `name 2`, ...).
-pub(crate) fn workspace_titles(roots: &[PathBuf]) -> Vec<String> {
+/// numbered by occurrence (`name`, `name 2`, ...). A non-empty entry in
+/// `custom` (parallel to `roots`, from the double-click rename editor)
+/// overrides the derived title for that slot; empty means auto.
+pub(crate) fn workspace_titles(roots: &[PathBuf], custom: &[String]) -> Vec<String> {
     let mut occurrences = std::collections::HashMap::<String, usize>::new();
     roots
         .iter()
-        .map(|root| {
+        .enumerate()
+        .map(|(idx, root)| {
+            // Count the occurrence even when a custom title overrides:
+            // renaming a tab must not renumber its siblings' auto titles
+            // ("alpha 2" stays "alpha 2" while tab 0 is called "shiny").
             let base = workspace_title(root);
             let occurrence = occurrences.entry(base.clone()).or_default();
             *occurrence += 1;
-            if *occurrence == 1 {
-                base
-            } else {
-                format!("{base} {occurrence}")
+            let overridden = custom.get(idx).map(|c| c.trim()).filter(|c| !c.is_empty());
+            match overridden {
+                Some(c) => c.to_string(),
+                None if *occurrence == 1 => base,
+                None => format!("{base} {occurrence}"),
             }
         })
         .collect()
@@ -213,8 +220,26 @@ mod tests {
         ];
 
         assert_eq!(
-            workspace_titles(&roots),
+            workspace_titles(&roots, &[]),
             vec!["alpha", "beta", "alpha 2", "alpha 3"]
+        );
+    }
+
+    /// A non-empty custom title overrides the derived basename; empty
+    /// entries fall back to auto (and still consume an occurrence slot
+    /// so numbering stays stable when some tabs are renamed).
+    #[test]
+    fn titles_custom_override_wins_empty_is_auto() {
+        let roots = vec![
+            PathBuf::from("/work/alpha"),
+            PathBuf::from("/other/beta"),
+            PathBuf::from("/copy/alpha"),
+        ];
+        let custom = vec!["shiny".to_string(), String::new(), String::new()];
+
+        assert_eq!(
+            workspace_titles(&roots, &custom),
+            vec!["shiny", "beta", "alpha 2"]
         );
     }
 

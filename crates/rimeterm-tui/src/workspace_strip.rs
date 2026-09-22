@@ -42,9 +42,63 @@ pub enum WorkspaceHit {
 /// Prefix cell width: ` rimeterm workspace: `.
 const PREFIX: &str = " rimeterm workspace: ";
 /// Separator between adjacent tab labels: ` │ `.
-const SEPARATOR: &str = " │ ";
 /// `[+]` affordance rendered after the last tab: ` [+]`.
 const NEW_TAB: &str = " [+]";
+/// Separator between adjacent tab labels: ` │ `.
+const SEPARATOR: &str = " │ ";
+
+/// Double-click window for opening the rename editor. Matches
+/// [`crate::pty_selection::MULTI_CLICK_MS`] / xterm's default.
+const DOUBLE_CLICK_MS: u128 = 400;
+
+/// Double-click streak detector that decides when a Down on a tab
+/// opens the rename editor. `App` owns one permanently (streaks must
+/// survive across clicks even when no editor is open); see
+/// [`crate::pty_selection`] for the PTY-side equivalent.
+#[derive(Debug, Clone)]
+pub struct WorkspaceClickStreak {
+    last_click: (u16, u16),
+    last_click_at: std::time::Instant,
+}
+
+impl Default for WorkspaceClickStreak {
+    fn default() -> Self {
+        Self {
+            last_click: (u16::MAX, u16::MAX),
+            last_click_at: std::time::Instant::now()
+                - std::time::Duration::from_millis(DOUBLE_CLICK_MS as u64 + 1),
+        }
+    }
+}
+
+impl WorkspaceClickStreak {
+    /// Register a fresh `Down` at the given cell. Returns `true` when
+    /// it lands on the same cell as the previous Down within
+    /// [`DOUBLE_CLICK_MS`], i.e. the caller should treat it as the
+    /// second half of a double-click.
+    pub fn register(&mut self, col: u16, row: u16, now: std::time::Instant) -> bool {
+        let same_cell = self.last_click == (col, row);
+        let in_window = now.duration_since(self.last_click_at).as_millis() < DOUBLE_CLICK_MS;
+        self.last_click = (col, row);
+        self.last_click_at = now;
+        same_cell && in_window
+    }
+}
+
+/// In-progress rename of a workspace tab. `App` owns this; the strip
+/// renders the edit pill while it is `Some`.
+///
+/// Keys while open (see `App::on_key`): typing appends, Backspace
+/// deletes, Enter accepts (empty restores the auto title), Esc
+/// cancels. A mouse Down anywhere else commits (browser inline-edit
+/// blur behavior).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRename {
+    /// Logical workspace index being renamed.
+    pub index: usize,
+    /// Draft text.
+    pub buffer: String,
+}
 
 /// Draw the workspace strip into `area` (one row).
 ///
@@ -57,6 +111,7 @@ pub fn render(
     titles: &[String],
     active: usize,
     hover: WorkspaceHover,
+    rename: Option<&WorkspaceRename>,
 ) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     let active_style = Style::default().add_modifier(Modifier::UNDERLINED);
@@ -69,14 +124,23 @@ pub fn render(
     for (idx, title) in titles.iter().enumerate() {
         let is_active = idx == active;
         let is_hover_tab = matches!(hover, WorkspaceHover::Tab(i) if i == idx);
-        let label_style = if is_active {
+        let is_renaming = rename.is_some_and(|r| r.index == idx);
+        let label_style = if is_renaming {
+            edit_pill_style()
+        } else if is_active {
             active_style
         } else if is_hover_tab {
             tab_hover_style
         } else {
             Style::default()
         };
-        spans.push(Span::styled(format!(" {title} "), label_style));
+        let label = if is_renaming {
+            let draft = rename.unwrap().buffer.clone();
+            format!(" {draft}")
+        } else {
+            format!(" {title} ")
+        };
+        spans.push(Span::styled(label, label_style));
         let is_hover_close = matches!(hover, WorkspaceHover::Close(i) if i == idx);
         let close_style = if is_hover_close {
             close_hover_style
@@ -97,6 +161,35 @@ pub fn render(
     spans.push(Span::styled(NEW_TAB, new_style));
 
     Paragraph::new(Line::from(spans)).render(area, buf);
+}
+
+/// Reverse-video edit pill for the tab being renamed.
+fn edit_pill_style() -> Style {
+    Style::default().add_modifier(Modifier::REVERSED)
+}
+
+/// Grid cell of the rename draft's block caret: walk the rendered
+/// layout (prefix + each earlier tab's label/`×`/space + separator),
+/// then 1 leading space + the draft width. `App::draw` uses this to
+/// place the visible caret while the editor is open. Clamped to the
+/// strip's last cell so an over-long draft can't push the caret off-row.
+pub fn rename_caret_col(area: Rect, titles: &[String], rename: &WorkspaceRename) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    let end_x = area.x.saturating_add(area.width);
+    let mut x = area.x.saturating_add(UnicodeWidthStr::width(PREFIX) as u16);
+    for (idx, title) in titles.iter().enumerate() {
+        if idx == rename.index {
+            let caret = x.saturating_add(1 + UnicodeWidthStr::width(rename.buffer.as_str()) as u16);
+            return caret.min(end_x.saturating_sub(1));
+        }
+        let label_w = UnicodeWidthStr::width(title.as_str()) as u16 + 2;
+        // label + `×` + trailing space
+        x = x.saturating_add(label_w + 2);
+        if idx + 1 < titles.len() {
+            x = x.saturating_add(UnicodeWidthStr::width(SEPARATOR) as u16);
+        }
+    }
+    end_x.saturating_sub(1)
 }
 
 /// Deterministic layout of [`render`] for mouse hit-testing. Mirrors the
@@ -273,7 +366,14 @@ mod tests {
         let backend = TestBackend::new(80, 1);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
-            render(f.area(), f.buffer_mut(), &titles(), 1, WorkspaceHover::None);
+            render(
+                f.area(),
+                f.buffer_mut(),
+                &titles(),
+                1,
+                WorkspaceHover::None,
+                None,
+            )
         })
         .unwrap();
 
@@ -300,7 +400,14 @@ mod tests {
         let backend = TestBackend::new(80, 1);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
-            render(f.area(), f.buffer_mut(), &titles(), 0, WorkspaceHover::None);
+            render(
+                f.area(),
+                f.buffer_mut(),
+                &titles(),
+                0,
+                WorkspaceHover::None,
+                None,
+            )
         })
         .unwrap();
         let text: String = (0..80)
@@ -311,5 +418,95 @@ mod tests {
         assert!(text.contains("beta"));
         assert!(text.contains("[+]"));
         assert!(text.contains("│"));
+    }
+
+    /// Double-click streak: same cell within 400 ms promotes; a second
+    /// click elsewhere or after the window resets.
+    fn click_streak_promotes_on_double_click() {
+        let mut streak = WorkspaceClickStreak::default();
+        let t0 = std::time::Instant::now();
+        assert!(!streak.register(30, 0, t0)); // first click
+        assert!(streak.register(30, 0, t0 + std::time::Duration::from_millis(300)));
+        // Different cell restarts the streak.
+        assert!(!streak.register(35, 0, t0 + std::time::Duration::from_millis(500)));
+        // Same cell but outside the window restarts.
+        assert!(!streak.register(35, 0, t0 + std::time::Duration::from_secs(2)));
+        assert!(!streak.register(35, 0, t0 + std::time::Duration::from_secs(3)));
+    }
+
+    /// Caret column walks the rendered layout: tab 0's caret sits after
+    /// prefix + leading space + draft; tab 1's after tab 0's full
+    /// label/close/pad + separator.
+    #[test]
+    fn rename_caret_col_walks_layout() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 1,
+        };
+        let t = titles();
+        // Tab 0: prefix 21 + " " + draft "ab" → 24.
+        let r0 = WorkspaceRename {
+            index: 0,
+            buffer: "ab".into(),
+        };
+        assert_eq!(rename_caret_col(area, &t, &r0), 24);
+        // Tab 1: 21 + " alpha " (7) + "× " (2) + " │ " (3) + " " + "cd" → 36.
+        let r1 = WorkspaceRename {
+            index: 1,
+            buffer: "cd".into(),
+        };
+        assert_eq!(rename_caret_col(area, &t, &r1), 36);
+    }
+
+    /// The renamed tab renders as a REVERSED pill with the draft text
+    /// replacing the title.
+    #[test]
+    fn render_pill_replaces_active_title_with_draft() {
+        let backend = TestBackend::new(80, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let rename = WorkspaceRename {
+            index: 1,
+            buffer: "draft".into(),
+        };
+        term.draw(|f| {
+            render(
+                f.area(),
+                f.buffer_mut(),
+                &titles(),
+                1,
+                WorkspaceHover::None,
+                Some(&rename),
+            )
+        })
+        .unwrap();
+        let text: String = (0..80)
+            .map(|x| term.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(text.contains("draft"));
+        assert!(!text.contains(" beta"));
+        // Pill cells carry REVERSED; the replaced title's cells do not
+        // (checked via the first draft cell).
+        let pill_start = text.find(" draft").expect("pill present");
+        let cell = &term.backend().buffer()[(pill_start as u16 + 1, 0)];
+        assert!(cell.style().add_modifier.contains(Modifier::REVERSED));
+    }
+
+    /// Over-long drafts clamp the caret to the strip's last cell.
+    #[test]
+    fn rename_caret_clamps_on_overflow() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 1,
+        };
+        let t = vec!["alpha".to_string()];
+        let r = WorkspaceRename {
+            index: 0,
+            buffer: "x".repeat(20),
+        };
+        assert_eq!(rename_caret_col(area, &t, &r), 29);
     }
 }

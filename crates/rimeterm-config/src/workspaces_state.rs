@@ -21,6 +21,11 @@ pub struct WorkspacesState {
     /// primary instance for a root; duplicates use non-zero ids in daemon keys.
     #[serde(default)]
     pub instances: Vec<u64>,
+    /// Custom tab titles parallel to `roots` (double-click rename in the
+    /// strip). Empty string = derive the title from the root's folder
+    /// basename. A stale shorter/longer list is normalized on load.
+    #[serde(default)]
+    pub titles: Vec<String>,
     /// Next duplicate instance id. Monotonic tombstone: closing a tab never
     /// permits its daemon session key to be reused by a later duplicate.
     #[serde(default = "default_next_instance")]
@@ -35,6 +40,7 @@ impl Default for WorkspacesState {
             enabled: true,
             roots: Vec::new(),
             instances: Vec::new(),
+            titles: Vec::new(),
             next_instance: 1,
             active: 0,
         }
@@ -77,6 +83,9 @@ impl WorkspacesState {
                 .collect();
         }
         state.active = state.active.min(state.roots.len().saturating_sub(1));
+        if state.titles.len() != state.roots.len() {
+            state.titles.resize(state.roots.len(), String::new());
+        }
         let minimum_next = state
             .instances
             .iter()
@@ -210,6 +219,7 @@ mod tests {
             roots: vec![r"C:\proj\a".into(), r"C:\proj\b".into()],
             active: 1,
             instances: vec![0, 2],
+            titles: vec!["".into(), "custom".into()],
             next_instance: 3,
         };
         state.save_to(&path).unwrap();
@@ -258,6 +268,7 @@ mod tests {
             roots: vec![PathBuf::from("C:/a"), PathBuf::from("C:/b")],
             active: 1,
             instances: vec![0, 2],
+            titles: vec![String::new(), "work".into()],
             next_instance: 3,
         };
         original.save_to(&path).unwrap();

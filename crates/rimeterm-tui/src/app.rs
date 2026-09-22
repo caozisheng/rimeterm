@@ -1252,9 +1252,23 @@ pub struct App {
     /// duplicate from reusing a still-live detached daemon session key.
     next_ws_instance: u64,
     active_ws: usize,
-    /// Display titles, parallel to `ws_order` (root folder basename,
-    /// duplicates suffixed ` 2`, ` 3`, …).
+    /// Display titles, parallel to `ws_order` (custom name when set,
+    /// otherwise root folder basename with duplicates suffixed
+    /// ` 2`, ` 3`, …).
     ws_titles: Vec<String>,
+    /// Custom titles parallel to `ws_order`; empty = auto-derived.
+    /// Persisted as `titles` in `workspaces.state.toml`. Only the
+    /// ACTIVE tab can be renamed (double-click in the strip), so
+    /// entries always match the tab they belong to.
+    ws_custom_titles: Vec<String>,
+    /// In-progress double-click rename of the active workspace tab.
+    /// While open, `on_key` routes all keys here instead of the
+    /// panes, and the strip renders the edit pill.
+    ws_rename: Option<crate::workspace_strip::WorkspaceRename>,
+    /// Double-click streak detector for opening the rename editor.
+    /// Kept separate from `ws_rename` (the editor itself) so a single
+    /// click on a tab never enters edit mode.
+    ws_click_streak: crate::workspace_strip::WorkspaceClickStreak,
     ws_stash: Vec<crate::workspace::WorkspaceBundle>,
     /// Feature toggle persisted in `workspaces.state.toml` (default on).
     workspace_tabs_enabled: bool,
@@ -1853,6 +1867,16 @@ impl App {
             next_ws_instance: persisted_workspaces.next_instance,
             active_ws: 0,
             ws_titles: vec![crate::workspace::workspace_title(&ws_root)],
+            // Launch slot's custom title: the persisted title for the
+            // launch root's slot (`launch_index` = first match, same slot
+            // the restore loop inlines as current); auto when absent.
+            ws_custom_titles: vec![
+                launch_index
+                    .and_then(|i| persisted_workspaces.titles.get(i).cloned())
+                    .unwrap_or_default(),
+            ],
+            ws_rename: None,
+            ws_click_streak: crate::workspace_strip::WorkspaceClickStreak::default(),
             workspace_tabs_enabled: persisted_workspaces.enabled,
             last_workspace_strip_hits: Vec::new(),
             hovered_workspace: crate::workspace_strip::WorkspaceHover::None,
@@ -1880,10 +1904,15 @@ impl App {
                     desired.len() - 1
                 });
             if desired.is_empty() {
-                desired.push(ws_root.clone());
+                desired.push(ws_root);
                 desired_instances.push(0);
             }
 
+            // Custom titles track restored slots: a slot skipped for a
+            // missing root must also drop its title so the vectors stay
+            // parallel. The current workspace (already inlined above)
+            // reuses the persisted title for its slot too.
+            let mut restored_titles = Vec::with_capacity(desired.len());
             let memory = rimeterm_config::memory_state::MemoryState::load().unwrap_or_default();
             let mut restored_roots = Vec::with_capacity(desired.len());
             let mut restored_instances = Vec::with_capacity(desired.len());
@@ -1896,11 +1925,13 @@ impl App {
                     continue;
                 }
                 let instance_id = desired_instances.get(index).copied().unwrap_or(0);
+                let restored_title = persisted.titles.get(index).cloned().unwrap_or_default();
                 if index == current_index {
                     restored_current = restored_roots.len();
                     restored_by_persisted[index] = Some(restored_current);
                     restored_roots.push(root);
                     restored_instances.push(instance_id);
+                    restored_titles.push(restored_title);
                     continue;
                 }
                 let config = match load_workspace_config(&root) {
@@ -1923,18 +1954,23 @@ impl App {
                         restored_by_persisted[index] = Some(restored_index);
                         restored_roots.push(root);
                         restored_instances.push(instance_id);
+                        restored_titles.push(restored_title);
                         restored_stash.push(build.bundle);
                     }
                     Err(error) => {
                         warn!(root = %root.display(), error = %error, "skipping workspace restore");
+                        continue;
                     }
-                }
+                };
             }
             app.ws_order = restored_roots;
+
             app.ws_instances = restored_instances;
+            app.ws_custom_titles = restored_titles;
             app.ws_stash = restored_stash;
             app.active_ws = restored_current;
-            app.ws_titles = crate::workspace::workspace_titles(&app.ws_order);
+            app.ws_titles =
+                crate::workspace::workspace_titles(&app.ws_order, &app.ws_custom_titles);
             let target = crate::workspace::restored_active(
                 &restored_by_persisted,
                 persisted.active,
@@ -3051,11 +3087,77 @@ impl App {
             enabled: self.workspace_tabs_enabled,
             roots: self.ws_order.clone(),
             instances: self.ws_instances.clone(),
+            titles: self.ws_custom_titles.clone(),
             next_instance: self.next_ws_instance,
             active: crate::workspace::clamp_active(self.active_ws, self.ws_order.len()),
         };
         if let Err(error) = rimeterm_config::workspaces_state::save_current(&state) {
             warn!(error = %error, "failed to persist workspace tabs state");
+        }
+    }
+
+    /// Key routing while the workspace rename editor is open.
+    ///
+    /// Enter commits; Esc cancels; Backspace deletes the last char;
+    /// plain printable chars append (capped at `RENAME_TITLE_MAX`).
+    /// Everything else (arrows, modifiers, function keys) is swallowed
+    /// so keystrokes never leak into the PTY while the editor is up.
+    fn on_workspace_rename_key(&mut self, key: KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let Some(rename) = self.ws_rename.as_mut() else {
+            return;
+        };
+        // Some((index, draft, apply)) — take() releases the borrow so
+        // ws_custom_titles / ws_titles can be mutated below.
+        let mut commit: Option<(usize, String, bool)> = None;
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, _) | (KeyCode::Char('\n' | '\r'), _) => {
+                let draft = rename.buffer.trim().to_string();
+                commit = Some((rename.index, draft, true));
+            }
+            (KeyCode::Esc, _) => {
+                let index = rename.index;
+                commit = Some((index, String::new(), false));
+            }
+            (KeyCode::Backspace, _) => {
+                rename.buffer.pop();
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                if rename.buffer.chars().count() < RENAME_TITLE_MAX {
+                    rename.buffer.push(c);
+                }
+            }
+            _ => {}
+        }
+        if let Some((index, draft, apply)) = commit {
+            self.ws_rename = None;
+            if apply {
+                if let Some(slot) = self.ws_custom_titles.get_mut(index) {
+                    *slot = draft;
+                }
+                self.ws_titles =
+                    crate::workspace::workspace_titles(&self.ws_order, &self.ws_custom_titles);
+                self.persist_workspaces_state();
+            }
+        }
+        self.needs_redraw = true;
+        let _ = self.redraw_tx.send(());
+    }
+
+    /// Commit an in-flight rename (click-outside / blur path). The
+    /// editor's draft as written — trimmed, never empty-checked: an
+    /// empty draft resets the slot to auto-derived.
+    pub(crate) fn commit_workspace_rename(&mut self) {
+        if let Some(rename) = self.ws_rename.take() {
+            let draft = rename.buffer.trim().to_string();
+            if let Some(slot) = self.ws_custom_titles.get_mut(rename.index) {
+                *slot = draft;
+            }
+            self.ws_titles =
+                crate::workspace::workspace_titles(&self.ws_order, &self.ws_custom_titles);
+            self.persist_workspaces_state();
+            self.needs_redraw = true;
+            let _ = self.redraw_tx.send(());
         }
     }
 
@@ -3088,8 +3190,9 @@ impl App {
         self.merge_workspace_build_metadata(&build);
         self.ws_order.push(root);
         self.ws_instances.push(0);
+        self.ws_custom_titles.push(String::new());
         self.ws_stash.push(build.bundle);
-        self.ws_titles = crate::workspace::workspace_titles(&self.ws_order);
+        self.ws_titles = crate::workspace::workspace_titles(&self.ws_order, &self.ws_custom_titles);
         self.switch_workspace(target);
         self.persist_workspaces_state();
         Ok((target, true))
@@ -3125,11 +3228,12 @@ impl App {
         let target = crate::workspace::duplicate_target(self.active_ws, self.ws_order.len());
         self.ws_order.insert(target, root);
         self.ws_instances.insert(target, instance_id);
+        self.ws_custom_titles.insert(target, String::new());
         self.ws_stash.insert(
             crate::workspace::stash_slot(target, self.active_ws),
             build.bundle,
         );
-        self.ws_titles = crate::workspace::workspace_titles(&self.ws_order);
+        self.ws_titles = crate::workspace::workspace_titles(&self.ws_order, &self.ws_custom_titles);
         self.switch_workspace(target);
         self.persist_workspaces_state();
         Ok(())
@@ -3173,10 +3277,11 @@ impl App {
         self.release_workspace_bundle(bundle);
         self.ws_order.remove(logical);
         self.ws_instances.remove(logical);
+        self.ws_custom_titles.remove(logical);
         if logical < self.active_ws {
             self.active_ws -= 1;
         }
-        self.ws_titles = crate::workspace::workspace_titles(&self.ws_order);
+        self.ws_titles = crate::workspace::workspace_titles(&self.ws_order, &self.ws_custom_titles);
         self.persist_workspaces_state();
         self.needs_redraw = true;
         let _ = self.redraw_tx.send(());
@@ -3419,6 +3524,14 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        // Workspace rename editor owns the keyboard while open — it
+        // must sit ABOVE every overlay dispatch because none of them
+        // can be open at the same time (opening an overlay commits
+        // the rename first; see `on_mouse` click-outside handling).
+        if self.ws_rename.is_some() {
+            self.on_workspace_rename_key(key);
+            return;
+        }
         // Overlay priority: any open overlay (app menu / settings /
         // picker / palette) owns the keyboard while it's up. The
         // viewer's own modal handler (`on_viewer_key`) MUST run
@@ -3776,6 +3889,31 @@ impl App {
             }
 
             if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                // Double-click detection: the streak tracker is a
+                // dedicated field, NOT the editor. Feeding it before
+                // any editor-open check lets the FIRST click of a
+                // pair register while the editor handles later keys.
+                if let Some(crate::workspace_strip::WorkspaceHit::Tab(index)) = hit {
+                    let now = std::time::Instant::now();
+                    let double_click = self.ws_click_streak.register(m.column, m.row, now);
+                    if double_click && index == self.active_ws {
+                        self.ws_rename = Some(crate::workspace_strip::WorkspaceRename {
+                            index,
+                            buffer: self
+                                .ws_custom_titles
+                                .get(index)
+                                .cloned()
+                                .unwrap_or_default(),
+                        });
+                        self.needs_redraw = true;
+                        let _ = self.redraw_tx.send(());
+                        return;
+                    }
+                } else {
+                    // A Down anywhere else commits the rename — matches
+                    // browser inline-edit behavior.
+                    self.commit_workspace_rename();
+                }
                 match hit {
                     Some(crate::workspace_strip::WorkspaceHit::Tab(index)) => {
                         self.switch_workspace(index);
@@ -4832,6 +4970,7 @@ impl App {
                 &self.ws_titles,
                 self.active_ws,
                 self.hovered_workspace,
+                self.ws_rename.as_ref(),
             );
         } else {
             self.last_workspace_strip_hits.clear();
@@ -5158,17 +5297,30 @@ impl App {
         // column (viewer_focused = false)" is unit-testable without a
         // live App instance. All state flowing into the decision goes
         // through arguments; no App field access happens inside.
-        let cursor = decide_frame_cursor(FrameCursorInputs {
-            menu_open: self.menu_state.open,
-            palette_open: self.palette_state.open,
-            picker_open: self.picker_state.open,
-            settings_open: self.settings_state.open,
-            ack_open: self.ack_state.open,
-            upgrade_open: self.upgrade_state.open,
-            viewer_open: self.viewer.is_open(),
-            viewer_focused: self.viewer_owns_caret(),
-            focused_cursor,
-        });
+        let cursor = if let Some(rename) = self.ws_rename.as_ref() {
+            // Rename editor owns the caret: block caret on the strip row
+            // right after the draft (see `workspace_strip::rename_caret_col`).
+            let (strip_rect, _) = vertical
+                .first()
+                .map(|r| (*r, ()))
+                .unwrap_or((Rect::default(), ()));
+            Some((
+                crate::workspace_strip::rename_caret_col(strip_rect, &self.ws_titles, rename),
+                strip_rect.y,
+            ))
+        } else {
+            decide_frame_cursor(FrameCursorInputs {
+                menu_open: self.menu_state.open,
+                palette_open: self.palette_state.open,
+                picker_open: self.picker_state.open,
+                settings_open: self.settings_state.open,
+                ack_open: self.ack_state.open,
+                upgrade_open: self.upgrade_state.open,
+                viewer_open: self.viewer.is_open(),
+                viewer_focused: self.viewer_owns_caret(),
+                focused_cursor,
+            })
+        };
 
         // Snapshot state for IPC consumers (§11). Cheap: reads &self + writes
         // a small owned struct; no PTY I/O.
