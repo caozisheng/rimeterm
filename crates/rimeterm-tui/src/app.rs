@@ -3542,19 +3542,22 @@ impl App {
         // too: with an overlay open the user should close it first;
         // opening or closing the viewer while a picker is visible
         // would produce a confusing z-order.
-        // ACK overlay is checked FIRST because it's a purely-modal
-        // credits popup — every other overlay can wait behind it.
-        if self.upgrade_state.open {
-            if let Some(action) = self.upgrade_state.handle_key(key) {
-                self.apply_upgrade_action(action);
-            }
-            return;
-        }
+        // The exit dialog renders LAST in `draw` (topmost of every
+        // overlay), so it dispatches FIRST here — an overlay still
+        // open beneath it must never steal the keys that resolve it.
+        // (`try_open_exit_dialog` closes every overlay before opening
+        // the dialog; this ordering is the second line of defense.)
         if self.exit_dialog.open {
             if let Some(decision) = self.exit_dialog.handle_key(key) {
                 self.apply_exit_decision(decision);
             }
             let _ = self.redraw_tx.send(());
+            return;
+        }
+        if self.upgrade_state.open {
+            if let Some(action) = self.upgrade_state.handle_key(key) {
+                self.apply_upgrade_action(action);
+            }
             return;
         }
         if self.ack_state.open {
@@ -3803,6 +3806,12 @@ impl App {
         // Palette handled by its own path below (it renders fullscreen
         // and captures its own input).
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            // The exit dialog is keyboard-driven and topmost; clicks
+            // while it's up must not fall through to the panes it is
+            // asking the user about.
+            if self.exit_dialog.open {
+                return;
+            }
             if self.menu_state.open {
                 self.handle_menu_mouse(m.column, m.row);
                 return;
@@ -3844,7 +3853,8 @@ impl App {
         }
         // Any non-Down mouse event while an overlay is open is
         // swallowed silently so scroll / drag doesn't leak past.
-        if (self.menu_state.open
+        if (self.exit_dialog.open
+            || self.menu_state.open
             || self.settings_state.open
             || self.picker_state.open
             || self.ack_state.open
@@ -6635,6 +6645,12 @@ impl App {
     /// `false` when quitting should proceed immediately — non-daemon
     /// mode, no daemon reachable, or no live sessions worth asking about.
     fn try_open_exit_dialog(&mut self) -> bool {
+        // Already up (e.g. a second Ctrl+Q while deciding): keep the
+        // current selection instead of re-probing the daemon and
+        // resetting the cursor to the default choice.
+        if self.exit_dialog.open {
+            return true;
+        }
         let endpoints = self.daemon_endpoints();
         let hosts_live = endpoints.iter().any(|endpoint| {
             match tokio::task::block_in_place(|| {
@@ -6651,6 +6667,19 @@ impl App {
         if !hosts_live {
             return false;
         }
+        // The exit dialog must be the only modal on screen: close every
+        // overlay first. Otherwise the topmost-painted dialog starves —
+        // the still-open overlay beneath it swallows every key (the
+        // finished-upgrade quit with Settings still open deadlocked
+        // exactly like that).
+        self.menu_state.close();
+        self.palette_state.close();
+        self.picker_state.close();
+        self.pending_dispatch = None;
+        self.settings_state.close();
+        self.ack_state.close();
+        self.close_upgrade_overlay();
+        self.commit_workspace_rename();
         self.exit_dialog.open();
         true
     }
@@ -6662,6 +6691,10 @@ impl App {
         self.exit_dialog.close();
         match decision {
             crate::exit_dialog::ExitDecision::KeepRunning => {
+                // Latch the confirmation: a detach keeps the sessions
+                // live, so an un-latched quit would re-probe the daemon
+                // and reopen this dialog forever.
+                self.exit_confirmed = true;
                 self.should_quit = true;
             }
             crate::exit_dialog::ExitDecision::KillNow => {
