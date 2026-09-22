@@ -50,11 +50,11 @@ impl PinnedHome {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let prev = std::env::var("RIMETERM_HOME").ok();
         let root = std::env::temp_dir().join(format!(
-            "rimeterm-ipc-walk-{}-{}",
+            "riwk-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
+                .map(|d| d.as_secs())
                 .unwrap_or(0)
         ));
         std::fs::create_dir_all(root.join("data").join("run")).unwrap();
