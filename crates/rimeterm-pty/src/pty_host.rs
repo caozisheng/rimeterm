@@ -150,19 +150,70 @@ impl NativePty {
 /// `taskkill` walks the parent-pid chain the OS tracks; `/T` matches the
 /// full tree, `/F` forces termination. Fails silently — the fallback
 /// `killer.kill()` below still terminates the root.
+///
+/// `CREATE_NO_WINDOW` is load-bearing: the session daemon runs as a
+/// `DETACHED_PROCESS` with no console, so a bare taskkill spawn makes
+/// Windows allocate a fresh console window for it — the user sees a
+/// terminal flash every time a tab's process tree is killed (e.g.
+/// closing an agent pane). Same treatment as `reg.exe` in
+/// `shell_integration.rs`.
 #[cfg(windows)]
 fn kill_tree_windows(pid: u32) {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW — see Win32 process-creation flags (winbase.h).
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let status = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .status();
     match status {
         Ok(s) if s.success() => {}
         other => {
             tracing::debug!(pid, ?other, "taskkill tree-kill failed; falling back");
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// `kill_tree_windows` must keep terminating the whole tree while
+    /// suppressing the console flash (`CREATE_NO_WINDOW`). Spawn a
+    /// parent that forks a child, kill the parent's pid, then assert
+    /// both are gone: the regressions we care about are (a) the flag
+    /// breaks taskkill, (b) `/T` stops reaching grandchildren.
+    #[test]
+    fn kill_tree_terminates_descendants_without_console() {
+        // cmd /C "start /b" keeps the grandchild parented to the cmd so
+        // /T reaches it; ping -n 30 holds both alive long enough.
+        let script = "start /b ping -n 30 127.0.0.1 > nul & ping -n 30 127.0.0.1 > nul";
+        let root = std::process::Command::new("cmd")
+            .args(["/C", script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawning test process tree");
+        let pid = root.id();
+        std::thread::sleep(std::time::Duration::from_millis(750));
+
+        kill_tree_windows(pid);
+
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        let alive = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .stdout(std::process::Stdio::piped())
+            .output()
+            .expect("running tasklist");
+        let stdout = String::from_utf8_lossy(&alive.stdout);
+        assert!(
+            !stdout.contains(&pid.to_string()),
+            "root pid {pid} still alive after tree kill:\n{stdout}"
+        );
     }
 }
 
