@@ -781,6 +781,9 @@ fn draw_list_scrollbar(frame: &mut Frame<'_>, area: Rect, total: usize, selected
         vertical: 1,
     });
     let position = selected.unwrap_or(0);
+    // The bar overlays list content; a wide glyph under the lane would
+    // both bleed into it and suppress its diff update.
+    crate::scrollbar::prepare_scrollbar_column(frame.buffer_mut(), inner);
     let mut state = ScrollbarState::new(total).position(position);
     Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .begin_symbol(None)
@@ -1000,6 +1003,8 @@ fn render_detail_overlay(
 
     // Right-edge scrollbar tracks position through the rendered content.
     if line_count > inner.height as usize {
+        // Same wide-glyph / style-bleed hazard as the list scrollbar.
+        crate::scrollbar::prepare_scrollbar_column(frame.buffer_mut(), inner);
         let mut state = ScrollbarState::new(line_count).position(scroll as usize);
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)

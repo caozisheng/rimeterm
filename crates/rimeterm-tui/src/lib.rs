@@ -37,6 +37,7 @@ pub mod picker;
 pub mod placeholder_pane;
 pub mod pty_pane;
 pub mod pty_selection;
+pub mod scrollbar;
 pub mod sessions;
 pub mod settings;
 pub mod shell_factory;

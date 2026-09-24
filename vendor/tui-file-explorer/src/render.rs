@@ -85,6 +85,22 @@ pub(crate) fn paint_scrollbar(
     let x = area.x + area.width.saturating_sub(1);
     let buf = frame.buffer_mut();
 
+    // A wide glyph (CJK filename) ending in the last content column
+    // physically covers the bar cell and suppresses its buffer-diff
+    // update, leaving a hole in the thumb as it scrolls past. Narrow
+    // it to a space so the thumb can always repaint. Style is kept so
+    // the row background stays uniform.
+    if x > 0 {
+        for y in area.y..area.bottom() {
+            let neighbor = buf.cell_mut(Position::new(x - 1, y));
+            if let Some(neighbor) = neighbor {
+                if neighbor.symbol().width() > 1 {
+                    neighbor.set_char(' ');
+                }
+            }
+        }
+    }
+
     for y in 0..area.height {
         if y >= thumb_start && y < thumb_end {
             if let Some(cell) = buf.cell_mut(Position::new(x, area.y + y)) {

@@ -1020,6 +1020,9 @@ fn render_column(
     .column_spacing(1)
     .render(inner, frame.buffer_mut());
     if column.rows.len() > viewport && inner.width > 1 && viewport > 0 {
+        // Same wide-glyph / style-bleed hazard as the other panes'
+        // overlay scrollbars (see `crate::scrollbar`).
+        crate::scrollbar::prepare_scrollbar_column(frame.buffer_mut(), inner);
         let mut state = ScrollbarState::new(column.rows.len())
             .position(column.scroll)
             .viewport_content_length(viewport);

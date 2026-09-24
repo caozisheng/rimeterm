@@ -482,6 +482,11 @@ impl PaneProvider for PtyPane {
                 width: 1,
                 height: inner.height,
             };
+            // The bar overlays the grid's last column. A wide glyph at
+            // the second-to-last column would cover the bar cell and
+            // suppress its diff (see `scrollbar` module docs) — narrow
+            // it and clear content styling under the lane first.
+            crate::scrollbar::prepare_scrollbar_column(buf, scrollbar_rect);
             let position = history_size.saturating_sub(display_offset);
             let mut state = ScrollbarState::new(history_size.saturating_add(inner.height as usize))
                 .position(position)
