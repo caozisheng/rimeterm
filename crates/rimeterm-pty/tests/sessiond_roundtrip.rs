@@ -257,3 +257,80 @@ async fn kill_removes_session_from_list() {
         }
     }
 }
+
+/// A live child that never wrote a byte and is older than the daemon's
+/// silence threshold is a console-less child (the Windows ConPTY
+/// burst-create hazard): reattaching with a spawn spec must respawn it
+/// instead of replaying an empty ring — the user sees a working child,
+/// not a black pane. Regression test for the omp agent-pane bug.
+#[cfg(unix)]
+// ConPTY injects a banner into every Windows child, so a
+//             byte-silent child cannot be constructed there; the Unix
+//              PTY faithfully relays only the child's own bytes.
+#[tokio::test]
+async fn silent_child_is_respawned_on_reattach() {
+    // Mirror of the daemon's SILENT_CHILD_RESPAWN_AFTER (private const).
+    let silence_after = Duration::from_secs(15);
+    let endpoint = temp_endpoint("silent");
+    let _daemon_thread = spawn_daemon(endpoint.clone()).await.expect("daemon up");
+
+    // A child that stays alive and prints nothing: `sleep` writes no
+    // bytes and the Unix PTY injects nothing of its own.
+    let quiet_spec = SpawnSpec {
+        program: "sleep".into(),
+        args: vec!["120".into()],
+        cwd: None,
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+    };
+
+    let attached1 = attach_session(&endpoint, "q1", "label", "shell", quiet_spec, Some(300))
+        .await
+        .expect("attach quiet");
+    let pid1 = attached1.welcome.pid;
+
+    let mut r1 = attached1.reader;
+    let mut initial_bytes = 0usize;
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while let Some(timeout) = drain_deadline.checked_duration_since(tokio::time::Instant::now()) {
+        match tokio::time::timeout(timeout, r1.read_frame()).await {
+            Ok(Ok(Some(Frame::DaemonOutput(bytes)))) => initial_bytes += bytes.len(),
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) | Ok(Err(_)) => break,
+            Err(_elapsed) => break,
+        }
+    }
+    drop(r1);
+
+    // Cross the silence threshold with the child alive and mute.
+    tokio::time::sleep(silence_after + Duration::from_millis(500)).await;
+    drop(attached1.writer);
+    eprintln!("initial bytes from quiet child: {initial_bytes}");
+
+    // Reattach with a REAL spawn spec (what the TUI always sends): the
+    // daemon must kill the mute child and spawn the spec's child.
+    let attached2 = attach_session(
+        &endpoint,
+        "q1",
+        "label",
+        "shell",
+        echo_spec("RESURRECTED"),
+        Some(300),
+    )
+    .await
+    .expect("attach respawn");
+    assert_ne!(
+        attached2.welcome.pid, pid1,
+        "silent child must be replaced, not reattached"
+    );
+    let mut r2 = attached2.reader;
+    let replay = await_output(&mut r2, "RESURRECTED").await;
+    let replay = String::from_utf8_lossy(&replay).to_string();
+    assert!(
+        replay.contains("RESURRECTED"),
+        "respawned child must print its banner: {replay}"
+    );
+
+    w2_kill_and_exit(r2, attached2.writer).await;
+}

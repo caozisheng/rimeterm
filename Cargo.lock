@@ -2592,7 +2592,7 @@ dependencies = [
 
 [[package]]
 name = "glab-tui"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5068,7 +5068,7 @@ dependencies = [
 
 [[package]]
 name = "rimectl"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "rimeterm-ipc",
@@ -5078,7 +5078,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "rimeterm-config",
@@ -5096,7 +5096,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-config"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "directories",
@@ -5111,7 +5111,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-core"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -5125,14 +5125,14 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-game"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "rimeterm-ipc"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "libc",
@@ -5148,7 +5148,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-markdown"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "image",
  "mermaid-rs-renderer",
@@ -5164,7 +5164,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-models"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -5175,7 +5175,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-pet"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "chrono",
  "libc",
@@ -5188,7 +5188,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-pty"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -5208,7 +5208,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-stock"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "akshare",
  "chrono",
@@ -5227,7 +5227,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-tui"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -5292,7 +5292,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-zones"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "chrono",
  "chrono-tz",

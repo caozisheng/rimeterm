@@ -54,6 +54,52 @@ use crate::session::{
     Listener, PtyBackend, SessionConfig, new_headless_term, parse_chunks, resize_term,
     respond_to_terminal_queries,
 };
+
+/// A live child that has not written a single byte to its PTY for this
+/// long is treated as console-less (Windows ConPTY burst-create hazard)
+/// and respawned once on the next attach. Shells and agents print a
+/// banner within a second or two of starting, so 15 s is a conservative
+/// threshold that a healthy child never crosses.
+const SILENT_CHILD_RESPAWN_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Pure decision for the silent-child respawn (unit-testable): a live
+/// session qualifies when its ring never received a byte, it has not
+/// been respawned for silence before, the child is old enough to have
+/// printed its banner, and the reattaching client carries a spawn spec
+/// to replace it with.
+fn is_silent_child(
+    ring_len: usize,
+    silence_respawned: bool,
+    age: std::time::Duration,
+    has_spawn_spec: bool,
+) -> bool {
+    ring_len == 0 && !silence_respawned && age >= SILENT_CHILD_RESPAWN_AFTER && has_spawn_spec
+}
+
+#[cfg(test)]
+mod silence_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn silent_child_qualifies_after_threshold() {
+        assert!(is_silent_child(0, false, SILENT_CHILD_RESPAWN_AFTER, true));
+        // A child that wrote anything is healthy.
+        assert!(!is_silent_child(1, false, SILENT_CHILD_RESPAWN_AFTER, true));
+        // Young children get the benefit of the doubt.
+        assert!(!is_silent_child(
+            0,
+            false,
+            SILENT_CHILD_RESPAWN_AFTER - Duration::from_millis(1),
+            true
+        ));
+        // One respawn per key — no loop on deliberately quiet children.
+        assert!(!is_silent_child(0, true, Duration::from_secs(3600), true));
+        // No spawn spec → nothing to respawn with; attach as-is.
+        assert!(!is_silent_child(0, false, Duration::from_secs(3600), false));
+    }
+}
+
 /// Shared daemon state. Locked with a parking_lot mutex; never held across
 /// an `.await`.
 struct Registry {
@@ -70,6 +116,14 @@ struct Registry {
     /// connection's broadcast registration is tagged with the id minted
     /// here — `unregister_sender` removes exactly that entry on detach.
     next_conn_id: u64,
+    /// Serializes child spawns (openpty + CreateProcess). Windows ConPTY
+    /// creation is not race-free under a burst: a TUI startup that opens
+    /// 6+ pseudoconsoles within one second has produced children whose
+    /// console host never came up — alive, silent forever, black pane.
+    /// One spawn at a time trades ~150 ms of startup latency for never
+    /// shipping a console-less child. `Arc` so a connection can hold the
+    /// gate guard without borrowing the registry.
+    spawn_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 enum Entry {
@@ -94,6 +148,15 @@ struct LiveSession {
     /// Which registry generation spawned this session; see
     /// [`Registry::next_generation`].
     generation: u64,
+    /// When the child was born. Feeds the silent-child respawn check:
+    /// a session whose ring is still empty long after birth produced a
+    /// console-less child (observed on Windows when several ConPTY
+    /// consoles are created back-to-back during a TUI startup storm —
+    /// the child runs, writes into a dead console, the pane stays black).
+    spawned_at: std::time::Instant,
+    /// Already respawned once because the previous child never wrote a
+    /// byte. Deliberately-silent children must not loop.
+    silence_respawned: bool,
     /// Outbound channels of attached clients, tagged with the owning
     /// connection's id so a detach removes exactly its own entry.
     attached: Vec<(u64, mpsc::UnboundedSender<Frame>)>,
@@ -136,6 +199,7 @@ pub async fn run(endpoint: &str, grace_secs: Option<u64>) -> anyhow::Result<()> 
         conns: 0,
         next_generation: 0,
         next_conn_id: 0,
+        spawn_gate: Arc::new(tokio::sync::Mutex::new(())),
     }));
     // client that had already connected to it would strand its bytes —
     // nothing would ever read them. `recv()` below is cancel-safe, so the
@@ -368,6 +432,7 @@ async fn serve_attached(
     let key = attach.key.clone();
     debug!(conn_id, key = %key, spawn = attach.spawn.is_some(), "sessiond serve_attached: enter");
 
+    let mut respawned_from_silence = false;
     let attached: bool = 'attach: {
         // Fast path: attach to an existing live session under one lock
         // hold — replay snapshot + sender registration are atomic w.r.t.
@@ -377,33 +442,64 @@ async fn serve_attached(
         {
             let mut reg = registry.lock();
             if let Some(Entry::Live(session)) = reg.sessions.get_mut(&key) {
-                // Register the sender BEFORE queuing frames: everything
-                // below happens under the same lock hold as the child
-                // pump's broadcast, so no live output can be missed
-                // between the replay snapshot and this registration.
-                // (The slow path and the spawn-race path both register;
-                // this one used to skip it — live frames and Exited
-                // never reached a reattached client.)
-                session.attached.push((conn_id, tx.clone()));
-                let snapshot = session.ring.snapshot();
-                debug!(conn_id, key = %key, snap_bytes = snapshot.len(), "sessiond fast-path: hit; queuing welcome+replay");
-                let _ = tx.send(Frame::DaemonJson(DaemonMsg::Welcome(Welcome {
-                    pid: session.pty.root_pid(),
-                    cols: session.cols,
-                    rows: session.rows,
-                    exit: None,
-                })));
-                for chunk in snapshot.chunks(MAX_FRAME_BODY) {
-                    let _ = tx.send(Frame::DaemonOutput(chunk.to_vec()));
+                // Silent-console child: never wrote a byte, old enough to
+                // have printed its banner. Respawn once instead of
+                // replaying nothing at the user (see `is_silent_child`).
+                let silent_child = is_silent_child(
+                    session.ring.len(),
+                    session.silence_respawned,
+                    session.spawned_at.elapsed(),
+                    attach.spawn.is_some(),
+                );
+                if silent_child {
+                    warn!(
+                        conn_id,
+                        key = %key,
+                        pid = ?session.pty.root_pid(),
+                        age_secs = session.spawned_at.elapsed().as_secs(),
+                        "sessiond: live child never produced output; respawning (console-less ConPTY child)"
+                    );
+                    // Detach every sender first so the old child's Exited
+                    // broadcast reaches nobody, mark killed so the reaper
+                    // forgets the entry instead of recording Dead, then
+                    // remove it and fall through to the slow path which
+                    // spawns a replacement under the same key.
+                    session.attached.clear();
+                    session.killed = true;
+                    session.pty.kill();
+                    reg.sessions.remove(&key);
+                    respawned_from_silence = true;
+                    drop(reg);
+                    // NOT breaking 'attach: fall to the slow path below.
+                } else {
+                    // Register the sender BEFORE queuing frames: everything
+                    // below happens under the same lock hold as the child
+                    // pump's broadcast, so no live output can be missed
+                    // between the replay snapshot and this registration.
+                    // (The slow path and the spawn-race path both register;
+                    // this one used to skip it — live frames and Exited
+                    // never reached a reattached client.)
+                    session.attached.push((conn_id, tx.clone()));
+                    let snapshot = session.ring.snapshot();
+                    debug!(conn_id, key = %key, snap_bytes = snapshot.len(), "sessiond fast-path: hit; queuing welcome+replay");
+                    let _ = tx.send(Frame::DaemonJson(DaemonMsg::Welcome(Welcome {
+                        pid: session.pty.root_pid(),
+                        cols: session.cols,
+                        rows: session.rows,
+                        exit: None,
+                    })));
+                    for chunk in snapshot.chunks(MAX_FRAME_BODY) {
+                        let _ = tx.send(Frame::DaemonOutput(chunk.to_vec()));
+                    }
+                    break 'attach true;
                 }
-                break 'attach true;
             }
         }
 
         debug!(conn_id, key = %key, "sessiond fast-path: MISS; slow path");
-        // Slow path: no live session under this key. Spawn *without*
-        // holding the lock (openpty + exec blocks; holding the registry
-        // would stall every other session's child pump).
+        // Slow path: no live session under this key (or the silent-child
+        // respawn above just removed one). Spawn outside the registry
+        // lock, serialized by the spawn gate.
         let Some(spec) = attach.spawn.clone() else {
             let reason = match registry.lock().sessions.get(&key) {
                 Some(Entry::Dead) => "session exited".to_string(),
@@ -416,18 +512,45 @@ async fn serve_attached(
                 shutdown: false,
             };
         };
-        let mut session = match spawn_session(&key, &attach, spec) {
-            Ok(session) => session,
-            Err(reason) => {
-                warn!(key = %key, %reason, "sessiond spawn failed");
-                let _ = tx.send(Frame::DaemonJson(DaemonMsg::Denied { reason }));
-                return ConnOutcome {
-                    session_key: None,
-                    conn_id: 0,
-                    shutdown: false,
-                };
+        // Spawn gate: one openpty+CreateProcess at a time (Windows ConPTY
+        // burst-create hazard — see `Registry::spawn_gate`). The gate is
+        // an async mutex and `spawn_session` is blocking, so acquire the
+        // gate through a bound handle (never hold the registry lock
+        // across an `.await`) and run the spawn on the blocking pool.
+        let session = {
+            // Bound Arc handle: the registry guard drops here, before any
+            // `.await`; the gate guard then lives to the end of the block.
+            let gate = {
+                let reg = registry.lock();
+                Arc::clone(&reg.spawn_gate)
+            };
+            let _gate = gate.lock().await;
+            let spawn_result = tokio::task::spawn_blocking({
+                let key = key.clone();
+                let attach = attach.clone();
+                move || spawn_session(&key, &attach, spec)
+            })
+            .await
+            .map_err(|e| format!("spawn task panicked: {e}"))
+            .and_then(|r| r);
+            match spawn_result {
+                Ok(session) => session,
+                Err(reason) => {
+                    warn!(key = %key, %reason, "sessiond spawn failed");
+                    let _ = tx.send(Frame::DaemonJson(DaemonMsg::Denied { reason }));
+                    return ConnOutcome {
+                        session_key: None,
+                        conn_id: 0,
+                        shutdown: false,
+                    };
+                }
             }
         };
+        // A respawn that exists to replace a silent child must not be
+        // respawned again for silence — deliberately quiet children
+        // would otherwise loop forever.
+        let mut session = session;
+        session.silence_respawned = respawned_from_silence;
         let reader = session.pty.reader.take();
         let mut reg = registry.lock();
         // Raced: another connection spawned this key first and inserted
@@ -688,6 +811,8 @@ fn spawn_session(key: &str, attach: &Attach, spec: SpawnSpec) -> Result<LiveSess
         rows: spec.rows,
         killed: false,
         generation: 0, // assigned at registry insert
+        spawned_at: std::time::Instant::now(),
+        silence_respawned: false,
         attached: Vec::new(),
     })
 }
