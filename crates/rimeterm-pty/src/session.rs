@@ -631,6 +631,18 @@ impl Write for RemoteStdin {
 /// Socket writer half of a remote session: drains stdin bytes and control
 /// requests, encoding them as frames. Exits when either channel closes
 /// (session dropped / daemon gone), which detaches cleanly.
+///
+/// Ordering guarantee: control frames (Resize, and critically Kill) are
+/// polled BEFORE stdin bytes and before the channels-closed arms. This is
+/// `biased` + control-first, not cosmetic: `Session::kill()` enqueues
+/// `RemoteControl::Kill` and immediately drops the stdin writer, which
+/// closes `write_rx`. With a random-branch `select!` the writer could
+/// observe the closed stdin first and exit without ever writing the Kill
+/// frame — the daemon then saw a plain detach and kept the child alive
+/// forever (orphaned agent session under a PaneId-suffixed key that no
+/// later attach can reclaim). Draining `control_rx` to exhaustion before
+/// honoring either closed-channel arm guarantees a queued Kill always
+/// reaches the wire.
 async fn remote_writer_task(
     mut writer: FrameWriter,
     mut write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -638,16 +650,8 @@ async fn remote_writer_task(
 ) {
     loop {
         tokio::select! {
-            maybe_bytes = write_rx.recv() => {
-                match maybe_bytes {
-                    Some(bytes) => {
-                        if writer.write_frame(&Frame::ClientWrite(bytes)).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
+            biased;
+
             maybe_control = control_rx.recv() => {
                 match maybe_control {
                     Some(RemoteControl::Resize { cols, rows }) => {
@@ -657,13 +661,48 @@ async fn remote_writer_task(
                         }
                     }
                     Some(RemoteControl::Kill) => {
-                        // Best effort — the daemon kills and reports Exited.
+                        // The frame MUST go out even though `Session::kill`
+                        // already closed the stdin channel (see the ordering
+                        // note above) — this is the session's only kill path.
                         let _ = writer
                             .write_frame(&Frame::ClientJson(ClientMsg::Kill))
                             .await;
                         break;
                     }
                     None => break,
+                }
+            }
+
+            maybe_bytes = write_rx.recv() => {
+                match maybe_bytes {
+                    Some(bytes) => {
+                        if writer.write_frame(&Frame::ClientWrite(bytes)).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => {
+                        // Stdin dropped (kill() or session teardown). Do NOT
+                        // exit yet: a Kill may still be queued behind this
+                        // wake-up in `control_rx`. Drain controls first.
+                        while let Ok(control) = control_rx.try_recv() {
+                            match control {
+                                RemoteControl::Resize { cols, rows } => {
+                                    let frame =
+                                        Frame::ClientJson(ClientMsg::Resize { cols, rows });
+                                    if writer.write_frame(&frame).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                RemoteControl::Kill => {
+                                    let _ = writer
+                                        .write_frame(&Frame::ClientJson(ClientMsg::Kill))
+                                        .await;
+                                    return;
+                                }
+                            }
+                        }
+                        break;
+                    }
                 }
             }
         }

@@ -334,3 +334,99 @@ async fn silent_child_is_respawned_on_reattach() {
 
     w2_kill_and_exit(r2, attached2.writer).await;
 }
+
+/// Regression: `Session::kill()` on a daemon-attached session used to
+/// race its own writer task — `kill()` closes the stdin channel while a
+/// `Kill` control message sits queued, and tokio's *random* `select!`
+/// branch choice could drain-and-exit on the closed stdin half before
+/// writing the `Kill` frame. The daemon then saw a plain detach and kept
+/// the child alive: an orphaned agent session that no later attach could
+/// reclaim (fresh `PaneId`-suffixed keys never reattach).
+///
+/// This drives the REAL client path (`Session::attach_remote` +
+/// `Session::kill`) against a real daemon, repeatedly, and requires every
+/// child to actually die. One lost frame in N attempts fails the test.
+#[tokio::test]
+async fn session_kill_always_reaches_daemon_despite_stdin_close_race() {
+    use rimeterm_pty::Session;
+
+    const ATTEMPTS: usize = 12;
+    let endpoint = temp_endpoint("killrace");
+    let _daemon_thread = spawn_daemon(endpoint.clone()).await.expect("daemon up");
+
+    for attempt in 0..ATTEMPTS {
+        // Fresh key per attempt: the daemon must spawn (not reattach).
+        let key = format!("killrace-{attempt}");
+        let (session, mut events) = Session::attach_remote(
+            &endpoint,
+            &key,
+            "label",
+            "shell",
+            echo_spec("RACE-BANNER"),
+            Some(300),
+            80,
+            24,
+        )
+        .await
+        .expect("attach");
+
+        // Wait until the child has actually produced output: with a
+        // live, echoing child on the other side, a lost Kill is
+        // unambiguous (the child survives; a delivered Kill kills it).
+        let banner_seen = tokio::time::timeout(Duration::from_secs(10), events.recv())
+            .await
+            .expect("attempt {attempt}: no output within 10 s")
+            .is_some();
+        assert!(
+            banner_seen,
+            "attempt {attempt}: event channel closed before banner"
+        );
+
+        // The exact racy sequence the TUI performs on tab close.
+        session.kill();
+
+        // The daemon must kill the child and the pump must observe
+        // Exited. With the bug, ~50% of attempts never see Exited.
+        let exited = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Some(rimeterm_pty::SessionOutput::Exited { .. }) => break true,
+                    Some(_) => continue,
+                    None => break false,
+                }
+            }
+        })
+        .await
+        .expect("attempt {attempt}: no Exited within 10 s");
+        assert!(
+            exited,
+            "attempt {attempt}: stream ended without Exited — Kill frame lost"
+        );
+
+        // Belt and braces: the child must be gone from the daemon's
+        // table. A lost Kill leaves a live session under this key.
+        let mut probe = connect(&endpoint).await.expect("probe connect");
+        probe
+            .write_frame(&Frame::ClientJson(ClientMsg::List))
+            .await
+            .unwrap();
+        let mut listed = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let frame = tokio::time::timeout_at(deadline, probe.read_frame())
+                .await
+                .expect("list probe timed out")
+                .expect("list probe io error");
+            let Some(frame) = frame else { break };
+            if let Frame::DaemonJson(DaemonMsg::Sessions { sessions }) = frame {
+                listed = sessions;
+                break;
+            }
+        }
+        drop(probe);
+        assert!(
+            !listed.iter().any(|s| s.key == key),
+            "attempt {attempt}: session {key} still live after kill: {listed:?}"
+        );
+    }
+}

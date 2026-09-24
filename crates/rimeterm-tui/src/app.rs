@@ -1319,6 +1319,38 @@ struct WorkspaceBuild {
     agent_ids: Vec<(PaneId, &'static str)>,
     agent_pids: Vec<(PaneId, u32)>,
 }
+/// Why a workspace bundle's sessions are being released.
+///
+/// `Close`: the workspace is removed from the persisted list — its daemon
+/// key prefix (`<workspace-hash>-`) will never be attached again, so
+/// keeping daemon sessions alive is a guaranteed leak (observed as
+/// orphaned `omp` agent children accumulating under the sessiond).
+/// Daemon sessions MUST be killed, tmux-style background persistence
+/// notwithstanding.
+///
+/// `Shutdown`: the whole TUI exits. Daemon sessions stay alive on
+/// purpose — that is sessiond's core feature ("关闭后台不断流"); the
+/// next launch reattaches under the same stable keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReleasePurpose {
+    Close,
+    Shutdown,
+}
+
+/// Decide whether a session owned by a released bundle must be killed.
+/// Native children are always killed (they die with the process anyway);
+/// daemon-attached sessions only die when the workspace itself goes away.
+pub(crate) fn should_kill_session_on_release(
+    purpose: ReleasePurpose,
+    host_is_daemon: bool,
+) -> bool {
+    match purpose {
+        // Workspace closed → key prefix is dead; daemon sessions leak.
+        ReleasePurpose::Close => true,
+        // TUI shutdown → daemon sessions persist by design.
+        ReleasePurpose::Shutdown => !host_is_daemon,
+    }
+}
 
 impl App {
     /// Build the application for `workspace_root`.
@@ -3239,11 +3271,15 @@ impl App {
         Ok(())
     }
 
-    fn release_workspace_bundle(&mut self, bundle: crate::workspace::WorkspaceBundle) {
+    fn release_workspace_bundle(
+        &mut self,
+        bundle: crate::workspace::WorkspaceBundle,
+        purpose: ReleasePurpose,
+    ) {
         let pane_ids: Vec<PaneId> = bundle.panes.ids().collect();
         for pane_id in pane_ids {
             if let Some(session) = self.session_writes.lock().remove(&pane_id)
-                && !bundle.host.is_daemon()
+                && should_kill_session_on_release(purpose, bundle.host.is_daemon())
             {
                 session.kill();
             }
@@ -3274,7 +3310,7 @@ impl App {
 
         let slot = crate::workspace::stash_slot(logical, self.active_ws);
         let bundle = self.ws_stash.remove(slot);
-        self.release_workspace_bundle(bundle);
+        self.release_workspace_bundle(bundle, ReleasePurpose::Close);
         self.ws_order.remove(logical);
         self.ws_instances.remove(logical);
         self.ws_custom_titles.remove(logical);
@@ -6720,7 +6756,7 @@ impl App {
         // active bundle so native children are killed and daemon sessions
         // detach instead of leaking until process teardown.
         for bundle in std::mem::take(&mut self.ws_stash) {
-            self.release_workspace_bundle(bundle);
+            self.release_workspace_bundle(bundle, ReleasePurpose::Shutdown);
         }
 
         // Native: kill every hosted child (documented behavior). Daemon:
@@ -11210,11 +11246,38 @@ mod tests {
         // Reproduces the real layout: the hint bar sits on the last
         // row, so `area.y` is non-zero. Off-by-ones in `x + width -
         // chip_width` would shift the chip off-screen.
+
         let area = Rect::new(3, 47, 100, 1);
         let release = fake_release("0.2.17");
         let out = upgrade_chip_layout(area, Some(&release)).chip.unwrap();
         assert_eq!(out.rect.x + out.rect.width, 103);
         assert_eq!(out.rect.y, 47);
+    }
+    #[test]
+    fn closing_workspace_kills_daemon_sessions_because_keys_never_reattach() {
+        // The leak this guards against: a closed workspace's key prefix
+        // (`<workspace-hash>-`) leaves the persisted roots list, so no
+        // later attach can ever reach those daemon sessions again — they
+        // accumulate under the sessiond as orphan agent children (the
+        // "11 omp in agtop, 3 in the UI" bug).
+        assert!(should_kill_session_on_release(ReleasePurpose::Close, true));
+        // Native children always die with the bundle.
+        assert!(should_kill_session_on_release(ReleasePurpose::Close, false));
+    }
+
+    #[test]
+    fn tui_shutdown_detaches_daemon_sessions_but_kills_native_ones() {
+        // sessiond's core feature: quitting the TUI keeps daemon-hosted
+        // children alive for reattach on next launch.
+        assert!(!should_kill_session_on_release(
+            ReleasePurpose::Shutdown,
+            true
+        ));
+        // Native children have no host outside this process.
+        assert!(should_kill_session_on_release(
+            ReleasePurpose::Shutdown,
+            false
+        ));
     }
 
     #[test]
