@@ -171,9 +171,18 @@ impl Sampler {
             matchers: builtin(),
             user_matchers,
             prices: PriceTable::builtin(),
-            plugins_cache: Vec::new(),
-            plugins_cached_at: Instant::now() - PLUGIN_CACHE_TTL * 2,
             skills_cache: HashMap::new(),
+            plugins_cache: Vec::new(),
+            // Backdate so the first `refresh()` scans plugins
+            // immediately. `checked_sub`, not `-`: on Windows the
+            // `Instant` epoch is boot time (QPC), so a rimeterm
+            // started within 60 s of boot would underflow and kill
+            // the worker thread — the pane then shows zero agents
+            // forever. Fall back to `now`; worst case the first
+            // plugin scan lands one TTL later.
+            plugins_cached_at: Instant::now()
+                .checked_sub(PLUGIN_CACHE_TTL * 2)
+                .unwrap_or_else(Instant::now),
             history: HashMap::new(),
             tick: 0,
         }

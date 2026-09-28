@@ -93,7 +93,15 @@ impl ActivityMonitor {
             response_rx,
             agents: Vec::new(),
             latest: ActivitySnapshot::default(),
-            last_request: Instant::now() - POLL_INTERVAL,
+            // Backdate so the first `poll()` fires immediately, but
+            // via `checked_sub` — `Instant - Duration` panics on
+            // underflow and on Windows the epoch is boot time, so an
+            // autostarted rimeterm can sit inside POLL_INTERVAL of
+            // it. Fallback to `now` just delays the first poll by
+            // one interval.
+            last_request: Instant::now()
+                .checked_sub(POLL_INTERVAL)
+                .unwrap_or_else(Instant::now),
         }
     }
 
