@@ -76,10 +76,10 @@ use crate::pet_pane::PetPane;
 use crate::placeholder_pane::PlaceholderPane;
 use crate::sessions::SessionHost;
 use crate::shell_factory::spawn_shell;
-use crate::status_bar::{StatusBarHits, StatusBarHover, render as render_status_bar};
 use crate::tab_strip::render as render_tab_strip;
 use crate::terminal::TerminalGuard;
 use crate::todo_pane::{TodoAction, TodoPane};
+use crate::top_bar::{StatusBarHits, StatusBarHover};
 use crate::viewer::{
     self, SelectionSnapshot, SourceMeta, ViewerCompletion, ViewerKind, ViewerOverlayState,
 };
@@ -1185,8 +1185,8 @@ pub struct App {
     /// hover style in `draw()` so the affordance reads as clickable —
     /// the terminal can't advertise it via an OS cursor change.
     hovered_ui: Option<HoveredUi>,
-    /// Status-bar hit rects from the last `draw`. Populated by
-    /// [`crate::status_bar::render`] and consumed by `on_mouse` to
+    /// Top-bar status hit rects from the last `draw`. Populated by
+    /// [`crate::top_bar::render`] and consumed by `on_mouse` to
     /// route clicks on `≡ rimeterm` / `[×]` back into the same
     /// commands (`app.menu.toggle`, `app.quit`) the keyboard uses.
     last_status_bar_hits: StatusBarHits,
@@ -1272,6 +1272,10 @@ pub struct App {
     ws_stash: Vec<crate::workspace::WorkspaceBundle>,
     /// Feature toggle persisted in `workspaces.state.toml` (default on).
     workspace_tabs_enabled: bool,
+    /// First logical workspace-tab index rendered in the top bar's tab
+    /// region. Scrolls only when tabs overflow the row; the layout
+    /// clamps it to keep the active tab visible.
+    ws_scroll: usize,
     /// Workspace-strip geometry from the last draw, used for mouse routing.
     last_workspace_strip_hits: Vec<(Rect, crate::workspace_strip::WorkspaceHit)>,
     hovered_workspace: crate::workspace_strip::WorkspaceHover,
@@ -1910,6 +1914,7 @@ impl App {
             ws_rename: None,
             ws_click_streak: crate::workspace_strip::WorkspaceClickStreak::default(),
             workspace_tabs_enabled: persisted_workspaces.enabled,
+            ws_scroll: 0,
             last_workspace_strip_hits: Vec::new(),
             hovered_workspace: crate::workspace_strip::WorkspaceHover::None,
             ws_stash: Vec::new(),
@@ -3114,6 +3119,19 @@ impl App {
         self.persist_workspaces_state();
     }
 
+    /// Scroll the workspace tab region by `delta` tabs (mouse clicks
+    /// on the `‹` / `›` overflow affordances). The next draw clamps
+    /// the offset so the active tab stays visible.
+    fn scroll_workspace_tabs(&mut self, delta: i32) {
+        let max = self.ws_titles.len().saturating_sub(1) as i32;
+        let next = (self.ws_scroll as i32 + delta).clamp(0, max) as usize;
+        if next != self.ws_scroll {
+            self.ws_scroll = next;
+            self.needs_redraw = true;
+            let _ = self.redraw_tx.send(());
+        }
+    }
+
     fn persist_workspaces_state(&self) {
         let state = rimeterm_config::workspaces_state::WorkspacesState {
             enabled: self.workspace_tabs_enabled,
@@ -3922,6 +3940,12 @@ impl App {
                     Some(crate::workspace_strip::WorkspaceHit::New) => {
                         crate::workspace_strip::WorkspaceHover::New
                     }
+                    Some(crate::workspace_strip::WorkspaceHit::OverflowPrev) => {
+                        crate::workspace_strip::WorkspaceHover::OverflowPrev
+                    }
+                    Some(crate::workspace_strip::WorkspaceHit::OverflowNext) => {
+                        crate::workspace_strip::WorkspaceHover::OverflowNext
+                    }
                     None => crate::workspace_strip::WorkspaceHover::None,
                 };
                 if hover != self.hovered_workspace {
@@ -3974,6 +3998,13 @@ impl App {
                         if let Err(error) = self.duplicate_workspace() {
                             self.set_hint(format!("duplicate workspace failed: {error}"));
                         }
+                    }
+                    Some(crate::workspace_strip::WorkspaceHit::OverflowPrev) => {
+                        self.scroll_workspace_tabs(-1);
+                        return;
+                    }
+                    Some(crate::workspace_strip::WorkspaceHit::OverflowNext) => {
+                        self.scroll_workspace_tabs(1);
                         return;
                     }
                     None => {}
@@ -4986,41 +5017,14 @@ impl App {
     }
 
     fn draw(&mut self, area: Rect, frame: &mut ratatui::Frame<'_>) -> Option<(u16, u16)> {
-        let strip_visible = self.workspace_tabs_enabled && self.ws_order.len() > 0;
         let vertical = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(if strip_visible {
-                vec![
-                    Constraint::Length(1), // workspace strip
-                    Constraint::Length(1), // status
-                    Constraint::Min(1),    // pane area
-                    Constraint::Length(1), // hint bar
-                ]
-            } else {
-                vec![
-                    Constraint::Length(1), // status
-                    Constraint::Min(1),    // pane area
-                    Constraint::Length(1), // hint bar
-                ]
-            })
+            .constraints([
+                Constraint::Length(1), // single-row workspace header
+                Constraint::Min(1),    // pane area
+                Constraint::Length(1), // hint bar
+            ])
             .split(area);
-        let status_row = usize::from(strip_visible);
-        let pane_row = status_row + 1;
-        let hint_row = pane_row + 1;
-        if strip_visible {
-            self.last_workspace_strip_hits =
-                crate::workspace_strip::hit_rects(vertical[0], &self.ws_titles);
-            crate::workspace_strip::render(
-                vertical[0],
-                frame.buffer_mut(),
-                &self.ws_titles,
-                self.active_ws,
-                self.hovered_workspace,
-                self.ws_rename.as_ref(),
-            );
-        } else {
-            self.last_workspace_strip_hits.clear();
-        }
 
         let ws_label = self
             .active_root
@@ -5035,8 +5039,8 @@ impl App {
             _ => StatusBarHover::None,
         };
         // C22.6: while the viewer overlay is up, surface `F9 menu`
-        // as a status-bar chip. F9 is the only keyboard path to the
-        // pane menu (markdown-theme picker on markdown snapshots, "no
+        // as a header chip. F9 is the only keyboard path to the pane
+        // menu (markdown-theme picker on markdown snapshots, "no
         // actions here" toast otherwise) and users have no other
         // visible affordance for it — the viewer's own chrome only
         // advertises `Esc / ←` (close) and the `[×]` mouse button.
@@ -5045,19 +5049,33 @@ impl App {
         } else {
             None
         };
-        self.last_status_bar_hits = render_status_bar(
-            vertical[status_row],
-            frame.buffer_mut(),
-            ws_label,
-            &self.shell_short,
-            self.layout_mode,
-            status_hover,
+        // Keep the active workspace tab inside the scrolled window.
+        let mut header_input = crate::top_bar::TopBarInput {
+            titles: &self.ws_titles,
+            active: self.active_ws,
+            workspace_label: ws_label,
+            shell_short: &self.shell_short,
+            layout_mode: self.layout_mode,
+            tabs_enabled: self.workspace_tabs_enabled && !self.ws_titles.is_empty(),
+            scroll_offset: self.ws_scroll,
             key_hint,
+        };
+        self.ws_scroll = crate::top_bar::ensure_active_visible(vertical[0], &header_input);
+        header_input.scroll_offset = self.ws_scroll;
+        let hits = crate::top_bar::render(
+            vertical[0],
+            frame.buffer_mut(),
+            &header_input,
+            self.hovered_workspace,
+            status_hover,
+            self.ws_rename.as_ref(),
         );
+        self.last_workspace_strip_hits = hits.workspace.clone();
+        self.last_status_bar_hits = hits.status;
         // Cache current-frame geometry so mouse hit-tests use the same
         // rects the user is looking at.
-        self.last_pane_area = vertical[pane_row];
-        self.last_dividers = self.tree.dividers(vertical[pane_row]);
+        self.last_pane_area = vertical[1];
+        self.last_dividers = self.tree.dividers(vertical[1]);
         self.last_tab_strips.clear();
         self.last_pane_outer_rects.clear();
         self.last_viewer_rect = None;
@@ -5081,7 +5099,7 @@ impl App {
             WorkspaceLayoutMode::Vertical => &[BUILTIN_AGENTS, BUILTIN_TOOLS],
         };
         for &gid in group_ids {
-            let Some(cell) = group_cell_rect(&self.tree, vertical[pane_row], gid) else {
+            let Some(cell) = group_cell_rect(&self.tree, vertical[1], gid) else {
                 continue;
             };
             let inner = Layout::default()
@@ -5153,11 +5171,11 @@ impl App {
             let overlay_rect = match self.layout_mode {
                 WorkspaceLayoutMode::Landscape => split_parent_rect(
                     &self.tree,
-                    vertical[pane_row],
+                    vertical[1],
                     &rimeterm_core::layout::SplitPath::root().push(0),
                 ),
                 WorkspaceLayoutMode::Vertical => {
-                    group_cell_rect(&self.tree, vertical[pane_row], BUILTIN_TOOLS)
+                    group_cell_rect(&self.tree, vertical[1], BUILTIN_TOOLS)
                 }
             };
             if let Some(rect) = overlay_rect {
@@ -5274,7 +5292,7 @@ impl App {
         // Layout math lives in the pure helper `upgrade_chip_layout`
         // so the width bookkeeping (chip glyphs vs. terminal width,
         // 1-cell gap between hint text and chip) is unit-testable
-        let hint_bar_rect = vertical[hint_row];
+        let hint_bar_rect = vertical[2];
         let layout = upgrade_chip_layout(hint_bar_rect, self.latest_available.as_ref());
         Paragraph::new(Line::from(hint_text))
             .style(hint_style)
@@ -5344,15 +5362,23 @@ impl App {
         // live App instance. All state flowing into the decision goes
         // through arguments; no App field access happens inside.
         let cursor = if let Some(rename) = self.ws_rename.as_ref() {
-            // Rename editor owns the caret: block caret on the strip row
-            // right after the draft (see `workspace_strip::rename_caret_col`).
-            let (strip_rect, _) = vertical
-                .first()
-                .map(|r| (*r, ()))
-                .unwrap_or((Rect::default(), ()));
+            // Rename editor owns the caret: block caret on the header
+            // row right after the draft (see
+            // `top_bar::rename_caret_col`), clamped to the tab region.
+            let header_rect = vertical.first().copied().unwrap_or_default();
+            let input = crate::top_bar::TopBarInput {
+                titles: &self.ws_titles,
+                active: self.active_ws,
+                workspace_label: "",
+                shell_short: &self.shell_short,
+                layout_mode: self.layout_mode,
+                tabs_enabled: self.workspace_tabs_enabled && !self.ws_titles.is_empty(),
+                scroll_offset: self.ws_scroll,
+                key_hint: None,
+            };
             Some((
-                crate::workspace_strip::rename_caret_col(strip_rect, &self.ws_titles, rename),
-                strip_rect.y,
+                crate::top_bar::rename_caret_col(header_rect, &input, rename),
+                header_rect.y,
             ))
         } else {
             decide_frame_cursor(FrameCursorInputs {
