@@ -1049,9 +1049,17 @@ mod shell_spawn_smoke_tests {
     /// tabs whose children exit at once.
     #[tokio::test]
     async fn dead_child_terminates_read_loop_without_spin() {
+        // Pick a shell that exists on the host: CI runs this suite on
+        // Linux/macOS where `cmd` is absent and the spawn would fail
+        // before exercising the read loop at all.
+        let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
+            ("cmd", vec!["/D", "/C", "exit 1"])
+        } else {
+            ("sh", vec!["-c", "exit 1"])
+        };
         let (session, mut events) = Session::spawn(SessionConfig {
-            program: std::path::PathBuf::from("cmd"),
-            args: vec!["/D".into(), "/C".into(), "exit 1".into()],
+            program: std::path::PathBuf::from(program),
+            args: args.into_iter().map(String::from).collect(),
             cwd: None,
             env: Vec::new(),
             cols: 80,
