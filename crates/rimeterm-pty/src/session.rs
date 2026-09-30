@@ -73,6 +73,17 @@ impl SessionVisible {
     }
 }
 
+/// How long the read loop waits between reads while its session is
+/// hidden (inactive tab or stashed workspace). Caps hidden-session
+/// parsing at ~5 reads/s; the ConPTY pipe backpressures the child so
+/// its animation writes stall too. Visible sessions never pace.
+const HIDDEN_READ_PACING: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Pacing decision for the read loop. `None` = read immediately.
+fn read_pacing_delay(visible: &SessionVisible) -> Option<std::time::Duration> {
+    (!visible.get()).then_some(HIDDEN_READ_PACING)
+}
+
 #[derive(Clone)]
 struct ViewportAtBottom(Arc<AtomicBool>);
 
@@ -313,10 +324,12 @@ impl Session {
             Arc::new(Mutex::new(Some(writer)));
         let render_dirty = RenderDirty::default();
         let viewport_at_bottom = ViewportAtBottom::default();
+        let visible = SessionVisible::default();
         let dirty_for_reader = render_dirty.clone();
         let writer_for_reader = Arc::clone(&writer_shared);
         let term_reader = Arc::clone(&term);
         let events_tx_reader = events_tx.clone();
+        let visible_for_reader = visible.clone();
         tokio::task::spawn_blocking(move || {
             read_loop(
                 reader,
@@ -324,6 +337,7 @@ impl Session {
                 events_tx_reader,
                 writer_for_reader,
                 dirty_for_reader,
+                visible_for_reader,
             )
         });
         // Reap the child in a background task so we don't zombie it.
@@ -352,7 +366,7 @@ impl Session {
                     },
                     term,
                     render_dirty,
-                    visible: SessionVisible::default(),
+                    visible,
                     viewport_at_bottom,
                 }),
             },
@@ -401,6 +415,7 @@ impl Session {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let render_dirty = RenderDirty::default();
         let viewport_at_bottom = ViewportAtBottom::default();
+        let visible = SessionVisible::default();
 
         // Attaching to a session whose child already exited: no stream
         // will follow, so surface the exit immediately like the native
@@ -421,11 +436,13 @@ impl Session {
         // answers terminal-capability queries itself (headless Term);
         // this side never responds, so each query is answered exactly
         // once even with a client attached.
+        let visible_for_pump = visible.clone();
         tokio::spawn(remote_pump(
             reader,
             Arc::clone(&term),
             events_tx.clone(),
             render_dirty.clone(),
+            visible_for_pump,
         ));
 
         Ok((
@@ -438,7 +455,7 @@ impl Session {
                     },
                     term,
                     render_dirty,
-                    visible: SessionVisible::default(),
+                    visible,
                     viewport_at_bottom,
                 }),
             },
@@ -762,12 +779,17 @@ async fn remote_pump(
     term: Arc<Mutex<Term<Listener>>>,
     tx: mpsc::UnboundedSender<SessionOutput>,
     dirty: RenderDirty,
+    visible: SessionVisible,
 ) {
     // One Processor per session — parser state (partial escape
     // sequences) must persist across frames, same as native reads.
     let mut processor: Processor = Processor::new();
     let mut osc_scanner = OscScanner::new();
     loop {
+        // Hidden-session pacing (see read_loop for rationale).
+        if let Some(delay) = read_pacing_delay(&visible) {
+            tokio::time::sleep(delay).await;
+        }
         match reader.read_frame().await {
             Ok(Some(Frame::DaemonOutput(bytes))) => {
                 for chunk in parse_chunks(&bytes) {
@@ -1280,6 +1302,7 @@ fn read_loop(
     tx: mpsc::UnboundedSender<SessionOutput>,
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     dirty: RenderDirty,
+    visible: SessionVisible,
 ) {
     // 8 KiB matches ConPTY internal ring size on modern Windows.
     let mut buf = [0u8; 8192];
@@ -1292,6 +1315,12 @@ fn read_loop(
     // state kept here (see osc_bridge.rs).
     let mut osc_scanner = OscScanner::new();
     loop {
+        // Hidden-session pacing: cap reads at ~5/s while the user can't
+        // see this session. Bytes queue in the pipe (nothing lost);
+        // ConPTY backpressures the child so its animation stalls too.
+        if let Some(delay) = read_pacing_delay(&visible) {
+            std::thread::sleep(delay);
+        }
         match reader.read(&mut buf) {
             Ok(0) => {
                 debug!("pty read loop hit EOF");
@@ -1427,5 +1456,20 @@ mod visibility_tests {
         let b = a.clone();
         a.set(false);
         assert!(!b.get(), "clone must observe the flip");
+    }
+
+    #[test]
+    fn hidden_session_read_pacing_engages() {
+        // A hidden session's read loop must pace itself (sleep between
+        // reads) so background animations can't peg a core per hidden
+        // session. Visible sessions never pace.
+        let vis = SessionVisible::default();
+        assert_eq!(read_pacing_delay(&vis), None, "visible: no pacing");
+        vis.set(false);
+        assert_eq!(
+            read_pacing_delay(&vis),
+            Some(HIDDEN_READ_PACING),
+            "hidden: paced at HIDDEN_READ_PACING"
+        );
     }
 }
