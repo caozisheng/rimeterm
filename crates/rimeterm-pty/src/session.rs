@@ -48,6 +48,31 @@ impl RenderDirty {
     }
 }
 
+/// Whether the pane hosting this session is currently rendered. Gate
+/// for the app-wide redraw pulse: a session in a stashed (inactive)
+/// workspace still receives bytes into its grid, but its output must
+/// not drag the ACTIVE workspace into a full redraw per event — the
+/// spin observed with several Ink-TUI agents animating in background
+/// workspaces (~60 fps × N sessions, pegging every core).
+#[derive(Clone)]
+struct SessionVisible(Arc<AtomicBool>);
+
+impl Default for SessionVisible {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+}
+
+impl SessionVisible {
+    fn set(&self, visible: bool) {
+        self.0.store(visible, Ordering::Release);
+    }
+
+    fn get(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone)]
 struct ViewportAtBottom(Arc<AtomicBool>);
 
@@ -212,6 +237,7 @@ struct SessionInner {
     term: Arc<Mutex<Term<Listener>>>,
     render_dirty: RenderDirty,
     viewport_at_bottom: ViewportAtBottom,
+    visible: SessionVisible,
 }
 
 enum Backend {
@@ -326,6 +352,7 @@ impl Session {
                     },
                     term,
                     render_dirty,
+                    visible: SessionVisible::default(),
                     viewport_at_bottom,
                 }),
             },
@@ -411,6 +438,7 @@ impl Session {
                     },
                     term,
                     render_dirty,
+                    visible: SessionVisible::default(),
                     viewport_at_bottom,
                 }),
             },
@@ -555,6 +583,22 @@ impl Session {
     /// `Term.selection`) so the next `render` repaints.
     pub fn mark_render_dirty(&self) {
         self.inner.render_dirty.mark();
+    }
+
+    /// Whether the pane hosting this session currently renders it.
+    /// Starts `true` (a freshly spawned session is assumed on-screen);
+    /// the app flips it to `false` when the pane's tab loses focus or
+    /// its workspace is stashed, and back to `true` when it returns.
+    /// The redraw forwarders consult this to drop redraw pulses from
+    /// invisible sessions — their bytes still land in the grid; only
+    /// the "repaint now" signal is suppressed.
+    pub fn is_visible(&self) -> bool {
+        self.inner.visible.get()
+    }
+
+    /// See [`Session::is_visible`].
+    pub fn set_visible(&self, visible: bool) {
+        self.inner.visible.set(visible);
     }
 
     /// Best-effort kill for shutdown / respawn (`drop_pane_and_session`).
@@ -976,6 +1020,48 @@ mod shell_spawn_smoke_tests {
         .await
         .unwrap();
     }
+
+    /// A child that exits immediately must leave the master read loop
+    /// terminated — no tight spin on a dead pipe. Regression guard for
+    /// the multi-core idle burn observed with several restored agent
+    /// tabs whose children exit at once.
+    #[tokio::test]
+    async fn dead_child_terminates_read_loop_without_spin() {
+        let (session, mut events) = Session::spawn(SessionConfig {
+            program: std::path::PathBuf::from("cmd"),
+            args: vec!["/D".into(), "/C".into(), "exit 1".into()],
+            cwd: None,
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+            backend: PtyBackend::Native,
+        })
+        .unwrap();
+
+        // Wait for the Exited event (bounded) — the reaper fires it
+        // when the child dies; the reader must drain to EOF on its own.
+        let saw_exit = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if matches!(events.recv().await, Some(SessionOutput::Exited { .. })) {
+                    break true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(saw_exit, "child exit was not observed");
+
+        // After exit, the read loop hits EOF and the forwarder breaks;
+        // the render-dirty flag may carry the final bytes, but no NEW
+        // dirty may appear afterwards.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = session.take_render_dirty();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !session.take_render_dirty(),
+            "read loop still producing output after child death — spin on dead pipe"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1316,5 +1402,30 @@ pub(crate) fn respond_to_terminal_queries(
     if let Some(w) = w.as_mut() {
         let _ = w.write_all(&reply);
         let _ = w.flush();
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+
+    #[test]
+    fn visibility_defaults_true_and_toggles() {
+        let v = SessionVisible::default();
+        assert!(v.get(), "fresh sessions are assumed on-screen");
+        v.set(false);
+        assert!(!v.get());
+        v.set(true);
+        assert!(v.get());
+    }
+
+    #[test]
+    fn visibility_clones_share_state() {
+        // The forwarder task and the pane both hold Session clones; a
+        // set_visible through one must be observed by the other.
+        let a = SessionVisible::default();
+        let b = a.clone();
+        a.set(false);
+        assert!(!b.get(), "clone must observe the flip");
     }
 }

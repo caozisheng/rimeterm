@@ -55,13 +55,23 @@ pub fn spawn_shell(
     // double-mint.
     let pane_id = rimeterm_core::pane::PaneId::next();
 
+    let session_for_pulse = session.clone();
     // Forwarder: coalesce Redraw / Exited into the app-wide redraw pulse
     // and route OscRimeterm payloads onto the OSC channel (C18-D).
+    // Redraw pulses are gated on session visibility: a session in an
+    // inactive tab / stashed workspace still writes its grid, but its
+    // output must not drag the active workspace into a full redraw per
+    // event (the multi-core spin with background Ink-TUI agents).
     tokio::spawn(async move {
         while let Some(evt) = rx.recv().await {
             match evt {
                 rimeterm_pty::SessionOutput::OscRimeterm { payload } => {
                     if osc_tx.send((pane_id, payload)).is_err() {
+                        break;
+                    }
+                }
+                rimeterm_pty::SessionOutput::Redraw => {
+                    if session_for_pulse.is_visible() && redraw.send(()).is_err() {
                         break;
                     }
                 }

@@ -45,6 +45,12 @@ impl PaneRegistry {
         self.map.keys().copied()
     }
 
+    /// Mutable iterator over every pane. Used by workspace switching to
+    /// flip session visibility for the whole tree at once.
+    pub fn panes_mut(&mut self) -> impl Iterator<Item = &mut dyn PaneProvider> {
+        self.map.values_mut().map(|b| b.as_mut())
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }

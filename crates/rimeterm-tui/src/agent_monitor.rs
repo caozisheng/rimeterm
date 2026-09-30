@@ -10,6 +10,39 @@ use crate::agtop_worker::AgtopWorker;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(1500);
 
+/// Minimum spacing between full-table process refreshes in the
+/// `match_main_agent` descendant-fallback. The fallback fires from the
+/// main loop every tick whenever the launcher pid is absent from the
+/// agtop snapshot (dead agent, or sampling lag); unthrottled that is a
+/// `ProcessesToUpdate::All` syscall storm per frame and pegs every
+/// core. 1.5 s matches the agtop sampler cadence, so the fallback
+/// never waits longer than one snapshot behind reality.
+const FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Last fallback refresh. Cleared to `None` whenever an exact/child
+/// match succeeds so a later fallback starts fresh.
+static FALLBACK_LAST_REFRESH: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
+
+/// Whether a fallback full-table refresh may run given the last run
+/// time, and the new last-run time to store. Pure half of the limiter
+/// so the interval logic is unit-testable without racing other tests
+/// through the process-wide static.
+fn fallback_refresh_step(last: Option<Instant>, now: Instant) -> (bool, Option<Instant>) {
+    match last {
+        Some(t) if now.saturating_duration_since(t) < FALLBACK_REFRESH_INTERVAL => (false, last),
+        _ => (true, Some(now)),
+    }
+}
+
+/// Whether a fallback full-table refresh may run now (and marks it as
+/// run when it returns `true`).
+fn fallback_refresh_due(now: Instant) -> bool {
+    let mut last = FALLBACK_LAST_REFRESH.lock();
+    let (due, next) = fallback_refresh_step(*last, now);
+    *last = next;
+    due
+}
+
 pub type SharedAgentSnapshot = Arc<RwLock<Snapshot>>;
 pub type SharedMainAgentSignal = Arc<RwLock<MainAgentSignal>>;
 
@@ -107,7 +140,15 @@ pub fn match_main_agent(root_pid: u32, snapshot: &Snapshot) -> Option<&AgentInfo
         return Some(worker);
     }
     if exact.is_some() {
+        FALLBACK_LAST_REFRESH.lock().take();
         return exact;
+    }
+    // Descendant fallback. Rate-limited: this path refreshes the WHOLE
+    // process table and the main loop calls it every tick — without
+    // the limiter a dead launcher pid turns into a per-frame syscall
+    // storm (the multi-core idle burn).
+    if !fallback_refresh_due(Instant::now()) {
+        return None;
     }
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -277,6 +318,27 @@ mod tests {
             match_main_agent(42, &snapshot).map(|agent| agent.status),
             Some(AgentStatus::Busy)
         );
+    }
+
+    /// The descendant-fallback in `match_main_agent` refreshes the
+    /// WHOLE process table (`ProcessesToUpdate::All` with exe/cwd).
+    /// Called from the main loop every tick, a dead launcher pid turns
+    /// that into a full-table syscall storm per frame — the observed
+    /// multi-core idle burn. The fallback must be rate-limited: at
+    /// most one refresh per FALLBACK_REFRESH_INTERVAL.
+    #[test]
+    fn fallback_process_refresh_is_rate_limited() {
+        let now = Instant::now();
+        // First call performs a refresh; an immediate second call
+        // must NOT (interval not elapsed).
+        let (due, last) = fallback_refresh_step(None, now);
+        assert!(due);
+        let (due_again, _) = fallback_refresh_step(last, now);
+        assert!(!due_again);
+        // After the interval elapses the refresh may run again.
+        let later = now + FALLBACK_REFRESH_INTERVAL;
+        let (due_later, _) = fallback_refresh_step(Some(now), later);
+        assert!(due_later);
     }
     #[test]
     fn exact_root_pid_matches_agent() {

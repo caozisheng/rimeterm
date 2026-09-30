@@ -332,6 +332,15 @@ impl PaneProvider for PtyPane {
         true
     }
 
+    fn set_visible(&mut self, visible: bool) {
+        // Forward to the session so the redraw forwarders can drop
+        // pulses from panes the user can't see (inactive tab or
+        // stashed workspace). Bytes keep landing in the grid; only the
+        // "repaint now" signal is gated. Re-activating the tab sets it
+        // back and the accumulated render-dirty flag drives the repaint.
+        self.session.set_visible(visible);
+    }
+
     fn caps(&self) -> PaneCaps {
         PaneCaps {
             wants_raw_input: true,

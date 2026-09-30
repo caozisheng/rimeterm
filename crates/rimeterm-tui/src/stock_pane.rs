@@ -547,7 +547,17 @@ impl StockPane {
 
 fn next_refresh_deadline(started: Instant, interval: Duration, now: Instant) -> Instant {
     let deadline = started + interval;
-    if deadline > now { deadline } else { now }
+    // Anchor to request start while the response arrived inside the
+    // interval. When the request consumed the whole interval (network
+    // timeout, slow proxy), `deadline` is already in the past — retrying
+    // "now" degenerates into a tight retry spin (~1 failed HTTPS call
+    // per second per market). Back off a full interval from completion
+    // instead.
+    if deadline > now {
+        deadline
+    } else {
+        now + interval
+    }
 }
 
 fn apply_snapshot(column: &mut ColumnState, snapshot: Snapshot) {
@@ -1526,6 +1536,25 @@ mod tests {
         let deadline = next_refresh_deadline(request_started, interval, Instant::now());
 
         assert!(deadline.duration_since(Instant::now()) <= Duration::from_millis(260));
+    }
+
+    #[test]
+    fn slow_request_failure_backs_off_from_completion() {
+        // A request that took longer than the interval (e.g. a network
+        // timeout) must NOT be retried immediately — the next attempt
+        // is a full interval after the response landed, or the pane
+        // degener into a tight retry spin (observed as ~1 failed
+        // HTTPS request per second, pegging CPU).
+        let interval = Duration::from_secs(1);
+        let request_started = Instant::now() - Duration::from_secs(30);
+        let now = Instant::now();
+
+        let deadline = next_refresh_deadline(request_started, interval, now);
+
+        assert!(
+            deadline >= now + interval - Duration::from_millis(50),
+            "deadline {deadline:?} must back off a full interval from now"
+        );
     }
 
     #[test]

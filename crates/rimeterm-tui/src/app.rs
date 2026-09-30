@@ -2005,6 +2005,14 @@ impl App {
             app.ws_instances = restored_instances;
             app.ws_custom_titles = restored_titles;
             app.ws_stash = restored_stash;
+            // Restored background workspaces start hidden: their panes
+            // must not emit redraw pulses until the user activates the
+            // tab (see switch_workspace for the matching flip).
+            for bundle in &mut app.ws_stash {
+                for pane in bundle.panes.panes_mut() {
+                    pane.set_visible(false);
+                }
+            }
             app.active_ws = restored_current;
             app.ws_titles =
                 crate::workspace::workspace_titles(&app.ws_order, &app.ws_custom_titles);
@@ -3097,6 +3105,15 @@ impl App {
         // preference at swap time — snapshot it for its next restore.
         bundle.built_left_tabs = self.left_tabs_state.clone();
 
+        // Visibility gate for redraw pulses: mark the outgoing tree's
+        // panes hidden BEFORE stashing (bundle moves into the stash on
+        // insert). The restored tree gets re-marked visible by the
+        // next draw's per-tab set_visible pass; its sessions' pulses
+        // resume from that frame.
+        for pane in bundle.panes.panes_mut() {
+            pane.set_visible(false);
+        }
+
         self.ws_stash
             .insert(crate::workspace::stash_slot(old_active, logical), bundle);
         self.active_ws = logical;
@@ -3953,7 +3970,10 @@ impl App {
                     self.needs_redraw = true;
                     let _ = self.redraw_tx.send(());
                 }
-                if strip_row == Some(m.row) {
+                // Only swallow a Moved when it lands on a workspace
+                // affordance — row 0 now also hosts the status group,
+                // whose hover tracking happens in `find_hovered_ui`.
+                if hit.is_some() {
                     return;
                 }
             }
@@ -4011,7 +4031,17 @@ impl App {
                 }
             }
 
-            if strip_row == Some(m.row) {
+            // Wheel over a rendered workspace affordance cycles tabs.
+            // Like the Moved arm above, this must NOT swallow the whole
+            // row: the status group on the same row owns its own
+            // wheel/click routing further down `on_mouse`.
+            if strip_row == Some(m.row)
+                && matches!(
+                    m.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                )
+                && hit.is_some()
+            {
                 match m.kind {
                     MouseEventKind::ScrollUp => self.cycle_workspace(true),
                     MouseEventKind::ScrollDown => self.cycle_workspace(false),

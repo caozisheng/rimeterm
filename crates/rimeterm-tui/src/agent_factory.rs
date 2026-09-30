@@ -69,7 +69,10 @@ pub fn spawn_external(
         while let Some(evt) = rx.recv().await {
             match evt {
                 rimeterm_pty::SessionOutput::Redraw => {
-                    if redraw.send(()).is_err() {
+                    // Visibility-gated (see shell_factory for rationale):
+                    // dead/hidden agents must not drag the active
+                    // workspace into a redraw spin.
+                    if session_for_events.is_visible() && redraw.send(()).is_err() {
                         break;
                     }
                 }
