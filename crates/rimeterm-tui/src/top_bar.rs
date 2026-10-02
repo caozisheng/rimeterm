@@ -908,7 +908,7 @@ fn paint_tabs(
                 let style = if is_renaming {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else if is_active {
-                    Style::default().add_modifier(Modifier::UNDERLINED)
+                    Style::default().add_modifier(Modifier::REVERSED)
                 } else if matches!(hover, WorkspaceHover::Tab(i) if i == idx) {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
