@@ -4,20 +4,24 @@ mod adapter;
 mod claude_code;
 mod codex;
 mod omp;
+mod opencode;
 mod protocol;
+mod qwen;
 mod validation;
 
 pub use adapter::{AgentEvent, AgentStatusAdapter};
 pub use claude_code::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;
 pub use omp::OmpAdapter;
+pub use opencode::OpenCodeAdapter;
 pub use protocol::{AgentLifecycle, AgentStatusSnapshot, PROTOCOL_VERSION, encode_osc};
+pub use qwen::QwenAdapter;
 pub use validation::{
     MAX_PAYLOAD_BYTES, StatusValidationError, validate_json_payload, validate_snapshot,
 };
 
 pub fn supports_agent(agent: &str) -> bool {
-    matches!(agent, "omp" | "claude" | "codex")
+    matches!(agent, "omp" | "claude" | "codex" | "qwen" | "opencode")
 }
 
 pub const OMP_EXTENSION_SOURCE: &str = r#"import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";

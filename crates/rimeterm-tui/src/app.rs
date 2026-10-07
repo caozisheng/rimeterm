@@ -7533,6 +7533,16 @@ fn build_external_pane(
                     "notify=[\"rimeterm-agent-status\",\"codex-hook-ipc\"]".into(),
                 ]);
             }
+            if spec.id == "qwen" || spec.id == "opencode" {
+                if let Some(hooks_file) = materialize_project_agent_hooks(&spec.id, workspace_root)
+                {
+                    info!(
+                        agent = spec.id.as_str(),
+                        path = %hooks_file.display(),
+                        "installed realtime Agent status hooks"
+                    );
+                }
+            }
             let spawn = crate::agent_factory::spawn_external(
                 host,
                 key,
@@ -7673,6 +7683,76 @@ fn materialize_claude_status_settings() -> Option<std::path::PathBuf> {
     let json = serde_json::to_string_pretty(&settings).ok()?;
     if let Err(error) = std::fs::write(&path, json) {
         warn!(%error, path = %path.display(), "failed to write Claude status settings");
+        return None;
+    }
+    Some(path)
+}
+
+/// Install project-level realtime status hooks for Qwen Code / OpenCode,
+/// modeled on the Claude Code adapter.
+///
+/// These tools have no `--settings`-style CLI override (unlike Claude)
+/// and read hooks from project config files: `.qwen/settings.json` and
+/// `.opencode/opencode.json`. Both use the Claude-compatible hook event
+/// vocabulary and pipe the hook JSON on stdin, so the same
+/// `claude-hook-ipc` bridge handles them — it dispatches on the payload,
+/// not the invoking agent.
+///
+/// Non-destructive: writes only when the config file does not exist. An
+/// existing user config is left untouched (status stays off until the
+/// user adds the hook entry themselves).
+fn materialize_project_agent_hooks(
+    agent_id: &str,
+    workspace_root: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let (dir_name, file_name, hook_command) = match agent_id {
+        "qwen" => (
+            ".qwen",
+            "settings.json",
+            "rimeterm-agent-status qwen-hook-ipc",
+        ),
+        "opencode" => (
+            ".opencode",
+            "opencode.json",
+            "rimeterm-agent-status opencode-hook-ipc",
+        ),
+        _ => return None,
+    };
+    let dir = workspace_root.join(dir_name);
+    let path = dir.join(file_name);
+    if path.exists() {
+        // User-owned config — never overwrite.
+        return None;
+    }
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        warn!(%error, "failed to create Agent config directory");
+        return None;
+    }
+
+    let hook = || {
+        serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": hook_command,
+                "timeout": 5
+            }]
+        })
+    };
+    let settings = serde_json::json!({
+        "hooks": {
+            "SessionStart": [hook()],
+            "UserPromptSubmit": [hook()],
+            "PreToolUse": [hook()],
+            "PostToolUse": [hook()],
+            "PostToolUseFailure": [hook()],
+            "PermissionRequest": [hook()],
+            "PreCompact": [hook()],
+            "Stop": [hook()],
+        }
+    });
+    let json = serde_json::to_string_pretty(&settings).ok()?;
+    if let Err(error) = std::fs::write(&path, json) {
+        warn!(%error, path = %path.display(), "failed to write Agent status hooks");
         return None;
     }
     Some(path)

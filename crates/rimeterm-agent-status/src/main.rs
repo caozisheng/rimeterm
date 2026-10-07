@@ -2,7 +2,8 @@ use std::env;
 use std::io::{self, Read, Write};
 
 use rimeterm_agent_status::{
-    AgentEvent, AgentStatusAdapter, ClaudeCodeAdapter, CodexAdapter, OmpAdapter, encode_osc,
+    AgentEvent, AgentStatusAdapter, ClaudeCodeAdapter, CodexAdapter, OmpAdapter, OpenCodeAdapter,
+    QwenAdapter, encode_osc,
 };
 
 /// Best-effort hook mode error: hooks must never block the host agent.
@@ -45,7 +46,15 @@ fn main() {
         return;
     }
     if args.first().map(String::as_str) == Some("claude-hook-ipc") {
-        emit_claude_hook_ipc();
+        emit_agent_hook_ipc("claude");
+        return;
+    }
+    if args.first().map(String::as_str) == Some("qwen-hook-ipc") {
+        emit_agent_hook_ipc("qwen");
+        return;
+    }
+    if args.first().map(String::as_str) == Some("opencode-hook-ipc") {
+        emit_agent_hook_ipc("opencode");
         return;
     }
     if args.first().map(String::as_str) != Some("emit") {
@@ -72,9 +81,11 @@ fn main() {
     });
 
     let encoded = match agent.as_str() {
-        "omp" => encode_osc(&OmpCode::new(&session, &cwd).apply(event)),
-        "claude" => encode_osc(&ClaudeCode::new(&session, &cwd).apply(event)),
-        "codex" => encode_osc(&Codex::new(&session, &cwd).apply(event)),
+        "omp" => encode_osc(&OmpAdapter::new(&session, &cwd).apply(event)),
+        "claude" => encode_osc(&ClaudeCodeAdapter::new(&session, &cwd).apply(event)),
+        "codex" => encode_osc(&CodexAdapter::new(&session, &cwd).apply(event)),
+        "qwen" => encode_osc(&QwenAdapter::new(&session, &cwd).apply(event)),
+        "opencode" => encode_osc(&OpenCodeAdapter::new(&session, &cwd).apply(event)),
         _ => {
             eprintln!("unsupported realtime Agent `{agent}`");
             std::process::exit(2);
@@ -207,40 +218,19 @@ fn emit_claude_hook_osc() {
     let _ = io::stdout().flush();
 }
 
-fn emit_claude_hook_ipc() {
+fn emit_agent_hook_ipc(agent: &str) {
     let snapshot = parse_claude_hook();
+    // The hook payload identifies the session/cwd; override the agent id
+    // to the invoking CLI so IPC binding matches the workspace's first
+    // Agent pane.
+    let snapshot = rimeterm_agent_status::AgentStatusSnapshot {
+        agent: agent.to_string(),
+        ..snapshot
+    };
     let Ok(payload) = serde_json::to_string(&snapshot) else {
         hook_silent();
     };
     let _ = std::process::Command::new("rimectl")
         .args(["agent.status", "--json", &payload])
         .status();
-}
-
-struct OmpCode(OmpAdapter);
-impl OmpCode {
-    fn new(session: &str, cwd: &str) -> Self {
-        Self(OmpAdapter::new(session, cwd))
-    }
-    fn apply(&mut self, event: AgentEvent) -> rimeterm_agent_status::AgentStatusSnapshot {
-        self.0.apply(event)
-    }
-}
-struct ClaudeCode(ClaudeCodeAdapter);
-impl ClaudeCode {
-    fn new(session: &str, cwd: &str) -> Self {
-        Self(ClaudeCodeAdapter::new(session, cwd))
-    }
-    fn apply(&mut self, event: AgentEvent) -> rimeterm_agent_status::AgentStatusSnapshot {
-        self.0.apply(event)
-    }
-}
-struct Codex(CodexAdapter);
-impl Codex {
-    fn new(session: &str, cwd: &str) -> Self {
-        Self(CodexAdapter::new(session, cwd))
-    }
-    fn apply(&mut self, event: AgentEvent) -> rimeterm_agent_status::AgentStatusSnapshot {
-        self.0.apply(event)
-    }
 }
