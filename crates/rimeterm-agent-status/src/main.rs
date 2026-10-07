@@ -25,6 +25,10 @@ fn has(args: &[String], flag: &str) -> bool {
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("codex-hook") {
+        emit_codex_hook();
+        return;
+    }
     if args.first().map(String::as_str) == Some("claude-hook") {
         emit_claude_hook();
         return;
@@ -68,6 +72,52 @@ fn main() {
     let _ = io::stdout().write_all(encoded.as_bytes());
     let _ = io::stdout().flush();
 }
+fn emit_codex_hook() {
+    let mut input = String::new();
+    if io::stdin().read_to_string(&mut input).is_err() {
+        std::process::exit(1);
+    }
+    let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_else(|_| {
+        eprintln!("invalid Codex notify JSON");
+        std::process::exit(2);
+    });
+    let event_name = value
+        .get("event")
+        .and_then(|v| v.as_str())
+        .unwrap_or("agent-turn-complete");
+    let session = value
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let cwd = value.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+    let event = match event_name {
+        "agent-turn-complete" | "turn-complete" => AgentEvent::AgentEnd { error: false },
+        "error" | "turn-failed" => AgentEvent::AgentEnd { error: true },
+        "approval-requested" | "permission-request" => AgentEvent::ToolApprovalRequested,
+        "tool-start" | "tool_execution_start" => AgentEvent::ToolStart {
+            tool: value
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool")
+                .into(),
+            activity: value
+                .get("activity")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        },
+        "tool-end" | "tool_execution_end" => AgentEvent::ToolEnd { error: false },
+        _ => AgentEvent::AgentEnd { error: false },
+    };
+    let mut adapter = CodexAdapter::new(session, cwd);
+    let snapshot = adapter.apply(event);
+    let encoded = encode_osc(&snapshot).unwrap_or_else(|error| {
+        eprintln!("encode status: {error}");
+        std::process::exit(1);
+    });
+    let _ = io::stdout().write_all(encoded.as_bytes());
+    let _ = io::stdout().flush();
+}
+
 fn emit_claude_hook() {
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() {

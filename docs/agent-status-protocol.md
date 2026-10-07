@@ -71,6 +71,14 @@ For Claude Code hooks, configure a command that forwards the hook JSON on stdin:
 ```
 
 Merge these entries into the existing settings instead of replacing the user's hook configuration.
+
+For Codex CLI, add the notify hook to `~/.codex/config.toml` (merge with existing settings):
+
+```toml
+notify = ["sh", "-c", "rimeterm-agent-status codex-hook"]
+```
+
+Codex sends a JSON payload on stdin. The current documented `agent-turn-complete` event maps to `success`; additional tool and approval event names are accepted when supplied by the installed Codex version.
 Hooks that cannot write OSC can use the generic IPC command interface:
 
 ```powershell
