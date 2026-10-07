@@ -391,6 +391,7 @@ jobs:
         run: |
           set -euo pipefail
           DIR="rimeterm-${{ steps.version.outputs.value }}-termux-aarch64"
+          mkdir -p "$DIR"
           cp "target/aarch64-linux-android/release/rimeterm" "$DIR/"
           cp "target/aarch64-linux-android/release/rimectl"  "$DIR/"
           cp "target/aarch64-linux-android/release/rimeterm-agent-status" "$DIR/"
