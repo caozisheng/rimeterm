@@ -51,21 +51,29 @@ struct ActivityCandidate {
     state: Option<ActivityState>,
 }
 
-fn select_current_activity<I>(candidates: I, session_id: Option<&str>) -> Option<ActivityState>
-where
-    I: IntoIterator<Item = ActivityCandidate>,
-{
-    let candidates = candidates.into_iter().collect::<Vec<_>>();
+/// Pick at most two transcript files worth reading: the one matching the
+/// agent's `session_id` (when known) and the newest by mtime. Reading
+/// every JSONL in a project directory made each poll O(directory size):
+/// long-lived projects accumulate hundreds of multi-megabyte sessions,
+/// which turned the 250 ms activity poll into a sustained ~20 MB/s read
+/// + JSON parse loop that pegged the UI thread.
+fn limit_candidates(
+    mut files: Vec<(PathBuf, u64, String)>,
+    session_id: Option<&str>,
+) -> Vec<(PathBuf, u64, String)> {
+    let mut selected: Vec<(PathBuf, u64, String)> = Vec::with_capacity(2);
     if let Some(session_id) = session_id {
-        return candidates
-            .into_iter()
-            .find(|candidate| candidate.session_id == session_id)
-            .and_then(|candidate| candidate.state);
+        if let Some(index) = files.iter().position(|(_, _, stem)| stem == session_id) {
+            selected.push(files.remove(index));
+        }
     }
-    candidates
-        .into_iter()
-        .max_by_key(|candidate| candidate.mtime_ms)
-        .and_then(|candidate| candidate.state)
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    if let Some(newest) = files.into_iter().next() {
+        if !selected.iter().any(|(_, _, stem)| *stem == newest.2) {
+            selected.push(newest);
+        }
+    }
+    selected
 }
 
 enum Request {
@@ -163,19 +171,30 @@ fn find_omp_activity(agent: &ActivityAgent) -> Option<ActivityState> {
     let mut candidates = Vec::new();
     for variant in crate::agtop_omp::encode_cwd_variants(&agent.cwd, &home) {
         let dir = root.join(variant);
-        for path in jsonl_files(&dir) {
+        let files = jsonl_files(&dir)
+            .into_iter()
+            .map(|path| {
+                let mtime_ms = file_mtime_ms(&path);
+                let session_id = session_stem(&path);
+                (path, mtime_ms, session_id)
+            })
+            .collect();
+        for (path, mtime_ms, session_id) in limit_candidates(files, agent.session_id.as_deref()) {
             let records = parse_jsonl(&read_tail(&path));
             candidates.push(ActivityCandidate {
-                session_id: path
-                    .file_stem()
-                    .map(|stem| stem.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                mtime_ms: file_mtime_ms(&path),
+                session_id,
+                mtime_ms,
                 state: parse_omp_activity(&records),
             });
         }
     }
     select_current_activity(candidates, agent.session_id.as_deref())
+}
+
+fn session_stem(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn find_claude_activity(agent: &ActivityAgent) -> Option<ActivityState> {
@@ -184,15 +203,20 @@ fn find_claude_activity(agent: &ActivityAgent) -> Option<ActivityState> {
         .join(".claude")
         .join("projects")
         .join(crate::agtop_session::encode_cwd(&agent.cwd));
+    let files = jsonl_files(&dir)
+        .into_iter()
+        .map(|path| {
+            let mtime_ms = file_mtime_ms(&path);
+            let session_id = session_stem(&path);
+            (path, mtime_ms, session_id)
+        })
+        .collect();
     let mut candidates = Vec::new();
-    for path in jsonl_files(&dir) {
+    for (path, mtime_ms, session_id) in limit_candidates(files, agent.session_id.as_deref()) {
         let records = parse_jsonl(&read_tail(&path));
         candidates.push(ActivityCandidate {
-            session_id: path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            mtime_ms: file_mtime_ms(&path),
+            session_id,
+            mtime_ms,
             state: parse_claude_activity(&records),
         });
     }
@@ -617,5 +641,18 @@ mod tests {
             select_current_activity([old, current], Some("current-session")),
             None
         );
+    }
+
+    #[test]
+    fn limit_candidates_reads_matching_then_newest_only() {
+        let files = vec![
+            (PathBuf::from("old.jsonl"), 10, "old".to_string()),
+            (PathBuf::from("new.jsonl"), 30, "new".to_string()),
+            (PathBuf::from("current.jsonl"), 20, "current".to_string()),
+        ];
+        let selected = limit_candidates(files, Some("current"));
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].2, "current");
+        assert_eq!(selected[1].2, "new");
     }
 }
