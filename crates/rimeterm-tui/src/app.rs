@@ -7527,6 +7527,12 @@ fn build_external_pane(
             {
                 args.extend(["--settings".into(), settings.display().to_string()]);
             }
+            if spec.id == "codex" {
+                args.extend([
+                    "-c".into(),
+                    "notify=[\"rimeterm-agent-status\",\"codex-hook-ipc\"]".into(),
+                ]);
+            }
             let spawn = crate::agent_factory::spawn_external(
                 host,
                 key,

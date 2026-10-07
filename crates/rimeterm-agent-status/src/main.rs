@@ -26,7 +26,11 @@ fn has(args: &[String], flag: &str) -> bool {
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("codex-hook") {
-        emit_codex_hook();
+        emit_codex_hook_osc();
+        return;
+    }
+    if args.first().map(String::as_str) == Some("codex-hook-ipc") {
+        emit_codex_hook_ipc();
         return;
     }
     if args.first().map(String::as_str) == Some("claude-hook") {
@@ -129,7 +133,7 @@ fn parse_claude_hook() -> rimeterm_agent_status::AgentStatusSnapshot {
     ClaudeCodeAdapter::new(session, cwd).apply(event)
 }
 
-fn emit_codex_hook() {
+fn parse_codex_hook() -> rimeterm_agent_status::AgentStatusSnapshot {
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() {
         std::process::exit(1);
@@ -165,14 +169,39 @@ fn emit_codex_hook() {
         "tool-end" | "tool_execution_end" => AgentEvent::ToolEnd { error: false },
         _ => AgentEvent::AgentEnd { error: false },
     };
-    let mut adapter = CodexAdapter::new(session, cwd);
-    let snapshot = adapter.apply(event);
+    CodexAdapter::new(session, cwd).apply(event)
+}
+
+fn emit_codex_hook_osc() {
+    let snapshot = parse_codex_hook();
     let encoded = encode_osc(&snapshot).unwrap_or_else(|error| {
         eprintln!("encode status: {error}");
         std::process::exit(1);
     });
     let _ = io::stdout().write_all(encoded.as_bytes());
     let _ = io::stdout().flush();
+}
+
+fn emit_codex_hook_ipc() {
+    let snapshot = parse_codex_hook();
+    let payload = serde_json::to_string(&snapshot).unwrap_or_else(|error| {
+        eprintln!("serialize status: {error}");
+        std::process::exit(1);
+    });
+    let status = std::process::Command::new("rimectl")
+        .args(["agent.status", "--json", &payload])
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("rimectl agent.status failed with {status}");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("failed to run rimectl: {error}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn emit_claude_hook_osc() {
