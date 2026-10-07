@@ -1291,6 +1291,7 @@ pub struct App {
     ws_click_streak: crate::workspace_strip::WorkspaceClickStreak,
     /// Epoch used to phase non-idle workspace status glyph blinking.
     blink_epoch: Instant,
+    blink_phase: bool,
     ws_stash: Vec<crate::workspace::WorkspaceBundle>,
     /// Feature toggle persisted in `workspaces.state.toml` (default on).
     workspace_tabs_enabled: bool,
@@ -1931,6 +1932,7 @@ impl App {
             ws_rename: None,
             ws_click_streak: crate::workspace_strip::WorkspaceClickStreak::default(),
             blink_epoch: Instant::now(),
+            blink_phase: true,
             workspace_tabs_enabled: persisted_workspaces.enabled,
             ws_scroll: 0,
             last_workspace_strip_hits: Vec::new(),
@@ -2100,13 +2102,16 @@ impl App {
             if self.poll_pane_background() {
                 self.needs_redraw = true;
             }
-            if self
-                .workspace_activity
-                .iter()
-                .any(|activity| *activity != WorkspaceActivity::Quiet)
-                && self.blink_epoch.elapsed() >= Duration::from_millis(500)
-            {
-                self.needs_redraw = true;
+            let blink_on = crate::top_bar::blink_on(self.blink_epoch.elapsed());
+            if blink_on != self.blink_phase {
+                self.blink_phase = blink_on;
+                if self
+                    .workspace_activity
+                    .iter()
+                    .any(|activity| *activity != WorkspaceActivity::Quiet)
+                {
+                    self.needs_redraw = true;
+                }
             }
 
             if self.expire_hint() {
