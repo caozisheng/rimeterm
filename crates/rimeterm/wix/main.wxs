@@ -76,6 +76,12 @@
                               Source="$(var.CargoTargetBinDir)\rimectl.exe"
                               KeyPath="yes" />
                     </Component>
+                    <Component Id="AgentStatusExe" Guid="6E478F85-B01C-4A6D-E7FA-0C2D8F1A3B45" Win64="yes">
+                        <File Id="AgentStatusExeFile"
+                              Name="rimeterm-agent-status.exe"
+                              Source="$(var.CargoTargetBinDir)\rimeterm-agent-status.exe"
+                              KeyPath="yes" />
+                    </Component>
 
                     <!-- Docs -->
                     <Component Id="LicenseDoc" Guid="3EC46085-01B1-604E-D2D9-9F8D6F0F3C42" Win64="yes">
@@ -165,6 +171,7 @@
         <Feature Id="Complete" Level="1" Title="rimeterm" Description="rimeterm">
             <ComponentRef Id="RimetermExe" />
             <ComponentRef Id="RimectlExe" />
+            <ComponentRef Id="AgentStatusExe" />
             <ComponentRef Id="LicenseDoc" />
             <ComponentRef Id="ReadmeDoc" />
             <ComponentRef Id="AckDoc" />

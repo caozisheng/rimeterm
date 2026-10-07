@@ -46,6 +46,7 @@ maintainer-scripts = "debian/"
 assets = [
     ["target/release/rimeterm", "usr/lib/rimeterm/rimeterm", "755"],
     ["target/release/rimectl",  "usr/lib/rimeterm/rimectl",  "755"],
+    ["target/release/rimeterm-agent-status", "usr/lib/rimeterm/rimeterm-agent-status", "755"],
     ["README.md",               "usr/share/doc/rimeterm/README",         "644"],
     ["LICENSE",                 "usr/share/doc/rimeterm/copyright",      "644"],
     ["ACKNOWLEDGEMENTS.md",     "usr/share/doc/rimeterm/ACKNOWLEDGEMENTS","644"],

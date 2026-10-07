@@ -368,6 +368,7 @@ jobs:
           mkdir -p "$STAGE"
           cp "target/${{ matrix.target }}/release/rimeterm" "$STAGE/"
           cp "target/${{ matrix.target }}/release/rimectl"  "$STAGE/"
+          cp "target/${{ matrix.target }}/release/rimeterm-agent-status" "$STAGE/"
           cp README.md LICENSE ACKNOWLEDGEMENTS.md "$STAGE/"
 
           OUT="rimeterm-${{ steps.version.outputs.value }}-aarch64.dmg"
@@ -390,9 +391,9 @@ jobs:
         run: |
           set -euo pipefail
           DIR="rimeterm-${{ steps.version.outputs.value }}-termux-aarch64"
-          mkdir -p "$DIR"
           cp "target/aarch64-linux-android/release/rimeterm" "$DIR/"
           cp "target/aarch64-linux-android/release/rimectl"  "$DIR/"
+          cp "target/aarch64-linux-android/release/rimeterm-agent-status" "$DIR/"
           cp README.md LICENSE ACKNOWLEDGEMENTS.md "$DIR/"
           OUT="rimeterm-${{ steps.version.outputs.value }}-termux-aarch64.tar.gz"
           tar czf "$OUT" "$DIR"
