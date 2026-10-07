@@ -262,18 +262,6 @@ and per-zone markers in-process. The stack:
   integration, global persistence, multi-instance ownership, and bounded
   main-agent status auras.
 
-## Game
-
-`GamePane` embeds an in-process terminal Pac-Man. No external binary ships.
-
-- [tui-game](https://github.com/MXFish/tui-game) — MIT. The complete game
-  engine (map, ghost AI with scatter/chase cycles and per-ghost targeting,
-  power-pellet fright chains, fruit schedule, scoring, levels) was ported
-  from `scripts/game/pacman.lua` at commit `a5d0903d1f8b80b28ef74a15e1b
-  ebe6ad7f7ee83` into the `rimeterm-game` crate. The maze is stored in the
-  upstream orientation and transposed at parse time so the board fits the
-  wide, short left-bottom pane; mechanics are unchanged.
-
 ## Terminal / TUI design lineage
 
 - [zellij](https://github.com/zellij-org/zellij) and

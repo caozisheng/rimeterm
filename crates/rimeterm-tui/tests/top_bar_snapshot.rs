@@ -17,6 +17,7 @@ fn titles() -> Vec<String> {
 fn input(titles: &[String]) -> TopBarInput<'_> {
     TopBarInput {
         titles,
+        activities: &[],
         active: 0,
         workspace_label: "myproj",
         shell_short: "pwsh",

@@ -59,6 +59,8 @@ use crate::agent_monitor::{
     AgentMonitor, MainAgentPhase, MainAgentSignal, SharedMainAgentSignal, event_for_agent,
     match_main_agent, resolve_main_phase,
 };
+use crate::workspace_activity::{WorkspaceActivity, stabilize};
+
 use crate::file_manager_pane::FileManagerPane;
 use crate::fr_pane::{FrAction, FrPane};
 use crate::glab_pane::GlabPane;
@@ -1256,6 +1258,12 @@ pub struct App {
     /// otherwise root folder basename with duplicates suffixed
     /// ` 2`, ` 3`, …).
     ws_titles: Vec<String>,
+    /// Aggregate Agent activity rendered in the corresponding workspace tab.
+    /// Parallel to `ws_order` / `ws_titles`; `Quiet` has no visual marker.
+    workspace_activity: Vec<WorkspaceActivity>,
+    /// Consecutive quiet samples used to suppress one-sample activity flicker.
+    workspace_quiet_samples: Vec<u8>,
+
     /// Custom titles parallel to `ws_order`; empty = auto-derived.
     /// Persisted as `titles` in `workspaces.state.toml`. Only the
     /// ACTIVE tab can be renamed (double-click in the strip), so
@@ -1634,13 +1642,6 @@ impl App {
         pinned_pane_ids.insert(pet_id);
         git_members.push(pet_id);
 
-        let game_best = rimeterm_config::paths::game_best_file()
-            .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-pacman-best.json"));
-        let game = crate::game_pane::GamePane::new(game_best);
-        let game_id = game.id();
-        panes.insert(Box::new(game));
-        pinned_pane_ids.insert(game_id);
-        git_members.push(game_id);
         panes.insert(Box::new(zones));
         pinned_pane_ids.insert(zones_id);
         git_members.push(zones_id);
@@ -1692,7 +1693,6 @@ impl App {
                 git_pane_id,
             ),
             LeftTabCatalogEntry::new("glab", "Glab", glab_pane_id),
-            LeftTabCatalogEntry::new("game", "Game", game_id),
             LeftTabCatalogEntry::new("sysmon", "Sysmon", sysmon_id),
             LeftTabCatalogEntry::new("agtop", "Agtop", agtop_id),
             LeftTabCatalogEntry::new("pet", "Pet", pet_id),
@@ -1903,6 +1903,9 @@ impl App {
             next_ws_instance: persisted_workspaces.next_instance,
             active_ws: 0,
             ws_titles: vec![crate::workspace::workspace_title(&ws_root)],
+            workspace_activity: vec![WorkspaceActivity::Quiet],
+            workspace_quiet_samples: vec![0],
+
             // Launch slot's custom title: the persisted title for the
             // launch root's slot (`launch_index` = first match, same slot
             // the restore loop inlines as current); auto when absent.
@@ -2004,6 +2007,9 @@ impl App {
 
             app.ws_instances = restored_instances;
             app.ws_custom_titles = restored_titles;
+            app.workspace_activity = vec![WorkspaceActivity::Quiet; app.ws_order.len()];
+            app.workspace_quiet_samples = vec![0; app.ws_order.len()];
+
             app.ws_stash = restored_stash;
             // Restored background workspaces start hidden: their panes
             // must not emit redraw pulses until the user activates the
@@ -2080,6 +2086,7 @@ impl App {
             if self.poll_pane_background() {
                 self.needs_redraw = true;
             }
+
             if self.expire_hint() {
                 self.needs_redraw = true;
             }
@@ -3257,6 +3264,10 @@ impl App {
         self.merge_workspace_build_metadata(&build);
         self.ws_order.push(root);
         self.ws_instances.push(0);
+        self.workspace_activity.push(WorkspaceActivity::Quiet);
+
+        self.workspace_quiet_samples.push(0);
+
         self.ws_custom_titles.push(String::new());
         self.ws_stash.push(build.bundle);
         self.ws_titles = crate::workspace::workspace_titles(&self.ws_order, &self.ws_custom_titles);
@@ -3295,6 +3306,10 @@ impl App {
         let target = crate::workspace::duplicate_target(self.active_ws, self.ws_order.len());
         self.ws_order.insert(target, root);
         self.ws_instances.insert(target, instance_id);
+        self.workspace_activity
+            .insert(target, WorkspaceActivity::Quiet);
+        self.workspace_quiet_samples.insert(target, 0);
+
         self.ws_custom_titles.insert(target, String::new());
         self.ws_stash.insert(
             crate::workspace::stash_slot(target, self.active_ws),
@@ -3349,6 +3364,9 @@ impl App {
         self.ws_order.remove(logical);
         self.ws_instances.remove(logical);
         self.ws_custom_titles.remove(logical);
+        self.workspace_quiet_samples.remove(logical);
+        self.workspace_activity.remove(logical);
+
         if logical < self.active_ws {
             self.active_ws -= 1;
         }
@@ -5082,6 +5100,7 @@ impl App {
         // Keep the active workspace tab inside the scrolled window.
         let mut header_input = crate::top_bar::TopBarInput {
             titles: &self.ws_titles,
+            activities: &self.workspace_activity,
             active: self.active_ws,
             workspace_label: ws_label,
             shell_short: &self.shell_short,
@@ -5090,6 +5109,7 @@ impl App {
             scroll_offset: self.ws_scroll,
             key_hint,
         };
+
         self.ws_scroll = crate::top_bar::ensure_active_visible(vertical[0], &header_input);
         header_input.scroll_offset = self.ws_scroll;
         let hits = crate::top_bar::render(
@@ -5398,6 +5418,7 @@ impl App {
             let header_rect = vertical.first().copied().unwrap_or_default();
             let input = crate::top_bar::TopBarInput {
                 titles: &self.ws_titles,
+                activities: &self.workspace_activity,
                 active: self.active_ws,
                 workspace_label: "",
                 shell_short: &self.shell_short,
@@ -6362,6 +6383,8 @@ impl App {
             })
             .collect::<Vec<_>>();
         dirty |= self.activity_monitor.poll(&activity_agents);
+        dirty |= self.refresh_workspace_activity(&snapshot);
+
         dirty |= self.refresh_main_agent_signal(&snapshot);
         for id in ids {
             if let Some(pane) = self.panes.get_mut(id)
@@ -6373,6 +6396,45 @@ impl App {
         dirty |= self.drain_glab_status_message();
         self.sync_from_file_manager();
         dirty
+    }
+    fn refresh_workspace_activity(&mut self, snapshot: &crate::agtop_model::Snapshot) -> bool {
+        if self.workspace_activity.len() != self.ws_order.len() {
+            self.workspace_activity
+                .resize(self.ws_order.len(), WorkspaceActivity::Quiet);
+        }
+        if self.workspace_quiet_samples.len() != self.ws_order.len() {
+            self.workspace_quiet_samples.resize(self.ws_order.len(), 0);
+        }
+        let active = self.active_ws;
+        let mut changed = false;
+        for logical in 0..self.ws_order.len() {
+            let observed = if logical == active {
+                workspace_activity_for_panes(self.panes.ids(), &self.pane_agent_pid, snapshot)
+            } else {
+                let slot = crate::workspace::stash_slot(logical, active);
+                self.ws_stash
+                    .get(slot)
+                    .map(|bundle| {
+                        workspace_activity_for_panes(
+                            bundle.panes.ids(),
+                            &self.pane_agent_pid,
+                            snapshot,
+                        )
+                    })
+                    .unwrap_or_default()
+            };
+            let (state, quiet_samples) = stabilize(
+                self.workspace_activity[logical],
+                observed,
+                self.workspace_quiet_samples[logical],
+            );
+            if self.workspace_activity[logical] != state {
+                self.workspace_activity[logical] = state;
+                changed = true;
+            }
+            self.workspace_quiet_samples[logical] = quiet_samples;
+        }
+        changed
     }
 
     fn refresh_main_agent_signal(&mut self, snapshot: &crate::agtop_model::Snapshot) -> bool {
@@ -7472,6 +7534,23 @@ fn build_agent_pane(
         Color::LightMagenta,
         "agent",
     )
+}
+
+fn workspace_activity_for_panes(
+    pane_ids: impl Iterator<Item = PaneId>,
+    pane_agent_pid: &std::collections::HashMap<PaneId, u32>,
+    snapshot: &crate::agtop_model::Snapshot,
+) -> WorkspaceActivity {
+    pane_ids
+        .filter_map(|pane_id| pane_agent_pid.get(&pane_id).copied())
+        .filter_map(|pid| snapshot.agents.iter().find(|agent| agent.pid == pid))
+        .fold(WorkspaceActivity::Quiet, |state, agent| {
+            let has_active_work = matches!(agent.status, crate::agtop_model::AgentStatus::Spawning)
+                || agent.current_tool.is_some()
+                || agent.subagents > 0
+                || !agent.in_flight_subagents.is_empty();
+            state.fold_agent_activity(agent.status, agent.session_id.is_some(), has_active_work)
+        })
 }
 
 /// Locate the rect a tab group occupies inside the pane area.

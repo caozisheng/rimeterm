@@ -505,7 +505,7 @@ fn classify_state(
     if is_live && has_in_flight_task {
         return SessionState::Spawning;
     }
-    if is_live && (age_ms < BUSY_WINDOW_MS || has_in_flight_tool) {
+    if is_live && has_in_flight_tool {
         return SessionState::Busy;
     }
     if is_live && age_ms < ACTIVE_WINDOW_MS {
@@ -1030,10 +1030,11 @@ mod tests {
             classify_state(true, 0, &None, true, false),
             SessionState::Spawning
         );
-        // Live + fresh mtime → Busy.
+        // A fresh transcript without an in-flight tool is recent activity,
+        // not current work; workspace tabs must not turn blue for it.
         assert_eq!(
             classify_state(true, 1_000, &None, false, false),
-            SessionState::Busy
+            SessionState::Active
         );
         // Live + in-flight tool but no fresh mtime → Busy still.
         assert_eq!(

@@ -103,12 +103,7 @@ impl AgentStatus {
                 SessionState::Spawning => Self::Spawning,
                 SessionState::Busy => Self::Busy,
                 SessionState::Active => Self::Active,
-                SessionState::Idle => {
-                    // A live-but-quiet Claude with real CPU usage
-                    // should read as Active, not Idle — matches
-                    // upstream's CPU-blended classifier.
-                    if cpu >= 3.0 { Self::Active } else { Self::Idle }
-                }
+                SessionState::Idle => Self::Idle,
                 SessionState::Waiting => Self::Waiting,
                 SessionState::Completed => Self::Completed,
                 SessionState::Stale => Self::Stale,
@@ -538,11 +533,11 @@ mod tests {
             AgentStatus::classify(0.0, Some(SessionState::Spawning)),
             AgentStatus::Spawning
         );
-        // A session claiming Idle but with real CPU usage upgrades
-        // to Active.
+        // An enriched Idle session is authoritative; CPU noise must not
+        // promote it to Active and make the workspace tab flash.
         assert_eq!(
             AgentStatus::classify(5.0, Some(SessionState::Idle)),
-            AgentStatus::Active
+            AgentStatus::Idle
         );
     }
 

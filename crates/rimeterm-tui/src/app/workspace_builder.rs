@@ -273,13 +273,6 @@ impl App {
         pinned_pane_ids.insert(pet_id);
         git_members.push(pet_id);
 
-        let game_best = rimeterm_config::paths::game_best_file()
-            .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-pacman-best.json"));
-        let game = crate::game_pane::GamePane::new(game_best);
-        let game_id = game.id();
-        panes.insert(Box::new(game));
-        pinned_pane_ids.insert(game_id);
-        git_members.push(game_id);
         panes.insert(Box::new(zones));
         pinned_pane_ids.insert(zones_id);
         git_members.push(zones_id);
@@ -331,7 +324,6 @@ impl App {
                 git_pane_id,
             ),
             LeftTabCatalogEntry::new("glab", "Glab", glab_pane_id),
-            LeftTabCatalogEntry::new("game", "Game", game_id),
             LeftTabCatalogEntry::new("sysmon", "Sysmon", sysmon_id),
             LeftTabCatalogEntry::new("agtop", "Agtop", agtop_id),
             LeftTabCatalogEntry::new("pet", "Pet", pet_id),

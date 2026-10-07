@@ -15,6 +15,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use rimeterm_config::memory_state::WorkspaceLayoutMode;
 
+use crate::workspace_activity::WorkspaceActivity;
+
 pub use crate::workspace_strip::{WorkspaceHit, WorkspaceHover, WorkspaceRename};
 
 /// Menu button ` ≡ rimeterm ` = 12 cells (unchanged from the old
@@ -73,6 +75,7 @@ pub struct StatusBarHits {
 #[derive(Debug, Clone)]
 pub struct TopBarInput<'a> {
     pub titles: &'a [String],
+    pub activities: &'a [WorkspaceActivity],
     pub active: usize,
     pub workspace_label: &'a str,
     pub shell_short: &'a str,
@@ -588,9 +591,29 @@ struct TabLayout {
     last_visible: Option<usize>,
 }
 
-/// Natural width of tab `idx`: ` title ` + `× `.
-fn tab_natural(title: &str) -> u16 {
-    dw(title) + 4
+/// Natural width of a rendered tab label plus its close affordance.
+fn tab_natural(label: &str) -> u16 {
+    dw(label) + 2
+}
+
+fn activity_for(input: &TopBarInput<'_>, idx: usize) -> WorkspaceActivity {
+    input.activities.get(idx).copied().unwrap_or_default()
+}
+
+fn activity_title(input: &TopBarInput<'_>, idx: usize, title: &str) -> String {
+    match activity_for(input, idx).glyph() {
+        Some(glyph) => format!("{glyph} {title}"),
+        None => title.to_string(),
+    }
+}
+
+fn tab_label(input: &TopBarInput<'_>, idx: usize, title: &str, renaming: bool) -> String {
+    let title = activity_title(input, idx, title);
+    if renaming {
+        format!(" {title}")
+    } else {
+        format!(" {title} ")
+    }
 }
 
 /// Fit the workspace tabs into `region`, applying the shrink ladder:
@@ -600,30 +623,30 @@ fn fit_tabs(region: Rect, input: &TopBarInput<'_>, rename: Option<&WorkspaceRena
     if !input.tabs_enabled || input.titles.is_empty() || region.width == 0 {
         return layout;
     }
-    let titles = input.titles;
-    let len = titles.len();
+    let len = input.titles.len();
     let offset = input.scroll_offset.min(len - 1);
 
-    // Total width with every tab at `natural` (rename draft replaces
-    // the renamed tab's title).
+    // Total width with every rendered tab label at `natural` (rename draft
+    // replaces the renamed tab's title).
     let title_of = |idx: usize| -> String {
         if let Some(r) = rename
             && r.index == idx
         {
             r.buffer.clone()
         } else {
-            titles[idx].clone()
+            input.titles[idx].clone()
         }
     };
     let natural_total = |cap: Option<u16>| -> u16 {
         let mut total = dw(NEW_TAB);
         for idx in 0..len {
-            let t = if cap.is_some() && idx != input.active {
-                truncate_cells(&titles[idx], cap.unwrap_or(u16::MAX))
+            let title = if cap.is_some() && idx != input.active {
+                truncate_cells(&title_of(idx), cap.unwrap_or(u16::MAX))
             } else {
-                titles[idx].clone()
+                title_of(idx)
             };
-            total += tab_natural(&t);
+            let renaming = rename.is_some_and(|r| r.index == idx);
+            total += tab_natural(&tab_label(input, idx, &title, renaming));
         }
         total + dw(TAB_SEP) * (len.saturating_sub(1)) as u16
     };
@@ -663,8 +686,10 @@ fn fit_tabs(region: Rect, input: &TopBarInput<'_>, rename: Option<&WorkspaceRena
         let mut first_idx = None;
         for idx in offset..len {
             let title = title_of(idx);
+            let renaming = rename.is_some_and(|r| r.index == idx);
+            let label = tab_label(input, idx, &title, renaming);
             let sep_w = if last_idx.is_some() { dw(TAB_SEP) } else { 0 };
-            let natural = tab_natural(&title);
+            let natural = tab_natural(&label);
             if x + sep_w + natural <= avail_end {
                 if last_idx.is_some() {
                     layout.entries.push(TabEntry {
@@ -675,7 +700,6 @@ fn fit_tabs(region: Rect, input: &TopBarInput<'_>, rename: Option<&WorkspaceRena
                     });
                     x += sep_w;
                 }
-                let label = format!(" {title} ");
                 let lw = dw(&label);
                 layout.entries.push(TabEntry {
                     kind: EntryKind::Tab(idx),
@@ -709,7 +733,8 @@ fn fit_tabs(region: Rect, input: &TopBarInput<'_>, rename: Option<&WorkspaceRena
                         x += sep_w;
                     }
                     let budget = room.saturating_sub(2 + 2 + 1); // close `× ` + padding + …-space
-                    let label = format!(" {}", truncate_cells(&title, budget.max(1)));
+                    let short_title = truncate_cells(&title, budget.max(1));
+                    let label = tab_label(input, idx, &short_title, renaming);
                     let lw = dw(&label);
                     layout.entries.push(TabEntry {
                         kind: EntryKind::Tab(idx),
@@ -740,8 +765,10 @@ fn fit_tabs(region: Rect, input: &TopBarInput<'_>, rename: Option<&WorkspaceRena
                 .saturating_sub(if show_prev { dw(OVERFLOW_PREV) } else { 0 });
             if room >= 5 {
                 let title = title_of(offset);
+                let renaming = rename.is_some_and(|r| r.index == offset);
                 let budget = room.saturating_sub(3);
-                let label = format!(" {}", truncate_cells(&title, budget.max(1)));
+                let short_title = truncate_cells(&title, budget.max(1));
+                let label = tab_label(input, offset, &short_title, renaming);
                 let lw = dw(&label);
                 let entry_x = if show_prev {
                     region.x + dw(OVERFLOW_PREV)
@@ -829,11 +856,7 @@ fn push_all(
             });
             x += dw(TAB_SEP);
         }
-        let label = if rename.is_some_and(|r| r.index == idx) {
-            format!(" {title}")
-        } else {
-            format!(" {title} ")
-        };
+        let label = tab_label(input, idx, &title, rename.is_some_and(|r| r.index == idx));
         let lw = dw(&label);
         layout.entries.push(TabEntry {
             kind: EntryKind::Tab(idx),
@@ -905,23 +928,26 @@ fn paint_tabs(
                 let label = e.label.clone().unwrap_or_default();
                 let is_active = idx == input.active;
                 let is_renaming = rename.is_some_and(|r| r.index == idx);
-                let style = if is_renaming {
-                    Style::default().add_modifier(Modifier::REVERSED)
-                } else if is_active {
-                    Style::default().add_modifier(Modifier::REVERSED)
-                } else if matches!(hover, WorkspaceHover::Tab(i) if i == idx) {
-                    Style::default().add_modifier(Modifier::BOLD)
+                let style = if is_renaming || is_active {
+                    let mut style = Style::default().add_modifier(Modifier::REVERSED);
+                    if matches!(hover, WorkspaceHover::Tab(i) if i == idx) {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    style
                 } else {
-                    Style::default()
+                    let mut style = Style::default();
+                    if matches!(hover, WorkspaceHover::Tab(i) if i == idx) {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    style
                 };
                 spans.push(Span::styled(label, style));
             }
-            EntryKind::Close(idx) => {
-                let style = if matches!(hover, WorkspaceHover::Close(i) if i == idx) {
-                    Style::default().fg(Color::LightRed)
-                } else {
-                    dim
-                };
+            EntryKind::Close(_idx) => {
+                let mut style = dim;
+                if matches!(hover, WorkspaceHover::Close(i) if i == _idx) {
+                    style = style.fg(Color::LightRed).add_modifier(Modifier::BOLD);
+                }
                 spans.push(Span::styled("× ", style));
             }
         }
@@ -978,6 +1004,7 @@ mod tests {
     fn input(titles: &[String]) -> TopBarInput<'_> {
         TopBarInput {
             titles,
+            activities: &[],
             active: 0,
             workspace_label: "myproj",
             shell_short: "pwsh",
@@ -1059,6 +1086,91 @@ mod tests {
                 .iter()
                 .any(|(_, h)| matches!(h, WorkspaceHit::New))
         );
+    }
+    #[test]
+    fn inactive_tabs_show_status_glyphs_and_active_tab_stays_reversed() {
+        let t = titles();
+        let activities = [WorkspaceActivity::Failed, WorkspaceActivity::Working];
+        let inp = TopBarInput {
+            titles: &t,
+            activities: &activities,
+            ..input(&t)
+        };
+        let (text, _) = draw_to_string(100, &inp);
+        assert!(
+            text.contains("! alpha"),
+            "active status glyph is visible: {text}"
+        );
+        assert!(
+            text.contains("● be"),
+            "inactive status glyph is visible: {text}"
+        );
+    }
+    #[test]
+    fn current_tab_keeps_reverse_video_while_inactive_tab_uses_plain_background() {
+        let t = titles();
+        let activities = [WorkspaceActivity::Failed, WorkspaceActivity::Working];
+        let inp = TopBarInput {
+            titles: &t,
+            activities: &activities,
+            ..input(&t)
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        let mut hits = TopBarHits::default();
+        term.draw(|f| {
+            hits = render(
+                f.area(),
+                f.buffer_mut(),
+                &inp,
+                WorkspaceHover::None,
+                StatusBarHover::None,
+                None,
+            );
+        })
+        .unwrap();
+        let active_rect = hits
+            .workspace
+            .iter()
+            .find(|(_, hit)| matches!(hit, WorkspaceHit::Tab(0)))
+            .map(|(rect, _)| *rect)
+            .unwrap();
+        let inactive_rect = hits
+            .workspace
+            .iter()
+            .find(|(_, hit)| matches!(hit, WorkspaceHit::Tab(1)))
+            .map(|(rect, _)| *rect)
+            .unwrap();
+        let buffer = term.backend().buffer();
+        let active_style = buffer[(active_rect.x, 0)].style();
+        let inactive_style = buffer[(inactive_rect.x, 0)].style();
+        assert!(active_style.add_modifier.contains(Modifier::REVERSED));
+        assert_ne!(active_style.bg, Some(Color::Red));
+        assert_eq!(inactive_style.bg, Some(ratatui::style::Color::Reset));
+    }
+
+    #[test]
+    fn activity_label_width_includes_glyph() {
+        let t = titles();
+        let quiet = input(&t);
+        let active = TopBarInput {
+            activities: &[WorkspaceActivity::Quiet, WorkspaceActivity::NeedsInput],
+            ..quiet.clone()
+        };
+        let (_, quiet_hits) = draw_to_string(100, &quiet);
+        let (_, active_hits) = draw_to_string(100, &active);
+        let quiet_beta = quiet_hits
+            .workspace
+            .iter()
+            .find(|(_, hit)| matches!(hit, WorkspaceHit::Tab(1)))
+            .map(|(rect, _)| rect.width)
+            .unwrap();
+        let active_beta = active_hits
+            .workspace
+            .iter()
+            .find(|(_, hit)| matches!(hit, WorkspaceHit::Tab(1)))
+            .map(|(rect, _)| rect.width)
+            .unwrap();
+        assert_eq!(active_beta, quiet_beta + 2);
     }
 
     #[test]

@@ -99,12 +99,6 @@ pub fn pet_lock_file() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join("pet").join("pet.lock"))
 }
 
-/// Global best-score file for the in-app Pac-Man game, shared across
-/// workspaces like the pet state.
-pub fn game_best_file() -> Option<PathBuf> {
-    data_dir().map(|dir| dir.join("game").join("pacman-best.json"))
-}
-
 /// `~/.rimeterm/bin/` — essentials binaries live here (C21.5).
 ///
 /// Populated at first launch by [`crate::essentials::materialize`] from
