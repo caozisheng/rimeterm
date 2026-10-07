@@ -76,6 +76,23 @@ fn limit_candidates(
     selected
 }
 
+fn select_current_activity<I>(candidates: I, session_id: Option<&str>) -> Option<ActivityState>
+where
+    I: IntoIterator<Item = ActivityCandidate>,
+{
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    if let Some(session_id) = session_id {
+        return candidates
+            .into_iter()
+            .find(|candidate| candidate.session_id == session_id)
+            .and_then(|candidate| candidate.state);
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|candidate| candidate.mtime_ms)
+        .and_then(|candidate| candidate.state)
+}
+
 enum Request {
     Poll { agents: Vec<ActivityAgent> },
 }
