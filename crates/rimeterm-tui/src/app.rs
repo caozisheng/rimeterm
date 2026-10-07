@@ -88,6 +88,7 @@ use crate::viewer::{
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Coalesced wake-up channel. A producer that finds a redraw already queued
 /// succeeds without adding another item, so sustained PTY output cannot grow
@@ -2128,7 +2129,7 @@ impl App {
             let idle_wait = if self.needs_redraw {
                 FRAME_INTERVAL.saturating_sub(last_draw.elapsed())
             } else {
-                Duration::from_millis(16)
+                IDLE_POLL_INTERVAL
             };
             tokio::select! {
                 biased;
