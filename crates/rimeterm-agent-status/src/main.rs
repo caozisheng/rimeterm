@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 use rimeterm_agent_status::{
     AgentEvent, AgentStatusAdapter, ClaudeCodeAdapter, CodexAdapter, OmpAdapter, encode_osc,
@@ -25,6 +25,10 @@ fn has(args: &[String], flag: &str) -> bool {
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("claude-hook") {
+        emit_claude_hook();
+        return;
+    }
     if args.first().map(String::as_str) != Some("emit") {
         usage();
     }
@@ -58,6 +62,65 @@ fn main() {
         }
     }
     .unwrap_or_else(|error| {
+        eprintln!("encode status: {error}");
+        std::process::exit(1);
+    });
+    let _ = io::stdout().write_all(encoded.as_bytes());
+    let _ = io::stdout().flush();
+}
+fn emit_claude_hook() {
+    let mut input = String::new();
+    if io::stdin().read_to_string(&mut input).is_err() {
+        std::process::exit(1);
+    }
+    let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_else(|_| {
+        eprintln!("invalid Claude Code hook JSON");
+        std::process::exit(2);
+    });
+    let event_name = value
+        .get("hook_event_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("UserPromptSubmit");
+    let session = value
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let cwd = value
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("workspace").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let tool = value
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("toolName").and_then(|v| v.as_str()))
+        .map(str::to_string);
+    let activity = value
+        .get("tool_input")
+        .and_then(|v| {
+            v.get("command")
+                .or_else(|| v.get("description"))
+                .or_else(|| v.get("file_path"))
+        })
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let event = match event_name {
+        "SessionStart" | "UserPromptSubmit" | "SubagentStart" => AgentEvent::TurnStart,
+        "PreToolUse" => AgentEvent::ToolStart {
+            tool: tool.unwrap_or_else(|| "tool".into()),
+            activity,
+        },
+        "PermissionRequest" => AgentEvent::ToolApprovalRequested,
+        "PostToolUse" => AgentEvent::ToolEnd { error: false },
+        "PostToolUseFailure" => AgentEvent::ToolEnd { error: true },
+        "PreCompact" => AgentEvent::CompactionStart,
+        "Stop" | "SubagentStop" => AgentEvent::AgentEnd { error: false },
+        "SessionEnd" => AgentEvent::SessionStop,
+        _ => AgentEvent::TurnStart,
+    };
+    let mut adapter = ClaudeCodeAdapter::new(session, cwd);
+    let snapshot = adapter.apply(event);
+    let encoded = encode_osc(&snapshot).unwrap_or_else(|error| {
         eprintln!("encode status: {error}");
         std::process::exit(1);
     });

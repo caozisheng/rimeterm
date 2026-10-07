@@ -56,6 +56,21 @@ rimeterm-agent-status emit --agent codex --session "$CODEX_SESSION_ID" --cwd "$P
 ```
 
 Hook systems should forward stdout unchanged to the Agent PTY. The command is intentionally stateless; adapters should provide a stable session id and invoke it for every lifecycle transition.
+
+For Claude Code hooks, configure a command that forwards the hook JSON on stdin:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "rimeterm-agent-status claude-hook" }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "rimeterm-agent-status claude-hook" }] }],
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "rimeterm-agent-status claude-hook" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "rimeterm-agent-status claude-hook" }] }]
+  }
+}
+```
+
+Merge these entries into the existing settings instead of replacing the user's hook configuration.
 Hooks that cannot write OSC can use the generic IPC command interface:
 
 ```powershell
