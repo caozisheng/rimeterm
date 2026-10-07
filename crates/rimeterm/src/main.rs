@@ -132,6 +132,13 @@ fn main() -> Result<()> {
             if !rimectl_report.extracted.is_empty() {
                 tracing::info!("copied rimectl into ~/.rimeterm/bin/");
             }
+            let bridge_report = rimeterm_config::assets::copy_agent_status_alongside(parent);
+            for err in &bridge_report.errors {
+                tracing::warn!(error = %err, "agent-status bridge self-copy hit a snag");
+            }
+            if !bridge_report.extracted.is_empty() {
+                tracing::info!("copied rimeterm-agent-status into ~/.rimeterm/bin/");
+            }
         }
     }
 

@@ -7522,6 +7522,11 @@ fn build_external_pane(
             {
                 args.extend(["--extension".into(), extension.display().to_string()]);
             }
+            if spec.id == "claude"
+                && let Some(settings) = materialize_claude_status_settings()
+            {
+                args.extend(["--settings".into(), settings.display().to_string()]);
+            }
             let spawn = crate::agent_factory::spawn_external(
                 host,
                 key,
@@ -7626,6 +7631,42 @@ fn materialize_omp_status_extension() -> Option<std::path::PathBuf> {
     let path = dir.join("omp-rimeterm-status.ts");
     if let Err(error) = std::fs::write(&path, rimeterm_agent_status::OMP_EXTENSION_SOURCE) {
         warn!(%error, path = %path.display(), "failed to write OMP status extension");
+        return None;
+    }
+    Some(path)
+}
+
+fn materialize_claude_status_settings() -> Option<std::path::PathBuf> {
+    let dir = rimeterm_config::paths::data_dir()?.join("agent-status");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        warn!(%error, "failed to create Agent status directory");
+        return None;
+    }
+    let hook = || {
+        serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": "rimeterm-agent-status claude-hook-ipc",
+                "timeout": 5
+            }]
+        })
+    };
+    let settings = serde_json::json!({
+        "hooks": {
+            "SessionStart": [hook()],
+            "UserPromptSubmit": [hook()],
+            "PreToolUse": [hook()],
+            "PostToolUse": [hook()],
+            "PostToolUseFailure": [hook()],
+            "PermissionRequest": [hook()],
+            "PreCompact": [hook()],
+            "Stop": [hook()],
+        }
+    });
+    let path = dir.join("claude-settings.json");
+    let json = serde_json::to_string_pretty(&settings).ok()?;
+    if let Err(error) = std::fs::write(&path, json) {
+        warn!(%error, path = %path.display(), "failed to write Claude status settings");
         return None;
     }
     Some(path)

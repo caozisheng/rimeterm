@@ -30,7 +30,11 @@ fn main() {
         return;
     }
     if args.first().map(String::as_str) == Some("claude-hook") {
-        emit_claude_hook();
+        emit_claude_hook_osc();
+        return;
+    }
+    if args.first().map(String::as_str) == Some("claude-hook-ipc") {
+        emit_claude_hook_ipc();
         return;
     }
     if args.first().map(String::as_str) != Some("emit") {
@@ -72,53 +76,7 @@ fn main() {
     let _ = io::stdout().write_all(encoded.as_bytes());
     let _ = io::stdout().flush();
 }
-fn emit_codex_hook() {
-    let mut input = String::new();
-    if io::stdin().read_to_string(&mut input).is_err() {
-        std::process::exit(1);
-    }
-    let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_else(|_| {
-        eprintln!("invalid Codex notify JSON");
-        std::process::exit(2);
-    });
-    let event_name = value
-        .get("event")
-        .and_then(|v| v.as_str())
-        .unwrap_or("agent-turn-complete");
-    let session = value
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let cwd = value.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
-    let event = match event_name {
-        "agent-turn-complete" | "turn-complete" => AgentEvent::AgentEnd { error: false },
-        "error" | "turn-failed" => AgentEvent::AgentEnd { error: true },
-        "approval-requested" | "permission-request" => AgentEvent::ToolApprovalRequested,
-        "tool-start" | "tool_execution_start" => AgentEvent::ToolStart {
-            tool: value
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("tool")
-                .into(),
-            activity: value
-                .get("activity")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-        },
-        "tool-end" | "tool_execution_end" => AgentEvent::ToolEnd { error: false },
-        _ => AgentEvent::AgentEnd { error: false },
-    };
-    let mut adapter = CodexAdapter::new(session, cwd);
-    let snapshot = adapter.apply(event);
-    let encoded = encode_osc(&snapshot).unwrap_or_else(|error| {
-        eprintln!("encode status: {error}");
-        std::process::exit(1);
-    });
-    let _ = io::stdout().write_all(encoded.as_bytes());
-    let _ = io::stdout().flush();
-}
-
-fn emit_claude_hook() {
+fn parse_claude_hook() -> rimeterm_agent_status::AgentStatusSnapshot {
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() {
         std::process::exit(1);
@@ -168,7 +126,46 @@ fn emit_claude_hook() {
         "SessionEnd" => AgentEvent::SessionStop,
         _ => AgentEvent::TurnStart,
     };
-    let mut adapter = ClaudeCodeAdapter::new(session, cwd);
+    ClaudeCodeAdapter::new(session, cwd).apply(event)
+}
+
+fn emit_codex_hook() {
+    let mut input = String::new();
+    if io::stdin().read_to_string(&mut input).is_err() {
+        std::process::exit(1);
+    }
+    let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_else(|_| {
+        eprintln!("invalid Codex notify JSON");
+        std::process::exit(2);
+    });
+    let event_name = value
+        .get("event")
+        .and_then(|v| v.as_str())
+        .unwrap_or("agent-turn-complete");
+    let session = value
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let cwd = value.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+    let event = match event_name {
+        "agent-turn-complete" | "turn-complete" => AgentEvent::AgentEnd { error: false },
+        "error" | "turn-failed" => AgentEvent::AgentEnd { error: true },
+        "approval-requested" | "permission-request" => AgentEvent::ToolApprovalRequested,
+        "tool-start" | "tool_execution_start" => AgentEvent::ToolStart {
+            tool: value
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool")
+                .into(),
+            activity: value
+                .get("activity")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        },
+        "tool-end" | "tool_execution_end" => AgentEvent::ToolEnd { error: false },
+        _ => AgentEvent::AgentEnd { error: false },
+    };
+    let mut adapter = CodexAdapter::new(session, cwd);
     let snapshot = adapter.apply(event);
     let encoded = encode_osc(&snapshot).unwrap_or_else(|error| {
         eprintln!("encode status: {error}");
@@ -176,6 +173,38 @@ fn emit_claude_hook() {
     });
     let _ = io::stdout().write_all(encoded.as_bytes());
     let _ = io::stdout().flush();
+}
+
+fn emit_claude_hook_osc() {
+    let snapshot = parse_claude_hook();
+    let encoded = encode_osc(&snapshot).unwrap_or_else(|error| {
+        eprintln!("encode status: {error}");
+        std::process::exit(1);
+    });
+    let _ = io::stdout().write_all(encoded.as_bytes());
+    let _ = io::stdout().flush();
+}
+
+fn emit_claude_hook_ipc() {
+    let snapshot = parse_claude_hook();
+    let payload = serde_json::to_string(&snapshot).unwrap_or_else(|error| {
+        eprintln!("serialize status: {error}");
+        std::process::exit(1);
+    });
+    let status = std::process::Command::new("rimectl")
+        .args(["agent.status", "--json", &payload])
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("rimectl agent.status failed with {status}");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("failed to run rimectl: {error}");
+            std::process::exit(1);
+        }
+    }
 }
 
 struct OmpCode(OmpAdapter);

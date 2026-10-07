@@ -173,13 +173,24 @@ pub fn extract_essentials(source_dir: &Path, current_version: &str) -> Essential
 /// same size + mtime as the source (cheap proxy for "unchanged").
 /// Errors are collected in the returned report; nothing is fatal.
 pub fn copy_rimectl_alongside(source_dir: &Path) -> EssentialsExtractReport {
+    copy_named_alongside(source_dir, "rimectl")
+}
+
+/// Copy the Agent status bridge binary next to `rimectl` so Claude
+/// Code hooks can invoke `rimeterm-agent-status` via the augmented
+/// PATH without a global install.
+pub fn copy_agent_status_alongside(source_dir: &Path) -> EssentialsExtractReport {
+    copy_named_alongside(source_dir, "rimeterm-agent-status")
+}
+
+fn copy_named_alongside(source_dir: &Path, bin: &str) -> EssentialsExtractReport {
     let mut report = EssentialsExtractReport::default();
     let exe_name = if cfg!(windows) {
-        "rimectl.exe"
+        format!("{bin}.exe")
     } else {
-        "rimectl"
+        bin.to_string()
     };
-    let src = source_dir.join(exe_name);
+    let src = source_dir.join(&exe_name);
     if !src.is_file() {
         report.source_absent = true;
         return report;
