@@ -796,6 +796,10 @@ impl PaneProvider for StockPane {
         }
     }
 
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
     fn reload(&mut self) {
         self.request_all_refresh(true);
     }

@@ -181,6 +181,9 @@ impl PaneProvider for GlabPane {
     fn set_visible(&mut self, visible: bool) {
         self.app.set_visible(visible);
     }
+    fn is_visible(&self) -> bool {
+        self.app.is_visible()
+    }
     fn scrollbar_dragging(&self) -> bool {
         // The full embedded UI manages its own scroll state internally.
         false

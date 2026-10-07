@@ -6411,15 +6411,23 @@ impl App {
         let _ = self.redraw_tx.send(());
     }
 
-    /// Call `poll_background` on every registered pane. Returns `true`
-    /// when at least one pane reported that visible state changed so the
-    /// main loop can force a redraw.
+    /// Poll the ACTIVE workspace's visible panes. Returns `true` when at
+    /// least one pane reported that visible state changed so the main loop
+    /// can force a redraw.
+    ///
+    /// Hidden panes (inactive tabs and stashed workspaces) are skipped:
+    /// their worker replies queue in bounded channels and apply on the
+    /// next `poll_background` after the pane becomes visible again.
+    /// Polling every pane in every workspace here was a major idle-CPU
+    /// source — each hidden glab/sysmon/stock pane kept running its own
+    /// background work into channels this loop drained every tick.
     fn poll_pane_background(&mut self) -> bool {
         let ids: Vec<PaneId> = self
             .tree
             .tab_groups()
             .iter()
             .flat_map(|g| g.members().iter().copied())
+            .filter(|id| self.panes.get(*id).is_some_and(|pane| pane.is_visible()))
             .collect();
         let mut dirty = self.agent_monitor.poll();
         let snapshot = self.agent_monitor.snapshot();

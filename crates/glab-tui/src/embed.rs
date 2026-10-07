@@ -360,6 +360,11 @@ impl EmbeddedApp {
         }
     }
 
+    /// Whether the embedded app currently considers itself visible.
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
     /// Take the newest printable message for the embedding host's status bar.
     /// Messages produced directly by key handlers are drained from the inner
     /// app so the embedded pane does not paint a competing toast.

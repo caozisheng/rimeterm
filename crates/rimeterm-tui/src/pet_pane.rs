@@ -456,6 +456,10 @@ impl PaneProvider for PetPane {
         }
     }
 
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
     fn reload(&mut self) {
         self.hint = Some("reload applies on restart".to_string());
     }

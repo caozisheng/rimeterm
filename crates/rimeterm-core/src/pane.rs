@@ -178,6 +178,13 @@ pub trait PaneProvider: Send + 'static {
         let _ = visible;
     }
 
+    /// Whether the pane currently renders on screen. Defaults to `true`;
+    /// providers that track visibility via [`set_visible`](Self::set_visible)
+    /// override this so the main loop can skip hidden background work.
+    fn is_visible(&self) -> bool {
+        true
+    }
+
     /// Reload the pane's content in place. Providers that source data
     /// from disk (native file manager, editor) reread it and drop any
     /// caches; PTY / placeholder providers keep the default no-op. Bound

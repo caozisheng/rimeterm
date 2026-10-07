@@ -393,6 +393,10 @@ impl PaneProvider for ZonesPane {
         }
     }
 
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
     fn reload(&mut self) {
         if let Ok(list) = ZoneList::load_or_seed(&self.watchlist_path) {
             self.list = list;
