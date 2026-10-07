@@ -7,6 +7,7 @@ pub mod acknowledgement;
 pub mod activity_monitor;
 pub mod agent_factory;
 pub mod agent_monitor;
+pub mod agent_status_store;
 pub mod agtop_matchers;
 pub mod agtop_model;
 pub mod agtop_omp;

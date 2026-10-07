@@ -25,6 +25,7 @@ fn input(titles: &[String]) -> TopBarInput<'_> {
         tabs_enabled: true,
         scroll_offset: 0,
         key_hint: None,
+        blink_on: true,
     }
 }
 
@@ -62,7 +63,7 @@ fn wide_header_snapshot_shows_tabs_left_status_right() {
     assert!(text.trim_end().ends_with("[×]"));
     // Tabs sit in the left half, status in the right quarter.
     assert!(text.find("alpha").unwrap() < 40);
-    assert!(text.find("workspace:").unwrap() > text.find("beta").unwrap());
+    assert!(text.find("be").unwrap() < text.find("workspace:").unwrap());
 }
 
 #[test]

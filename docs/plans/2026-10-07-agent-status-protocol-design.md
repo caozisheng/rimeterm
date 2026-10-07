@@ -130,7 +130,7 @@ Source precedence:
 OSC from Pane > rimectl
 ```
 
-There is no JSONL, CPU, or process-status fallback for workspace status. A missing or stale record means the workspace has no observed status.
+There is no JSONL, CPU, or process-status fallback for workspace status. A missing record means the workspace has no observed status; a received lifecycle remains authoritative until the next snapshot, explicit clear, or Pane close.
 
 ## First-Agent workspace rule
 
@@ -161,7 +161,7 @@ The symbol slot always occupies one display cell before the workspace title. Non
 - Unknown protocol versions are ignored with debug logging.
 - Unknown states are rejected, not guessed.
 - Sequence numbers must not decrease for a `(PaneId, agent, session_id)` record.
-- Stale status expires to no observed status.
+- Lifecycle state persists until the next snapshot, explicit clear, or Pane close.
 - Pane close removes its status bindings.
 - Malformed or unauthorized local IPC requests return a command error.
 
@@ -170,7 +170,7 @@ The symbol slot always occupies one display cell before the workspace title. Non
 Permanent tests must cover:
 
 - Protocol serialization/deserialization and validation boundaries.
-- Sequence rejection and stale-record cleanup.
+- Sequence rejection, explicit clear, and Pane cleanup.
 - OMP, Claude Code, and Codex event-to-snapshot mappings.
 - OSC payload decoding and PaneId binding.
 - `rimectl` request routing.

@@ -59,7 +59,8 @@ use crate::agent_monitor::{
     AgentMonitor, MainAgentPhase, MainAgentSignal, SharedMainAgentSignal, event_for_agent,
     match_main_agent, resolve_main_phase,
 };
-use crate::workspace_activity::{WorkspaceActivity, stabilize};
+use crate::agent_status_store::{AgentStatusStore, StatusSource};
+use crate::workspace_activity::WorkspaceActivity;
 
 use crate::file_manager_pane::FileManagerPane;
 use crate::fr_pane::{FrAction, FrPane};
@@ -232,6 +233,18 @@ pub(crate) enum PaneMutation {
     ActivateWorkspace {
         index: usize,
         ack: std::sync::mpsc::SyncSender<Result<usize, String>>,
+    },
+    AgentStatus {
+        snapshot: rimeterm_agent_status::AgentStatusSnapshot,
+        ack: std::sync::mpsc::SyncSender<Result<serde_json::Value, String>>,
+    },
+    AgentStatusClear {
+        agent: String,
+        session_id: String,
+        ack: std::sync::mpsc::SyncSender<Result<serde_json::Value, String>>,
+    },
+    AgentStatusList {
+        ack: std::sync::mpsc::SyncSender<Result<serde_json::Value, String>>,
     },
 }
 
@@ -1221,6 +1234,7 @@ pub struct App {
     /// `persist_agents_state` to write the on-disk file.
     pane_agent_id: std::collections::HashMap<PaneId, &'static str>,
     pane_agent_pid: std::collections::HashMap<PaneId, u32>,
+    agent_status_store: AgentStatusStore,
     agent_monitor: AgentMonitor,
     main_agent_signal: SharedMainAgentSignal,
     activity_monitor: ActivityMonitor,
@@ -1261,8 +1275,6 @@ pub struct App {
     /// Aggregate Agent activity rendered in the corresponding workspace tab.
     /// Parallel to `ws_order` / `ws_titles`; `Quiet` has no visual marker.
     workspace_activity: Vec<WorkspaceActivity>,
-    /// Consecutive quiet samples used to suppress one-sample activity flicker.
-    workspace_quiet_samples: Vec<u8>,
 
     /// Custom titles parallel to `ws_order`; empty = auto-derived.
     /// Persisted as `titles` in `workspaces.state.toml`. Only the
@@ -1277,6 +1289,8 @@ pub struct App {
     /// Kept separate from `ws_rename` (the editor itself) so a single
     /// click on a tab never enters edit mode.
     ws_click_streak: crate::workspace_strip::WorkspaceClickStreak,
+    /// Epoch used to phase non-idle workspace status glyph blinking.
+    blink_epoch: Instant,
     ws_stash: Vec<crate::workspace::WorkspaceBundle>,
     /// Feature toggle persisted in `workspaces.state.toml` (default on).
     workspace_tabs_enabled: bool,
@@ -1889,6 +1903,7 @@ impl App {
             pending_dispatches: Vec::new(),
             pane_agent_id: startup_agent_ids.into_iter().collect(),
             pane_agent_pid: startup_agent_pids.into_iter().collect(),
+            agent_status_store: AgentStatusStore::default(),
             agent_monitor,
             activity_monitor,
             main_agent_signal,
@@ -1904,7 +1919,6 @@ impl App {
             active_ws: 0,
             ws_titles: vec![crate::workspace::workspace_title(&ws_root)],
             workspace_activity: vec![WorkspaceActivity::Quiet],
-            workspace_quiet_samples: vec![0],
 
             // Launch slot's custom title: the persisted title for the
             // launch root's slot (`launch_index` = first match, same slot
@@ -1916,6 +1930,7 @@ impl App {
             ],
             ws_rename: None,
             ws_click_streak: crate::workspace_strip::WorkspaceClickStreak::default(),
+            blink_epoch: Instant::now(),
             workspace_tabs_enabled: persisted_workspaces.enabled,
             ws_scroll: 0,
             last_workspace_strip_hits: Vec::new(),
@@ -2008,7 +2023,6 @@ impl App {
             app.ws_instances = restored_instances;
             app.ws_custom_titles = restored_titles;
             app.workspace_activity = vec![WorkspaceActivity::Quiet; app.ws_order.len()];
-            app.workspace_quiet_samples = vec![0; app.ws_order.len()];
 
             app.ws_stash = restored_stash;
             // Restored background workspaces start hidden: their panes
@@ -2084,6 +2098,14 @@ impl App {
             self.drain_flags();
             self.drain_fr_actions();
             if self.poll_pane_background() {
+                self.needs_redraw = true;
+            }
+            if self
+                .workspace_activity
+                .iter()
+                .any(|activity| *activity != WorkspaceActivity::Quiet)
+                && self.blink_epoch.elapsed() >= Duration::from_millis(500)
+            {
                 self.needs_redraw = true;
             }
 
@@ -3266,8 +3288,6 @@ impl App {
         self.ws_instances.push(0);
         self.workspace_activity.push(WorkspaceActivity::Quiet);
 
-        self.workspace_quiet_samples.push(0);
-
         self.ws_custom_titles.push(String::new());
         self.ws_stash.push(build.bundle);
         self.ws_titles = crate::workspace::workspace_titles(&self.ws_order, &self.ws_custom_titles);
@@ -3308,7 +3328,6 @@ impl App {
         self.ws_instances.insert(target, instance_id);
         self.workspace_activity
             .insert(target, WorkspaceActivity::Quiet);
-        self.workspace_quiet_samples.insert(target, 0);
 
         self.ws_custom_titles.insert(target, String::new());
         self.ws_stash.insert(
@@ -3335,6 +3354,7 @@ impl App {
             }
             self.pane_agent_id.remove(&pane_id);
             self.pane_agent_pid.remove(&pane_id);
+            self.agent_status_store.remove_pane(pane_id);
         }
         self.pending_dispatches
             .retain(|dispatch| !bundle.panes.contains(dispatch.pane_id));
@@ -3364,7 +3384,6 @@ impl App {
         self.ws_order.remove(logical);
         self.ws_instances.remove(logical);
         self.ws_custom_titles.remove(logical);
-        self.workspace_quiet_samples.remove(logical);
         self.workspace_activity.remove(logical);
 
         if logical < self.active_ws {
@@ -5108,6 +5127,7 @@ impl App {
             tabs_enabled: self.workspace_tabs_enabled && !self.ws_titles.is_empty(),
             scroll_offset: self.ws_scroll,
             key_hint,
+            blink_on: crate::top_bar::blink_on(self.blink_epoch.elapsed()),
         };
 
         self.ws_scroll = crate::top_bar::ensure_active_visible(vertical[0], &header_input);
@@ -5426,6 +5446,7 @@ impl App {
                 tabs_enabled: self.workspace_tabs_enabled && !self.ws_titles.is_empty(),
                 scroll_offset: self.ws_scroll,
                 key_hint: None,
+                blink_on: true,
             };
             Some((
                 crate::top_bar::rename_caret_col(header_rect, &input, rename),
@@ -5487,6 +5508,10 @@ impl App {
             Index(
                 std::sync::mpsc::SyncSender<Result<usize, String>>,
                 Result<usize, String>,
+            ),
+            Json(
+                std::sync::mpsc::SyncSender<Result<serde_json::Value, String>>,
+                Result<serde_json::Value, String>,
             ),
         }
         let mut acks: Vec<Ack> = Vec::with_capacity(batch.len());
@@ -5586,6 +5611,22 @@ impl App {
                         .map_err(|error| error.to_string());
                     acks.push(Ack::Index(ack, outcome));
                 }
+                PaneMutation::AgentStatus { snapshot, ack } => {
+                    let outcome = self.apply_ipc_agent_status(snapshot);
+                    acks.push(Ack::Json(ack, outcome));
+                }
+                PaneMutation::AgentStatusClear {
+                    agent,
+                    session_id,
+                    ack,
+                } => {
+                    let removed = self.agent_status_store.remove_identity(&agent, &session_id);
+                    acks.push(Ack::Json(ack, Ok(serde_json::json!({"removed": removed}))));
+                }
+                PaneMutation::AgentStatusList { ack } => {
+                    let value = self.list_agent_statuses();
+                    acks.push(Ack::Json(ack, Ok(value)));
+                }
             }
         }
         // Publish the post-mutation state THEN wake the waiting clients;
@@ -5607,6 +5648,9 @@ impl App {
                     let _ = tx.send(r);
                 }
                 Ack::Index(tx, r) => {
+                    let _ = tx.send(r);
+                }
+                Ack::Json(tx, r) => {
                     let _ = tx.send(r);
                 }
             }
@@ -6211,6 +6255,7 @@ impl App {
         self.drop_pane_and_session(removed);
         let was_agent = self.pane_agent_id.remove(&removed).is_some();
         self.pane_agent_pid.remove(&removed);
+        self.agent_status_store.remove_pane(removed);
         if was_agent {
             self.landscape_tabs.agents.retain(|pane| *pane != removed);
             self.landscape_tabs.agents_active = next_active
@@ -6397,42 +6442,31 @@ impl App {
         self.sync_from_file_manager();
         dirty
     }
-    fn refresh_workspace_activity(&mut self, snapshot: &crate::agtop_model::Snapshot) -> bool {
+    fn refresh_workspace_activity(&mut self, _snapshot: &crate::agtop_model::Snapshot) -> bool {
         if self.workspace_activity.len() != self.ws_order.len() {
             self.workspace_activity
                 .resize(self.ws_order.len(), WorkspaceActivity::Quiet);
         }
-        if self.workspace_quiet_samples.len() != self.ws_order.len() {
-            self.workspace_quiet_samples.resize(self.ws_order.len(), 0);
-        }
+        let now = Instant::now();
         let active = self.active_ws;
         let mut changed = false;
         for logical in 0..self.ws_order.len() {
-            let observed = if logical == active {
-                workspace_activity_for_panes(self.panes.ids(), &self.pane_agent_pid, snapshot)
+            let owner = if logical == active {
+                first_agent_status_owner(&self.tree, &self.pane_agent_id)
             } else {
                 let slot = crate::workspace::stash_slot(logical, active);
                 self.ws_stash
                     .get(slot)
-                    .map(|bundle| {
-                        workspace_activity_for_panes(
-                            bundle.panes.ids(),
-                            &self.pane_agent_pid,
-                            snapshot,
-                        )
-                    })
-                    .unwrap_or_default()
+                    .and_then(|bundle| first_agent_status_owner(&bundle.tree, &self.pane_agent_id))
             };
-            let (state, quiet_samples) = stabilize(
-                self.workspace_activity[logical],
-                observed,
-                self.workspace_quiet_samples[logical],
-            );
-            if self.workspace_activity[logical] != state {
-                self.workspace_activity[logical] = state;
+            let observed = owner
+                .and_then(|pane| self.agent_status_store.get(pane, now))
+                .map(|status| WorkspaceActivity::from(status.snapshot.state))
+                .unwrap_or_default();
+            if self.workspace_activity[logical] != observed {
+                self.workspace_activity[logical] = observed;
                 changed = true;
             }
-            self.workspace_quiet_samples[logical] = quiet_samples;
         }
         changed
     }
@@ -6489,6 +6523,51 @@ impl App {
         signal.activity = activity;
         signal.transition_seq = signal.transition_seq.saturating_add(1);
         true
+    }
+    fn apply_ipc_agent_status(
+        &mut self,
+        snapshot: rimeterm_agent_status::AgentStatusSnapshot,
+    ) -> Result<serde_json::Value, String> {
+        let cwd = canonical_workspace_path(PathBuf::from(&snapshot.cwd));
+        let pane = self
+            .ws_order
+            .iter()
+            .enumerate()
+            .find_map(|(logical, root)| {
+                if canonical_workspace_path(root.clone()) != cwd {
+                    return None;
+                }
+                let owner = if logical == self.active_ws {
+                    first_agent_status_owner(&self.tree, &self.pane_agent_id)
+                } else {
+                    let slot = crate::workspace::stash_slot(logical, self.active_ws);
+                    self.ws_stash.get(slot).and_then(|bundle| {
+                        first_agent_status_owner(&bundle.tree, &self.pane_agent_id)
+                    })
+                }?;
+                (self.pane_agent_id.get(&owner).copied() == Some(snapshot.agent.as_str()))
+                    .then_some(owner)
+            })
+            .ok_or_else(|| "no matching first Agent pane".to_string())?;
+        let accepted =
+            self.agent_status_store
+                .update(pane, snapshot, StatusSource::Ipc, Instant::now());
+        Ok(serde_json::json!({"accepted": accepted, "pane_id": pane.0}))
+    }
+
+    fn list_agent_statuses(&self) -> serde_json::Value {
+        let statuses = self
+            .agent_status_store
+            .entries(Instant::now())
+            .map(|(pane, status)| {
+                serde_json::json!({
+                    "pane_id": pane.0,
+                    "source": match status.source { StatusSource::Osc => "osc", StatusSource::Ipc => "ipc" },
+                    "snapshot": status.snapshot,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({"statuses": statuses})
     }
 
     fn drain_glab_status_message(&mut self) -> bool {
@@ -6684,6 +6763,16 @@ impl App {
     /// live here are gone with the yazi/gitui runtime tabs.
     fn dispatch_osc_event(&mut self, (origin, payload): (PaneId, String)) {
         match decode_osc_rimeterm(&payload) {
+            Ok(OscDecoded::AgentStatus(snapshot)) => {
+                if self.agent_status_store.update(
+                    origin,
+                    snapshot,
+                    StatusSource::Osc,
+                    Instant::now(),
+                ) {
+                    self.needs_redraw = true;
+                }
+            }
             Ok(OscDecoded::Ignored { event }) => {
                 debug!(
                     origin = origin.0,
@@ -7413,7 +7502,12 @@ fn build_external_pane(
         .unwrap_or_else(|| rimeterm_pty::detect_tool(&spec.command));
     match resolved {
         rimeterm_pty::ToolAvailability::Available(program) => {
-            let args: Vec<String> = spec.command.iter().skip(1).cloned().collect();
+            let mut args: Vec<String> = spec.command.iter().skip(1).cloned().collect();
+            if spec.id == "omp"
+                && let Some(extension) = materialize_omp_status_extension()
+            {
+                args.extend(["--extension".into(), extension.display().to_string()]);
+            }
             let spawn = crate::agent_factory::spawn_external(
                 host,
                 key,
@@ -7509,6 +7603,19 @@ fn resolve_managed_program(command: &[String]) -> Option<std::path::PathBuf> {
     }
     None
 }
+fn materialize_omp_status_extension() -> Option<std::path::PathBuf> {
+    let dir = rimeterm_config::paths::data_dir()?.join("agent-status");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        warn!(%error, "failed to create Agent status extension directory");
+        return None;
+    }
+    let path = dir.join("omp-rimeterm-status.ts");
+    if let Err(error) = std::fs::write(&path, rimeterm_agent_status::OMP_EXTENSION_SOURCE) {
+        warn!(%error, path = %path.display(), "failed to write OMP status extension");
+        return None;
+    }
+    Some(path)
+}
 
 /// Legacy alias for M3 callers.
 fn build_agent_pane(
@@ -7536,21 +7643,24 @@ fn build_agent_pane(
     )
 }
 
-fn workspace_activity_for_panes(
-    pane_ids: impl Iterator<Item = PaneId>,
-    pane_agent_pid: &std::collections::HashMap<PaneId, u32>,
-    snapshot: &crate::agtop_model::Snapshot,
-) -> WorkspaceActivity {
-    pane_ids
-        .filter_map(|pane_id| pane_agent_pid.get(&pane_id).copied())
-        .filter_map(|pid| snapshot.agents.iter().find(|agent| agent.pid == pid))
-        .fold(WorkspaceActivity::Quiet, |state, agent| {
-            let has_active_work = matches!(agent.status, crate::agtop_model::AgentStatus::Spawning)
-                || agent.current_tool.is_some()
-                || agent.subagents > 0
-                || !agent.in_flight_subagents.is_empty();
-            state.fold_agent_activity(agent.status, agent.session_id.is_some(), has_active_work)
-        })
+fn first_agent_status_owner(
+    tree: &LayoutTree,
+    pane_agent_id: &std::collections::HashMap<PaneId, &'static str>,
+) -> Option<PaneId> {
+    first_agent_status_owner_from_members(
+        tree.find_tab_group(BUILTIN_AGENTS)?.members(),
+        pane_agent_id,
+    )
+}
+
+fn first_agent_status_owner_from_members(
+    members: &[PaneId],
+    pane_agent_id: &std::collections::HashMap<PaneId, &'static str>,
+) -> Option<PaneId> {
+    members
+        .iter()
+        .copied()
+        .find(|pane| pane_agent_id.contains_key(pane))
 }
 
 /// Locate the rect a tab group occupies inside the pane area.
@@ -8354,6 +8464,86 @@ fn register_commands(
     // guaranteed `source_absent = true` no-op. If a future bundle
     // reintroduces essentials, restore `essentials.reinstall` here.
 
+    {
+        let queue = pending_mutations.clone();
+        let wake = redraw_tx.clone();
+        register(
+            cmds,
+            Command {
+                id: "agent.status",
+                title: "Push realtime Agent status",
+                description: Some("args: AgentStatusSnapshot v1"),
+                run: Arc::new(move |args: &serde_json::Value| {
+                    let snapshot: rimeterm_agent_status::AgentStatusSnapshot =
+                        serde_json::from_value(args.clone()).map_err(|error| error.to_string())?;
+                    rimeterm_agent_status::validate_snapshot(&snapshot)
+                        .map_err(|error| error.to_string())?;
+                    let (ack, rx) = std::sync::mpsc::sync_channel(1);
+                    queue
+                        .lock()
+                        .push_back(PaneMutation::AgentStatus { snapshot, ack });
+                    let _ = wake.send(());
+                    rx.recv_timeout(Duration::from_secs(5))
+                        .map_err(|_| "app main loop dropped agent.status ack".to_string())?
+                }),
+            },
+        )?;
+    }
+    {
+        let queue = pending_mutations.clone();
+        let wake = redraw_tx.clone();
+        register(
+            cmds,
+            Command {
+                id: "agent.status.clear",
+                title: "Clear realtime Agent status",
+                description: Some("args: {agent, session_id}"),
+                run: Arc::new(move |args: &serde_json::Value| {
+                    let agent = args
+                        .get("agent")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "missing `agent`".to_string())?
+                        .to_string();
+                    let session_id = args
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "missing `session_id`".to_string())?
+                        .to_string();
+                    let (ack, rx) = std::sync::mpsc::sync_channel(1);
+                    queue.lock().push_back(PaneMutation::AgentStatusClear {
+                        agent,
+                        session_id,
+                        ack,
+                    });
+                    let _ = wake.send(());
+                    rx.recv_timeout(Duration::from_secs(5))
+                        .map_err(|_| "app main loop dropped agent.status.clear ack".to_string())?
+                }),
+            },
+        )?;
+    }
+    {
+        let queue = pending_mutations.clone();
+        let wake = redraw_tx.clone();
+        register(
+            cmds,
+            Command {
+                id: "agent.status.list",
+                title: "List realtime Agent statuses",
+                description: Some("no args"),
+                run: Arc::new(move |_args: &serde_json::Value| {
+                    let (ack, rx) = std::sync::mpsc::sync_channel(1);
+                    queue
+                        .lock()
+                        .push_back(PaneMutation::AgentStatusList { ack });
+                    let _ = wake.send(());
+                    rx.recv_timeout(Duration::from_secs(5))
+                        .map_err(|_| "app main loop dropped agent.status.list ack".to_string())?
+                }),
+            },
+        )?;
+    }
+
     // ── §14 C14 Agents Picker ──
     //
     // `agents.list` mirrors `tools.list`: probes AGENT_REGISTRY, returns
@@ -8671,8 +8861,11 @@ fn args_type_name(v: &serde_json::Value) -> &'static str {
 /// on the same channel without touching every call site.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum OscDecoded {
+    AgentStatus(rimeterm_agent_status::AgentStatusSnapshot),
     /// Payload parsed but there is no live handler for the `event` name.
-    Ignored { event: String },
+    Ignored {
+        event: String,
+    },
 }
 
 /// Parse a raw OSC 1337 rimeterm payload into a structured [`OscDecoded`].
@@ -8685,6 +8878,12 @@ pub(crate) fn decode_osc_rimeterm(payload: &str) -> Result<OscDecoded, String> {
     let obj = root
         .as_object()
         .ok_or_else(|| "payload must be a JSON object".to_string())?;
+    if obj.get("type").and_then(|value| value.as_str()) == Some("agent_status") {
+        let bytes = serde_json::to_vec(&root).map_err(|e| format!("invalid status JSON: {e}"))?;
+        let snapshot =
+            rimeterm_agent_status::validate_json_payload(&bytes).map_err(|e| e.to_string())?;
+        return Ok(OscDecoded::AgentStatus(snapshot));
+    }
     let event = obj
         .get("event")
         .and_then(|v| v.as_str())
@@ -10692,6 +10891,19 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn osc_decode_accepts_agent_status_snapshot() {
+        let payload = r#"{"version":1,"type":"agent_status","agent":"omp","session_id":"s1","cwd":"C:\\work","state":"thinking","seq":1}"#;
+        let decoded = decode_osc_rimeterm(payload).expect("valid status");
+        let OscDecoded::AgentStatus(snapshot) = decoded else {
+            panic!("expected AgentStatus");
+        };
+        assert_eq!(snapshot.agent, "omp");
+        assert_eq!(
+            snapshot.state,
+            rimeterm_agent_status::AgentLifecycle::Thinking
+        );
+    }
 
     #[test]
     fn osc_decode_rejects_invalid_json_and_missing_event() {
@@ -11595,5 +11807,23 @@ mod tests {
             DispatchGate::Route { cwd, .. } => assert_eq!(cwd, target),
             other => panic!("expected Route, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn workspace_status_owner_is_first_real_agent_only() {
+        let picker = PaneId(1);
+        let first = PaneId(2);
+        let second = PaneId(3);
+        let agents = std::collections::HashMap::from([(first, "omp"), (second, "codex")]);
+        assert_eq!(
+            first_agent_status_owner_from_members(&[picker, first, second], &agents),
+            Some(first)
+        );
+        let unsupported_first =
+            std::collections::HashMap::from([(first, "qwen"), (second, "codex")]);
+        assert_eq!(
+            first_agent_status_owner_from_members(&[picker, first, second], &unsupported_first),
+            Some(first)
+        );
     }
 }

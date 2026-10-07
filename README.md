@@ -12,7 +12,7 @@
 - **All in-process** — file explorer, git (`gix`), GitLab/GitHub, sysmon, agent monitor, todo, and session search run inside the binary; no external TUIs spawned.
 - **tmux-style PTY multiplexing** — scrollback, mouse selection, clipboard, and per-workspace persisted layouts.
 - **Multi-workspace tabs** — switch project roots from the workspace strip; each keeps its own layout, tabs, and active agent.
-- **Workspace activity tabs** — the current workspace remains reverse-video; all tabs use a plain background and show `●` (working), `?` (needs input), `✓` (completed unread), or `!` (failed) before the title.
+- **Workspace activity tabs** — explicit realtime adapters for OMP, Claude Code, and Codex drive a fixed symbol slot on each workspace tab: `●` working, `?` needs input, `✓` success, `!` failure. Only the first Agent tab is observed; unsupported Agents stay blank, with no transcript/CPU fallback.
 - **Scriptable via `rimectl`** — every UI command exposed as line-delimited JSON over a named pipe / Unix socket.
 - **Cross-pane workflows** — dispatch todo tasks to an agent, resume past sessions via `fr`, track agent CPU / tokens / cost in `agtop`.
 - **Desktop pet** — mirrors the main agent's status and current tool intent.
@@ -160,6 +160,7 @@ uses a no-op `clipboard` shim instead.
 
 ## More
 
+- Realtime Agent status protocol: [`docs/agent-status-protocol.md`](docs/agent-status-protocol.md)
 - Third-party attributions: [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md)
 - License: Apache-2.0, see [`LICENSE`](LICENSE).
 

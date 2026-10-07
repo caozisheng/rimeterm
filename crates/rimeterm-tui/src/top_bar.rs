@@ -88,6 +88,8 @@ pub struct TopBarInput<'a> {
     /// Viewer `F9 menu` chip — painted inside the middle gap only when
     /// the gap has spare cells.
     pub key_hint: Option<&'a str>,
+    /// Whether non-idle status glyphs are visible in the current 1 Hz phase.
+    pub blink_on: bool,
 }
 
 /// Final status strings after the shrink ladder ran.
@@ -601,10 +603,12 @@ fn activity_for(input: &TopBarInput<'_>, idx: usize) -> WorkspaceActivity {
 }
 
 fn activity_title(input: &TopBarInput<'_>, idx: usize, title: &str) -> String {
-    match activity_for(input, idx).glyph() {
-        Some(glyph) => format!("{glyph} {title}"),
-        None => title.to_string(),
-    }
+    let marker = if activity_for(input, idx).glyph().is_some() && input.blink_on {
+        activity_for(input, idx).glyph().unwrap_or(" ")
+    } else {
+        " "
+    };
+    format!("{marker} {title}")
 }
 
 fn tab_label(input: &TopBarInput<'_>, idx: usize, title: &str, renaming: bool) -> String {
@@ -614,6 +618,9 @@ fn tab_label(input: &TopBarInput<'_>, idx: usize, title: &str, renaming: bool) -
     } else {
         format!(" {title} ")
     }
+}
+pub(crate) fn blink_on(elapsed: std::time::Duration) -> bool {
+    elapsed.as_millis() / 500 % 2 == 0
 }
 
 /// Fit the workspace tabs into `region`, applying the shrink ladder:
@@ -1012,6 +1019,7 @@ mod tests {
             tabs_enabled: true,
             scroll_offset: 0,
             key_hint: None,
+            blink_on: true,
         }
     }
 
@@ -1068,7 +1076,7 @@ mod tests {
 
     #[test]
     fn no_duplicated_rimeterm_workspace_prefix() {
-        let (text, hits) = draw_to_string(100, &input(&titles()));
+        let (text, hits) = draw_to_string(104, &input(&titles()));
         assert!(
             !text.contains("workspace: alpha"),
             "tabs must not carry the old prefix: {text}"
@@ -1170,7 +1178,20 @@ mod tests {
             .find(|(_, hit)| matches!(hit, WorkspaceHit::Tab(1)))
             .map(|(rect, _)| rect.width)
             .unwrap();
-        assert_eq!(active_beta, quiet_beta + 2);
+        assert_eq!(active_beta, quiet_beta);
+
+        let hidden = TopBarInput {
+            blink_on: false,
+            ..active
+        };
+        let (_, hidden_hits) = draw_to_string(100, &hidden);
+        let hidden_beta = hidden_hits
+            .workspace
+            .iter()
+            .find(|(_, hit)| matches!(hit, WorkspaceHit::Tab(1)))
+            .map(|(rect, _)| rect.width)
+            .unwrap();
+        assert_eq!(hidden_beta, active_beta);
     }
 
     #[test]
@@ -1379,5 +1400,14 @@ mod tests {
         };
         let clamped = rename_caret_col(row(80), &inp, &huge_draft);
         assert!(clamped < hits.tabs_region.x + hits.tabs_region.width);
+    }
+
+    #[test]
+    fn blink_phase_alternates_each_half_second() {
+        assert!(blink_on(std::time::Duration::from_millis(0)));
+        assert!(blink_on(std::time::Duration::from_millis(499)));
+        assert!(!blink_on(std::time::Duration::from_millis(500)));
+        assert!(!blink_on(std::time::Duration::from_millis(999)));
+        assert!(blink_on(std::time::Duration::from_millis(1000)));
     }
 }
