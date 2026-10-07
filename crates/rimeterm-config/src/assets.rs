@@ -207,14 +207,11 @@ fn copy_named_alongside(source_dir: &Path, bin: &str) -> EssentialsExtractReport
     }
     let dest = bin_dir.join(exe_name);
 
-    // Skip when the two files look identical. Byte-level compare is
-    // overkill for a bootstrap copy; size + mtime is enough.
-    if let (Ok(sm), Ok(dm)) = (std::fs::metadata(&src), std::fs::metadata(&dest)) {
-        if sm.len() == dm.len() && sm.modified().ok() == dm.modified().ok() {
-            report.skipped_up_to_date.push(dest.display().to_string());
-            return report;
-        }
-    }
+    // The status bridge participates in agent hooks, where a stale
+    // binary silently breaks status reporting (and once blocked the
+    // host agent). Always overwrite so `~/.rimeterm/bin` never lags
+    // behind the running rimeterm; the copy is one small file.
+    drop(std::fs::remove_file(&dest));
 
     match std::fs::copy(&src, &dest) {
         Ok(_) => {

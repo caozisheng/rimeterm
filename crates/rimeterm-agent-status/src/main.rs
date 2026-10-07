@@ -5,11 +5,18 @@ use rimeterm_agent_status::{
     AgentEvent, AgentStatusAdapter, ClaudeCodeAdapter, CodexAdapter, OmpAdapter, encode_osc,
 };
 
+/// Best-effort hook mode error: hooks must never block the host agent.
+/// A failing status bridge is an observability loss, not a workflow
+/// error, so hook entrypoints swallow diagnostics and always exit 0.
+fn hook_silent() -> ! {
+    std::process::exit(0)
+}
+
 fn usage() -> ! {
     eprintln!(
         "usage: rimeterm-agent-status emit --agent <omp|claude|codex> --session <id> --cwd <path> --event <name> [--tool <name>] [--activity <text>] [--error] [--denied]"
     );
-    std::process::exit(2);
+    std::process::exit(2)
 }
 
 fn value(args: &[String], flag: &str) -> String {
@@ -83,12 +90,11 @@ fn main() {
 fn parse_claude_hook() -> rimeterm_agent_status::AgentStatusSnapshot {
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() {
-        std::process::exit(1);
+        hook_silent();
     }
-    let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_else(|_| {
-        eprintln!("invalid Claude Code hook JSON");
-        std::process::exit(2);
-    });
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&input) else {
+        hook_silent();
+    };
     let event_name = value
         .get("hook_event_name")
         .and_then(|v| v.as_str())
@@ -136,12 +142,11 @@ fn parse_claude_hook() -> rimeterm_agent_status::AgentStatusSnapshot {
 fn parse_codex_hook() -> rimeterm_agent_status::AgentStatusSnapshot {
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() {
-        std::process::exit(1);
+        hook_silent();
     }
-    let value: serde_json::Value = serde_json::from_str(&input).unwrap_or_else(|_| {
-        eprintln!("invalid Codex notify JSON");
-        std::process::exit(2);
-    });
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&input) else {
+        hook_silent();
+    };
     let event_name = value
         .get("event")
         .and_then(|v| v.as_str())
@@ -184,24 +189,12 @@ fn emit_codex_hook_osc() {
 
 fn emit_codex_hook_ipc() {
     let snapshot = parse_codex_hook();
-    let payload = serde_json::to_string(&snapshot).unwrap_or_else(|error| {
-        eprintln!("serialize status: {error}");
-        std::process::exit(1);
-    });
-    let status = std::process::Command::new("rimectl")
+    let Ok(payload) = serde_json::to_string(&snapshot) else {
+        hook_silent();
+    };
+    let _ = std::process::Command::new("rimectl")
         .args(["agent.status", "--json", &payload])
         .status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!("rimectl agent.status failed with {status}");
-            std::process::exit(1);
-        }
-        Err(error) => {
-            eprintln!("failed to run rimectl: {error}");
-            std::process::exit(1);
-        }
-    }
 }
 
 fn emit_claude_hook_osc() {
@@ -216,24 +209,12 @@ fn emit_claude_hook_osc() {
 
 fn emit_claude_hook_ipc() {
     let snapshot = parse_claude_hook();
-    let payload = serde_json::to_string(&snapshot).unwrap_or_else(|error| {
-        eprintln!("serialize status: {error}");
-        std::process::exit(1);
-    });
-    let status = std::process::Command::new("rimectl")
+    let Ok(payload) = serde_json::to_string(&snapshot) else {
+        hook_silent();
+    };
+    let _ = std::process::Command::new("rimectl")
         .args(["agent.status", "--json", &payload])
         .status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!("rimectl agent.status failed with {status}");
-            std::process::exit(1);
-        }
-        Err(error) => {
-            eprintln!("failed to run rimectl: {error}");
-            std::process::exit(1);
-        }
-    }
 }
 
 struct OmpCode(OmpAdapter);
