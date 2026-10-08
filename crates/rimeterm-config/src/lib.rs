@@ -24,6 +24,7 @@ pub mod project_map;
 pub mod session_state;
 pub mod sessiond_state;
 pub mod shell_preference;
+pub mod tabs_state;
 pub mod workspaces_state;
 
 #[doc(hidden)]

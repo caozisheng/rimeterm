@@ -78,6 +78,7 @@ use crate::pane_registry::PaneRegistry;
 use crate::pet_pane::PetPane;
 use crate::placeholder_pane::PlaceholderPane;
 use crate::sessions::SessionHost;
+use crate::sessions::agent_session_key;
 use crate::shell_factory::spawn_shell;
 use crate::tab_strip::render as render_tab_strip;
 use crate::terminal::TerminalGuard;
@@ -89,6 +90,10 @@ use crate::viewer::{
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Periodic per-workspace tabs-state flush (per-shell cwd sampling via
+/// sysinfo). 30 s keeps a hard-killed rimeterm at most half a minute
+/// behind the user's latest `cd` without making the sampler hot.
+const TABS_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Coalesced wake-up channel. A producer that finds a redraw already queued
 /// succeeds without adding another item, so sustained PTY output cannot grow
@@ -1232,9 +1237,20 @@ pub struct App {
     pending_dispatches: Vec<PendingDispatch>,
     /// Reverse map from agent PaneId → static registry id (`omp` / `codex`
     /// / `claude` / `pi`). Populated on spawn, consumed by
-    /// `persist_agents_state` to write the on-disk file.
+    /// `persist_tabs_state` to write the on-disk file.
     pane_agent_id: std::collections::HashMap<PaneId, &'static str>,
     pane_agent_pid: std::collections::HashMap<PaneId, u32>,
+    /// Reverse map from agent PaneId → its persisted daemon-key slot.
+    /// Slot 0 keeps the historical unsuffixed `tool-{id}` key (existing
+    /// daemon sessions reattach); higher slots disambiguate duplicate
+    /// agent tabs so two `omp` panes never share one session. A new
+    /// tab takes the smallest slot unused by live panes of the same
+    /// agent id in this workspace — a closed tab's daemon session is
+    /// killed on close, so its slot is genuinely free.
+    pane_agent_slot: std::collections::HashMap<PaneId, u32>,
+    /// Deadline of the next periodic tab-state flush (cwd sampling).
+    /// `None` until the first loop iteration forces an initial write.
+    tabs_flush_at: Option<Instant>,
     agent_status_store: SharedAgentStatusStore,
     agent_monitor: AgentMonitor,
     main_agent_signal: SharedMainAgentSignal,
@@ -1346,6 +1362,7 @@ struct WorkspaceBuild {
     bundle: crate::workspace::WorkspaceBundle,
     agent_ids: Vec<(PaneId, &'static str)>,
     agent_pids: Vec<(PaneId, u32)>,
+    agent_slots: Vec<(PaneId, u32)>,
 }
 /// Why a workspace bundle's sessions are being released.
 ///
@@ -1519,6 +1536,23 @@ impl App {
         if launch_instance != 0 {
             key_prefix.push_str(&format!("dup{launch_instance}-"));
         }
+
+        // Per-workspace tab restore (ids + slots + per-shell cwds).
+        // Falls back to the v0.1 sources (agents.state.toml ids, global
+        // shell count) when this workspace has no tabs.state.toml yet.
+        let tabs_state = match rimeterm_config::tabs_state::workspace_state_file(
+            &workspace_root,
+            launch_instance,
+        )
+        .and_then(|path| rimeterm_config::tabs_state::TabsState::load_or_default(&path).ok())
+        {
+            Some(state) if !(state.agents.is_empty() && state.shells.is_empty()) => state,
+            _ => rimeterm_config::tabs_state::TabsState::from_legacy(
+                memory.ui.agent_tabs.as_deref().unwrap_or_default(),
+                memory.ui.shell_tabs,
+                &workspace_root,
+            ),
+        };
         for spec in &config.agents.tabs {
             let id = build_agent_pane(
                 &host,
@@ -1546,10 +1580,11 @@ impl App {
                 startup_agent_ids.push((id, registry_spec.id));
             }
         }
+        let mut startup_agent_slots: Vec<(PaneId, u32)> = Vec::new();
         if agents_members.is_empty() {
-            for id in memory.ui.agent_tabs.clone().unwrap_or_default() {
-                let Some(spec) = rimeterm_pty::agent_registry::find(&id) else {
-                    warn!(agent_id = id, "remembered agent id no longer exists");
+            for entry in tabs_state.agents.clone() {
+                let Some(spec) = rimeterm_pty::agent_registry::find(&entry.id) else {
+                    warn!(agent_id = %entry.id, "remembered agent id no longer exists");
                     continue;
                 };
                 let external_spec = rimeterm_config::AgentSpec {
@@ -1558,9 +1593,10 @@ impl App {
                     command: spec.argv.iter().map(|value| value.to_string()).collect(),
                     install_hint: Some(spec.install_hint.to_string()),
                 };
+                let key = agent_session_key(&key_prefix, &entry.id, entry.slot);
                 match build_agent_pane(
                     &host,
-                    &format!("{key_prefix}tool-{}", external_spec.id),
+                    &key,
                     &mut panes,
                     &session_writes,
                     &external_spec,
@@ -1582,9 +1618,10 @@ impl App {
                         }
                         agents_members.push(pane_id);
                         startup_agent_ids.push((pane_id, spec.id));
+                        startup_agent_slots.push((pane_id, entry.slot));
                     }
                     Err(error) => {
-                        warn!(agent_id = id, %error, "failed to restore agent tab");
+                        warn!(agent_id = %entry.id, %error, "failed to restore agent tab");
                     }
                 }
             }
@@ -1668,14 +1705,47 @@ impl App {
         pinned_pane_ids.insert(zones_id);
         git_members.push(zones_id);
 
-        let shell_count = memory.ui.shell_tabs.unwrap_or(1).clamp(1, 16);
+        // Per-shell restore: each tab respawns in its remembered cwd
+        // (fallback: workspace root when the dir vanished or the entry
+        // has no cwd). Daemon keys stay `shell-{n}` so live daemon
+        // sessions reattach regardless of the remembered cwd.
+        let shell_entries: Vec<(u32, PathBuf)> = tabs_state
+            .shells
+            .iter()
+            .map(|entry| {
+                let cwd = if entry.cwd.is_dir() {
+                    entry.cwd.clone()
+                } else {
+                    warn!(
+                        number = entry.number,
+                        cwd = %entry.cwd.display(),
+                        "remembered shell cwd no longer exists; using workspace root"
+                    );
+                    workspace_root.clone()
+                };
+                (entry.number, cwd)
+            })
+            .collect();
+        let shell_count = if shell_entries.is_empty() {
+            1
+        } else {
+            shell_entries.len().min(16)
+        };
         let (shell_spawns, restore_error) = restore_requested_shells(shell_count, |number| {
+            // `number` is 1-based position in the restored list; the
+            // remembered ordinal may differ after tabs were closed, so
+            // prefer the entry's number for BOTH key and title when
+            // present (stable daemon keys across close/restart).
+            let (ordinal, cwd) = shell_entries
+                .get(number - 1)
+                .cloned()
+                .unwrap_or_else(|| (number as u32, workspace_root.clone()));
             spawn_shell(
                 &host,
-                &format!("{key_prefix}shell-{number}"),
+                &format!("{key_prefix}shell-{ordinal}"),
                 &shell_choice,
-                workspace_root.clone(),
-                format!("shell-{number}"),
+                cwd,
+                format!("shell-{ordinal}"),
                 80,
                 24,
                 redraw_tx.clone(),
@@ -1911,6 +1981,8 @@ impl App {
             pending_dispatches: Vec::new(),
             pane_agent_id: startup_agent_ids.into_iter().collect(),
             pane_agent_pid: startup_agent_pids.into_iter().collect(),
+            pane_agent_slot: startup_agent_slots.into_iter().collect(),
+            tabs_flush_at: None,
             agent_status_store: Arc::clone(&agent_status_store),
             agent_monitor,
             activity_monitor,
@@ -2129,6 +2201,14 @@ impl App {
             }
             if self.drain_pending_dispatches() {
                 self.needs_redraw = true;
+            }
+            // Periodic tab-state flush: keeps per-shell cwds fresh so a
+            // hard kill (window ×, crash) still restores each shell in
+            // its latest directory. Rate-limited; sysinfo sampling only
+            // runs inside persist_tabs_state.
+            if self.tabs_flush_at.map_or(true, |at| at <= Instant::now()) {
+                self.persist_tabs_state();
+                self.tabs_flush_at = Some(Instant::now() + TABS_FLUSH_INTERVAL);
             }
 
             self.drain_todo_actions();
@@ -3084,6 +3164,10 @@ impl App {
         if logical >= self.ws_order.len() || logical == self.active_ws {
             return;
         }
+        // Flush the outgoing workspace's tab state (ids/slots/cwds)
+        // before the swap — the on-disk file must describe the
+        // workspace being stashed, not the one being restored.
+        self.persist_tabs_state();
         let old_active = self.active_ws;
         let slot = crate::workspace::stash_slot(logical, old_active);
         let mut bundle = self.ws_stash.remove(slot);
@@ -3272,6 +3356,8 @@ impl App {
     fn merge_workspace_build_metadata(&mut self, build: &WorkspaceBuild) {
         self.pane_agent_id.extend(build.agent_ids.iter().copied());
         self.pane_agent_pid.extend(build.agent_pids.iter().copied());
+        self.pane_agent_slot
+            .extend(build.agent_slots.iter().copied());
     }
 
     pub(crate) fn open_workspace(&mut self, root: PathBuf) -> Result<(usize, bool)> {
@@ -3323,6 +3409,31 @@ impl App {
         self.persist_ui_state();
         let root = self.workspace_root.clone();
         let instance_id = crate::workspace::allocate_instance(&mut self.next_ws_instance);
+        // Seed the duplicate's per-instance tabs file with the active
+        // workspace's current tabs so the copy opens with the same
+        // agent/shell set (fresh daemon sessions under its own
+        // `dup{instance}-` key prefix — no reattach of the original's).
+        let tabs = rimeterm_config::tabs_state::TabsState {
+            agents: self
+                .landscape_tabs
+                .agents
+                .iter()
+                .filter_map(|pane| {
+                    self.pane_agent_id.get(pane).map(|id| {
+                        rimeterm_config::tabs_state::AgentTabEntry {
+                            id: id.to_string(),
+                            slot: self.pane_agent_slot.get(pane).copied().unwrap_or(0),
+                        }
+                    })
+                })
+                .collect(),
+            shells: self.snapshot_shell_tabs(),
+        };
+        if let Some(path) = rimeterm_config::tabs_state::workspace_state_file(&root, instance_id) {
+            if let Err(error) = tabs.save_to(&path) {
+                warn!(error = %error, "failed to seed duplicate workspace tabs");
+            }
+        }
         let memory = rimeterm_config::memory_state::MemoryState {
             policy: self.memory_policy.clone(),
             ui: self.remembered_ui.clone(),
@@ -3393,10 +3504,23 @@ impl App {
         let slot = crate::workspace::stash_slot(logical, self.active_ws);
         let bundle = self.ws_stash.remove(slot);
         self.release_workspace_bundle(bundle, ReleasePurpose::Close);
+        // Capture the closed workspace's identity BEFORE the parallel
+        // vectors shift; its tabs file is dead state (the daemon keys
+        // died with the bundle; a future duplicate gets its own file).
+        let closed_root = self.ws_order.get(logical).cloned();
+        let closed_instance = self.ws_instances.get(logical).copied().unwrap_or(0);
         self.ws_order.remove(logical);
         self.ws_instances.remove(logical);
         self.ws_custom_titles.remove(logical);
         self.workspace_activity.remove(logical);
+        if let Some(root) = closed_root
+            && let Some(path) =
+                rimeterm_config::tabs_state::workspace_state_file(&root, closed_instance)
+            && let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(error = %error, "failed to remove closed workspace tabs state");
+        }
 
         if logical < self.active_ws {
             self.active_ws -= 1;
@@ -5974,7 +6098,7 @@ impl App {
         self.landscape_tabs.agents = group.members().to_vec();
         self.landscape_tabs.agents_active = group.active_index();
         self.focus.set_focus(new_id, Some(BUILTIN_AGENTS));
-        self.persist_agents_state();
+        self.persist_tabs_state();
         Ok(new_id)
     }
 
@@ -6084,17 +6208,23 @@ impl App {
             command: spec.argv.iter().map(|s| s.to_string()).collect(),
             install_hint: Some(spec.install_hint.to_string()),
         };
+        // Slot-stable daemon key: the smallest slot not used by a live
+        // pane of this agent id in this workspace. Slot 0 = historical
+        // unsuffixed key; higher slots give duplicate tabs their own
+        // daemon sessions AND let runtime-opened tabs reattach after a
+        // restart (the old `-{PaneId}` suffix never matched a restored
+        // key, so those sessions were orphaned by design).
+        let taken: std::collections::HashSet<u32> = self
+            .pane_agent_id
+            .iter()
+            .filter(|&(_, id)| *id == spec.id)
+            .filter_map(|(pane, _)| self.pane_agent_slot.get(pane).copied())
+            .collect();
+        let slot = (0u32..).find(|s| !taken.contains(s)).unwrap_or(0);
         let spawn_cwd = cwd;
         let new_id = build_agent_pane(
             &self.host,
-            // Fresh instance by design — a unique key means the daemon
-            // spawns a new child instead of reattaching a lingering one.
-            &format!(
-                "{}tool-{}-{}",
-                self.key_prefix,
-                spec.id,
-                rimeterm_core::pane::PaneId::next().0
-            ),
+            &crate::sessions::agent_session_key(&self.key_prefix, spec.id, slot),
             &mut self.panes,
             &self.session_writes,
             &external_spec,
@@ -6109,6 +6239,7 @@ impl App {
             pane.set_scrollback_enabled(true);
         }
         self.pane_agent_id.insert(new_id, spec.id);
+        self.pane_agent_slot.insert(new_id, slot);
         if let Some(pid) = self
             .session_writes
             .lock()
@@ -6151,7 +6282,7 @@ impl App {
             self.landscape_tabs.agents = group.members().to_vec();
             self.landscape_tabs.agents_active = group.active_index();
         }
-        self.persist_agents_state();
+        self.persist_tabs_state();
         Ok(new_id)
     }
 
@@ -6270,6 +6401,7 @@ impl App {
         self.drop_pane_and_session(removed);
         let was_agent = self.pane_agent_id.remove(&removed).is_some();
         self.pane_agent_pid.remove(&removed);
+        self.pane_agent_slot.remove(&removed);
         self.agent_status_store.write().remove_pane(removed);
         if was_agent {
             self.landscape_tabs.agents.retain(|pane| *pane != removed);
@@ -6286,7 +6418,7 @@ impl App {
             self.focus.set_focus(pane_id, Some(gid));
         }
         if was_agent || gid == BUILTIN_AGENTS {
-            self.persist_agents_state();
+            self.persist_tabs_state();
         } else {
             self.persist_ui_state();
         }
@@ -6552,6 +6684,7 @@ impl App {
         snapshot: rimeterm_agent_status::AgentStatusSnapshot,
     ) -> Result<serde_json::Value, String> {
         let cwd = canonical_workspace_path(PathBuf::from(&snapshot.cwd));
+        let agent = snapshot.agent.as_str();
         let pane = self
             .ws_order
             .iter()
@@ -6560,18 +6693,16 @@ impl App {
                 if canonical_workspace_path(root.clone()) != cwd {
                     return None;
                 }
-                let owner = if logical == self.active_ws {
-                    first_agent_status_owner(&self.tree, &self.pane_agent_id)
+                if logical == self.active_ws {
+                    first_agent_status_pane_for(&self.tree, &self.pane_agent_id, agent)
                 } else {
                     let slot = crate::workspace::stash_slot(logical, self.active_ws);
                     self.ws_stash.get(slot).and_then(|bundle| {
-                        first_agent_status_owner(&bundle.tree, &self.pane_agent_id)
+                        first_agent_status_pane_for(&bundle.tree, &self.pane_agent_id, agent)
                     })
-                }?;
-                (self.pane_agent_id.get(&owner).copied() == Some(snapshot.agent.as_str()))
-                    .then_some(owner)
+                }
             })
-            .ok_or_else(|| "no matching first Agent pane".to_string())?;
+            .ok_or_else(|| format!("no Agent pane bound to `{agent}` in workspace"))?;
         let accepted = self.agent_status_store.write().update(
             pane,
             snapshot,
@@ -7036,23 +7167,76 @@ impl App {
         self.save_remembered_ui();
     }
 
-    /// Write the current agents-quadrant tab list to
-    /// `${data_dir}/workspaces/<hash>/agents.state.toml`. Silent on
-    /// error — the next launch just won't restore, no user harm.
-    fn persist_agents_state(&mut self) {
-        self.remembered_ui.agent_tabs = self.memory_policy.agent_tabs.then(|| {
-            self.tree
-                .find_tab_group(BUILTIN_AGENTS)
-                .map(|group| {
-                    group
-                        .members()
-                        .iter()
-                        .filter_map(|pane| self.pane_agent_id.get(pane).map(|id| id.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        });
-        self.save_remembered_ui();
+    /// Write this workspace's agent/shell tab list (ids + daemon-key
+    /// slots + per-shell cwds) to
+    /// `${data_dir}/workspaces/<hash>/tabs[-dupN].state.toml`. Silent
+    /// on error — the next launch just won't restore, no user harm.
+    ///
+    /// Shell cwds are sampled from the children's root pids via
+    /// `sysinfo` (zero shell integration; a daemon-hosted child's cwd
+    /// is its real working dir even while detached). A pane whose pid
+    /// can't be sampled falls back to the workspace root.
+    fn persist_tabs_state(&mut self) {
+        // Each policy gate applies to its own section only: disabling
+        // "agent tabs" must not stop shell tabs (and their cwds) from
+        // persisting, and vice versa. Both off → no file at all.
+        let agents: Vec<rimeterm_config::tabs_state::AgentTabEntry> =
+            if self.memory_policy.agent_tabs {
+                self.landscape_tabs
+                    .agents
+                    .iter()
+                    .filter_map(|pane| {
+                        let id = self.pane_agent_id.get(pane)?;
+                        Some(rimeterm_config::tabs_state::AgentTabEntry {
+                            id: id.to_string(),
+                            slot: self.pane_agent_slot.get(pane).copied().unwrap_or(0),
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let shells = if self.memory_policy.shell_tabs {
+            self.snapshot_shell_tabs()
+        } else {
+            Vec::new()
+        };
+        let state = rimeterm_config::tabs_state::TabsState { agents, shells };
+        let instance = self.ws_instances.get(self.active_ws).copied().unwrap_or(0);
+        let Some(path) =
+            rimeterm_config::tabs_state::workspace_state_file(&self.workspace_root, instance)
+        else {
+            return;
+        };
+        if let Err(error) = state.save_to(&path) {
+            warn!(error = %error, "failed to persist workspace tab state");
+        }
+    }
+
+    /// Shell-tab snapshot for [`Self::persist_tabs_state`]: one entry
+    /// per live shell pane, keyed by its title ordinal
+    /// (`shell-{n}`), with the cwd sampled from the child process.
+    fn snapshot_shell_tabs(&self) -> Vec<rimeterm_config::tabs_state::ShellTabEntry> {
+        let mut pids: Vec<(u32, u32)> = Vec::with_capacity(self.landscape_tabs.shells.len());
+        for pane in &self.landscape_tabs.shells {
+            let Some(number) = self
+                .panes
+                .get(*pane)
+                .and_then(|p| p.title().strip_prefix("shell-"))
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let pid = self
+                .session_writes
+                .lock()
+                .get(pane)
+                .and_then(rimeterm_pty::Session::root_pid);
+            if let Some(pid) = pid {
+                pids.push((number, pid));
+            }
+        }
+        sample_shell_cwds(pids, &self.workspace_root)
     }
 
     fn persist_ui_state(&mut self) {
@@ -7089,17 +7273,12 @@ impl App {
                 shells: self.landscape_tabs.shells_active,
             }
         });
-        self.remembered_ui.agent_tabs = self.memory_policy.agent_tabs.then(|| {
-            self.landscape_tabs
-                .agents
-                .iter()
-                .filter_map(|pane| self.pane_agent_id.get(pane).map(|id| id.to_string()))
-                .collect()
-        });
-        self.remembered_ui.shell_tabs = self
-            .memory_policy
-            .shell_tabs
-            .then_some(self.landscape_tabs.shells.len());
+        // Agent/shell tab identity + count moved to the per-workspace
+        // `tabs.state.toml` (persist_tabs_state) — the global fields
+        // would otherwise leak this workspace's tabs into every other
+        // workspace's restore (last-writer-wins on the shared file).
+        self.remembered_ui.agent_tabs = None;
+        self.remembered_ui.shell_tabs = None;
         self.remembered_ui.files = self
             .memory_policy
             .files
@@ -7156,6 +7335,9 @@ impl App {
             crate::zones_pane::ZonesPane::snapshot_state,
         );
         self.save_remembered_ui();
+        // Tab identity/count/cwd live in the per-workspace file, not
+        // the global UiState.
+        self.persist_tabs_state();
     }
 
     fn active_left_tab_id_from_state(
@@ -7701,19 +7883,14 @@ fn materialize_claude_status_settings() -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// Install project-level realtime status hooks for Qwen Code / OpenCode,
-/// modeled on the Claude Code adapter.
+/// Install realtime status hooks for Qwen Code / OpenCode, merging into the
+/// project config while preserving existing settings and hook entries.
 ///
-/// These tools have no `--settings`-style CLI override (unlike Claude)
-/// and read hooks from project config files: `.qwen/settings.json` and
-/// `.opencode/opencode.json`. Both use the Claude-compatible hook event
-/// vocabulary and pipe the hook JSON on stdin, so the same
-/// `claude-hook-ipc` bridge handles them — it dispatches on the payload,
-/// not the invoking agent.
+/// Both tools use Claude-compatible hook event names and pass hook JSON on
+/// stdin; the bridge dispatches using its explicit CLI subcommand.
 ///
-/// Non-destructive: writes only when the config file does not exist. An
-/// existing user config is left untouched (status stays off until the
-/// user adds the hook entry themselves).
+/// Merge the status hook into the existing project config. User settings and
+/// hook entries are preserved; an existing identical command is not duplicated.
 fn materialize_project_agent_hooks(
     agent_id: &str,
     workspace_root: &std::path::Path,
@@ -7733,36 +7910,51 @@ fn materialize_project_agent_hooks(
     };
     let dir = workspace_root.join(dir_name);
     let path = dir.join(file_name);
-    if path.exists() {
-        // User-owned config — never overwrite.
-        return None;
-    }
     if let Err(error) = std::fs::create_dir_all(&dir) {
         warn!(%error, "failed to create Agent config directory");
         return None;
     }
-
-    let hook = || {
-        serde_json::json!({
-            "hooks": [{
-                "type": "command",
-                "command": hook_command,
-                "timeout": 5
-            }]
-        })
+    let mut settings: serde_json::Value = if path.exists() {
+        serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?
+    } else {
+        serde_json::json!({})
     };
-    let settings = serde_json::json!({
-        "hooks": {
-            "SessionStart": [hook()],
-            "UserPromptSubmit": [hook()],
-            "PreToolUse": [hook()],
-            "PostToolUse": [hook()],
-            "PostToolUseFailure": [hook()],
-            "PermissionRequest": [hook()],
-            "PreCompact": [hook()],
-            "Stop": [hook()],
+    let hooks = settings
+        .as_object_mut()?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()?;
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PermissionRequest",
+        "PreCompact",
+        "Stop",
+    ] {
+        let entries = hooks
+            .entry(event)
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()?;
+        let already_installed = entries.iter().any(|entry| {
+            entry["hooks"].as_array().is_some_and(|commands| {
+                commands
+                    .iter()
+                    .any(|command| command["command"] == hook_command)
+            })
+        });
+        if !already_installed {
+            entries.push(serde_json::json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_command,
+                    "timeout": 5
+                }]
+            }));
         }
-    });
+    }
     let json = serde_json::to_string_pretty(&settings).ok()?;
     if let Err(error) = std::fs::write(&path, json) {
         warn!(%error, path = %path.display(), "failed to write Agent status hooks");
@@ -7815,6 +8007,33 @@ fn first_agent_status_owner_from_members(
         .iter()
         .copied()
         .find(|pane| pane_agent_id.contains_key(pane))
+}
+
+/// IPC binding: find the first pane in the `agents` group bound to the
+/// given agent id. Unlike workspace-symbol ownership (which only ever
+/// reads the first real agent tab), IPC snapshots may target any agent
+/// tab in the group — each pane tracks its own status.
+fn first_agent_status_pane_for(
+    tree: &LayoutTree,
+    pane_agent_id: &std::collections::HashMap<PaneId, &'static str>,
+    agent: &str,
+) -> Option<PaneId> {
+    first_agent_status_pane_for_members(
+        tree.find_tab_group(BUILTIN_AGENTS)?.members(),
+        pane_agent_id,
+        agent,
+    )
+}
+
+fn first_agent_status_pane_for_members(
+    members: &[PaneId],
+    pane_agent_id: &std::collections::HashMap<PaneId, &'static str>,
+    agent: &str,
+) -> Option<PaneId> {
+    members
+        .iter()
+        .copied()
+        .find(|pane| pane_agent_id.get(pane).is_some_and(|bound| *bound == agent))
 }
 
 /// Locate the rect a tab group occupies inside the pane area.
@@ -9723,6 +9942,43 @@ fn next_shell_number(members: &[PaneId], panes: &PaneRegistry) -> usize {
         }
     }
     max + 1
+}
+
+/// Sample each shell child's working directory from its root pid via
+/// `sysinfo` (targeted refresh — only the listed pids, no CPU/cmd/exe
+/// so the walk stays cheap). Entries whose pid is gone or whose cwd
+/// can't be read fall back to `fallback`. Numbers are preserved as the
+/// daemon-key ordinals.
+///
+/// Pure-ish (OS read, no App state) so it stays unit-testable with a
+/// live child.
+fn sample_shell_cwds(
+    shells: Vec<(u32, u32)>,
+    fallback: &std::path::Path,
+) -> Vec<rimeterm_config::tabs_state::ShellTabEntry> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let mut out = Vec::with_capacity(shells.len());
+    if shells.is_empty() {
+        return out;
+    }
+    let mut system = System::new();
+    let pids: Vec<Pid> = shells.iter().map(|(_, pid)| Pid::from_u32(*pid)).collect();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&pids),
+        true,
+        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+    );
+    for (number, pid) in shells {
+        let cwd = system
+            .process(Pid::from_u32(pid))
+            .and_then(|process| process.cwd())
+            .map(|path| path.to_path_buf())
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(|| fallback.to_path_buf());
+        out.push(rimeterm_config::tabs_state::ShellTabEntry { number, cwd });
+    }
+    out
 }
 
 /// Inverse of [`parse_markdown_theme`]: produce the intent-tag slug
@@ -11822,6 +12078,63 @@ mod tests {
         assert_eq!(attempts, vec![1, 2, 3]);
     }
 
+    // --- per-workspace tab restore (tabs.state.toml) ----------------
+
+    #[test]
+    fn agent_session_key_slot_zero_keeps_legacy_form() {
+        // Slot 0 MUST stay `tool-{id}` — pre-existing daemon sessions
+        // live under that key and reattach on it.
+        assert_eq!(agent_session_key("ws-", "omp", 0), "ws-tool-omp");
+    }
+
+    #[test]
+    fn agent_session_key_slots_disambiguate_duplicates() {
+        // Two tabs of one agent get distinct keys so their daemon
+        // sessions never collide.
+        assert_eq!(agent_session_key("ws-", "omp", 1), "ws-tool-omp-1");
+        assert_eq!(agent_session_key("ws-", "omp", 2), "ws-tool-omp-2");
+        assert_ne!(
+            agent_session_key("ws-", "omp", 1),
+            agent_session_key("ws-", "omp", 2)
+        );
+    }
+
+    #[test]
+    fn sample_shell_cwds_falls_back_for_dead_pid() {
+        let fallback = std::path::Path::new("/fallback");
+        // pid 0xFFFFFF00 doesn't exist — cwd falls back, ordinal kept.
+        let out = sample_shell_cwds(vec![(7, 0xFFFFFF00)], fallback);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].number, 7);
+        assert_eq!(out[0].cwd, fallback);
+    }
+
+    #[test]
+    fn sample_shell_cwds_empty_input_is_empty() {
+        assert!(sample_shell_cwds(Vec::new(), std::path::Path::new("/w")).is_empty());
+    }
+
+    #[test]
+    fn tabs_state_round_trip_preserves_slots_and_cwds() {
+        let state = rimeterm_config::tabs_state::TabsState {
+            agents: vec![rimeterm_config::tabs_state::AgentTabEntry {
+                id: "omp".into(),
+                slot: 2,
+            }],
+            shells: vec![rimeterm_config::tabs_state::ShellTabEntry {
+                number: 3,
+                cwd: std::path::PathBuf::from(r"C:\deep\dir"),
+            }],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tabs.state.toml");
+        state.save_to(&path).unwrap();
+        assert_eq!(
+            rimeterm_config::tabs_state::TabsState::load_or_default(&path).unwrap(),
+            state
+        );
+    }
+
     // --- Ctrl+J dispatch helpers ---------------------------------
 
     /// Cross-platform absolute path helper for the classify tests.
@@ -11964,6 +12277,39 @@ mod tests {
     }
 
     #[test]
+    fn qwen_status_hooks_merge_into_existing_project_settings() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = workspace.path().join(".qwen");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let settings_path = config_dir.join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"model":{"name":"custom"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"existing-hook"}]}]}}"#,
+        )
+        .unwrap();
+
+        let installed = materialize_project_agent_hooks("qwen", workspace.path())
+            .expect("merged Qwen settings");
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(installed).unwrap()).unwrap();
+
+        assert_eq!(settings["model"]["name"], "custom");
+        let session_hooks = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert!(session_hooks.iter().any(|entry| {
+            entry["hooks"]
+                .as_array()
+                .is_some_and(|hooks| hooks.iter().any(|hook| hook["command"] == "existing-hook"))
+        }));
+        assert!(session_hooks.iter().any(|entry| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
+                hooks
+                    .iter()
+                    .any(|hook| hook["command"] == "rimeterm-agent-status qwen-hook-ipc")
+            })
+        }));
+    }
+
+    #[test]
     fn workspace_status_owner_is_first_real_agent_only() {
         let picker = PaneId(1);
         let first = PaneId(2);
@@ -11978,6 +12324,31 @@ mod tests {
         assert_eq!(
             first_agent_status_owner_from_members(&[picker, first, second], &unsupported_first),
             Some(first)
+        );
+    }
+
+    #[test]
+    fn ipc_binding_finds_first_pane_of_matching_agent_beyond_first_tab() {
+        let picker = PaneId(1);
+        let first = PaneId(2);
+        let second = PaneId(3);
+        // The qwen pane is the *second* agent tab; the first tab is omp.
+        let agents = std::collections::HashMap::from([(first, "omp"), (second, "qwen")]);
+        // Workspace-symbol ownership still reads the first real agent tab.
+        assert_eq!(
+            first_agent_status_owner_from_members(&[picker, first, second], &agents),
+            Some(first)
+        );
+        // IPC binding must find the qwen pane even though it is not the
+        // first agent tab.
+        assert_eq!(
+            first_agent_status_pane_for_members(&[picker, first, second], &agents, "qwen"),
+            Some(second)
+        );
+        // No pane bound to the requested agent → rejected.
+        assert_eq!(
+            first_agent_status_pane_for_members(&[picker, first, second], &agents, "claude"),
+            None
         );
     }
 }

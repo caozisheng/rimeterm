@@ -140,6 +140,20 @@ impl App {
         if instance_id != 0 {
             key_prefix.push_str(&format!("dup{instance_id}-"));
         }
+
+        // Per-workspace tab restore — same fallback chain as App::new.
+        let tabs_state =
+            match rimeterm_config::tabs_state::workspace_state_file(&workspace_root, instance_id)
+                .and_then(|path| {
+                    rimeterm_config::tabs_state::TabsState::load_or_default(&path).ok()
+                }) {
+                Some(state) if !(state.agents.is_empty() && state.shells.is_empty()) => state,
+                _ => rimeterm_config::tabs_state::TabsState::from_legacy(
+                    memory.ui.agent_tabs.as_deref().unwrap_or_default(),
+                    memory.ui.shell_tabs,
+                    &workspace_root,
+                ),
+            };
         for spec in &config.agents.tabs {
             let id = build_agent_pane(
                 &host,
@@ -167,10 +181,11 @@ impl App {
                 startup_agent_ids.push((id, registry_spec.id));
             }
         }
+        let mut startup_agent_slots: Vec<(PaneId, u32)> = Vec::new();
         if agents_members.is_empty() {
-            for id in memory.ui.agent_tabs.clone().unwrap_or_default() {
-                let Some(spec) = rimeterm_pty::agent_registry::find(&id) else {
-                    warn!(agent_id = id, "remembered agent id no longer exists");
+            for entry in tabs_state.agents.clone() {
+                let Some(spec) = rimeterm_pty::agent_registry::find(&entry.id) else {
+                    warn!(agent_id = %entry.id, "remembered agent id no longer exists");
                     continue;
                 };
                 let external_spec = rimeterm_config::AgentSpec {
@@ -181,7 +196,7 @@ impl App {
                 };
                 match build_agent_pane(
                     &host,
-                    &format!("{key_prefix}tool-{}", external_spec.id),
+                    &agent_session_key(&key_prefix, &entry.id, entry.slot),
                     &mut panes,
                     &session_writes,
                     &external_spec,
@@ -203,9 +218,10 @@ impl App {
                         }
                         agents_members.push(pane_id);
                         startup_agent_ids.push((pane_id, spec.id));
+                        startup_agent_slots.push((pane_id, entry.slot));
                     }
                     Err(error) => {
-                        warn!(agent_id = id, %error, "failed to restore agent tab");
+                        warn!(agent_id = %entry.id, %error, "failed to restore agent tab");
                     }
                 }
             }
@@ -282,14 +298,42 @@ impl App {
         pinned_pane_ids.insert(zones_id);
         git_members.push(zones_id);
 
-        let shell_count = memory.ui.shell_tabs.unwrap_or(1).clamp(1, 16);
+        // Per-shell restore with remembered cwds (same contract as
+        // App::new: daemon keys `shell-{ordinal}` stay stable so live
+        // daemon sessions reattach regardless of the remembered cwd).
+        let shell_entries: Vec<(u32, PathBuf)> = tabs_state
+            .shells
+            .iter()
+            .map(|entry| {
+                let cwd = if entry.cwd.is_dir() {
+                    entry.cwd.clone()
+                } else {
+                    warn!(
+                        number = entry.number,
+                        cwd = %entry.cwd.display(),
+                        "remembered shell cwd no longer exists; using workspace root"
+                    );
+                    workspace_root.clone()
+                };
+                (entry.number, cwd)
+            })
+            .collect();
+        let shell_count = if shell_entries.is_empty() {
+            1
+        } else {
+            shell_entries.len().min(16)
+        };
         let (shell_spawns, restore_error) = restore_requested_shells(shell_count, |number| {
+            let (ordinal, cwd) = shell_entries
+                .get(number - 1)
+                .cloned()
+                .unwrap_or_else(|| (number as u32, workspace_root.clone()));
             spawn_shell(
                 &host,
-                &format!("{key_prefix}shell-{number}"),
+                &format!("{key_prefix}shell-{ordinal}"),
                 &shell_choice,
-                workspace_root.clone(),
-                format!("shell-{number}"),
+                cwd,
+                format!("shell-{ordinal}"),
                 80,
                 24,
                 redraw_tx.clone(),
@@ -438,6 +482,7 @@ impl App {
             },
             agent_ids: startup_agent_ids,
             agent_pids: startup_agent_pids,
+            agent_slots: startup_agent_slots,
         })
     }
 }

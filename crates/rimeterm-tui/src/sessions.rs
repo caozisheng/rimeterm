@@ -94,6 +94,17 @@ pub fn key_prefix(workspace_root: &std::path::Path) -> String {
     )
 }
 
+/// Daemon session key for one agent tab. Slot 0 keeps the historical
+/// unsuffixed `tool-{id}` form so pre-existing daemon sessions keep
+/// reattaching; slots 1+ disambiguate duplicate tabs of the same agent.
+pub fn agent_session_key(key_prefix: &str, agent_id: &str, slot: u32) -> String {
+    if slot == 0 {
+        format!("{key_prefix}tool-{agent_id}")
+    } else {
+        format!("{key_prefix}tool-{agent_id}-{slot}")
+    }
+}
+
 /// Birth a session under `host`. Native: in-process spawn. Daemon:
 /// attach (respawn when the key is unknown, replay when it is live).
 ///

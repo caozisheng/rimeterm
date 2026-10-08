@@ -119,7 +119,11 @@ pub struct UiState {
     pub workspace_layout: WorkspaceLayoutMode,
     pub tab_layout: Option<LeftTabsState>,
     pub active_tabs: Option<ActiveTabsState>,
+    /// LEGACY one-workspace-era field. No longer written (always
+    /// `None` on save); read only as the migration fallback when a
+    /// workspace has no `tabs.state.toml` yet. See `tabs_state`.
     pub agent_tabs: Option<Vec<String>>,
+    /// LEGACY: same contract as `agent_tabs` — count only.
     pub shell_tabs: Option<usize>,
     pub files: Option<PaneState>,
     pub git: Option<PaneState>,
