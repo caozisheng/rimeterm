@@ -603,11 +603,11 @@ impl WddmGpuCollector {
             let name = String::from_utf16_lossy(&desc.Description)
                 .trim_end_matches('\0')
                 .to_string();
-            // LUID formatted to match `luid_from_pdh_instance` output
-            // (lowercase hex halves).
+            // LUID formatted to match `luid_from_pdh_instance` output:
+            // PDH instance names render the LUID as High_Low halves.
             let luid = format!(
                 "0x{:08x}_0x{:08x}",
-                desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart as u32
+                desc.AdapterLuid.HighPart as u32, desc.AdapterLuid.LowPart
             );
             adapters.push((luid, name, desc.DedicatedVideoMemory as u64));
         }
@@ -681,7 +681,7 @@ fn read_counter_array(
     // First call sizes the buffer (returns PDH_MORE_DATA).
     let mut buf_size = 0u32;
     let mut item_count = 0u32;
-    let status = unsafe {
+    let _status = unsafe {
         PdhGetFormattedCounterArrayW(
             counter,
             PDH_FMT_DOUBLE,
@@ -690,12 +690,24 @@ fn read_counter_array(
             None,
         )
     };
-    // 0 = ERROR_SUCCESS (single-instance case), 0x800007EA =
-    // PDH_MORE_DATA (normal wildcard case).
-    if status != 0 && status != 0x8000_07EA {
+    // Sizing call: PDH fills buf_size/item_count and returns
+    // PDH_MORE_DATA normally, but observed behaviour on Win11 24H2 is
+    // PDH_INVALID_ARGUMENT (0x800007D2) via the windows-rs None-buffer
+    // path — with the sizes still filled in. Trust the counts, not
+    // the status, when they're non-zero.
+    if item_count == 0 || buf_size == 0 {
         return std::collections::HashMap::new();
     }
-    let mut items = vec![PDH_FMT_COUNTERVALUE_ITEM_W::default(); item_count as usize];
+    // PDH's contract: ItemBuffer is a BYTE buffer of *buf_size* bytes,
+    // and PDH may write up to that — the size covers worst-case item
+    // (string) layout, not item_count * sizeof(item). Allocating by
+    // item count corrupted the heap on Win11 24H2; allocate by bytes
+    // and reinterpret after the call.
+    let item_size = std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+    // buf_size need not be a multiple of item_size — it covers
+    // worst-case string storage. Round up to whole items so the byte
+    // buffer can hold every item PDH writes.
+    let mut buf = vec![0u8; buf_size.div_ceil(item_size as u32) as usize * item_size];
     let mut read_back = 0u32;
     let status = unsafe {
         PdhGetFormattedCounterArrayW(
@@ -703,14 +715,18 @@ fn read_counter_array(
             PDH_FMT_DOUBLE,
             &mut buf_size,
             &mut read_back,
-            Some(items.as_mut_ptr()),
+            Some(buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W),
         )
     };
     if status != 0 {
         return std::collections::HashMap::new();
     }
+    // SAFETY: PDH wrote read_back contiguous items of the above
+    // struct into buf; the struct is Copy + repr(C).
+    let items: &[PDH_FMT_COUNTERVALUE_ITEM_W] =
+        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const _, read_back as usize) };
     let mut map = std::collections::HashMap::with_capacity(items.len());
-    for item in &items[..read_back as usize] {
+    for item in items {
         // szName is a NUL-terminated UTF-16 string; the PDH array
         // allocation owns the backing memory.
         let name = unsafe {
