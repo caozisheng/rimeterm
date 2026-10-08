@@ -59,7 +59,7 @@ use crate::agent_monitor::{
     AgentMonitor, MainAgentPhase, MainAgentSignal, SharedMainAgentSignal, event_for_agent,
     match_main_agent, resolve_main_phase,
 };
-use crate::agent_status_store::{AgentStatusStore, StatusSource};
+use crate::agent_status_store::{AgentStatusStore, SharedAgentStatusStore, StatusSource};
 use crate::workspace_activity::WorkspaceActivity;
 
 use crate::file_manager_pane::FileManagerPane;
@@ -1235,7 +1235,7 @@ pub struct App {
     /// `persist_agents_state` to write the on-disk file.
     pane_agent_id: std::collections::HashMap<PaneId, &'static str>,
     pane_agent_pid: std::collections::HashMap<PaneId, u32>,
-    agent_status_store: AgentStatusStore,
+    agent_status_store: SharedAgentStatusStore,
     agent_monitor: AgentMonitor,
     main_agent_signal: SharedMainAgentSignal,
     activity_monitor: ActivityMonitor,
@@ -1609,6 +1609,7 @@ impl App {
         let agent_monitor = AgentMonitor::new(Arc::clone(&shared_agent_snapshot));
         let activity_monitor = ActivityMonitor::new();
         let main_agent_signal = Arc::new(parking_lot::RwLock::new(MainAgentSignal::default()));
+        let agent_status_store = Arc::new(parking_lot::RwLock::new(AgentStatusStore::default()));
         let mut agtop = crate::agtop_pane::AgtopPane::new(Arc::clone(&shared_agent_snapshot));
         git_members.push(sysmon_id);
 
@@ -1652,7 +1653,12 @@ impl App {
             .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-pet-state.json"));
         let pet_lock = rimeterm_config::paths::pet_lock_file()
             .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-pet.lock"));
-        let pet = PetPane::new(pet_state, pet_lock, Arc::clone(&main_agent_signal));
+        let pet = PetPane::new(
+            pet_state,
+            pet_lock,
+            Arc::clone(&main_agent_signal),
+            Arc::clone(&agent_status_store),
+        );
         let pet_id = pet.id();
         panes.insert(Box::new(pet));
         pinned_pane_ids.insert(pet_id);
@@ -1905,7 +1911,7 @@ impl App {
             pending_dispatches: Vec::new(),
             pane_agent_id: startup_agent_ids.into_iter().collect(),
             pane_agent_pid: startup_agent_pids.into_iter().collect(),
-            agent_status_store: AgentStatusStore::default(),
+            agent_status_store: Arc::clone(&agent_status_store),
             agent_monitor,
             activity_monitor,
             main_agent_signal,
@@ -3360,7 +3366,7 @@ impl App {
             }
             self.pane_agent_id.remove(&pane_id);
             self.pane_agent_pid.remove(&pane_id);
-            self.agent_status_store.remove_pane(pane_id);
+            self.agent_status_store.write().remove_pane(pane_id);
         }
         self.pending_dispatches
             .retain(|dispatch| !bundle.panes.contains(dispatch.pane_id));
@@ -5626,7 +5632,10 @@ impl App {
                     session_id,
                     ack,
                 } => {
-                    let removed = self.agent_status_store.remove_identity(&agent, &session_id);
+                    let removed = self
+                        .agent_status_store
+                        .write()
+                        .remove_identity(&agent, &session_id);
                     acks.push(Ack::Json(ack, Ok(serde_json::json!({"removed": removed}))));
                 }
                 PaneMutation::AgentStatusList { ack } => {
@@ -6261,7 +6270,7 @@ impl App {
         self.drop_pane_and_session(removed);
         let was_agent = self.pane_agent_id.remove(&removed).is_some();
         self.pane_agent_pid.remove(&removed);
-        self.agent_status_store.remove_pane(removed);
+        self.agent_status_store.write().remove_pane(removed);
         if was_agent {
             self.landscape_tabs.agents.retain(|pane| *pane != removed);
             self.landscape_tabs.agents_active = next_active
@@ -6474,8 +6483,8 @@ impl App {
                     .and_then(|bundle| first_agent_status_owner(&bundle.tree, &self.pane_agent_id))
             };
             let observed = owner
-                .and_then(|pane| self.agent_status_store.get(pane, now))
-                .map(|status| WorkspaceActivity::from(status.snapshot.state))
+                .and_then(|pane| self.agent_status_store.read().snapshot_for(pane, now))
+                .map(|snapshot| WorkspaceActivity::from(snapshot.state))
                 .unwrap_or_default();
             if self.workspace_activity[logical] != observed {
                 self.workspace_activity[logical] = observed;
@@ -6563,15 +6572,19 @@ impl App {
                     .then_some(owner)
             })
             .ok_or_else(|| "no matching first Agent pane".to_string())?;
-        let accepted =
-            self.agent_status_store
-                .update(pane, snapshot, StatusSource::Ipc, Instant::now());
+        let accepted = self.agent_status_store.write().update(
+            pane,
+            snapshot,
+            StatusSource::Ipc,
+            Instant::now(),
+        );
         Ok(serde_json::json!({"accepted": accepted, "pane_id": pane.0}))
     }
 
     fn list_agent_statuses(&self) -> serde_json::Value {
         let statuses = self
             .agent_status_store
+            .read()
             .entries(Instant::now())
             .map(|(pane, status)| {
                 serde_json::json!({
@@ -6778,7 +6791,7 @@ impl App {
     fn dispatch_osc_event(&mut self, (origin, payload): (PaneId, String)) {
         match decode_osc_rimeterm(&payload) {
             Ok(OscDecoded::AgentStatus(snapshot)) => {
-                if self.agent_status_store.update(
+                if self.agent_status_store.write().update(
                     origin,
                     snapshot,
                     StatusSource::Osc,

@@ -16,8 +16,7 @@
 - **Workspace activity tabs** — realtime status adapters drive a fixed symbol slot on each workspace tab (see above); only the first Agent tab is observed, unsupported Agents stay blank.
 - **Scriptable via `rimectl`** — every UI command exposed as line-delimited JSON over a named pipe / Unix socket.
 - **Cross-pane workflows** — dispatch todo tasks to an agent, resume past sessions via `fr`, track agent CPU / tokens / cost in `agtop`.
-- **Desktop pet** — mirrors the main agent's status and current tool intent.
-- **Native mouse, 8 themes** — click / drag / scroll everywhere; `Alt+T` cycles palettes.
+- **Desktop pet** — mirrors the main agent's `rime-agent-status` snapshot, including tool/activity scenes; when no protocol snapshot is available it shows `status unavailable` rather than falling back to process heuristics.
 - **Cross-platform** — Windows (ConPTY, MSI), Debian/Ubuntu `.deb`, macOS `.dmg`, and Termux builds.
 
 

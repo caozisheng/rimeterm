@@ -2,7 +2,8 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::agent_monitor::{MainAgentPhase, SharedMainAgentSignal};
+use crate::agent_monitor::SharedMainAgentSignal;
+use crate::agent_status_store::SharedAgentStatusStore;
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -28,11 +29,13 @@ pub struct PetPane {
     title: String,
     store: PetStore,
     main_agent: SharedMainAgentSignal,
+    agent_statuses: SharedAgentStatusStore,
     last_agent_seq: u64,
+    last_agent_identity: Option<(String, String)>,
     aura: Option<rimeterm_pet::agent_link::AgentAura>,
     next_simulation: Instant,
-    next_animation: Instant,
     next_spectator_refresh: Instant,
+    next_animation: Instant,
     animation_frame: u8,
     visible: bool,
     hint: Option<String>,
@@ -44,6 +47,22 @@ impl PetPane {
         lock_path: PathBuf,
         main_agent: SharedMainAgentSignal,
     ) -> Result<Self, rimeterm_pet::persistence::StoreError> {
+        Self::try_new_with_status(
+            state_path,
+            lock_path,
+            main_agent,
+            std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::agent_status_store::AgentStatusStore::default(),
+            )),
+        )
+    }
+
+    pub fn try_new_with_status(
+        state_path: PathBuf,
+        lock_path: PathBuf,
+        main_agent: SharedMainAgentSignal,
+        agent_statuses: SharedAgentStatusStore,
+    ) -> Result<Self, rimeterm_pet::persistence::StoreError> {
         let now = Utc::now();
         let store = PetStore::open(&state_path, &lock_path, now)?;
         Ok(Self {
@@ -51,19 +70,32 @@ impl PetPane {
             title: "Pet".to_string(),
             store,
             main_agent,
+            agent_statuses,
+            last_agent_identity: None,
             last_agent_seq: 0,
-            aura: None,
             next_simulation: Instant::now() + SIMULATION_INTERVAL,
             next_spectator_refresh: Instant::now() + SPECTATOR_REFRESH_INTERVAL,
             next_animation: Instant::now() + ANIMATION_INTERVAL,
             animation_frame: 0,
             visible: false,
             hint: None,
+            aura: None,
         })
     }
 
-    pub fn new(state_path: PathBuf, lock_path: PathBuf, main_agent: SharedMainAgentSignal) -> Self {
-        Self::try_new(state_path, lock_path, main_agent.clone()).unwrap_or_else(|error| {
+    pub fn new(
+        state_path: PathBuf,
+        lock_path: PathBuf,
+        main_agent: SharedMainAgentSignal,
+        agent_statuses: SharedAgentStatusStore,
+    ) -> Self {
+        Self::try_new_with_status(
+            state_path,
+            lock_path,
+            main_agent.clone(),
+            agent_statuses.clone(),
+        )
+        .unwrap_or_else(|error| {
             tracing::warn!(%error, "failed to open pet state; using temporary pet store");
             let now = Utc::now();
             let mut store = PetStore::open(
@@ -78,14 +110,16 @@ impl PetPane {
                 title: "Pet".to_string(),
                 store,
                 main_agent,
+                agent_statuses,
+                last_agent_identity: None,
                 last_agent_seq: 0,
-                aura: None,
                 next_simulation: Instant::now() + SIMULATION_INTERVAL,
                 next_spectator_refresh: Instant::now() + SPECTATOR_REFRESH_INTERVAL,
                 next_animation: Instant::now() + ANIMATION_INTERVAL,
                 animation_frame: 0,
                 visible: false,
                 hint: Some(format!("pet state unavailable: {error}")),
+                aura: None,
             }
         })
     }
@@ -122,79 +156,44 @@ impl PetPane {
         format!("OK · {}", self.agent_status())
     }
 
+    fn current_snapshot(&self) -> Option<rimeterm_agent_status::AgentStatusSnapshot> {
+        let pane_id = self.main_agent.read().pane_id?;
+        self.agent_statuses
+            .read()
+            .snapshot_for(pane_id, Instant::now())
+    }
+
     fn agent_status(&self) -> String {
-        let signal = self.main_agent.read();
-        match &signal.phase {
-            MainAgentPhase::Unbound => "no main agent".to_string(),
-            MainAgentPhase::Starting => {
-                format!("{} starting", signal.agent_id.as_deref().unwrap_or("agent"))
-            }
-            MainAgentPhase::Observed(status) => format!(
-                "{} {}",
-                signal.agent_id.as_deref().unwrap_or("agent"),
-                status.label()
-            ),
-            MainAgentPhase::MonitorStale => "status unavailable".to_string(),
-        }
+        self.current_snapshot()
+            .map(|snapshot| format!("{} {}", snapshot.agent, status_label(snapshot.state)))
+            .unwrap_or_else(|| "status unavailable".to_string())
     }
 
     fn agent_scene(&self) -> String {
-        let signal = self.main_agent.read();
-        let scene = if let Some(event) = &signal.event {
-            event.clone()
-        } else {
-            match signal.phase {
-                MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Busy)
-                | MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Active) => {
-                    "thinking".into()
-                }
-                MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Spawning) => {
-                    "delegating".into()
-                }
-                MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Waiting) => {
-                    "waiting".into()
-                }
-                MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Completed) => {
-                    "done".into()
-                }
-                MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Idle)
-                | MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Stale) => {
-                    "resting".into()
-                }
-                MainAgentPhase::Starting => "starting".into(),
-                MainAgentPhase::MonitorStale => "status unavailable".into(),
-                MainAgentPhase::Unbound => "alone".into(),
-            }
-        };
-        match &signal.activity {
-            Some(activity) => format!("{scene} · {activity}"),
-            None => scene,
-        }
+        status_scene(self.current_snapshot().as_ref())
     }
 
     fn apply_agent_signal(&mut self, now: Instant) -> bool {
-        let signal = self.main_agent.read().clone();
-        if signal.transition_seq == self.last_agent_seq {
+        let snapshot = self.current_snapshot();
+        let identity = snapshot
+            .as_ref()
+            .map(|snapshot| (snapshot.agent.clone(), snapshot.session_id.clone()));
+        let seq = snapshot.as_ref().map_or(0, |snapshot| snapshot.seq);
+        if identity == self.last_agent_identity && seq == self.last_agent_seq {
             return false;
         }
-        self.last_agent_seq = signal.transition_seq;
-        let phase = match signal.phase {
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Busy) => {
-                Some(rimeterm_pet::agent_link::AgentPhase::Busy)
-            }
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Spawning) => {
-                Some(rimeterm_pet::agent_link::AgentPhase::Spawning)
-            }
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Active) => {
-                Some(rimeterm_pet::agent_link::AgentPhase::Active)
-            }
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Completed) => {
-                Some(rimeterm_pet::agent_link::AgentPhase::Completed)
-            }
-            _ => None,
-        };
-        self.aura = phase.map(|phase| {
-            rimeterm_pet::agent_link::AgentAura::for_phase(phase, signal.transition_seq, now)
+        self.last_agent_identity = identity;
+        self.last_agent_seq = seq;
+        self.aura = snapshot.as_ref().and_then(|snapshot| {
+            let phase = pet_phase_for_status(snapshot);
+            matches!(
+                phase,
+                rimeterm_pet::agent_link::AgentPhase::Busy
+                    | rimeterm_pet::agent_link::AgentPhase::Spawning
+                    | rimeterm_pet::agent_link::AgentPhase::Active
+                    | rimeterm_pet::agent_link::AgentPhase::Completed
+            )
+            .then(|| rimeterm_pet::agent_link::AgentAura::for_phase(phase, snapshot.seq, now))
         });
         true
     }
@@ -257,32 +256,11 @@ impl PaneProvider for PetPane {
             .border_style(border_style);
         let inner = block.inner(area);
         block.render(area, frame.buffer_mut());
-        let agent_phase = match self.main_agent.read().phase {
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Busy) => {
-                rimeterm_pet::agent_link::AgentPhase::Busy
-            }
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Spawning) => {
-                rimeterm_pet::agent_link::AgentPhase::Spawning
-            }
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Active) => {
-                rimeterm_pet::agent_link::AgentPhase::Active
-            }
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Completed) => {
-                rimeterm_pet::agent_link::AgentPhase::Completed
-            }
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Waiting) => {
-                rimeterm_pet::agent_link::AgentPhase::Waiting
-            }
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Idle) => {
-                rimeterm_pet::agent_link::AgentPhase::Idle
-            }
-            MainAgentPhase::Observed(crate::agtop_model::AgentStatus::Stale) => {
-                rimeterm_pet::agent_link::AgentPhase::Stale
-            }
-            MainAgentPhase::Starting => rimeterm_pet::agent_link::AgentPhase::Starting,
-            MainAgentPhase::MonitorStale => rimeterm_pet::agent_link::AgentPhase::MonitorStale,
-            MainAgentPhase::Unbound => rimeterm_pet::agent_link::AgentPhase::Unbound,
-        };
+        let agent_phase = self
+            .current_snapshot()
+            .as_ref()
+            .map(pet_phase_for_status)
+            .unwrap_or(rimeterm_pet::agent_link::AgentPhase::MonitorStale);
         if inner.width == 0 || inner.height == 0 {
             return RenderOutcome::default();
         }
@@ -471,12 +449,68 @@ fn hearts(value: u8, max: u8) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+fn pet_phase_for_status(
+    snapshot: &rimeterm_agent_status::AgentStatusSnapshot,
+) -> rimeterm_pet::agent_link::AgentPhase {
+    use rimeterm_agent_status::AgentLifecycle;
+    use rimeterm_pet::agent_link::AgentPhase;
+
+    match snapshot.state {
+        AgentLifecycle::Idle => AgentPhase::Idle,
+        AgentLifecycle::Thinking | AgentLifecycle::ToolRunning | AgentLifecycle::Compacting => {
+            AgentPhase::Busy
+        }
+        AgentLifecycle::WaitingUser => AgentPhase::Waiting,
+        AgentLifecycle::Success => AgentPhase::Completed,
+        AgentLifecycle::Error | AgentLifecycle::Interrupted => AgentPhase::Exited,
+    }
+}
+
+fn status_label(state: rimeterm_agent_status::AgentLifecycle) -> &'static str {
+    use rimeterm_agent_status::AgentLifecycle;
+    match state {
+        AgentLifecycle::Idle => "IDLE",
+        AgentLifecycle::Thinking => "THINKING",
+        AgentLifecycle::ToolRunning => "WORKING",
+        AgentLifecycle::WaitingUser => "WAITING",
+        AgentLifecycle::Success => "SUCCESS",
+        AgentLifecycle::Error => "ERROR",
+        AgentLifecycle::Interrupted => "INTERRUPTED",
+        AgentLifecycle::Compacting => "COMPACTING",
+    }
+}
+
+fn status_scene_for_snapshot(snapshot: &rimeterm_agent_status::AgentStatusSnapshot) -> String {
+    let scene = match snapshot.state {
+        rimeterm_agent_status::AgentLifecycle::Idle => "resting",
+        rimeterm_agent_status::AgentLifecycle::Thinking => "thinking",
+        rimeterm_agent_status::AgentLifecycle::ToolRunning => "working",
+        rimeterm_agent_status::AgentLifecycle::WaitingUser => "waiting",
+        rimeterm_agent_status::AgentLifecycle::Success => "done",
+        rimeterm_agent_status::AgentLifecycle::Error => "error",
+        rimeterm_agent_status::AgentLifecycle::Interrupted => "interrupted",
+        rimeterm_agent_status::AgentLifecycle::Compacting => "compacting",
+    };
+    match (snapshot.tool.as_deref(), snapshot.activity.as_deref()) {
+        (Some(tool), Some(activity)) => format!("{tool} · {activity}"),
+        (Some(tool), None) => tool.to_string(),
+        (None, Some(activity)) => format!("{scene} · {activity}"),
+        (None, None) => scene.to_string(),
+    }
+}
+
+fn status_scene(snapshot: Option<&rimeterm_agent_status::AgentStatusSnapshot>) -> String {
+    snapshot
+        .map(status_scene_for_snapshot)
+        .unwrap_or_else(|| "status unavailable".to_string())
+}
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
     use tempfile::tempdir;
 
-    use super::PetPane;
+    use super::{PetPane, pet_phase_for_status, status_scene, status_scene_for_snapshot};
 
     #[test]
     fn pet_pane_starts_with_a_live_egg() {
@@ -577,28 +611,34 @@ mod tests {
     }
 
     #[test]
-    fn busy_main_agent_renders_working_scene() {
-        use crate::agtop_model::AgentStatus;
+    fn protocol_status_renders_working_scene_and_agent_title() {
+        use crate::agent_status_store::{AgentStatusStore, StatusSource};
         use ratatui::{Terminal, backend::TestBackend, style::Color};
+        use rimeterm_agent_status::{AgentLifecycle, AgentStatusSnapshot};
         use rimeterm_core::pane::{PaneProvider, PaneRenderCtx};
 
         let directory = tempdir().expect("create fixture directory");
         let signal = std::sync::Arc::new(parking_lot::RwLock::new(
-            crate::agent_monitor::MainAgentSignal {
-                pane_id: None,
-                agent_id: Some("omp".to_string()),
-                phase: crate::agent_monitor::MainAgentPhase::Observed(AgentStatus::Busy),
-                transition_seq: 1,
-                event: Some("reading".to_string()),
-                activity: Some("Checking Tidy availability".to_string()),
-            },
+            crate::agent_monitor::MainAgentSignal::default(),
         ));
-        let mut pane = PetPane::try_new(
+        let statuses = std::sync::Arc::new(parking_lot::RwLock::new(AgentStatusStore::default()));
+        let mut pane = PetPane::try_new_with_status(
             directory.path().join("state.json"),
             directory.path().join("pet.lock"),
-            signal,
+            signal.clone(),
+            statuses.clone(),
         )
         .expect("create pet pane");
+        let pane_id = pane.id();
+        signal.write().pane_id = Some(pane_id);
+        let mut snapshot =
+            AgentStatusSnapshot::new("omp", "session", "C:\\work", AgentLifecycle::ToolRunning);
+        snapshot.tool = Some("bash".into());
+        snapshot.activity = Some("Checking Tidy availability".into());
+        statuses
+            .write()
+            .update(pane_id, snapshot, StatusSource::Ipc, Instant::now());
+
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("test terminal");
         terminal
             .draw(|frame| {
@@ -621,64 +661,44 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
+        assert!(rendered.contains("omp WORKING"), "{rendered}");
         assert!(
-            rendered.contains("reading · Checking Tidy availability"),
-            "{rendered}"
-        );
-        assert!(
-            !rendered.contains("omp BUSY · Checking Tidy availability"),
+            rendered.contains("bash · Checking Tidy availability"),
             "{rendered}"
         );
     }
-
     #[test]
-    fn agent_event_renders_below_pet_not_in_title() {
-        let signal = std::sync::Arc::new(parking_lot::RwLock::new(
-            crate::agent_monitor::MainAgentSignal {
-                pane_id: None,
-                agent_id: Some("omp".into()),
-                phase: crate::agent_monitor::MainAgentPhase::Observed(
-                    crate::agtop_model::AgentStatus::Busy,
-                ),
-                transition_seq: 1,
-                event: Some("reading".into()),
-                activity: Some("Checking Tidy availability".into()),
-            },
-        ));
-        let directory = tempdir().expect("create fixture directory");
-        let pane = PetPane::try_new(
-            directory.path().join("state.json"),
-            directory.path().join("pet.lock"),
-            signal,
-        )
-        .expect("create pet pane");
+    fn agent_status_snapshot_maps_to_pet_phase_and_scene() {
+        use rimeterm_agent_status::{AgentLifecycle, AgentStatusSnapshot};
 
-        assert_eq!(pane.agent_status(), "omp BUSY");
-        assert_eq!(pane.agent_scene(), "reading · Checking Tidy availability");
+        let mut snapshot =
+            AgentStatusSnapshot::new("omp", "session", "C:\\work", AgentLifecycle::ToolRunning);
+        snapshot.tool = Some("bash".into());
+        snapshot.activity = Some("cargo test".into());
+
+        assert_eq!(
+            pet_phase_for_status(&snapshot),
+            rimeterm_pet::agent_link::AgentPhase::Busy
+        );
+        assert_eq!(status_scene_for_snapshot(&snapshot), "bash · cargo test");
     }
 
     #[test]
-    fn activity_without_tool_semantic_renders_beside_thinking() {
-        let signal = std::sync::Arc::new(parking_lot::RwLock::new(
-            crate::agent_monitor::MainAgentSignal {
-                pane_id: None,
-                agent_id: Some("omp".into()),
-                phase: crate::agent_monitor::MainAgentPhase::Observed(
-                    crate::agtop_model::AgentStatus::Busy,
-                ),
-                transition_seq: 1,
-                event: None,
-                activity: Some("Checking Tidy availability".into()),
-            },
-        ));
-        let directory = tempdir().expect("create fixture directory");
-        let pane = PetPane::try_new(
-            directory.path().join("state.json"),
-            directory.path().join("pet.lock"),
-            signal,
-        )
-        .expect("create pet pane");
+    fn successful_status_maps_to_completed_pet_phase() {
+        use rimeterm_agent_status::{AgentLifecycle, AgentStatusSnapshot};
 
-        assert_eq!(pane.agent_scene(), "thinking · Checking Tidy availability");
+        let snapshot =
+            AgentStatusSnapshot::new("claude", "session", "C:\\work", AgentLifecycle::Success);
+
+        assert_eq!(
+            pet_phase_for_status(&snapshot),
+            rimeterm_pet::agent_link::AgentPhase::Completed
+        );
+        assert_eq!(status_scene_for_snapshot(&snapshot), "done");
+    }
+
+    #[test]
+    fn missing_status_renders_unavailable_scene() {
+        assert_eq!(status_scene(None), "status unavailable");
     }
 }

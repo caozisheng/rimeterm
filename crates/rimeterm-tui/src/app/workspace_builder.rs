@@ -267,7 +267,12 @@ impl App {
             .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-pet-state.json"));
         let pet_lock = rimeterm_config::paths::pet_lock_file()
             .unwrap_or_else(|| std::env::temp_dir().join("rimeterm-pet.lock"));
-        let pet = PetPane::new(pet_state, pet_lock, Arc::clone(&self.main_agent_signal));
+        let pet = PetPane::new(
+            pet_state,
+            pet_lock,
+            Arc::clone(&self.main_agent_signal),
+            Arc::clone(&self.agent_status_store),
+        );
         let pet_id = pet.id();
         panes.insert(Box::new(pet));
         pinned_pane_ids.insert(pet_id);

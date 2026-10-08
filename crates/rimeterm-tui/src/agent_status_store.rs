@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
+use parking_lot::RwLock;
 use rimeterm_agent_status::AgentStatusSnapshot;
 use rimeterm_core::pane::PaneId;
 
+pub type SharedAgentStatusStore = Arc<RwLock<AgentStatusStore>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatusSource {
     Ipc,
@@ -65,6 +68,10 @@ impl AgentStatusStore {
 
     pub fn get(&self, pane_id: PaneId, _now: Instant) -> Option<&LiveAgentStatus> {
         self.by_pane.get(&pane_id)
+    }
+
+    pub fn snapshot_for(&self, pane_id: PaneId, now: Instant) -> Option<AgentStatusSnapshot> {
+        self.get(pane_id, now).map(|status| status.snapshot.clone())
     }
     pub fn remove_identity(&mut self, agent: &str, session_id: &str) -> usize {
         let before = self.by_pane.len();
