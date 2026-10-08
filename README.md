@@ -8,11 +8,12 @@
 
 ## Features
 
-- **Agent-first** — a dedicated agents column auto-detects coding-agent CLIs (`omp`, `codex`, `claude`, `pi`); a persistent session daemon detaches and reattaches sessions.
-- **All in-process** — file explorer, git (`gix`), GitLab/GitHub, sysmon, agent monitor, todo, and session search run inside the binary; no external TUIs spawned.
+- **Persistent session daemon** — `sessiond` (on by default) hosts every PTY outside the TUI process: close rimeterm and your agents and shells keep running; relaunch reattaches and replays the full scrollback ring. tmux detach semantics, zero setup.
+- **Realtime agent status** — a status protocol + `rimeterm-agent-status` hook bridge light up a live symbol on each workspace tab: `●` working, `?` needs input, `✓` success, `!` failure. Hooks for `omp`, `claude`, `codex`, `qwen`, and `opencode` are wired automatically when the agent starts — no transcript/CPU heuristics.
+- **All in-process** — file explorer, git (`gix`), GitLab/GitHub, sysmon, agent monitor, todo, and session search run inside the binary; no external TUIs spawned. The agents column auto-detects coding-agent CLIs (`omp`, `codex`, `claude`, `pi`, and more).
 - **tmux-style PTY multiplexing** — scrollback, mouse selection, clipboard, and per-workspace persisted layouts.
 - **Multi-workspace tabs** — switch project roots from the workspace strip; each keeps its own layout, tabs, and active agent.
-- **Workspace activity tabs** — explicit realtime adapters for OMP, Claude Code, and Codex drive a fixed symbol slot on each workspace tab: `●` working, `?` needs input, `✓` success, `!` failure. Only the first Agent tab is observed; unsupported Agents stay blank, with no transcript/CPU fallback.
+- **Workspace activity tabs** — realtime status adapters drive a fixed symbol slot on each workspace tab (see above); only the first Agent tab is observed, unsupported Agents stay blank.
 - **Scriptable via `rimectl`** — every UI command exposed as line-delimited JSON over a named pipe / Unix socket.
 - **Cross-pane workflows** — dispatch todo tasks to an agent, resume past sessions via `fr`, track agent CPU / tokens / cost in `agtop`.
 - **Desktop pet** — mirrors the main agent's status and current tool intent.
