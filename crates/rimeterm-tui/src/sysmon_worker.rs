@@ -845,13 +845,6 @@ fn linux_collect_amdgpu(os_gpu_names: &[String]) -> Vec<crate::sysmon_model::Gpu
     out
 }
 
-/// Non-Linux stub: no sysfs to read. (Windows uses the WDDM
-/// collector; macOS stays name-only.)
-#[cfg(not(target_os = "linux"))]
-fn linux_collect_amdgpu(_os_gpu_names: &[String]) -> Vec<crate::sysmon_model::GpuStats> {
-    Vec::new()
-}
-
 /// Merge OS-enumerated GPU names with telemetry from NVML (NVIDIA)
 /// and the OS-side collector (WDDM on Windows / amdgpu sysfs on
 /// Linux — both vendor-agnostic for their platform).
