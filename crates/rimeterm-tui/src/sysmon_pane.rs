@@ -701,7 +701,7 @@ fn render_gpu_box(frame: &mut Frame<'_>, area: Rect, snapshot: &Snapshot) {
             return;
         }
         Paragraph::new(Line::styled(
-            "no NVIDIA GPU detected",
+            "no GPU detected",
             Style::default().fg(Color::DarkGray),
         ))
         .render(inner, frame.buffer_mut());
@@ -742,11 +742,11 @@ fn render_single_gpu(frame: &mut Frame<'_>, area: Rect, gpu: &GpuStats, index: u
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    // GPUs without telemetry (non-NVIDIA cards we can only enumerate
-    // by name — iGPU, AMD/Intel dGPU) get a compact "no telemetry"
-    // line instead of misleading `util 0%` / `mem n/a` bars. The
-    // vendor hint helps the user understand why (only NVIDIA cards
-    // report util/mem/temp via NVML today).
+    // GPUs without telemetry (cards we can only enumerate by name —
+    // e.g. Intel iGPU where no driver counter is exposed) get a
+    // compact "no telemetry" line instead of misleading `util 0%` /
+    // `mem n/a` bars. NVIDIA-named cards without data point at NVML,
+    // since they'd normally report through it.
     let has_telemetry = gpu.utilization.is_some() || gpu.memory_total > 0;
     let name_line = Line::styled(
         truncate(&gpu.name, inner.width as usize),
@@ -756,7 +756,7 @@ fn render_single_gpu(frame: &mut Frame<'_>, area: Rect, gpu: &GpuStats, index: u
         let hint = if gpu.name.to_lowercase().contains("nvidia") {
             "no telemetry (NVML unavailable)"
         } else {
-            "no telemetry (non-NVIDIA)"
+            "no telemetry"
         };
         let lines = vec![
             name_line,
@@ -1525,10 +1525,7 @@ mod tests {
             !all.contains("GPU (1)"),
             "empty state must NOT show an indexed title: {all}"
         );
-        assert!(
-            all.contains("no NVIDIA GPU detected"),
-            "placeholder line missing"
-        );
+        assert!(all.contains("no GPU detected"), "placeholder line missing");
     }
 
     #[test]

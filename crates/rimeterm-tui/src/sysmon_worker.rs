@@ -105,6 +105,10 @@ struct Collector {
     components: Components,
     last_refresh: Instant,
     nvml: Option<nvml_wrapper::Nvml>,
+    /// Windows WDDM GPU telemetry (DXGI identity + PDH counters).
+    /// `None` when init failed — GPU rows fall back to name-only.
+    #[cfg(target_os = "windows")]
+    wddm: Option<WddmGpuCollector>,
     docker: Option<DockerCollector>,
     /// Every graphics adapter reported by the OS at worker startup.
     /// GPUs don't hot-plug in normal use so we cache this once — each
@@ -141,6 +145,8 @@ impl Collector {
             components: Components::new_with_refreshed_list(),
             last_refresh: Instant::now(),
             nvml: init_nvml(),
+            #[cfg(target_os = "windows")]
+            wddm: WddmGpuCollector::try_init(),
             docker: DockerCollector::try_init(),
             os_gpu_names,
         }
@@ -234,7 +240,12 @@ impl Collector {
             .map(|c| c.frequency())
             .unwrap_or(0);
 
-        let gpus = compose_gpu_list(&self.os_gpu_names, collect_gpus_nvml(self.nvml.as_ref()));
+        let other_gpus = self.collect_gpus_os_side();
+        let gpus = compose_gpu_list(
+            &self.os_gpu_names,
+            collect_gpus_nvml(self.nvml.as_ref()),
+            other_gpus,
+        );
         let docker = self.docker.as_mut().and_then(DockerCollector::poll);
         #[cfg(target_os = "linux")]
         let cgroup = read_cgroup();
@@ -275,6 +286,23 @@ impl Collector {
             os_display,
             uptime_seconds,
             scanned_at: Instant::now(),
+        }
+    }
+
+    /// OS-side GPU telemetry for non-NVIDIA cards: WDDM counters on
+    /// Windows, amdgpu sysfs on Linux, nothing elsewhere.
+    fn collect_gpus_os_side(&mut self) -> Vec<crate::sysmon_model::GpuStats> {
+        #[cfg(target_os = "windows")]
+        {
+            self.wddm.as_mut().map(|w| w.sample()).unwrap_or_default()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            linux_collect_amdgpu(&self.os_gpu_names)
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            Vec::new()
         }
     }
 
@@ -801,39 +829,54 @@ fn linux_collect_amdgpu(_os_gpu_names: &[String]) -> Vec<crate::sysmon_model::Gp
     Vec::new()
 }
 
-/// Merge OS-enumerated GPU names with NVML telemetry.
+/// Merge OS-enumerated GPU names with telemetry from NVML (NVIDIA)
+/// and the OS-side collector (WDDM on Windows / amdgpu sysfs on
+/// Linux — both vendor-agnostic for their platform).
 ///
-/// - When both sides have entries: use the OS list as authoritative
-///   (covers iGPU + AMD dGPU that NVML can't see) and overlay NVML
-///   metrics onto matching entries by name substring.
+/// - OS list is authoritative when non-empty: NVML telemetry overlays
+///   matching entries by name substring first (NVML wins over the
+///   OS-side source when both cover a card — it's richer and
+///   battle-tested); OS-side telemetry then fills remaining entries
+///   the same way.
 /// - When only NVML has entries (WSL2, containers where lspci/wmic
 ///   can't see the passthrough device): return NVML-only.
-/// - When only OS enumeration has entries: return them with no
-///   telemetry (UI shows the name, "no telemetry" for util/mem/temp).
+/// - When only OS enumeration has entries: name-only rows ("no
+///   telemetry" in the UI).
 /// - When both empty: `[]` — UI shows "no GPU detected".
+/// - Unmatched NVML entries are appended (WSL2 passthrough scenario);
+///   unmatched OS-side entries are dropped — unlike NVML, an
+///   OS-resident collector has no scenario where the OS enumeration
+///   missed its device.
 fn compose_gpu_list(
     os_names: &[String],
     mut nvml_gpus: Vec<crate::sysmon_model::GpuStats>,
+    mut other_gpus: Vec<crate::sysmon_model::GpuStats>,
 ) -> Vec<crate::sysmon_model::GpuStats> {
     if os_names.is_empty() {
         return nvml_gpus;
     }
+    let matches_by_name = |g: &crate::sysmon_model::GpuStats, os_name: &str| {
+        let a = g.name.to_lowercase();
+        let b = os_name.to_lowercase();
+        a == b || a.contains(&b) || b.contains(&a)
+    };
     let mut result: Vec<crate::sysmon_model::GpuStats> = Vec::with_capacity(os_names.len());
     for os_name in os_names {
-        // Match by name substring — NVML reports "NVIDIA GeForce RTX
-        // 3080", wmic reports "NVIDIA GeForce RTX 3080" (identical) or
-        // sometimes with slight variations. Substring both ways is
-        // conservative enough that near-matches still hit.
-        let matched = nvml_gpus.iter().position(|g| {
-            let a = g.name.to_lowercase();
-            let b = os_name.to_lowercase();
-            a == b || a.contains(&b) || b.contains(&a)
-        });
+        // NVML first (richer data), then the OS-side collector.
+        let matched = nvml_gpus
+            .iter()
+            .position(|g| matches_by_name(g, os_name))
+            .map(|idx| nvml_gpus.remove(idx))
+            .or_else(|| {
+                other_gpus
+                    .iter()
+                    .position(|g| matches_by_name(g, os_name))
+                    .map(|idx| other_gpus.remove(idx))
+            });
         match matched {
-            Some(idx) => {
-                let mut g = nvml_gpus.remove(idx);
-                // Prefer the OS-formatted name (wmic uses "NVIDIA GeForce
-                // RTX 3080 Laptop GPU" while NVML abbreviates).
+            Some(mut g) => {
+                // Prefer the OS-formatted name (wmic uses "NVIDIA
+                // GeForce RTX 3080 Laptop GPU" while NVML abbreviates).
                 g.name = os_name.clone();
                 result.push(g);
             }
@@ -846,8 +889,8 @@ fn compose_gpu_list(
             }),
         }
     }
-    // Any NVML entries that didn't match (e.g. WSL2 passthrough not
-    // visible to wmic/lspci) still get appended so telemetry isn't lost.
+    // Unmatched NVML entries (WSL2 passthrough not visible to
+    // wmic/lspci) still get appended so telemetry isn't lost.
     result.extend(nvml_gpus);
     result
 }
@@ -1037,7 +1080,7 @@ mod tests {
     #[test]
     fn compose_empty_os_falls_back_to_nvml_only() {
         let nvml = vec![mk_nvml("NVIDIA GeForce RTX 3080")];
-        let composed = compose_gpu_list(&[], nvml.clone());
+        let composed = compose_gpu_list(&[], nvml.clone(), Vec::new());
         assert_eq!(composed.len(), 1);
         assert_eq!(composed[0].name, "NVIDIA GeForce RTX 3080");
         assert_eq!(composed[0].utilization, Some(42.0));
@@ -1049,7 +1092,7 @@ mod tests {
             "Intel(R) Iris(R) Xe Graphics".to_string(),
             "AMD Radeon RX 6600".to_string(),
         ];
-        let composed = compose_gpu_list(&os, Vec::new());
+        let composed = compose_gpu_list(&os, Vec::new(), Vec::new());
         assert_eq!(composed.len(), 2);
         assert_eq!(composed[0].name, "Intel(R) Iris(R) Xe Graphics");
         assert_eq!(composed[0].utilization, None);
@@ -1067,7 +1110,7 @@ mod tests {
             "NVIDIA GeForce RTX 3080 Laptop GPU".to_string(),
         ];
         let nvml = vec![mk_nvml("NVIDIA GeForce RTX 3080")];
-        let composed = compose_gpu_list(&os, nvml);
+        let composed = compose_gpu_list(&os, nvml, Vec::new());
         assert_eq!(composed.len(), 2);
         assert_eq!(composed[0].name, "Intel(R) Iris(R) Xe Graphics");
         assert_eq!(composed[0].utilization, None);
@@ -1083,12 +1126,63 @@ mod tests {
         // passthrough NVIDIA appears only via NVML. Both must show.
         let os = vec!["Intel(R) UHD Graphics".to_string()];
         let nvml = vec![mk_nvml("NVIDIA A100")];
-        let composed = compose_gpu_list(&os, nvml);
+        let composed = compose_gpu_list(&os, nvml, Vec::new());
         assert_eq!(composed.len(), 2);
         assert_eq!(composed[0].name, "Intel(R) UHD Graphics");
         assert_eq!(composed[0].utilization, None);
         assert_eq!(composed[1].name, "NVIDIA A100");
         assert_eq!(composed[1].utilization, Some(42.0));
+    }
+
+    #[test]
+    fn compose_nvml_beats_os_side_source_for_same_card() {
+        // NVIDIA cards report through both NVML and WDDM on Windows;
+        // NVML data (richer, includes temperature) must win.
+        let os = vec!["NVIDIA GeForce RTX 4090".to_string()];
+        let nvml = vec![mk_nvml("NVIDIA GeForce RTX 4090")];
+        let mut other = mk_nvml("NVIDIA GeForce RTX 4090");
+        other.utilization = Some(99.0);
+        other.temperature = None;
+        let composed = compose_gpu_list(&os, nvml, vec![other]);
+        assert_eq!(composed.len(), 1);
+        assert_eq!(composed[0].utilization, Some(42.0)); // NVML value
+        assert_eq!(composed[0].temperature, Some(58.0));
+    }
+
+    #[test]
+    fn compose_amd_gets_os_side_telemetry() {
+        // The motivating case: NVIDIA dGPU via NVML + AMD iGPU via
+        // WDDM/sysfs, both merged onto the OS enumeration.
+        let os = vec![
+            "AMD Radeon 780M Graphics".to_string(),
+            "NVIDIA GeForce RTX 4090".to_string(),
+        ];
+        let nvml = vec![mk_nvml("NVIDIA GeForce RTX 4090")];
+        let mut amd = mk_nvml("AMD Radeon 780M Graphics");
+        amd.utilization = Some(7.0);
+        amd.temperature = None;
+        amd.memory_used = 512 * 1024 * 1024;
+        amd.memory_total = 2 * 1024 * 1024 * 1024;
+        let composed = compose_gpu_list(&os, nvml, vec![amd]);
+        assert_eq!(composed.len(), 2);
+        assert_eq!(composed[0].name, "AMD Radeon 780M Graphics");
+        assert_eq!(composed[0].utilization, Some(7.0));
+        assert_eq!(composed[0].memory_total, 2 * 1024 * 1024 * 1024);
+        assert_eq!(composed[1].utilization, Some(42.0));
+    }
+
+    #[test]
+    fn compose_unmatched_os_side_entry_dropped() {
+        // OS-side collectors can't know a device the OS enumeration
+        // missed, so unmatched entries are dropped (vs NVML's append).
+        let os = vec!["AMD Radeon 780M Graphics".to_string()];
+        let other = vec![
+            mk_nvml("AMD Radeon 780M Graphics"),
+            mk_nvml("Phantom Adapter"),
+        ];
+        let composed = compose_gpu_list(&os, Vec::new(), other);
+        assert_eq!(composed.len(), 1);
+        assert_eq!(composed[0].name, "AMD Radeon 780M Graphics");
     }
 
     // ── luid_from_pdh_instance ────────────────────────────────────
