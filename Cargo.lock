@@ -5096,7 +5096,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-agent-status"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "serde",
  "serde_json",
@@ -5290,6 +5290,7 @@ dependencies = [
  "url",
  "webbrowser",
  "which",
+ "windows 0.62.2",
 ]
 
 [[package]]

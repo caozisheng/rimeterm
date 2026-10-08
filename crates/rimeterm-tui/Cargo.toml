@@ -85,6 +85,16 @@ glab-tui = { workspace = true }
 # `#[cfg(target_os = "linux")]` for the same reason.
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = { workspace = true }
+# Windows GPU telemetry (DXGI adapter identity + PDH GPU Engine /
+# GPU Adapter Memory counters) for non-NVIDIA cards. In-process, no
+# admin, same data source as Task Manager. Mirrors the procfs
+# conditional-target pattern above.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_System_Performance",
+    "Win32_Foundation",
+] }
 
 # `arboard` has no Android backend and does not compile on `target_os =
 # "android"`; src/clipboard.rs provides a no-op shim there instead.
