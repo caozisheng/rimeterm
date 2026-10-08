@@ -19,6 +19,13 @@
 //!   Missing daemon = feature is silently no-op.
 //! - `sysmon-procfs` (Linux only): cgroup context from
 //!   `/proc/self/cgroup` via `procfs`.
+//! - GPU telemetry for non-NVIDIA cards (no cargo feature): on
+//!   Windows, DXGI adapter identity + PDH `GPU Engine` / `GPU Adapter
+//!   Memory` counters via the `windows` crate (in-process, no admin,
+//!   Task Manager's data source; missing counters = name-only rows).
+//!   On Linux, the amdgpu driver sysfs (`gpu_busy_percent`,
+//!   `mem_info_vram_*`, hwmon `temp1_input`). NVML still wins for
+//!   NVIDIA cards it covers.
 //!
 //! The pane drives the sampling cadence: it sends a `Snapshot` request
 //! at its own 200 ms tick (see `SysmonPane::poll_background`). The

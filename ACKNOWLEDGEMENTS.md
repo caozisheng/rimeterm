@@ -217,6 +217,10 @@ failing startup.
   count. Missing daemon → Docker row hidden.
 - [procfs](https://github.com/eminence/procfs) — MIT / Apache-2.0 (Linux
   only). `/proc/self/cgroup` decoder for the cgroup badge on Linux.
+- [windows](https://github.com/microsoft/windows-rs) — MIT / Apache-2.0
+  (Windows only). DXGI adapter enumeration + PDH `GPU Engine` /
+  `GPU Adapter Memory` counters for `SysmonPane`'s non-NVIDIA GPU
+  telemetry. Missing counters → name-only GPU rows.
 
 ## Todo
 
