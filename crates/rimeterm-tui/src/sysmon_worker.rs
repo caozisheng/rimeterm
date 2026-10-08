@@ -520,6 +520,186 @@ fn luid_from_pdh_instance(instance: &str) -> Option<String> {
     Some(format!("0x{low}_0x{high}"))
 }
 
+// ── Windows WDDM GPU telemetry (DXGI identity + PDH counters) ────
+
+/// In-process GPU telemetry from Windows performance counters — the
+/// same data source Task Manager uses. DXGI supplies the stable
+/// adapter identity (LUID + name + dedicated VRAM, enumerated once);
+/// PDH supplies per-engine utilization and adapter memory usage keyed
+/// by LUID (sampled each tick).
+///
+/// Init failure (no counters, old OS, access denied) degrades to
+/// `None` and the pane falls back to name-only GPU rows — identical
+/// behaviour to NVML init failure.
+#[cfg(target_os = "windows")]
+struct WddmGpuCollector {
+    /// LUID key (as produced by `luid_from_pdh_instance`) →
+    /// (adapter name, dedicated VRAM bytes).
+    adapters: Vec<(String, String, u64)>,
+    query: windows::Win32::System::Performance::PDH_HQUERY,
+    util_counter: windows::Win32::System::Performance::PDH_HCOUNTER,
+    mem_counter: windows::Win32::System::Performance::PDH_HCOUNTER,
+}
+
+#[cfg(target_os = "windows")]
+impl WddmGpuCollector {
+    fn try_init() -> Option<Self> {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory1,
+        };
+        use windows::Win32::System::Performance::{
+            PDH_HCOUNTER, PDH_HQUERY, PdhAddEnglishCounterW, PdhCollectQueryData, PdhOpenQueryW,
+        };
+        use windows::core::PCWSTR;
+
+        // ── DXGI: LUID + name + dedicated VRAM per hardware adapter ──
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
+            .map_err(|err| tracing::debug!(error = %err, "CreateDXGIFactory1 failed"))
+            .ok()?;
+        let mut adapters: Vec<(String, String, u64)> = Vec::new();
+        for idx in 0u32.. {
+            let adapter: IDXGIAdapter1 = match unsafe { factory.EnumAdapters1(idx) } {
+                Ok(adapter) => adapter,
+                Err(_) => break, // DXGI_ERROR_NOT_FOUND: end of list
+            };
+            let desc = match unsafe { adapter.GetDesc1() } {
+                Ok(desc) => desc,
+                Err(_) => continue,
+            };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue; // Microsoft Basic Render Driver etc.
+            }
+            if desc.DedicatedVideoMemory == 0 {
+                continue; // no dedicated VRAM ⇒ not a real render target
+            }
+            let name = String::from_utf16_lossy(&desc.Description)
+                .trim_end_matches('\0')
+                .to_string();
+            // LUID formatted to match `luid_from_pdh_instance` output
+            // (lowercase hex halves).
+            let luid = format!(
+                "0x{:08x}_0x{:08x}",
+                desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart as u32
+            );
+            adapters.push((luid, name, desc.DedicatedVideoMemory as u64));
+        }
+        if adapters.is_empty() {
+            return None;
+        }
+
+        // ── PDH: GPU Engine util + GPU Adapter Memory dedicated ──
+        let mut query = PDH_HQUERY::default();
+        let mut util_counter = PDH_HCOUNTER::default();
+        let mut mem_counter = PDH_HCOUNTER::default();
+        if unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &mut query) } != 0 {
+            tracing::debug!("PdhOpenQuery failed");
+            return None;
+        }
+        let util_path: windows::core::HSTRING = r"\GPU Engine(*)\Utilization Percentage".into();
+        let mem_path: windows::core::HSTRING = r"\GPU Adapter Memory(*)\Dedicated Usage".into();
+        if unsafe { PdhAddEnglishCounterW(query, &util_path, 0, &mut util_counter) } != 0
+            || unsafe { PdhAddEnglishCounterW(query, &mem_path, 0, &mut mem_counter) } != 0
+            || unsafe { PdhCollectQueryData(query) } != 0
+        {
+            tracing::debug!("PDH GPU counters unavailable");
+            return None;
+        }
+        tracing::info!(adapters = adapters.len(), "WDDM GPU telemetry init ok");
+        Some(Self {
+            adapters,
+            query,
+            util_counter,
+            mem_counter,
+        })
+    }
+
+    /// One `GpuStats` per DXGI adapter with current counter data.
+    /// LUIDs the counters know but DXGI didn't list are dropped.
+    fn sample(&mut self) -> Vec<crate::sysmon_model::GpuStats> {
+        use windows::Win32::System::Performance::PdhCollectQueryData;
+
+        if unsafe { PdhCollectQueryData(self.query) } != 0 {
+            return Vec::new();
+        }
+        let util_map = read_counter_array(self.util_counter);
+        let mem_map = read_counter_array(self.mem_counter);
+        self.adapters
+            .iter()
+            .map(|(luid, name, vram_total)| {
+                let utilization = util_map.get(luid).map(|v| v.clamp(0.0, 100.0) as f32);
+                let memory_used = mem_map.get(luid).map(|v| *v as u64).unwrap_or(0);
+                crate::sysmon_model::GpuStats {
+                    name: name.clone(),
+                    utilization,
+                    memory_used,
+                    memory_total: *vram_total,
+                    temperature: None, // no OS-level GPU temp counter
+                }
+            })
+            .collect()
+    }
+}
+
+/// Read all instances of a wildcard counter, summing per LUID into a
+/// map. Instance names without a parsable LUID are skipped.
+#[cfg(target_os = "windows")]
+fn read_counter_array(
+    counter: windows::Win32::System::Performance::PDH_HCOUNTER,
+) -> std::collections::HashMap<String, f64> {
+    use windows::Win32::System::Performance::{
+        PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PdhGetFormattedCounterArrayW,
+    };
+
+    // First call sizes the buffer (returns PDH_MORE_DATA).
+    let mut buf_size = 0u32;
+    let mut item_count = 0u32;
+    let status = unsafe {
+        PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE,
+            &mut buf_size,
+            &mut item_count,
+            None,
+        )
+    };
+    // 0 = ERROR_SUCCESS (single-instance case), 0x800007EA =
+    // PDH_MORE_DATA (normal wildcard case).
+    if status != 0 && status != 0x8000_07EA {
+        return std::collections::HashMap::new();
+    }
+    let mut items = vec![PDH_FMT_COUNTERVALUE_ITEM_W::default(); item_count as usize];
+    let mut read_back = 0u32;
+    let status = unsafe {
+        PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE,
+            &mut buf_size,
+            &mut read_back,
+            Some(items.as_mut_ptr()),
+        )
+    };
+    if status != 0 {
+        return std::collections::HashMap::new();
+    }
+    let mut map = std::collections::HashMap::with_capacity(items.len());
+    for item in &items[..read_back as usize] {
+        // szName is a NUL-terminated UTF-16 string; the PDH array
+        // allocation owns the backing memory.
+        let name = unsafe {
+            let mut len = 0usize;
+            while *item.szName.0.add(len) != 0 {
+                len += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(item.szName.0, len))
+        };
+        if let Some(luid) = luid_from_pdh_instance(&name) {
+            let value = unsafe { item.FmtValue.Anonymous.doubleValue };
+            *map.entry(luid).or_insert(0.0) += value;
+        }
+    }
+    map
+}
+
 // ── Linux amdgpu sysfs telemetry ──────────────────────────────────
 
 /// Parse a decimal u64 from a sysfs file body (trailing newline
