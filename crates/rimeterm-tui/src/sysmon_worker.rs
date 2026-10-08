@@ -494,6 +494,133 @@ fn collect_gpus_nvml(nvml: Option<&nvml_wrapper::Nvml>) -> Vec<crate::sysmon_mod
     out
 }
 
+/// Extract the LUID key (`0x…_0x…`, lowercase) from a PDH GPU counter
+/// instance name. GPU Engine instances look like
+/// `pid_1234_luid_0x00000000_0x0000c117_phys_0_eng_0_engtype_3D`;
+/// GPU Adapter Memory instances are the bare `luid_0x…_0x…` pair.
+/// Returns `None` when no well-formed `luid_0x…_0x…` segment exists.
+#[cfg(any(target_os = "windows", test))]
+fn luid_from_pdh_instance(instance: &str) -> Option<String> {
+    let lower = instance.to_lowercase();
+    let start = lower.find("luid_")?;
+    let rest = lower[start + "luid_".len()..].strip_prefix("0x")?;
+    // Two `0x<hex>` halves joined by `_`. `x` is not a hex digit, so
+    // each half is scanned as pure hex with the literal `0x` prefix
+    // required explicitly — `luid_not_hex` and truncated LUIDs fail.
+    let low_len = rest.find(|c: char| !c.is_ascii_hexdigit())?;
+    let (low, rest) = rest.split_at(low_len);
+    let rest = rest.strip_prefix("_0x")?;
+    let high_len = rest
+        .find(|c: char| !c.is_ascii_hexdigit())
+        .unwrap_or(rest.len());
+    let high = &rest[..high_len];
+    if low.is_empty() || high.is_empty() {
+        return None;
+    }
+    Some(format!("0x{low}_0x{high}"))
+}
+
+// ── Linux amdgpu sysfs telemetry ──────────────────────────────────
+
+/// Parse a decimal u64 from a sysfs file body (trailing newline
+/// included). `None` on empty/garbage — callers treat that as
+/// "sensor not exposed".
+#[cfg(any(target_os = "linux", test))]
+fn parse_sysfs_u64(s: &str) -> Option<u64> {
+    s.trim().parse().ok()
+}
+
+/// Parse an hwmon `tempN_input` value (milli-°C integer) into °C.
+#[cfg(any(target_os = "linux", test))]
+fn parse_temp_milli_c(s: &str) -> Option<f32> {
+    s.trim().parse::<i64>().ok().map(|m| m as f32 / 1000.0)
+}
+
+/// Per-card telemetry from the amdgpu driver sysfs interface
+/// (kernel-documented). One `GpuStats` per AMD card found; empty vec
+/// when the driver exposes nothing (no AMD GPU, non-Linux, permission
+/// errors). File reads only — cheap enough for every 200 ms tick.
+///
+/// Paths:
+/// - `/sys/class/drm/card*/device/gpu_busy_percent` → utilization %
+/// - `/sys/class/drm/card*/device/mem_info_vram_used` / `_total`
+/// - `/sys/class/drm/card*/device/hwmon/hwmon*/temp1_input` (milli-°C)
+///
+/// Name join: `device` is a symlink to
+/// `/sys/bus/pci/devices/0000:XX:YY.Z`; its basename is the slot
+/// `lspci` prints, which the OS enumeration list already carries.
+#[cfg(target_os = "linux")]
+fn linux_collect_amdgpu(os_gpu_names: &[String]) -> Vec<crate::sysmon_model::GpuStats> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let card = entry.file_name();
+        let card = card.to_string_lossy();
+        if !(card.starts_with("card") && card[4..].chars().all(|c| c.is_ascii_digit())) {
+            continue; // cardN only — skip cardN-K partitions and render nodes
+        }
+        let base = entry.path().join("device");
+        // AMD only: PCI vendor id 0x1002. Intel (0x8086) exposes no
+        // gpu_busy_percent and would read as garbage zeros.
+        let vendor = std::fs::read_to_string(base.join("vendor")).unwrap_or_default();
+        if vendor.trim() != "0x1002" {
+            continue;
+        }
+        let util = std::fs::read_to_string(base.join("gpu_busy_percent"))
+            .ok()
+            .and_then(|s| parse_sysfs_u64(&s))
+            .map(|v| v as f32);
+        let used = std::fs::read_to_string(base.join("mem_info_vram_used"))
+            .ok()
+            .and_then(|s| parse_sysfs_u64(&s))
+            .unwrap_or(0);
+        let total = std::fs::read_to_string(base.join("mem_info_vram_total"))
+            .ok()
+            .and_then(|s| parse_sysfs_u64(&s))
+            .unwrap_or(0);
+        // hwmon index varies per boot (hwmon2, hwmon5, …) — scan all.
+        let temp = std::fs::read_dir(base.join("hwmon")).ok().and_then(|rd| {
+            rd.flatten().find_map(|h| {
+                std::fs::read_to_string(h.path().join("temp1_input"))
+                    .ok()
+                    .and_then(|s| parse_temp_milli_c(&s))
+            })
+        });
+        if util.is_none() && used == 0 && total == 0 {
+            continue; // card present but driver exposes nothing useful
+        }
+        // Resolve the PCI slot from the `device` symlink and match it
+        // against the OS enumeration names (which came from lspci).
+        let gpu_name = std::fs::read_link(&base)
+            .ok()
+            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+            .and_then(|slot| {
+                os_gpu_names
+                    .iter()
+                    .find(|n| n.to_lowercase().contains(&slot.to_lowercase()))
+            })
+            .cloned()
+            .unwrap_or_else(|| format!("AMD GPU ({card})"));
+        out.push(crate::sysmon_model::GpuStats {
+            name: gpu_name,
+            utilization: util,
+            memory_used: used,
+            memory_total: total,
+            temperature: temp,
+        });
+    }
+    out
+}
+
+/// Non-Linux stub: no sysfs to read. (Windows uses the WDDM
+/// collector; macOS stays name-only.)
+#[cfg(not(target_os = "linux"))]
+fn linux_collect_amdgpu(_os_gpu_names: &[String]) -> Vec<crate::sysmon_model::GpuStats> {
+    Vec::new()
+}
+
 /// Merge OS-enumerated GPU names with NVML telemetry.
 ///
 /// - When both sides have entries: use the OS list as authoritative
@@ -782,5 +909,49 @@ mod tests {
         assert_eq!(composed[0].utilization, None);
         assert_eq!(composed[1].name, "NVIDIA A100");
         assert_eq!(composed[1].utilization, Some(42.0));
+    }
+
+    // ── luid_from_pdh_instance ────────────────────────────────────
+
+    #[test]
+    fn luid_extracted_from_engine_instance() {
+        let inst = "pid_1234_luid_0x00000000_0x0000c117_phys_0_eng_0_engtype_3D";
+        assert_eq!(
+            luid_from_pdh_instance(inst),
+            Some("0x00000000_0x0000c117".to_string())
+        );
+    }
+
+    #[test]
+    fn luid_none_when_missing_or_malformed() {
+        assert_eq!(luid_from_pdh_instance("pid_1234_phys_0"), None);
+        assert_eq!(luid_from_pdh_instance(""), None);
+        assert_eq!(luid_from_pdh_instance("luid_not_hex"), None);
+    }
+
+    #[test]
+    fn luid_extracted_from_adapter_memory_instance() {
+        // GPU Adapter Memory instances are the bare LUID pair.
+        assert_eq!(
+            luid_from_pdh_instance("luid_0x00000000_0x0000c117"),
+            Some("0x00000000_0x0000c117".to_string())
+        );
+    }
+
+    // ── sysfs value parsing ───────────────────────────────────────
+
+    #[test]
+    fn sysfs_u64_parses_trimmed_decimal() {
+        assert_eq!(parse_sysfs_u64("4096\n"), Some(4096));
+        assert_eq!(parse_sysfs_u64("42"), Some(42));
+        assert_eq!(parse_sysfs_u64(""), None);
+        assert_eq!(parse_sysfs_u64("abc\n"), None);
+    }
+
+    #[test]
+    fn sysfs_temp_parses_milli_celsius() {
+        assert_eq!(parse_temp_milli_c("45000\n"), Some(45.0));
+        assert_eq!(parse_temp_milli_c("-12500\n"), Some(-12.5));
+        assert_eq!(parse_temp_milli_c("x\n"), None);
     }
 }
