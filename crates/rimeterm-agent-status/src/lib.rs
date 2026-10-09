@@ -40,7 +40,7 @@ export default async (pi: ExtensionAPI) => {
   pi.on("agent_start", (_event, ctx) => send(ctx as { cwd?: string }, "thinking"));
   pi.on("turn_start", (_event, ctx) => send(ctx as { cwd?: string }, "thinking"));
   pi.on("tool_approval_requested", (_event, ctx) => send(ctx as { cwd?: string }, "waiting_user"));
-  pi.on("tool_execution_start", (event, ctx) => send(ctx as { cwd?: string }, "tool_running", { tool: event.toolName }));
+  pi.on("tool_execution_start", (event, ctx) => send(ctx as { cwd?: string }, event.toolName === "ask" ? "waiting_user" : "tool_running", { tool: event.toolName }));
   pi.on("tool_execution_end", (event, ctx) => send(ctx as { cwd?: string }, event.isError ? "error" : "thinking"));
   pi.on("session.compacting", (_event, ctx) => send(ctx as { cwd?: string }, "compacting"));
   pi.on("auto_compaction_end", (_event, ctx) => send(ctx as { cwd?: string }, "thinking"));
