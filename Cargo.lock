@@ -5096,7 +5096,7 @@ dependencies = [
 
 [[package]]
 name = "rimeterm-agent-status"
-version = "0.3.20"
+version = "0.3.21"
 dependencies = [
  "serde",
  "serde_json",
