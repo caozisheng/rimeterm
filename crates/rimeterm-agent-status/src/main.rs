@@ -155,15 +155,27 @@ fn parse_codex_hook() -> rimeterm_agent_status::AgentStatusSnapshot {
     if io::stdin().read_to_string(&mut input).is_err() {
         hook_silent();
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&input) else {
-        hook_silent();
+    parse_codex_hook_input(&input, env::args().nth(2).as_deref()).unwrap_or_else(|| hook_silent())
+}
+
+fn parse_codex_hook_input(
+    stdin: &str,
+    argument: Option<&str>,
+) -> Option<rimeterm_agent_status::AgentStatusSnapshot> {
+    let input = if stdin.trim().is_empty() {
+        argument?
+    } else {
+        stdin
     };
+    let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
     let event_name = value
         .get("event")
+        .or_else(|| value.get("type"))
         .and_then(|v| v.as_str())
         .unwrap_or("agent-turn-complete");
     let session = value
         .get("session_id")
+        .or_else(|| value.get("thread-id"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let cwd = value.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
@@ -185,7 +197,28 @@ fn parse_codex_hook() -> rimeterm_agent_status::AgentStatusSnapshot {
         "tool-end" | "tool_execution_end" => AgentEvent::ToolEnd { error: false },
         _ => AgentEvent::AgentEnd { error: false },
     };
-    CodexAdapter::new(session, cwd).apply(event)
+    Some(CodexAdapter::new(session, cwd).apply(event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_notify_reads_json_from_last_argument() {
+        let snapshot = parse_codex_hook_input(
+            "",
+            Some(r#"{"type":"agent-turn-complete","thread-id":"thread-1","cwd":"C:\\work"}"#),
+        )
+        .expect("Codex notify payload");
+
+        assert_eq!(snapshot.session_id, "thread-1");
+        assert_eq!(snapshot.cwd, r"C:\work");
+        assert_eq!(
+            snapshot.state,
+            rimeterm_agent_status::AgentLifecycle::Success
+        );
+    }
 }
 
 fn emit_codex_hook_osc() {

@@ -4,13 +4,9 @@ Rimeterm workspace tabs consume explicit lifecycle snapshots from Agent adapters
 
 ## Supported adapters
 
-The first implementation ships protocol adapters for:
+Protocol adapters are available for Oh-My-Pi (`omp`), Claude Code (`claude`), Codex (`codex`), Qwen Code (`qwen`), and OpenCode (`opencode`). Other Agent binaries still run normally, but their workspace tabs show an empty status slot until an adapter emits this protocol.
 
-- Oh-My-Pi (`omp`)
-- Claude Code (`claude`)
-- Codex (`codex`)
-
-Other Agent binaries in the rimeterm registry still run normally, but their workspace tabs show an empty status slot until an adapter emits this protocol.
+omp's `ask` tool maps to `waiting_user` on `tool_execution_start` (`toolName === "ask"`); other tools map to `tool_running`.
 
 ## Snapshot format
 
@@ -72,13 +68,15 @@ For Claude Code hooks, configure a command that forwards the hook JSON on stdin:
 
 Merge these entries into the existing settings instead of replacing the user's hook configuration.
 
-For Codex CLI, add the notify hook to `~/.codex/config.toml` (merge with existing settings):
+For Codex CLI, configure `notify` in `~/.codex/config.toml` (merge with existing settings):
 
 ```toml
-notify = ["sh", "-c", "rimeterm-agent-status codex-hook"]
+notify = ["rimeterm-agent-status", "codex-hook-ipc"]
 ```
 
-Codex sends a JSON payload on stdin. The current documented `agent-turn-complete` event maps to `success`; additional tool and approval event names are accepted when supplied by the installed Codex version.
+Codex passes its notification JSON as the final command-line argument, not stdin. The bridge accepts that payload, including `thread-id`, `cwd`, and the `agent-turn-complete` event, which maps to `success`.
+
+Qwen Code and OpenCode use Claude-compatible command hooks. Rimeterm adds its hook to the project config while preserving existing settings and hooks. For Qwen the command is `rimeterm-agent-status qwen-hook-ipc`; for OpenCode it is `rimeterm-agent-status opencode-hook-ipc`.
 Hooks that cannot write OSC can use the generic IPC command interface:
 
 ```powershell
@@ -92,7 +90,7 @@ rimectl agent.status.clear --json '{"agent":"claude","session_id":"s1"}'
 rimectl agent.status.list
 ```
 
-IPC binding uses the Agent id and canonical workspace cwd. The matching Agent must be the first real tab in the workspace's `agents` group.
+IPC binding uses the Agent id and canonical workspace cwd: the snapshot binds to the first tab of that Agent in the workspace's `agents` group, not necessarily the first real tab overall.
 
 ## Workspace ownership
 
