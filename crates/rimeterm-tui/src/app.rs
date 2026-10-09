@@ -6209,16 +6209,23 @@ impl App {
             install_hint: Some(spec.install_hint.to_string()),
         };
         // Slot-stable daemon key: the smallest slot not used by a live
-        // pane of this agent id in this workspace. Slot 0 = historical
+        // pane of this agent id in THIS workspace (keys are already
+        // workspace-scoped by the key prefix, so other workspaces'
+        // panes must not consume slots here). Slot 0 = historical
         // unsuffixed key; higher slots give duplicate tabs their own
         // daemon sessions AND let runtime-opened tabs reattach after a
         // restart (the old `-{PaneId}` suffix never matched a restored
         // key, so those sessions were orphaned by design).
         let taken: std::collections::HashSet<u32> = self
-            .pane_agent_id
+            .landscape_tabs
+            .agents
             .iter()
-            .filter(|&(_, id)| *id == spec.id)
-            .filter_map(|(pane, _)| self.pane_agent_slot.get(pane).copied())
+            .filter(|pane| {
+                self.pane_agent_id
+                    .get(pane)
+                    .is_some_and(|id| *id == spec.id)
+            })
+            .filter_map(|pane| self.pane_agent_slot.get(pane).copied())
             .collect();
         let slot = (0u32..).find(|s| !taken.contains(s)).unwrap_or(0);
         let spawn_cwd = cwd;
@@ -7197,7 +7204,17 @@ impl App {
                 Vec::new()
             };
         let shells = if self.memory_policy.shell_tabs {
-            self.snapshot_shell_tabs()
+            // Merge with the on-disk state: a dead/unsampled pid must
+            // NOT clobber the last good cwd with the workspace root —
+            // the KillNow path samples AFTER the daemon killed the
+            // children, so every pid is dead exactly then.
+            let on_disk = rimeterm_config::tabs_state::workspace_state_file(
+                &self.workspace_root,
+                self.ws_instances.get(self.active_ws).copied().unwrap_or(0),
+            )
+            .and_then(|path| rimeterm_config::tabs_state::TabsState::load_or_default(&path).ok())
+            .unwrap_or_default();
+            self.snapshot_shell_tabs_with_fallback(on_disk)
         } else {
             Vec::new()
         };
@@ -7237,6 +7254,21 @@ impl App {
             }
         }
         sample_shell_cwds(pids, &self.workspace_root)
+    }
+
+    /// Like [`Self::snapshot_shell_tabs`], but a shell whose cwd can't
+    /// be sampled (dead pid — the KillNow path samples AFTER the
+    /// daemon killed the children) keeps its previous entry from
+    /// `previous` instead of falling back to the workspace root.
+    fn snapshot_shell_tabs_with_fallback(
+        &self,
+        previous: rimeterm_config::tabs_state::TabsState,
+    ) -> Vec<rimeterm_config::tabs_state::ShellTabEntry> {
+        merge_sampled_shell_cwds(
+            self.snapshot_shell_tabs(),
+            previous.shells,
+            &self.workspace_root,
+        )
     }
 
     fn persist_ui_state(&mut self) {
@@ -9981,6 +10013,41 @@ fn sample_shell_cwds(
     out
 }
 
+/// Merge freshly sampled shell cwds with the last persisted ones. A
+/// sampled entry that fell back to the workspace root (dead pid — the
+/// KillNow exit path samples after the daemon already killed the
+/// children) must not clobber the disk's real directory: keep the
+/// previous cwd for that ordinal instead. Live samples and genuinely
+/// new ordinals pass through untouched.
+fn merge_sampled_shell_cwds(
+    sampled: Vec<rimeterm_config::tabs_state::ShellTabEntry>,
+    previous: Vec<rimeterm_config::tabs_state::ShellTabEntry>,
+    workspace_root: &std::path::Path,
+) -> Vec<rimeterm_config::tabs_state::ShellTabEntry> {
+    sampled
+        .into_iter()
+        .map(|entry| {
+            let cwd = if entry.cwd == workspace_root
+                && let Some(prev) = previous
+                    .iter()
+                    .find(|p| p.number == entry.number && p.cwd != workspace_root)
+            {
+                // Sample fell back to the workspace root but the disk
+                // has a real directory for this ordinal — the pid died
+                // since the last flush; trust the disk (sampled while
+                // the child was live).
+                prev.cwd.clone()
+            } else {
+                entry.cwd
+            };
+            rimeterm_config::tabs_state::ShellTabEntry {
+                number: entry.number,
+                cwd,
+            }
+        })
+        .collect()
+}
+
 /// Inverse of [`parse_markdown_theme`]: produce the intent-tag slug
 /// used in `md.theme:<slug>` picker entries. Keeping this separate
 /// (rather than piggybacking on `Theme::label()`) ensures the tag is
@@ -12112,6 +12179,61 @@ mod tests {
     #[test]
     fn sample_shell_cwds_empty_input_is_empty() {
         assert!(sample_shell_cwds(Vec::new(), std::path::Path::new("/w")).is_empty());
+    }
+
+    #[test]
+    fn merge_keeps_previous_cwd_when_sample_fell_back() {
+        // KillNow scenario: children dead → sample returns workspace
+        // root for shell-2, but the disk recorded a real directory.
+        let sampled = vec![
+            rimeterm_config::tabs_state::ShellTabEntry {
+                number: 1,
+                cwd: std::path::PathBuf::from("/ws"),
+            },
+            rimeterm_config::tabs_state::ShellTabEntry {
+                number: 2,
+                cwd: std::path::PathBuf::from("/ws"),
+            },
+        ];
+        let previous = vec![rimeterm_config::tabs_state::ShellTabEntry {
+            number: 2,
+            cwd: std::path::PathBuf::from("/deep/work/dir"),
+        }];
+        let merged = merge_sampled_shell_cwds(sampled, previous, std::path::Path::new("/ws"));
+        assert_eq!(merged[0].cwd, std::path::PathBuf::from("/ws"));
+        assert_eq!(merged[1].cwd, std::path::PathBuf::from("/deep/work/dir"));
+    }
+
+    #[test]
+    fn merge_prefers_live_sample_over_stale_disk_entry() {
+        // Normal flush: child live and moved — the fresh sample wins
+        // even when the disk disagrees.
+        let sampled = vec![rimeterm_config::tabs_state::ShellTabEntry {
+            number: 1,
+            cwd: std::path::PathBuf::from("/new/dir"),
+        }];
+        let previous = vec![rimeterm_config::tabs_state::ShellTabEntry {
+            number: 1,
+            cwd: std::path::PathBuf::from("/old/dir"),
+        }];
+        let merged = merge_sampled_shell_cwds(sampled, previous, std::path::Path::new("/ws"));
+        assert_eq!(merged[0].cwd, std::path::PathBuf::from("/new/dir"));
+    }
+
+    #[test]
+    fn merge_keeps_workspace_root_when_shell_lived_there() {
+        // A shell genuinely sitting in the workspace root is normal,
+        // not a dead-pid artifact — previous agrees, nothing to heal.
+        let sampled = vec![rimeterm_config::tabs_state::ShellTabEntry {
+            number: 1,
+            cwd: std::path::PathBuf::from("/ws"),
+        }];
+        let previous = vec![rimeterm_config::tabs_state::ShellTabEntry {
+            number: 1,
+            cwd: std::path::PathBuf::from("/ws"),
+        }];
+        let merged = merge_sampled_shell_cwds(sampled, previous, std::path::Path::new("/ws"));
+        assert_eq!(merged[0].cwd, std::path::PathBuf::from("/ws"));
     }
 
     #[test]
