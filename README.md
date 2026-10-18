@@ -126,6 +126,8 @@ curl -LO https://github.com/caozisheng/rimeterm/releases/latest/download/rimeter
 sudo apt install ./rimeterm-<version>_amd64.deb
 ```
 
+For Linux aarch64 (ARM64), use `rimeterm-<version>_arm64.deb` instead.
+
 From source (note `--locked`: the committed `Cargo.lock` is currently required — `bisync 0.3.x`, a transitive `gix` dependency, is yanked on crates.io, so fresh resolution fails):
 
 ```bash

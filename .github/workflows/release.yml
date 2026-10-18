@@ -20,7 +20,7 @@
 #   * Windows → `rimeterm-<version>-x86_64.msi`
 #                 cargo-wix with in-tree wix/main.wxs, %ProgramFiles%\rimeterm
 #                 auto-appended to MACHINE PATH, Start-menu shortcut.
-#   * Linux   → `rimeterm-<version>_amd64.deb`
+#   * Linux   → `rimeterm-<version>_{amd64,arm64}.deb`
 #                 cargo-deb with debian/{postinst,prerm}, payload at
 #                 /usr/lib/rimeterm/, symlinks in /usr/bin/.
 #   * macOS   → `rimeterm-<version>-aarch64.dmg`
@@ -72,6 +72,11 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             shared-key: release-linux
+            deb-arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            shared-key: release-linux-arm
+            deb-arch: arm64
           - target: aarch64-apple-darwin
             os: macos-latest     # Apple Silicon
             shared-key: release-macos-arm
@@ -180,7 +185,7 @@ jobs:
       # One cargo invocation so incremental linking + parallel codegen share
       # work across both binaries (macOS / Windows).
       - name: Cargo build --release (rimeterm + rimectl)
-        if: matrix.target != 'x86_64-unknown-linux-gnu' && matrix.target != 'aarch64-linux-android'
+        if: ${{ !endsWith(matrix.target, '-unknown-linux-gnu') && matrix.target != 'aarch64-linux-android' }}
         run: cargo build --release --workspace --bins --target ${{ matrix.target }}
 
       # Linux: link against an older glibc with cargo-zigbuild so the .deb
@@ -191,25 +196,25 @@ jobs:
       # (no glibc-suffix), so `cargo deb --no-build --target` below is
       # unchanged. Versions pinned to the combo validated for v0.2.44.
       - name: Install cargo-zigbuild + zig (Linux)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
         run: |
           pip3 install --user ziglang==0.16.0
           python3 -m ziglang version
           cargo install cargo-zigbuild --locked --version ^0.23
 
       - name: Cargo zigbuild --release, glibc 2.31 (Linux)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo zigbuild --release --workspace --bins --target x86_64-unknown-linux-gnu.2.31
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        run: cargo zigbuild --release --workspace --bins --target ${{ matrix.target }}.2.31
 
       # Guard the baseline: if a future dependency drags in symbols newer
       # than 2.31, the .deb silently stops installing on Ubuntu 20.04/WSL
       # again. readelf walks .gnu.version_r; awk does a numeric compare.
       - name: Verify glibc symbol baseline (Linux)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
         shell: bash
         run: |
           set -euo pipefail
-          BIN="target/x86_64-unknown-linux-gnu/release/rimeterm"
+          BIN="target/${{ matrix.target }}/release/rimeterm"
           MAX_GLIBC="$(readelf --version-info "$BIN" \
             | grep -oE 'GLIBC_2\.[0-9]+' | sort -Vu | tail -n1 | cut -d_ -f3)"
           echo "max GLIBC symbol: ${MAX_GLIBC}"
@@ -322,11 +327,11 @@ jobs:
             >> "$GITHUB_OUTPUT"
 
       - name: Install cargo-deb (Linux)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
         run: cargo install cargo-deb --locked --version ^2
 
       - name: Build .deb (Linux)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
         id: deb
         shell: bash
         # `--no-build` reuses the already-compiled release binary;
@@ -340,10 +345,10 @@ jobs:
           ln -sf ../../README.md            crates/rimeterm/README.md
           ln -sf ../../LICENSE              crates/rimeterm/LICENSE
           ln -sf ../../ACKNOWLEDGEMENTS.md  crates/rimeterm/ACKNOWLEDGEMENTS.md
-          cargo deb --no-build --target "${{ matrix.target }}" -p rimeterm -o "rimeterm-${{ steps.version.outputs.value }}_amd64.deb"
+          cargo deb --no-build --target "${{ matrix.target }}" -p rimeterm -o "rimeterm-${{ steps.version.outputs.value }}_${{ matrix.deb-arch }}.deb"
           rm -f crates/rimeterm/README.md crates/rimeterm/LICENSE crates/rimeterm/ACKNOWLEDGEMENTS.md
-          ls -la "rimeterm-${{ steps.version.outputs.value }}_amd64.deb"
-          echo "path=rimeterm-${{ steps.version.outputs.value }}_amd64.deb" \
+          ls -la "rimeterm-${{ steps.version.outputs.value }}_${{ matrix.deb-arch }}.deb"
+          echo "path=rimeterm-${{ steps.version.outputs.value }}_${{ matrix.deb-arch }}.deb" \
             >> "$GITHUB_OUTPUT"
 
       - name: Build .dmg (macOS)
@@ -411,7 +416,7 @@ jobs:
           set -euo pipefail
           if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
             echo "path=${{ steps.msi.outputs.path }}" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+          elif [[ "${{ matrix.target }}" == *-unknown-linux-gnu ]]; then
             echo "path=${{ steps.deb.outputs.path }}" >> "$GITHUB_OUTPUT"
           elif [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
             echo "path=${{ steps.dmg.outputs.path }}" >> "$GITHUB_OUTPUT"
