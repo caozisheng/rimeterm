@@ -5417,7 +5417,7 @@ impl App {
             let pane_rect = inner[1];
 
             if let Some(group) = self.tree.find_tab_group(gid) {
-                let titles: Vec<String> = group
+                let mut titles: Vec<String> = group
                     .members()
                     .iter()
                     .map(|id| {
