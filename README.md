@@ -70,6 +70,12 @@ Every PTY pane has scrollback, an inline scrollbar, mouse text selection, and
 `Ctrl+Shift+C/V` clipboard actions. Layout ratios, visible tabs, tab order, and
 the active agent are persisted per workspace.
 
+Double-click an Agent or Shell tab label to edit its name in place. Type to
+append, use `Backspace` to delete, `Enter` or click outside to save, and `Esc`
+to cancel. Names are limited to 64 characters; an empty draft keeps the
+previous name. These display names last for the current rimeterm process and
+do not change shell session identifiers or working directories.
+
 ### Cross-pane workflows
 
 - **Agent work** — work in an `agents` tab, watch process/resource details in

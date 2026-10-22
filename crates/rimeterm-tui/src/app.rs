@@ -10100,7 +10100,7 @@ fn next_shell_number(members: &[PaneId], panes: &PaneRegistry) -> usize {
             max = n;
         }
     }
-    max.max(members.len()) + 1
+    max + 1
 }
 
 /// Sample each shell child's working directory from its root pid via
