@@ -295,6 +295,11 @@ pub(crate) enum TabStripHit {
     /// Click on the `[+]` — dispatch new-tab for that group.
     Plus { gid: TabGroupId },
 }
+#[derive(Debug, Clone)]
+struct PaneRename {
+    pane_id: PaneId,
+    buffer: String,
+}
 
 /// Snapshot of live workspace state, exposed through
 /// `workspace.snapshot` IPC command. Updated at the end of every frame.
@@ -1248,6 +1253,8 @@ pub struct App {
     /// agent id in this workspace — a closed tab's daemon session is
     /// killed on close, so its slot is genuinely free.
     pane_agent_slot: std::collections::HashMap<PaneId, u32>,
+    /// In-memory display labels for renamed Agent and Shell tabs.
+    pane_custom_titles: std::collections::HashMap<PaneId, String>,
     /// Deadline of the next periodic tab-state flush (cwd sampling).
     /// `None` until the first loop iteration forces an initial write.
     tabs_flush_at: Option<Instant>,
@@ -1306,6 +1313,8 @@ pub struct App {
     /// Kept separate from `ws_rename` (the editor itself) so a single
     /// click on a tab never enters edit mode.
     ws_click_streak: crate::workspace_strip::WorkspaceClickStreak,
+    pane_rename: Option<PaneRename>,
+    pane_click_streak: crate::workspace_strip::WorkspaceClickStreak,
     /// Epoch used to phase non-idle workspace status glyph blinking.
     blink_epoch: Instant,
     blink_phase: bool,
@@ -1982,6 +1991,7 @@ impl App {
             pane_agent_id: startup_agent_ids.into_iter().collect(),
             pane_agent_pid: startup_agent_pids.into_iter().collect(),
             pane_agent_slot: startup_agent_slots.into_iter().collect(),
+            pane_custom_titles: std::collections::HashMap::new(),
             tabs_flush_at: None,
             agent_status_store: Arc::clone(&agent_status_store),
             agent_monitor,
@@ -2010,6 +2020,8 @@ impl App {
             ],
             ws_rename: None,
             ws_click_streak: crate::workspace_strip::WorkspaceClickStreak::default(),
+            pane_rename: None,
+            pane_click_streak: crate::workspace_strip::WorkspaceClickStreak::default(),
             blink_epoch: Instant::now(),
             blink_phase: true,
             workspace_tabs_enabled: persisted_workspaces.enabled,
@@ -3352,6 +3364,44 @@ impl App {
             let _ = self.redraw_tx.send(());
         }
     }
+    fn on_pane_rename_key(&mut self, key: KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let Some(rename) = self.pane_rename.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, _) | (KeyCode::Char('\n' | '\r'), _) => {
+                let draft = rename.buffer.trim().to_string();
+                if !draft.is_empty() {
+                    self.pane_custom_titles.insert(rename.pane_id, draft);
+                }
+                self.pane_rename = None;
+            }
+            (KeyCode::Esc, _) => self.pane_rename = None,
+            (KeyCode::Backspace, _) => {
+                rename.buffer.pop();
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) if !c.is_control() => {
+                if rename.buffer.chars().count() < RENAME_TITLE_MAX {
+                    rename.buffer.push(c);
+                }
+            }
+            _ => {}
+        }
+        self.needs_redraw = true;
+        let _ = self.redraw_tx.send(());
+    }
+
+    fn commit_pane_rename(&mut self) {
+        if let Some(rename) = self.pane_rename.take() {
+            let title = rename.buffer.trim().to_string();
+            if !title.is_empty() {
+                self.pane_custom_titles.insert(rename.pane_id, title);
+            }
+            self.needs_redraw = true;
+            let _ = self.redraw_tx.send(());
+        }
+    }
 
     fn merge_workspace_build_metadata(&mut self, build: &WorkspaceBuild) {
         self.pane_agent_id.extend(build.agent_ids.iter().copied());
@@ -3768,6 +3818,10 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        if self.pane_rename.is_some() {
+            self.on_pane_rename_key(key);
+            return;
+        }
         // Workspace rename editor owns the keyboard while open — it
         // must sit ABOVE every overlay dispatch because none of them
         // can be open at the same time (opening an overlay commits
@@ -4106,6 +4160,20 @@ impl App {
             && !matches!(m.kind, MouseEventKind::Moved)
         {
             return;
+        }
+        if matches!(m.kind, MouseEventKind::Down(_)) && self.pane_rename.is_some() {
+            let same_tab = match self.tab_hit(m.column, m.row) {
+                Some(TabStripHit::Activate { gid, idx }) => self
+                    .tree
+                    .find_tab_group(gid)
+                    .and_then(|group| group.members().get(idx))
+                    .is_some_and(|id| self.pane_rename.as_ref().is_some_and(|r| r.pane_id == *id)),
+                _ => false,
+            };
+            if same_tab {
+                return;
+            }
+            self.commit_pane_rename();
         }
         // --- Active layout drag has the highest priority (C22.6 fix) ---
         if self.workspace_tabs_enabled {
@@ -4492,7 +4560,40 @@ impl App {
             // 3. Tab strip: activate / close / fire the group's `[+]`.
             if let Some(hit) = self.tab_hit(m.column, m.row) {
                 match hit {
-                    TabStripHit::Activate { gid, idx } => self.activate_tab(gid, idx),
+                    TabStripHit::Activate { gid, idx } => {
+                        let target = self
+                            .tree
+                            .find_tab_group(gid)
+                            .and_then(|group| group.members().get(idx).copied());
+                        let renameable = target.is_some_and(|pane| {
+                            self.landscape_tabs.agents.contains(&pane)
+                                || self.landscape_tabs.shells.contains(&pane)
+                        });
+                        let doubled = renameable
+                            && self
+                                .pane_click_streak
+                                .register(m.column, m.row, Instant::now());
+                        if doubled {
+                            if let Some(pane_id) = target {
+                                self.activate_tab(gid, idx);
+                                let title = self
+                                    .pane_custom_titles
+                                    .get(&pane_id)
+                                    .cloned()
+                                    .or_else(|| {
+                                        self.panes.get(pane_id).map(|pane| pane.title().to_string())
+                                    })
+                                    .unwrap_or_default();
+                                self.pane_rename = Some(PaneRename {
+                                    pane_id,
+                                    buffer: title,
+                                });
+                            }
+                        } else {
+                            self.commit_pane_rename();
+                            self.activate_tab(gid, idx);
+                        }
+                    }
                     TabStripHit::Close { gid, idx } => self.close_tab_at(gid, idx),
                     TabStripHit::Plus { gid } => self.new_tab_in(gid),
                 }
@@ -5338,6 +5439,17 @@ impl App {
                             && (gid != BUILTIN_TOOLS || self.landscape_tabs.shells.contains(id))
                     })
                     .collect();
+                for (id, title) in group.members().iter().zip(titles.iter_mut()) {
+                    if let Some(custom) = self.pane_custom_titles.get(id) {
+                        *title = custom.clone();
+                    }
+                }
+                if let Some(rename) = self.pane_rename.as_ref()
+                    && let Some(idx) = group.members().iter().position(|id| *id == rename.pane_id)
+                    && let Some(title) = titles.get_mut(idx)
+                {
+                    *title = rename.buffer.clone();
+                }
                 let hits = crate::tab_strip::hit_rects(strip_rect, group, &titles, &closable);
                 self.last_tab_strips.push((gid, hits));
                 let tab_hover = tab_strip_hover_for(gid, self.hovered_ui);
@@ -5567,7 +5679,22 @@ impl App {
         // column (viewer_focused = false)" is unit-testable without a
         // live App instance. All state flowing into the decision goes
         // through arguments; no App field access happens inside.
-        let cursor = if let Some(rename) = self.ws_rename.as_ref() {
+        let cursor = if let Some(rename) = self.pane_rename.as_ref() {
+            use unicode_width::UnicodeWidthStr;
+            self.last_tab_strips.iter().find_map(|(gid, hits)| {
+                let group = self.tree.find_tab_group(*gid)?;
+                hits.tabs.iter().find_map(|(idx, rect)| {
+                    (group.members().get(*idx) == Some(&rename.pane_id)).then(|| {
+                        let col = rect
+                            .x
+                            .saturating_add(1)
+                            .saturating_add(UnicodeWidthStr::width(rename.buffer.as_str()) as u16)
+                            .min(rect.x.saturating_add(rect.width).saturating_sub(1));
+                        (col, rect.y)
+                    })
+                })
+            })
+        } else if let Some(rename) = self.ws_rename.as_ref() {
             // Rename editor owns the caret: block caret on the header
             // row right after the draft (see
             // `top_bar::rename_caret_col`), clamped to the tab region.
@@ -9973,7 +10100,7 @@ fn next_shell_number(members: &[PaneId], panes: &PaneRegistry) -> usize {
             max = n;
         }
     }
-    max + 1
+    max.max(members.len()) + 1
 }
 
 /// Sample each shell child's working directory from its root pid via
