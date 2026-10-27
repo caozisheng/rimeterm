@@ -19,6 +19,10 @@
 - **Desktop pet** — mirrors the main agent's `rime-agent-status` snapshot, including tool/activity scenes; when no protocol snapshot is available it shows `status unavailable` rather than falling back to process heuristics.
 - **Cross-platform** — Windows (ConPTY, MSI), Debian/Ubuntu `.deb`, macOS `.dmg`, and Termux builds.
 
+Agent process monitoring samples the process tree on a background worker every
+1.5 seconds. Matching an agent through shell or runtime wrappers uses that
+snapshot; UI input and rendering never trigger a full process-table scan.
+
 
 
 ## Layout

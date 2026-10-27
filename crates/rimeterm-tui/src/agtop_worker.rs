@@ -316,6 +316,17 @@ impl Sampler {
 
         Snapshot {
             agents,
+            process_parents: std::sync::Arc::new(
+                self.system
+                    .processes()
+                    .iter()
+                    .filter_map(|(pid, process)| {
+                        process
+                            .parent()
+                            .map(|parent| (pid.as_u32(), parent.as_u32()))
+                    })
+                    .collect(),
+            ),
             total_cpu,
             total_rss,
             total_tokens,

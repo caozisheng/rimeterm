@@ -6777,7 +6777,7 @@ impl App {
                     .map(str::to_string);
                 let root_pid = self.pane_agent_pid.get(&pane_id).copied();
                 let matched = root_pid.and_then(|pid| match_main_agent(pid, snapshot));
-                let phase = resolve_main_phase(root_pid, snapshot, Instant::now());
+                let phase = resolve_main_phase(root_pid, snapshot, matched, Instant::now());
                 let fast_activity =
                     matched.and_then(|agent| self.activity_monitor.activity_for(agent.pid));
                 let event = fast_activity

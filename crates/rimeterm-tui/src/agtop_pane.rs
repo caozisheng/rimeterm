@@ -1411,6 +1411,7 @@ mod tests {
             total_cost_usd,
             sampled_at: Instant::now(),
             sampled_at_ms: 0,
+            ..Snapshot::empty()
         };
     }
 

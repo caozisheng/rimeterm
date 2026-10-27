@@ -13,6 +13,8 @@
 //!
 //! [`AgtopPane`]: crate::agtop_pane::AgtopPane
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::agtop_pricing::CostBasis;
@@ -282,6 +284,9 @@ pub const CMDLINE_TRUNCATE: usize = 512;
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub agents: Vec<AgentInfo>,
+    /// Full parent table sampled by the worker, including non-agent wrappers.
+    /// Shared across snapshot clones so UI ticks never copy the process table.
+    pub process_parents: Arc<HashMap<u32, u32>>,
     /// Sum of CPU% across every detected agent — cached because the
     /// title bar re-uses it per frame.
     pub total_cpu: f32,
@@ -303,6 +308,7 @@ impl Snapshot {
     pub fn empty() -> Self {
         Self {
             agents: Vec::new(),
+            process_parents: Arc::default(),
             total_cpu: 0.0,
             total_rss: 0,
             total_tokens: 0,
@@ -310,6 +316,31 @@ impl Snapshot {
             sampled_at: Instant::now(),
             sampled_at_ms: 0,
         }
+    }
+
+    /// Bounded, allocation-free ancestry lookup over this sample only.
+    pub fn descendant_depth(&self, pid: u32, ancestor: u32) -> Option<usize> {
+        let mut current = pid;
+        let mut seen = [0; 32];
+        for depth in 0..seen.len() {
+            if current == ancestor {
+                return Some(depth);
+            }
+            if seen[..depth].contains(&current) {
+                return None;
+            }
+            seen[depth] = current;
+            current = self.process_parents.get(&current).copied().or_else(|| {
+                self.agents
+                    .iter()
+                    .find(|agent| agent.pid == current)
+                    .map(|agent| agent.ppid)
+            })?;
+            if current == 0 {
+                return None;
+            }
+        }
+        None
     }
 
     /// Header aggregates for the pane title bar. Kept small so a
@@ -450,6 +481,15 @@ pub enum AgtopResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ancestry_stops_at_missing_parent_or_cycle() {
+        let mut snapshot = Snapshot::empty();
+        snapshot.process_parents = Arc::new([(10, 11), (11, 10), (20, 21)].into());
+        assert_eq!(snapshot.descendant_depth(10, 11), Some(1));
+        assert_eq!(snapshot.descendant_depth(10, 99), None);
+        assert_eq!(snapshot.descendant_depth(20, 99), None);
+    }
 
     fn row(label: &str, pid: u32, cpu: f32, rss: u64, uptime: u64, tokens: u64) -> AgentInfo {
         AgentInfo {
