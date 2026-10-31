@@ -325,8 +325,8 @@ mod tests {
     fn dropping_writer_drains_queue_and_exits_worker() {
         let (handle, writer) = BlockingHandle::new();
         let mut pty = PtyWriter::spawn(Box::new(writer)).expect("worker");
-        pty.write(b"queued-1").unwrap();
-        pty.write(b"queued-2").unwrap();
+        pty.write_all(b"queued-1").unwrap();
+        pty.write_all(b"queued-2").unwrap();
         assert!(handle.wait_entered(Duration::from_secs(2)));
         handle.release();
         drop(pty);
