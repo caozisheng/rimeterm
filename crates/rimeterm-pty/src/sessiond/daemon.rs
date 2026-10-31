@@ -33,8 +33,16 @@
 //!   order.
 //! - The child pump also owns reaping: it `wait()`s only after the reader
 //!   hit EOF, so `Exited` is always the last frame after all output.
+//! - The registry lock covers metadata, ring pushes and sender
+//!   registration only. VT parsing, query replies, the input enqueue,
+//!   and every blocking control-path OS call (`resize`, tree `kill`, and
+//!   the master drop that closes the pseudoconsole) run outside it — a
+//!   slow pane can never stall another session, an attach, or a Tokio
+//!   worker. Resizes are serialized per session; kills are not, so a
+//!   resize parked in `ResizePseudoConsole` can never delay termination.
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::sync::Arc;
 
 use alacritty_terminal::term::Term;
@@ -49,7 +57,8 @@ use super::{
     Attach, ClientMsg, DaemonMsg, Frame, GRACE_NEVER, IDLE_EXIT_AFTER, MAX_FRAME_BODY,
     RING_CAPACITY_BYTES, SessionInfo, SpawnSpec, Welcome, grace_to_atomic,
 };
-use crate::pty_host::{NativePty, open_native_pty};
+use crate::pty_control::ControlWorker;
+use crate::pty_host::{NativePty, open_native_pty, terminate_tree};
 use crate::session::{
     Listener, PtyBackend, SessionConfig, new_headless_term, parse_chunks, resize_term,
     respond_to_terminal_queries,
@@ -160,6 +169,14 @@ struct LiveSession {
     /// Outbound channels of attached clients, tagged with the owning
     /// connection's id so a detach removes exactly its own entry.
     attached: Vec<(u64, mpsc::UnboundedSender<Frame>)>,
+    /// Dedicated resize + kill OS threads fed by mailboxes (see
+    /// [`crate::pty_control::ControlWorker`]). The connection loop only
+    /// enqueues: `ResizePseudoConsole` can park and the tree kill spawns
+    /// `taskkill`, so neither may run on that task, and a parked resize
+    /// must never delay termination. The resize worker also keeps the
+    /// last `master` Arc after eviction alive, so pseudoconsole teardown
+    /// happens on its own thread rather than under the registry lock.
+    control: Arc<ControlWorker>,
 }
 
 impl Registry {
@@ -282,13 +299,24 @@ pub async fn run(endpoint: &str, grace_secs: Option<u64>) -> anyhow::Result<()> 
     // Live sessions at this point can only exist if `conns == 0` was
     // shadowed between tick and break — it cannot; break only happens when
     // both are zero. Kill any stragglers defensively anyway.
-    {
+    //
+    // The sessions leave the registry under the lock but are killed and
+    // dropped on the blocking pool: `kill` shells out (`taskkill`) and
+    // the final master drop (`ClosePseudoConsole`) are blocking OS calls
+    // that must never run under the registry lock or on a Tokio worker.
+    let doomed: Vec<Entry> = {
         let mut reg = registry.lock();
-        for entry in reg.sessions.values_mut() {
-            if let Entry::Live(s) = entry {
-                s.pty.kill();
+        reg.sessions.drain().map(|(_, entry)| entry).collect()
+    };
+    if !doomed.is_empty() {
+        let _ = tokio::task::spawn_blocking(move || {
+            for entry in doomed {
+                if let Entry::Live(s) = entry {
+                    s.pty.kill();
+                }
             }
-        }
+        })
+        .await;
     }
     // Best-effort remove of a bound Unix socket so a restart rebinds
     // cleanly (named pipes vanish with the process).
@@ -439,7 +467,11 @@ async fn serve_attached(
         // the child pump (same lock), so live output can never interleave
         // between replay chunks. The entry never leaves the map here, so
         // the pump keeps running throughout.
-        {
+        //
+        // The guard is scoped to this block: the silent-respawn cleanup
+        // below awaits a blocking task, and a parking_lot guard must not
+        // be live across an await point.
+        let stale = {
             let mut reg = registry.lock();
             if let Some(Entry::Live(session)) = reg.sessions.get_mut(&key) {
                 // Silent-console child: never wrote a byte, old enough to
@@ -466,11 +498,8 @@ async fn serve_attached(
                     // spawns a replacement under the same key.
                     session.attached.clear();
                     session.killed = true;
-                    session.pty.kill();
-                    reg.sessions.remove(&key);
                     respawned_from_silence = true;
-                    drop(reg);
-                    // NOT breaking 'attach: fall to the slow path below.
+                    reg.sessions.remove(&key)
                 } else {
                     // Register the sender BEFORE queuing frames: everything
                     // below happens under the same lock hold as the child
@@ -493,7 +522,22 @@ async fn serve_attached(
                     }
                     break 'attach true;
                 }
+            } else {
+                None
             }
+        };
+        // Kill and drop the stale child OFF the registry lock, on the
+        // blocking pool: `kill` spawns `taskkill` and the entry's drop
+        // releases its control workers / master (`ClosePseudoConsole`) —
+        // all blocking OS calls. NOT breaking 'attach: fall to the slow
+        // path below.
+        if let Some(stale) = stale {
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Entry::Live(s) = stale {
+                    s.pty.kill();
+                }
+            })
+            .await;
         }
 
         debug!(conn_id, key = %key, "sessiond fast-path: MISS; slow path");
@@ -552,18 +596,30 @@ async fn serve_attached(
         let mut session = session;
         session.silence_respawned = respawned_from_silence;
         let reader = session.pty.reader.take();
-        let mut reg = registry.lock();
         // Raced: another connection spawned this key first and inserted
         // its Live entry while we were outside the lock. Kill our
         // duplicate child and attach to theirs (replay under the same
         // lock, same as the fast path).
-        if reg
-            .sessions
-            .get(&key)
-            .is_some_and(|e| matches!(e, Entry::Live(_)))
-        {
-            drop(reg);
-            session.pty.kill();
+        //
+        // The probe guard is scoped so it never lives across the await
+        // below.
+        let raced = {
+            let reg = registry.lock();
+            reg.sessions
+                .get(&key)
+                .is_some_and(|e| matches!(e, Entry::Live(_)))
+        };
+        if raced {
+            // Our duplicate child never got a Live entry: kill it and let
+            // the PTY + its reader drop on the blocking pool — `kill`
+            // (`taskkill`) and the master's `ClosePseudoConsole` are both
+            // blocking OS calls, never to run under the registry lock.
+            let _ = tokio::task::spawn_blocking(move || {
+                session.pty.kill();
+                drop(reader);
+                drop(session);
+            })
+            .await;
             let mut reg = registry.lock();
             if let Some(Entry::Live(earlier)) = reg.sessions.get_mut(&key) {
                 let snapshot = earlier.ring.snapshot();
@@ -580,6 +636,7 @@ async fn serve_attached(
             }
             break 'attach true;
         }
+        let mut reg = registry.lock();
         session.attached.push((conn_id, tx.clone()));
         let _ = tx.send(Frame::DaemonJson(DaemonMsg::Welcome(Welcome {
             pid: session.pty.root_pid(),
@@ -593,8 +650,12 @@ async fn serve_attached(
         let generation = reg.next_generation;
         reg.next_generation += 1;
         session.generation = generation;
-        reg.sessions.insert(key.clone(), Entry::Live(session));
+        // Only a `Dead` record can be evicted here; still drop it outside
+        // the lock so the "no PTY teardown under the registry lock" rule
+        // has no exception.
+        let replaced = reg.sessions.insert(key.clone(), Entry::Live(session));
         drop(reg);
+        drop(replaced);
         let pump_registry = Arc::clone(registry);
         let pump_key = key.clone();
         let reaper_registry = Arc::clone(registry);
@@ -623,30 +684,54 @@ async fn serve_attached(
         match frame {
             Frame::ClientWrite(bytes) => {
                 debug!(conn_id, key = %key, len = bytes.len(), "sessiond ClientWrite received");
-                let reg = registry.lock();
-                let Some(Entry::Live(s)) = reg.sessions.get(&key) else {
-                    break;
+                // The PTY writer is a dedicated-thread queue: this is an
+                // enqueue, not an OS write, so it stays on this task with
+                // only the (short) writer-slot mutex held.
+                let writer = {
+                    let reg = registry.lock();
+                    let Some(Entry::Live(s)) = reg.sessions.get(&key) else {
+                        break;
+                    };
+                    Arc::clone(&s.pty.writer)
                 };
-                if let Err(e) = s.pty.write(&bytes) {
+                if let Err(e) = write_stdin(&writer, &bytes) {
                     debug!(key = %key, error = %e, "sessiond write to child failed");
                 }
             }
             Frame::ClientJson(ClientMsg::Resize { cols, rows }) => {
-                let mut reg = registry.lock();
-                let Some(Entry::Live(s)) = reg.sessions.get_mut(&key) else {
-                    break;
+                // Record the *requested* size for replay metadata and
+                // hand the actual resize to the session's own worker,
+                // both under one short lock. The enqueue never blocks, so
+                // this connection keeps processing (Kill/Detach included)
+                // while a previous resize is parked in
+                // `ResizePseudoConsole`. The worker captured *this*
+                // session's headless grid + master, so a respawn under
+                // the same key can never be resized by the old worker.
+                let control = {
+                    let mut reg = registry.lock();
+                    let Some(Entry::Live(s)) = reg.sessions.get_mut(&key) else {
+                        break;
+                    };
+                    s.set_grid(cols, rows);
+                    Arc::clone(&s.control)
                 };
-                s.resize(cols, rows);
+                if !control.resize(cols, rows) {
+                    // Worker already shut down: the session is going away.
+                    break;
+                }
             }
             Frame::ClientJson(ClientMsg::Kill) => {
                 // Explicit close: kill the child but leave the Live entry —
                 // the reaper finalizes it (wait → broadcast Exited →
                 // forget, no Dead record, no respawn on next attach). The
                 // connection stays open until that Exited arrives.
-                let mut reg = registry.lock();
-                if let Some(Entry::Live(s)) = reg.sessions.get_mut(&key) {
-                    s.killed = true;
-                    s.pty.kill();
+                //
+                // The kill is fired at the session's dedicated kill
+                // worker: it never queues behind a resize parked in
+                // `ResizePseudoConsole`, and this connection never waits
+                // for the tree kill.
+                if let Some(control) = request_kill(registry, &key) {
+                    control.kill();
                 }
                 continue;
             }
@@ -705,27 +790,39 @@ fn child_pump(
             }
             Ok(n) => {
                 let slice = &buf[..n];
-                let mut reg = registry.lock();
-                let Some(Entry::Live(s)) = reg.sessions.get_mut(&key) else {
-                    return;
+                // Step 1 — short registry lock: verify the generation,
+                // retain the bytes and broadcast them. Atomic w.r.t.
+                // attach snapshots, so replay can never interleave with
+                // live output. Nothing else runs under this lock.
+                let (headless, writer) = {
+                    let mut reg = registry.lock();
+                    let Some(Entry::Live(s)) = reg.sessions.get_mut(&key) else {
+                        return;
+                    };
+                    if s.generation != generation {
+                        // Finalized, forgotten, or re-spawned — stop pumping.
+                        return;
+                    }
+                    s.ring.push(slice);
+                    for (_, tx) in &s.attached {
+                        let _ = tx.send(Frame::DaemonOutput(slice.to_vec()));
+                    }
+                    (Arc::clone(&s.headless), Arc::clone(&s.pty.writer))
                 };
-                if s.generation != generation {
-                    // Finalized, forgotten, or re-spawned — stop pumping.
-                    return;
+                // Step 2 — parse into the headless replica outside the
+                // lock: 8 KiB of VT from one busy pane must never stall
+                // every attach, every other session, or the control loop.
+                {
+                    let mut t = headless.lock();
+                    for chunk in parse_chunks(slice) {
+                        processor.advance(&mut *t, chunk);
+                    }
                 }
-                // 1. Feed the headless replica (query-answer accuracy).
-                for chunk in parse_chunks(slice) {
-                    let mut t = s.headless.lock();
-                    processor.advance(&mut *t, chunk);
-                }
-                // 2. Retain + broadcast under the same lock (atomic w.r.t.
-                // attach snapshots).
-                s.ring.push(slice);
-                for (_, tx) in &s.attached {
-                    let _ = tx.send(Frame::DaemonOutput(slice.to_vec()));
-                }
-                // 3. Answer DA/DSR queries from the child.
-                respond_to_terminal_queries(slice, &s.headless, &s.pty.writer);
+                // Step 3 — answer DA/DSR queries from the child, after the
+                // bytes are retained/broadcast and parsed. The writer is
+                // the queued handle, so this cannot block on the OS, and
+                // no registry lock is held.
+                respond_to_terminal_queries(slice, &headless, &writer);
             }
             Err(e) => {
                 // ConPTY surfaces pipe-closed as an error at shutdown.
@@ -768,25 +865,45 @@ fn child_reaper(registry: Arc<Mutex<Registry>>, key: String, generation: u64) {
         }
     };
 
-    // Finalize: `Exited` is queued after every output frame each
-    // connection already holds (pump sends under the same lock).
-    let mut reg = registry.lock();
-    if let Some(Entry::Live(s)) = reg.sessions.get_mut(&key) {
+    finalize_exit(&registry, &key, generation, status);
+}
+
+/// Finalize a session whose child exited: queue `Exited` after every
+/// output frame the connections already hold (the pump pushes under the
+/// same lock), then evict the entry.
+///
+/// The evicted session is *dropped outside* the registry lock: its drop
+/// releases the master (`ClosePseudoConsole`) and blocks until conhost
+/// lets go — exactly the call that must never run under the lock. The
+/// caller is a blocking thread, so the teardown also never stalls the
+/// Tokio runtime. Publishing `Exited` before the eviction keeps the
+/// master alive until the exit frame is queued (no ConPTY teardown while
+/// the pump may still be broadcasting).
+fn finalize_exit(registry: &Arc<Mutex<Registry>>, key: &str, generation: u64, status: u32) {
+    let evicted: Option<Entry> = {
+        let mut reg = registry.lock();
+        let Some(Entry::Live(s)) = reg.sessions.get_mut(key) else {
+            return;
+        };
         if s.generation != generation {
             return;
         }
-        info!(key = %key, status, "sessiond session exited");
+        info!(key, status, "sessiond session exited");
         for (_, tx) in &s.attached {
             let _ = tx.send(Frame::DaemonJson(DaemonMsg::Exited { status }));
         }
         s.attached.clear();
-        if s.killed {
+        let killed = s.killed;
+        if killed {
             // Explicit close: forget entirely — no respawn on next attach.
-            reg.sessions.remove(&key);
+            reg.sessions.remove(key)
         } else {
-            reg.sessions.insert(key, Entry::Dead);
+            reg.sessions.insert(key.to_string(), Entry::Dead)
         }
-    }
+    };
+    // Off-lock, on this (blocking) thread: dropping the evicted session
+    // releases the master and closes the pseudoconsole.
+    drop(evicted);
 }
 fn spawn_session(key: &str, attach: &Attach, spec: SpawnSpec) -> Result<LiveSession, String> {
     let cfg = SessionConfig {
@@ -800,6 +917,28 @@ fn spawn_session(key: &str, attach: &Attach, spec: SpawnSpec) -> Result<LiveSess
     };
     let pty = open_native_pty(&cfg).map_err(|e| format!("spawn `{key}`: {e}"))?;
     let headless = Arc::new(Mutex::new(new_headless_term(spec.cols, spec.rows)));
+    // Control workers: `ResizePseudoConsole` parks on a wedged ConPTY and
+    // the tree kill spawns `taskkill`; both run on dedicated OS threads
+    // fed by mailboxes. The resize closure holds this session's headless
+    // grid + master only (never the registry), so a respawn under the
+    // same key gets a fresh worker and no stale resize can cross
+    // generations.
+    let master_for_resize = Arc::clone(&pty.master);
+    let headless_for_resize = Arc::clone(&headless);
+    let killer_for_kill = Arc::clone(&pty.killer);
+    let root_pid_for_kill = pty.root_pid();
+    let control = match ControlWorker::spawn(
+        move |cols, rows| resize_session(&headless_for_resize, &master_for_resize, cols, rows),
+        move || terminate_tree(root_pid_for_kill, &killer_for_kill),
+    ) {
+        Ok(control) => control,
+        Err(e) => {
+            // Worker threads failed to start; never leave an unmanaged
+            // child behind (same cleanup as the native `Session`).
+            terminate_tree(pty.root_pid(), &pty.killer);
+            return Err(format!("spawn `{key}`: control worker: {e}"));
+        }
+    };
     info!(key = %key, label = %attach.label, "sessiond session spawned");
     Ok(LiveSession {
         label: attach.label.clone(),
@@ -814,16 +953,81 @@ fn spawn_session(key: &str, attach: &Attach, spec: SpawnSpec) -> Result<LiveSess
         spawned_at: std::time::Instant::now(),
         silence_respawned: false,
         attached: Vec::new(),
+        control: Arc::new(control),
     })
 }
 
 impl LiveSession {
-    fn resize(&mut self, cols: u16, rows: u16) {
-        resize_term(&mut self.headless.lock(), cols, rows);
+    /// Requested grid size for replay `Welcome` frames.
+    ///
+    /// Set under the registry lock when a `Resize` is accepted. The PTY
+    /// itself is resized asynchronously by this session's control worker
+    /// (which coalesces storms), so this may briefly lead the real size.
+    /// A stale worker can never overwrite it: the worker captured only
+    /// *this* session's headless grid + master and never touches the
+    /// registry.
+    fn set_grid(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
-        let _ = self.pty.resize(cols, rows);
     }
+}
+
+/// Resize the headless replica and the PTY master: grid first, then the
+/// PTY (mirrors `Session::resize`). Runs on the session's resize worker
+/// only — never on a Tokio worker and never under the registry lock.
+fn resize_session(
+    headless: &Arc<Mutex<Term<Listener>>>,
+    master: &Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    cols: u16,
+    rows: u16,
+) {
+    resize_term(&mut headless.lock(), cols, rows);
+    if let Err(e) = master.lock().resize(portable_pty::PtySize {
+        cols,
+        rows,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        debug!(cols, rows, error = %e, "sessiond pty resize failed");
+    }
+}
+
+/// Enqueue `bytes` on the session's PTY writer.
+///
+/// Production writers are queue-backed: `PtyWriter::write` only appends to
+/// the dedicated writer thread's queue, so this stays on the connection
+/// task (no blocking-pool hop, no OS write). The writer-slot mutex is held
+/// just for the enqueue. `BrokenPipe` means the child is already gone.
+fn write_stdin(
+    writer: &Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let mut slot = writer.lock();
+    let Some(writer) = slot.as_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "child already exited",
+        ));
+    };
+    writer.write_all(bytes)?;
+    writer.flush()
+}
+
+/// Mark `key`'s session killed and hand back its control worker.
+///
+/// The `killed` flag (the reaper forgets the entry instead of recording
+/// `Dead`) and the worker snapshot are taken under one short registry
+/// lock; the caller then fires the worker's kill channel, which is a
+/// notify — not an OS call. The kill worker owns only the killer handle
+/// and pid, so a resize parked in `ResizePseudoConsole` can never delay
+/// termination. `None` means the session is already gone.
+fn request_kill(registry: &Arc<Mutex<Registry>>, key: &str) -> Option<Arc<ControlWorker>> {
+    let mut reg = registry.lock();
+    let Some(Entry::Live(s)) = reg.sessions.get_mut(key) else {
+        return None;
+    };
+    s.killed = true;
+    Some(Arc::clone(&s.control))
 }
 
 /// Remove this connection's sender from the session's broadcast list.
@@ -834,5 +1038,598 @@ fn unregister_sender(registry: &Arc<Mutex<Registry>>, key: &Option<String>, conn
     let mut reg = registry.lock();
     if let Some(Entry::Live(s)) = reg.sessions.get_mut(key) {
         s.attached.retain(|(id, _)| id != conn_id);
+    }
+}
+
+#[cfg(test)]
+mod io_isolation_tests {
+    //! Lock-isolation regressions for the daemon's I/O paths.
+    //!
+    //! Real PTYs cannot be made slow on demand, so these tests pair the
+    //! daemon's actual resize/kill/pump/finalize paths with fake
+    //! `portable_pty` handles whose blocking OS calls park on a gate.
+    //! That makes the load-bearing invariant observable: while a pane's
+    //! resize/kill/teardown is in flight, the registry lock is free and
+    //! other sessions keep working. End-to-end attach/replay behaviour is
+    //! covered by `tests/sessiond_roundtrip.rs`.
+
+    use super::*;
+    use std::collections::HashMap;
+    use std::io;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use parking_lot::{Condvar, Mutex as PlMutex};
+    use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
+
+    /// A blocking fake OS call that a test can hold open.
+    #[derive(Default)]
+    struct Gate {
+        /// `(entered, released)`.
+        state: PlMutex<(bool, bool)>,
+        cv: Condvar,
+    }
+
+    impl Gate {
+        fn enter_and_wait(&self) {
+            let mut st = self.state.lock();
+            st.0 = true;
+            self.cv.notify_all();
+            while !st.1 {
+                self.cv.wait(&mut st);
+            }
+        }
+
+        fn wait_entered(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            let mut st = self.state.lock();
+            while !st.0 {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                self.cv.wait_for(&mut st, left);
+            }
+            true
+        }
+
+        fn release(&self) {
+            let mut st = self.state.lock();
+            st.1 = true;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Wait (off the runtime workers) until `gate` has been entered.
+    async fn gate_entered(gate: &Arc<Gate>) {
+        let gate = Arc::clone(gate);
+        let ok = tokio::task::spawn_blocking(move || gate.wait_entered(Duration::from_secs(10)))
+            .await
+            .expect("gate waiter panicked");
+        assert!(ok, "the fake PTY op never reached its blocking point");
+    }
+
+    /// PTY stand-in: every OS call a control path makes goes through a
+    /// gate (when configured) and records what happened.
+    struct FakeMaster {
+        resize_gate: Option<Arc<Gate>>,
+        drop_gate: Option<Arc<Gate>>,
+        resizes: Arc<PlMutex<Vec<(u16, u16)>>>,
+    }
+
+    impl MasterPty for FakeMaster {
+        fn resize(&self, size: PtySize) -> anyhow::Result<()> {
+            self.resizes.lock().push((size.cols, size.rows));
+            if let Some(gate) = &self.resize_gate {
+                gate.enter_and_wait();
+            }
+            Ok(())
+        }
+
+        fn get_size(&self) -> anyhow::Result<PtySize> {
+            Ok(PtySize::default())
+        }
+
+        fn try_clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send>> {
+            Ok(Box::new(io::empty()))
+        }
+
+        fn take_writer(&self) -> anyhow::Result<Box<dyn io::Write + Send>> {
+            Ok(Box::new(io::sink()))
+        }
+
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<portable_pty::unix::RawFd> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    impl Drop for FakeMaster {
+        fn drop(&mut self) {
+            // Stand in for `ClosePseudoConsole`, which blocks until
+            // conhost lets go of the pipes.
+            if let Some(gate) = &self.drop_gate {
+                gate.enter_and_wait();
+            }
+        }
+    }
+
+    struct FakeKiller {
+        kills: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Debug for FakeKiller {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("FakeKiller")
+        }
+    }
+
+    impl ChildKiller for FakeKiller {
+        fn kill(&mut self) -> io::Result<()> {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(FakeKiller {
+                kills: Arc::clone(&self.kills),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeChild {
+        killer: FakeKiller,
+    }
+
+    impl ChildKiller for FakeChild {
+        fn kill(&mut self) -> io::Result<()> {
+            self.killer.kill()
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            self.killer.clone_killer()
+        }
+    }
+
+    impl Child for FakeChild {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            Ok(Some(ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> io::Result<ExitStatus> {
+            Ok(ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    /// Configurable bits of a fake session.
+    #[derive(Default)]
+    struct FakePty {
+        resize_gate: Option<Arc<Gate>>,
+        drop_gate: Option<Arc<Gate>>,
+        resizes: Arc<PlMutex<Vec<(u16, u16)>>>,
+        kills: Arc<AtomicUsize>,
+    }
+
+    fn fake_session(parts: FakePty) -> LiveSession {
+        let FakePty {
+            resize_gate,
+            drop_gate,
+            resizes,
+            kills,
+        } = parts;
+        let headless = Arc::new(Mutex::new(new_headless_term(80, 24)));
+        let master: Arc<Mutex<Box<dyn MasterPty + Send>>> =
+            Arc::new(Mutex::new(Box::new(FakeMaster {
+                resize_gate,
+                drop_gate,
+                resizes,
+            })));
+        let killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>> =
+            Arc::new(Mutex::new(Box::new(FakeKiller { kills })));
+        // Same shape as production: the resize worker captures only this
+        // session's headless grid + master (it never touches the
+        // registry), the kill worker only the killer handle + pid.
+        let resize_headless = Arc::clone(&headless);
+        let resize_master = Arc::clone(&master);
+        let kill_killer = Arc::clone(&killer);
+        let control = ControlWorker::spawn(
+            move |cols, rows| resize_session(&resize_headless, &resize_master, cols, rows),
+            move || terminate_tree(None, &kill_killer),
+        )
+        .expect("test control workers start");
+        LiveSession {
+            label: "test".into(),
+            kind: "test".into(),
+            pty: NativePty {
+                child: Arc::new(Mutex::new(Box::new(FakeChild {
+                    killer: FakeKiller {
+                        kills: Arc::new(AtomicUsize::new(0)),
+                    },
+                }))),
+                killer,
+                master,
+                // The queued writer is a fast enqueue in production; a
+                // sink keeps the pump's query answers observable in tests.
+                writer: Arc::new(Mutex::new(Some(Box::new(io::sink())))),
+                reader: None,
+                root_pid: None,
+            },
+            ring: ByteRing::new(RING_CAPACITY_BYTES),
+            headless,
+            cols: 80,
+            rows: 24,
+            killed: false,
+            generation: 7,
+            spawned_at: std::time::Instant::now(),
+            silence_respawned: false,
+            attached: Vec::new(),
+            control: Arc::new(control),
+        }
+    }
+
+    /// Poll `pred` from the test task; the control workers are plain OS
+    /// threads, so their effects land asynchronously.
+    async fn eventually(mut pred: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pred() {
+            assert!(Instant::now() < deadline, "condition never became true");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn control_of(registry: &Arc<Mutex<Registry>>, key: &str) -> Arc<ControlWorker> {
+        let reg = registry.lock();
+        let Some(Entry::Live(s)) = reg.sessions.get(key) else {
+            panic!("test session missing");
+        };
+        Arc::clone(&s.control)
+    }
+
+    fn test_registry() -> Registry {
+        Registry {
+            sessions: HashMap::new(),
+            conns: 1,
+            next_generation: 100,
+            next_conn_id: 0,
+            spawn_gate: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    fn registry_with(key: &str, session: LiveSession) -> Arc<Mutex<Registry>> {
+        let mut reg = test_registry();
+        reg.sessions.insert(key.to_string(), Entry::Live(session));
+        Arc::new(Mutex::new(reg))
+    }
+
+    /// A resize request only enqueues: the connection loop is never
+    /// parked in `ResizePseudoConsole`, the registry lock stays free
+    /// while the PTY call is in flight, and other panes keep working.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resize_enqueue_is_non_blocking_and_off_lock() {
+        let gate = Arc::new(Gate::default());
+        let resizes = Arc::new(PlMutex::new(Vec::new()));
+        let other_resizes = Arc::new(PlMutex::new(Vec::new()));
+        let registry = registry_with(
+            "slow",
+            fake_session(FakePty {
+                resize_gate: Some(Arc::clone(&gate)),
+                resizes: Arc::clone(&resizes),
+                ..FakePty::default()
+            }),
+        );
+        registry.lock().sessions.insert(
+            "other".into(),
+            Entry::Live(fake_session(FakePty {
+                resizes: Arc::clone(&other_resizes),
+                ..FakePty::default()
+            })),
+        );
+        let other = control_of(&registry, "other");
+
+        // Exactly what the connection loop does: one short lock, then the
+        // mailbox enqueue.
+        let start = Instant::now();
+        let control = {
+            let mut reg = registry.lock();
+            let Some(Entry::Live(s)) = reg.sessions.get_mut("slow") else {
+                panic!("test session missing");
+            };
+            s.set_grid(120, 40);
+            Arc::clone(&s.control)
+        };
+        assert!(control.resize(120, 40));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "resize enqueue blocked the connection loop"
+        );
+
+        gate_entered(&gate).await;
+        // Parked inside the OS call: the registry lock is free...
+        let start = Instant::now();
+        {
+            let reg = registry.lock();
+            assert_eq!(reg.live_infos().len(), 2);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "registry lock blocked behind a PTY resize"
+        );
+        // ...and another pane's resize still applies.
+        assert!(other.resize(90, 30));
+        eventually(|| *other_resizes.lock() == vec![(90u16, 30u16)]).await;
+
+        gate.release();
+        eventually(|| *resizes.lock() == vec![(120u16, 40u16)]).await;
+        // Requested metadata is what replay reports.
+        let reg = registry.lock();
+        let Some(Entry::Live(s)) = reg.sessions.get("slow") else {
+            panic!("test session missing");
+        };
+        assert_eq!((s.cols, s.rows), (120, 40));
+    }
+
+    /// End-to-end through the real control loop: a `Resize` parked in
+    /// `ResizePseudoConsole` must not stop the *same connection* from
+    /// delivering `Kill` (the loop only enqueues; it never awaits the
+    /// worker), and `Detach` still closes it cleanly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kill_is_processed_while_the_same_connection_resizes() {
+        let gate = Arc::new(Gate::default());
+        let kills = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with(
+            "s",
+            fake_session(FakePty {
+                resize_gate: Some(Arc::clone(&gate)),
+                kills: Arc::clone(&kills),
+                ..FakePty::default()
+            }),
+        );
+
+        // Real framed connection: the server half is driven by the
+        // production `serve_attached` loop, the client half writes
+        // control frames the way the TUI does.
+        let (server, client) = tokio::io::duplex(4096);
+        let (mut reader, _server_writer) = SessionConn::from_stream(Box::new(server)).into_split();
+        let mut client = SessionConn::from_stream(Box::new(client));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        let attach = Attach {
+            key: "s".into(),
+            label: "test".into(),
+            kind: "test".into(),
+            spawn: None,
+        };
+        let reg = Arc::clone(&registry);
+        let serve =
+            tokio::spawn(async move { serve_attached(&mut reader, &tx, &reg, attach, 1).await });
+
+        // Attach fast path: replay is empty, so only Welcome arrives.
+        assert!(matches!(
+            rx.recv().await,
+            Some(Frame::DaemonJson(DaemonMsg::Welcome(_)))
+        ));
+
+        client
+            .write_frame(&Frame::ClientJson(ClientMsg::Resize {
+                cols: 120,
+                rows: 40,
+            }))
+            .await
+            .expect("write resize");
+        gate_entered(&gate).await;
+
+        // Same connection, resize still parked: the loop must hand the
+        // Kill to the kill worker instead of awaiting the resize.
+        client
+            .write_frame(&Frame::ClientJson(ClientMsg::Kill))
+            .await
+            .expect("write kill");
+        eventually(|| kills.load(Ordering::SeqCst) == 1).await;
+        {
+            let reg = registry.lock();
+            let Some(Entry::Live(s)) = reg.sessions.get("s") else {
+                panic!("test session missing");
+            };
+            assert!(s.killed, "kill flag not set");
+        }
+
+        gate.release();
+        client
+            .write_frame(&Frame::ClientJson(ClientMsg::Detach))
+            .await
+            .expect("write detach");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), serve)
+            .await
+            .expect("serve_attached did not return after Detach")
+            .expect("serve_attached panicked");
+        assert_eq!(outcome.session_key.as_deref(), Some("s"));
+    }
+
+    /// The exiting session's PTY teardown (`ClosePseudoConsole`) happens
+    /// after the registry lock is released — and after `Exited` is
+    /// queued — so it cannot wedge the daemon.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exiting_session_is_dropped_outside_the_registry_lock() {
+        let drop_gate = Arc::new(Gate::default());
+        let registry = registry_with(
+            "x",
+            fake_session(FakePty {
+                drop_gate: Some(Arc::clone(&drop_gate)),
+                ..FakePty::default()
+            }),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        {
+            let mut reg = registry.lock();
+            let Some(Entry::Live(s)) = reg.sessions.get_mut("x") else {
+                panic!("test session missing");
+            };
+            s.attached.push((1, tx));
+        }
+
+        let reg = Arc::clone(&registry);
+        let finalize = tokio::task::spawn_blocking(move || finalize_exit(&reg, "x", 7, 0));
+        gate_entered(&drop_gate).await;
+
+        // `Exited` is already queued, the entry is evicted, and the
+        // registry lock is free while the PTY drop is still blocked.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Frame::DaemonJson(DaemonMsg::Exited { status: 0 }))
+        ));
+        let start = Instant::now();
+        {
+            let reg = registry.lock();
+            assert!(!reg.has_live_sessions());
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "registry lock blocked behind the PTY teardown"
+        );
+
+        drop_gate.release();
+        finalize.await.expect("finalize task panicked");
+        assert!(!registry.lock().has_live_sessions());
+    }
+
+    struct ScriptedReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = std::cmp::min(buf.len(), self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    struct CaptureWriter(Arc<PlMutex<Vec<u8>>>);
+
+    impl io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_writer() -> (
+        Arc<PlMutex<Vec<u8>>>,
+        Arc<Mutex<Option<Box<dyn io::Write + Send>>>>,
+    ) {
+        let replies = Arc::new(PlMutex::new(Vec::new()));
+        let writer: Box<dyn io::Write + Send> = Box::new(CaptureWriter(Arc::clone(&replies)));
+        (replies, Arc::new(Mutex::new(Some(writer))))
+    }
+
+    /// The restructured pump still retains + broadcasts the chunk and
+    /// answers DA/DSR queries from the headless replica (now parsed
+    /// outside the registry lock).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pump_retains_broadcasts_and_answers_queries() {
+        // CUP to (3,5), then DSR-CPR.
+        let bytes = b"\x1b[3;5H\x1b[6n".to_vec();
+        let (replies, writer) = capture_writer();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        let registry = registry_with("p", fake_session(FakePty::default()));
+        {
+            let mut reg = registry.lock();
+            let Some(Entry::Live(s)) = reg.sessions.get_mut("p") else {
+                panic!("test session missing");
+            };
+            s.generation = 7;
+            s.pty.writer = writer;
+            s.attached.push((1, tx));
+        }
+
+        let reg = Arc::clone(&registry);
+        let scripted = bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            child_pump(
+                reg,
+                "p".to_string(),
+                7,
+                Some(Box::new(ScriptedReader {
+                    data: scripted,
+                    pos: 0,
+                })),
+            );
+        })
+        .await
+        .expect("pump panicked");
+
+        assert!(
+            matches!(rx.try_recv(), Ok(Frame::DaemonOutput(out)) if out == bytes),
+            "live chunk was not broadcast"
+        );
+        let reg = registry.lock();
+        let Some(Entry::Live(s)) = reg.sessions.get("p") else {
+            panic!("pump removed the live session");
+        };
+        assert_eq!(s.ring.snapshot(), bytes);
+        assert_eq!(&*replies.lock(), b"\x1b[3;5R");
+    }
+
+    /// A stale pump generation never touches the (re-born) session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pump_stops_on_generation_mismatch() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        let registry = registry_with("p", fake_session(FakePty::default()));
+        {
+            let mut reg = registry.lock();
+            let Some(Entry::Live(s)) = reg.sessions.get_mut("p") else {
+                panic!("test session missing");
+            };
+            s.generation = 7;
+            s.attached.push((1, tx));
+        }
+
+        let reg = Arc::clone(&registry);
+        tokio::task::spawn_blocking(move || {
+            child_pump(
+                reg,
+                "p".to_string(),
+                6, // retired generation
+                Some(Box::new(ScriptedReader {
+                    data: b"stale".to_vec(),
+                    pos: 0,
+                })),
+            );
+        })
+        .await
+        .expect("pump panicked");
+
+        assert!(rx.try_recv().is_err(), "stale pump broadcast output");
+        let reg = registry.lock();
+        let Some(Entry::Live(s)) = reg.sessions.get("p") else {
+            panic!("stale pump removed the live session");
+        };
+        assert!(s.ring.is_empty());
     }
 }

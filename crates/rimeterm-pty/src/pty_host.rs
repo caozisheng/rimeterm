@@ -70,6 +70,12 @@ pub(crate) fn open_native_pty(cfg: &SessionConfig) -> Result<NativePty, SessionE
         source: e,
     })?;
 
+    // Enqueue-only writer backed by a per-session OS thread: callers
+    // (TUI input, daemon client-write loop, query replies) must never
+    // block on a ConPTY pipe the child has stopped draining.
+    let writer: Box<dyn Write + Send> =
+        Box::new(crate::pty_writer::PtyWriter::spawn(writer).map_err(SessionError::Io)?);
+
     let reader = pair
         .master
         .try_clone_reader()
@@ -97,32 +103,6 @@ impl NativePty {
         self.root_pid
     }
 
-    /// Write to the child's stdin. `Err(AlreadyExited)` after exit.
-    pub(crate) fn write(&self, bytes: &[u8]) -> Result<(), SessionError> {
-        let mut w = self.writer.lock();
-        let Some(writer) = w.as_mut() else {
-            return Err(SessionError::AlreadyExited);
-        };
-        writer.write_all(bytes).map_err(SessionError::Io)?;
-        writer.flush().map_err(SessionError::Io)
-    }
-
-    /// Resize the PTY pair.
-    pub(crate) fn resize(&self, cols: u16, rows: u16) -> Result<(), SessionError> {
-        self.master
-            .lock()
-            .resize(PtySize {
-                cols,
-                rows,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| SessionError::Spawn {
-                program: "resize".into(),
-                source: e,
-            })
-    }
-
     /// Kill the child **and its whole process tree**.
     ///
     /// `ChildKiller::kill` only terminates the root pid. A shell hosting
@@ -130,19 +110,32 @@ impl NativePty {
     /// ConPTY handles, so the master reader never sees EOF and the session
     /// lingers. Killing the tree closes every handle at once.
     pub(crate) fn kill(&self) {
-        #[cfg(windows)]
-        if let Some(pid) = self.root_pid {
-            kill_tree_windows(pid);
-        }
-        #[cfg(unix)]
-        if let Some(pid) = self.root_pid {
-            kill_tree_unix(pid);
-        }
-        // Also nudge the portable-pty killer for good measure (it is a
-        // no-op on an already-dead child and idempotent).
-        let mut k = self.killer.lock();
-        let _ = k.kill();
+        terminate_tree(self.root_pid, &self.killer);
     }
+}
+
+/// Kill the child **and its whole process tree**.
+///
+/// Split out of [`NativePty::kill`] so a caller that must keep its own
+/// thread responsive (the native [`crate::session::Session`] control
+/// worker) can run the same logic off-thread. See [`NativePty::kill`]
+/// for why the tree, not just the root pid, has to die.
+pub(crate) fn terminate_tree(
+    root_pid: Option<u32>,
+    killer: &Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+) {
+    #[cfg(windows)]
+    if let Some(pid) = root_pid {
+        kill_tree_windows(pid);
+    }
+    #[cfg(unix)]
+    if let Some(pid) = root_pid {
+        kill_tree_unix(pid);
+    }
+    // Also nudge the portable-pty killer for good measure (it is a
+    // no-op on an already-dead child and idempotent).
+    let mut k = killer.lock();
+    let _ = k.kill();
 }
 
 /// Kill a process and all descendants on Windows via `taskkill /T /F`.

@@ -50,6 +50,7 @@ const CARGO_LOCK = resolve(REPO_ROOT, "Cargo.lock");
 const WORKSPACE_VERSIONED_CRATES = [
   "glab-tui",
   "rimeterm",
+  "rimeterm-agent-status",
   "rimectl",
   "rimeterm-config",
   "rimeterm-core",

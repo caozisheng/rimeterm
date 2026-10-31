@@ -28,7 +28,7 @@
 //!   NVIDIA cards it covers.
 //!
 //! The pane drives the sampling cadence: it sends a `Snapshot` request
-//! at its own 200 ms tick (see `SysmonPane::poll_background`). The
+//! at its own one-second tick (see `SysmonPane::poll_background`). The
 //! worker only samples when asked, so an idle rimeterm process still
 //! sleeps in `Receiver::recv`.
 
@@ -161,7 +161,7 @@ impl Collector {
 
     fn refresh(&mut self, generation: u64) -> Snapshot {
         // Bytes-since-last-refresh counters need REAL elapsed time to
-        // convert into an accurate bytes/sec rate; the pane's 200 ms
+        // convert into an accurate bytes/sec rate; the pane's one-second
         // tick is a target, not a guarantee (a busy main loop or a
         // suspend/resume gap could stretch it).
         let elapsed_secs = self.last_refresh.elapsed().as_secs_f64().max(0.001);
@@ -770,7 +770,7 @@ fn parse_temp_milli_c(s: &str) -> Option<f32> {
 /// Per-card telemetry from the amdgpu driver sysfs interface
 /// (kernel-documented). One `GpuStats` per AMD card found; empty vec
 /// when the driver exposes nothing (no AMD GPU, non-Linux, permission
-/// errors). File reads only — cheap enough for every 200 ms tick.
+/// errors). File reads only — cheap enough for every sampling tick.
 ///
 /// Paths:
 /// - `/sys/class/drm/card*/device/gpu_busy_percent` → utilization %

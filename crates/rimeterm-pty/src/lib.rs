@@ -9,7 +9,9 @@
 pub mod agent_detect;
 pub mod agent_registry;
 pub mod osc_bridge;
+mod pty_control;
 pub mod pty_host;
+mod pty_writer;
 pub mod resize_throttle;
 pub mod session;
 pub mod sessiond;

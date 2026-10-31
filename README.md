@@ -23,6 +23,11 @@ Agent process monitoring samples the process tree on a background worker every
 1.5 seconds. Matching an agent through shell or runtime wrappers uses that
 snapshot; UI input and rendering never trigger a full process-table scan.
 
+PTY writes and resize/termination operations run on per-session workers;
+remote terminal parsing stays off the async socket workers. Process priorities
+are unchanged. Sysmon samples once per second and retains approximately one
+minute of CPU history; manual refresh remains immediate.
+
 
 
 ## Layout

@@ -254,20 +254,21 @@ struct SessionInner {
 enum Backend {
     Native {
         root_pid: Option<u32>,
-        /// Independent killer handle cloned off the child at spawn time.
+        /// Resize and kill workers, each on its own OS thread.
         ///
         /// The reaper task holds `child`'s mutex inside a blocking
-        /// `wait()` for the child's entire lifetime, so any code path
-        /// that tries to `child.lock().kill()` — the shape `Session::kill`
-        /// used to have — deadlocks against the reaper on interactive
-        /// TUIs (gitui, shells) that never exit on their own.
-        /// `portable_pty::ChildKiller::clone_killer` hands us a separate
-        /// object that talks to the same OS process handle without
-        /// needing exclusive access to the `Child`; storing it here lets
-        /// [`Session::kill`] fire regardless of what the reaper is doing.
-        killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
-        master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
-        /// Writer end for stdin. `None` after the child exits.
+        /// `wait()` for the child's entire lifetime, so neither resize
+        /// nor kill may go through `child.lock()`. The workers use the
+        /// independent `ChildKiller` handle cloned at spawn time plus
+        /// the master PTY; handing that work to dedicated threads keeps
+        /// the TUI caller off `ResizePseudoConsole` and off the
+        /// `taskkill` wait. The resize worker also owns the last
+        /// `MasterPty` Arc, so ConPTY teardown happens on that worker
+        /// instead of during a UI-side `Session` drop.
+        control: crate::pty_control::ControlWorker,
+        /// Writer end for stdin. Enqueue-only: the actual PTY
+        /// `write_all`/`flush` runs on the per-session writer thread
+        /// (see `crate::pty_writer`). `None` after the child exits.
         writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     },
     Remote {
@@ -314,6 +315,32 @@ impl Session {
         } = pty;
         let reader = reader.expect("fresh reader from open_native_pty");
         let writer: Box<dyn Write + Send> = writer.lock().take().expect("fresh writer");
+
+        // Control workers own the master/killer handles. Resize runs
+        // `ResizePseudoConsole`, kill runs the tree kill, both off the
+        // caller's thread; the resize worker dropping the last
+        // `MasterPty` Arc also keeps ConPTY teardown off the UI thread.
+        let master_for_resize = Arc::clone(&master);
+        let resize = move |cols: u16, rows: u16| {
+            if let Err(e) = master_for_resize.lock().resize(PtySize {
+                cols,
+                rows,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) {
+                debug!(cols, rows, error = %e, "pty resize failed");
+            }
+        };
+        let killer_for_kill = Arc::clone(&killer);
+        let kill = move || crate::pty_host::terminate_tree(root_pid, &killer_for_kill);
+        let control = match crate::pty_control::ControlWorker::spawn(resize, kill) {
+            Ok(control) => control,
+            Err(e) => {
+                // Thread startup failed; never leave an unmanaged child.
+                crate::pty_host::terminate_tree(root_pid, &killer);
+                return Err(SessionError::Io(e));
+            }
+        };
         let term = Arc::new(Mutex::new(new_term_grid(cfg.cols, cfg.rows)));
         let (events_tx, events_rx) = mpsc::unbounded_channel();
 
@@ -360,8 +387,7 @@ impl Session {
                 inner: Arc::new(SessionInner {
                     backend: Backend::Native {
                         root_pid,
-                        killer,
-                        master,
+                        control,
                         writer: writer_shared,
                     },
                     term,
@@ -470,7 +496,15 @@ impl Session {
         }
     }
 
-    /// Send raw bytes to the child. Silent no-op after the child exited.
+    /// Queue raw bytes for the child. Success means accepted by the queue,
+    /// not that the child has already consumed the bytes.
+    ///
+    /// Native: enqueues on the session's writer thread and returns
+    /// without touching the PTY, so a child that stopped draining its
+    /// stdin cannot block the caller. The queue is a plain FIFO, the
+    /// same shape as the remote stdin channel; it only carries user
+    /// input and small DA/DSR replies, never PTY output. A failed or
+    /// closed writer rejects subsequent writes.
     pub fn write(&self, bytes: &[u8]) -> Result<(), SessionError> {
         let mut w = match &self.inner.backend {
             Backend::Native { writer, .. } | Backend::Remote { writer, .. } => writer.lock(),
@@ -482,26 +516,22 @@ impl Session {
         writer.flush().map_err(SessionError::Io)
     }
 
-    /// Ask the child to resize. On Windows this ends up in `ResizePseudoConsole`,
-    /// which is expensive (~200 μs) — caller should throttle (§19.12.6).
+    /// Ask the child to resize. The alacritty grid is resized inline so
+    /// redraw is immediate; the native PTY resize itself (on Windows
+    /// `ResizePseudoConsole`, ~200 μs and potentially blocking) is
+    /// enqueued to the session's resize worker, where only the newest
+    /// requested size survives. Callers should still throttle (§19.12.6).
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), SessionError> {
         // Update the alacritty grid first so redraw is instant.
         resize_term(&mut self.inner.term.lock(), cols, rows);
         self.inner.render_dirty.mark();
         match &self.inner.backend {
-            // On Windows this ends up in `ResizePseudoConsole`.
-            Backend::Native { master, .. } => master
-                .lock()
-                .resize(PtySize {
-                    cols,
-                    rows,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .map_err(|e| SessionError::Spawn {
-                    program: "resize".into(),
-                    source: e,
-                })?,
+            // The control worker owns the master; enqueue only.
+            Backend::Native { control, .. } => {
+                if !control.resize(cols, rows) {
+                    return Err(SessionError::AlreadyExited);
+                }
+            }
             // The daemon resizes its headless query Term and the real PTY;
             // our replica grid was already resized above.
             Backend::Remote { control, .. } => {
@@ -620,19 +650,20 @@ impl Session {
 
     /// Best-effort kill for shutdown / respawn (`drop_pane_and_session`).
     ///
-    /// Native: uses the independent killer handle so we never race the
-    /// reaper task that lives inside `child.lock().wait()`. Remote: sends
-    /// `Kill` to the daemon, which kills the hosted child; the pump then
-    /// sees the daemon's `Exited` frame and the pane renders "[exit N]".
+    /// Native: hands the request to the per-session kill worker, which
+    /// runs on its own thread and channel — independent of the resize
+    /// worker and of the writer queue, so a blocked
+    /// `ResizePseudoConsole` or a wedged PTY write can never delay it.
+    /// The worker also stays off `child.lock()`, so it never races the
+    /// reaper task blocked in `wait()`. Remote: sends `Kill` to the
+    /// daemon, which kills the hosted child; the pump then sees the
+    /// daemon's `Exited` frame and the pane renders "[exit N]".
     /// Errors are swallowed in both arms — killing a process that already
     /// exited returns an OS-specific "no such process" error which we
     /// don't want to log noisily.
     pub fn kill(&self) {
         match &self.inner.backend {
-            Backend::Native { killer, .. } => {
-                let mut k = killer.lock();
-                let _ = k.kill();
-            }
+            Backend::Native { control, .. } => control.kill(),
             Backend::Remote {
                 control, writer, ..
             } => {
@@ -781,22 +812,51 @@ async fn remote_pump(
     dirty: RenderDirty,
     visible: SessionVisible,
 ) {
-    // One Processor per session — parser state (partial escape
-    // sequences) must persist across frames, same as native reads.
-    let mut processor: Processor = Processor::new();
-    let mut osc_scanner = OscScanner::new();
+    // Socket I/O stays asynchronous; VT parsing and its grid mutex run on a
+    // dedicated blocking worker. A slow parser backpressures this reader
+    // instead of occupying a Tokio worker or growing a local output queue.
+    // Each protocol frame is capped at MAX_FRAME_BODY (1 MiB).
+    let (parse_tx, parse_rx) = mpsc::channel(2);
+    tokio::task::spawn_blocking(move || remote_parse_loop(parse_rx, term, tx, dirty));
     loop {
         // Hidden-session pacing (see read_loop for rationale).
         if let Some(delay) = read_pacing_delay(&visible) {
             tokio::time::sleep(delay).await;
         }
         match reader.read_frame().await {
-            Ok(Some(Frame::DaemonOutput(bytes))) => {
+            Ok(Some(frame)) => {
+                let exited = matches!(frame, Frame::DaemonJson(DaemonMsg::Exited { .. }));
+                if parse_tx.send(frame).await.is_err() || exited {
+                    return;
+                }
+            }
+            Ok(None) => {
+                debug!("sessiond stream ended");
+                return;
+            }
+            Err(e) => {
+                warn!(error = %e, "sessiond pump errored");
+                return;
+            }
+        }
+    }
+}
+
+fn remote_parse_loop(
+    mut rx: mpsc::Receiver<Frame>,
+    term: Arc<Mutex<Term<Listener>>>,
+    tx: mpsc::UnboundedSender<SessionOutput>,
+    dirty: RenderDirty,
+) {
+    // Parser/scanner state survives frame boundaries, including replay.
+    let mut processor: Processor = Processor::new();
+    let mut osc_scanner = OscScanner::new();
+    while let Some(frame) = rx.blocking_recv() {
+        match frame {
+            Frame::DaemonOutput(bytes) => {
                 for chunk in parse_chunks(&bytes) {
                     let mut t = term.lock();
                     processor.advance(&mut *t, chunk);
-                    // Hand the grid directly to a waiting renderer instead
-                    // of immediately reacquiring it for the next chunk.
                     parking_lot::MutexGuard::unlock_fair(t);
                 }
                 dirty.mark();
@@ -809,21 +869,12 @@ async fn remote_pump(
                     return;
                 }
             }
-            Ok(Some(Frame::DaemonJson(DaemonMsg::Exited { status }))) => {
+            Frame::DaemonJson(DaemonMsg::Exited { status }) => {
                 debug!(status, "sessiond session exited");
                 let _ = tx.send(SessionOutput::Exited { status });
                 return;
             }
-            // Other JSON frames aren't part of the post-attach stream.
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                debug!("sessiond stream ended");
-                return;
-            }
-            Err(e) => {
-                warn!(error = %e, "sessiond pump errored");
-                return;
-            }
+            _ => {}
         }
     }
 }
@@ -950,6 +1001,105 @@ mod parse_chunk_tests {
         );
         assert!(chunks.iter().all(|chunk| chunk.len() <= 1024));
         assert_eq!(chunks.concat(), input);
+    }
+}
+
+#[cfg(test)]
+mod remote_parser_tests {
+    use super::*;
+    use crate::sessiond::transport::SessionConn;
+    use std::time::Duration;
+
+    #[test]
+    fn parser_preserves_split_sequences_and_emits_exit_after_output() {
+        let term = Arc::new(Mutex::new(new_term_grid(80, 24)));
+        let dirty = RenderDirty::default();
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        for bytes in [
+            b"\x1b[3".as_slice(),
+            b"1mred\x1b]1337;rimeterm;{\"event\":".as_slice(),
+            b"\"ok\"}\x07".as_slice(),
+        ] {
+            frames_tx
+                .try_send(Frame::DaemonOutput(bytes.to_vec()))
+                .unwrap();
+        }
+        frames_tx
+            .try_send(Frame::DaemonJson(DaemonMsg::Exited { status: 7 }))
+            .unwrap();
+        drop(frames_tx);
+        remote_parse_loop(frames_rx, Arc::clone(&term), events_tx, dirty.clone());
+
+        assert!(matches!(events_rx.try_recv(), Ok(SessionOutput::Redraw)));
+        assert!(matches!(events_rx.try_recv(), Ok(SessionOutput::Redraw)));
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(SessionOutput::OscRimeterm { payload }) if payload == r#"{"event":"ok"}"#
+        ));
+        assert!(matches!(events_rx.try_recv(), Ok(SessionOutput::Redraw)));
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(SessionOutput::Exited { status: 7 })
+        ));
+        assert!(events_rx.try_recv().is_err());
+        assert!(dirty.take());
+        assert_eq!(term_to_string(&term.lock()).trim(), "red");
+    }
+
+    #[tokio::test]
+    async fn locked_grid_does_not_block_socket_runtime() {
+        let term = Arc::new(Mutex::new(new_term_grid(80, 24)));
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held_term = Arc::clone(&term);
+        let holder = std::thread::spawn(move || {
+            let _guard = held_term.lock();
+            locked_tx.send(()).unwrap();
+            // A broken parser must fail the test instead of hanging its runtime.
+            release_rx.recv_timeout(Duration::from_secs(3)).is_err()
+        });
+        locked_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+
+        let (client, server) = tokio::io::duplex(1024);
+        let (reader, _client_writer) = SessionConn::from_stream(Box::new(client)).into_split();
+        let (_server_reader, mut writer) = SessionConn::from_stream(Box::new(server)).into_split();
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let pump = tokio::spawn(remote_pump(
+            reader,
+            term,
+            events_tx,
+            RenderDirty::default(),
+            SessionVisible::default(),
+        ));
+        writer
+            .write_frame(&Frame::DaemonOutput(b"hello".to_vec()))
+            .await
+            .unwrap();
+
+        // This timer runs on the same single-thread runtime as the socket pump.
+        let pending = tokio::time::timeout(Duration::from_millis(100), events_rx.recv()).await;
+        let _ = release_tx.send(());
+        let watchdog_expired = holder.join().unwrap();
+        assert!(!watchdog_expired, "grid parsing blocked the Tokio runtime");
+        assert!(pending.is_err(), "grid was parsed while its lock was held");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), events_rx.recv())
+                .await
+                .unwrap(),
+            Some(SessionOutput::Redraw)
+        ));
+        writer
+            .write_frame(&Frame::DaemonJson(DaemonMsg::Exited { status: 0 }))
+            .await
+            .unwrap();
+        pump.await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), events_rx.recv())
+                .await
+                .unwrap(),
+            Some(SessionOutput::Exited { status: 0 })
+        ));
     }
 }
 

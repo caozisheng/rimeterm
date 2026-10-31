@@ -4,7 +4,7 @@
 //! is a big Braille-marker CPU waveform + memory/swap gauges + optional
 //! GPU / Docker / cgroup rows; Processes view is a sortable, filterable
 //! table. Sampling is worker-driven: the pane sends a `Snapshot`
-//! request every 200 ms via [`SysmonPane::poll_background`].
+//! request every second via [`SysmonPane::poll_background`].
 //!
 //! Key bindings match the design doc §4.3:
 //!
@@ -40,15 +40,11 @@ use crate::sysmon_model::{
 };
 use crate::sysmon_worker::SysmonWorker;
 
-/// Worker-poll cadence. 200 ms keeps the wave smooth without stealing
-/// idle-CPU headroom; a full process-table sample on a mid-tier laptop
-/// finishes well inside 30 ms.
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
+/// Sample once per second to reduce process and hardware polling overhead.
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How many CPU-average samples the chart retains. 300 samples × 200 ms
-/// tick ≈ 60 s of history, wide enough to spot a build spike without
-/// stealing more than one screen-height of state.
-const CPU_HISTORY_CAP: usize = 300;
+/// Keep approximately one minute of CPU history at the sampling cadence.
+const CPU_HISTORY_CAP: usize = 60;
 
 /// Modal state — nothing, filter entry, or kill-confirm prompt.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -75,7 +71,7 @@ pub struct SysmonPane {
     /// harmlessly when they overlap a fresh one.
     requested_generation: u64,
     applied_generation: u64,
-    /// When the pane last kicked the worker; drives 200 ms polling.
+    /// When the pane last kicked the worker; drives one-second polling.
     last_request: Instant,
     view: SysmonView,
     sort_key: SortKey,
