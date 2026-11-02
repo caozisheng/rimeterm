@@ -35,6 +35,7 @@ pub mod pane_registry;
 pub mod pet_pane;
 pub mod picker;
 pub mod placeholder_pane;
+pub(crate) mod presentation;
 pub mod pty_pane;
 pub mod pty_selection;
 pub mod scrollbar;

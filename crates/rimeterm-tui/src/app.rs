@@ -2158,21 +2158,11 @@ impl App {
         // bar bottom-right. Network hiccups stay silent by design.
         self.spawn_startup_upgrade_check();
 
-        // Keep the OS caret hidden across the diff flush, then re-position it
-        // (still hidden) and only reveal it at the very end. If `draw` re-shows
-        // the caret via `set_cursor_position` it first appears on the last
-        // changed cell (status bar, sysmon, stock, spinners) and then jumps to
-        // the focused caret — the visible "cursor hop". Positioning before
-        // `show_cursor` pins the caret to the focused pane for the whole frame.
-        guard.terminal.hide_cursor()?;
-        let mut cursor = None;
-        guard.terminal.draw(|f| {
-            cursor = self.draw(f.area(), f);
-        })?;
-        if let Some((x, y)) = cursor {
-            guard.terminal.set_cursor_position((x, y))?;
-            guard.terminal.show_cursor()?;
-        }
+        // Render into the in-memory compositor and hand the finished frame to the presenter.
+        // No stdout I/O happens here: the presenter writes diffs and positions the caret as one
+        // synchronized update, so a slow terminal cannot stall input handling.
+        guard.draw(|f| self.draw(f.area(), f))?;
+
         self.needs_redraw = false;
         let mut last_draw = Instant::now();
         loop {
@@ -2278,15 +2268,7 @@ impl App {
                 // Consume the pulse this frame is about to represent. Output
                 // arriving while draw runs remains queued for the next frame.
                 let _ = self.redraw_rx.try_recv();
-                guard.terminal.hide_cursor()?;
-                let mut cursor = None;
-                guard.terminal.draw(|f| {
-                    cursor = self.draw(f.area(), f);
-                })?;
-                if let Some((x, y)) = cursor {
-                    guard.terminal.set_cursor_position((x, y))?;
-                    guard.terminal.show_cursor()?;
-                }
+                guard.draw(|f| self.draw(f.area(), f))?;
                 self.needs_redraw = false;
                 last_draw = now;
             }

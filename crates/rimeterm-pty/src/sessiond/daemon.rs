@@ -46,7 +46,6 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use alacritty_terminal::term::Term;
-use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -60,9 +59,10 @@ use super::{
 use crate::pty_control::ControlWorker;
 use crate::pty_host::{NativePty, open_native_pty, terminate_tree};
 use crate::session::{
-    Listener, PtyBackend, SessionConfig, new_headless_term, parse_chunks, resize_term,
+    Listener, PtyBackend, SessionConfig, new_headless_term, resize_term,
     respond_to_terminal_queries,
 };
+use crate::sync_timeout::SyncDriver;
 
 /// A live child that has not written a single byte to its PTY for this
 /// long is treated as console-less (Windows ConPTY burst-create hazard)
@@ -781,11 +781,19 @@ fn child_pump(
     let Some(mut reader) = reader else { return };
     let mut buf = [0u8; 8192];
     // Parser state must persist across reads (partial escape sequences).
-    let mut processor: Processor = Processor::new();
+    // The parser and its safe-timeout timer are created from the session's
+    // headless grid on the first byte batch; the Live entry already exists
+    // when the pump starts. The timer touches only the headless grid — it
+    // never takes the registry lock. Each remote replica runs its own
+    // timer, so the daemon never schedules a client redraw.
+    let mut sync: Option<SyncDriver> = None;
     loop {
         match reader.read(&mut buf) {
             Ok(0) => {
                 debug!(key = %key, "sessiond child stdout EOF");
+                if let Some(sync) = &sync {
+                    sync.finish();
+                }
                 return;
             }
             Ok(n) => {
@@ -794,30 +802,36 @@ fn child_pump(
                 // retain the bytes and broadcast them. Atomic w.r.t.
                 // attach snapshots, so replay can never interleave with
                 // live output. Nothing else runs under this lock.
-                let (headless, writer) = {
+                let entry = {
                     let mut reg = registry.lock();
-                    let Some(Entry::Live(s)) = reg.sessions.get_mut(&key) else {
-                        return;
-                    };
-                    if s.generation != generation {
-                        // Finalized, forgotten, or re-spawned — stop pumping.
-                        return;
+                    match reg.sessions.get_mut(&key) {
+                        Some(Entry::Live(s)) if s.generation == generation => {
+                            s.ring.push(slice);
+                            for (_, tx) in &s.attached {
+                                let _ = tx.send(Frame::DaemonOutput(slice.to_vec()));
+                            }
+                            Some((Arc::clone(&s.headless), Arc::clone(&s.pty.writer)))
+                        }
+                        // Finalized, forgotten, re-spawned, or unknown —
+                        // stop pumping. Flush after the registry lock is
+                        // released: parsing never runs under it.
+                        _ => None,
                     }
-                    s.ring.push(slice);
-                    for (_, tx) in &s.attached {
-                        let _ = tx.send(Frame::DaemonOutput(slice.to_vec()));
+                };
+                let Some((headless, writer)) = entry else {
+                    if let Some(sync) = &sync {
+                        sync.finish();
                     }
-                    (Arc::clone(&s.headless), Arc::clone(&s.pty.writer))
+                    return;
                 };
                 // Step 2 — parse into the headless replica outside the
                 // lock: 8 KiB of VT from one busy pane must never stall
                 // every attach, every other session, or the control loop.
-                {
-                    let mut t = headless.lock();
-                    for chunk in parse_chunks(slice) {
-                        processor.advance(&mut *t, chunk);
-                    }
-                }
+                // A synchronized update whose ESU never arrives is
+                // committed by the parser timer, not by the next read.
+                let driver =
+                    sync.get_or_insert_with(|| SyncDriver::new(Arc::clone(&headless), || {}));
+                driver.advance(slice);
                 // Step 3 — answer DA/DSR queries from the child, after the
                 // bytes are retained/broadcast and parsed. The writer is
                 // the queued handle, so this cannot block on the OS, and
@@ -827,6 +841,9 @@ fn child_pump(
             Err(e) => {
                 // ConPTY surfaces pipe-closed as an error at shutdown.
                 debug!(key = %key, error = %e, "sessiond child read ended");
+                if let Some(sync) = &sync {
+                    sync.finish();
+                }
                 return;
             }
         }
@@ -1526,6 +1543,26 @@ mod io_isolation_tests {
         }
     }
 
+    /// Blocks like an idle pipe after its first batch, so the pump is
+    /// parked in `read` while the parser timer runs. The release channel
+    /// doubles as a fail-safe: a broken test exits on EOF instead of
+    /// hanging the process.
+    struct StalledReader {
+        first: Option<Vec<u8>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Read for StalledReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(bytes) = self.first.take() {
+                buf[..bytes.len()].copy_from_slice(&bytes);
+                return Ok(bytes.len());
+            }
+            let _ = self.release.recv_timeout(Duration::from_secs(5));
+            Ok(0)
+        }
+    }
+
     struct CaptureWriter(Arc<PlMutex<Vec<u8>>>);
 
     impl io::Write for CaptureWriter {
@@ -1594,6 +1631,55 @@ mod io_isolation_tests {
         };
         assert_eq!(s.ring.snapshot(), bytes);
         assert_eq!(&*replies.lock(), b"\x1b[3;5R");
+    }
+
+    /// The headless query grid must also leave a stalled synchronized
+    /// update after vte's 150 ms deadline. The pump stays parked in
+    /// `read`, the timer commits, and the registry lock is never involved
+    /// in parsing or timing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pump_commits_stalled_sync_update_into_headless_grid() {
+        let registry = registry_with("p", fake_session(FakePty::default()));
+        {
+            let mut reg = registry.lock();
+            let Some(Entry::Live(s)) = reg.sessions.get_mut("p") else {
+                panic!("test session missing");
+            };
+            s.generation = 7;
+        }
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reg = Arc::clone(&registry);
+        let pump = tokio::task::spawn_blocking(move || {
+            child_pump(
+                reg,
+                "p".to_string(),
+                7,
+                Some(Box::new(StalledReader {
+                    first: Some(b"\x1b[?2026hdaemon stalled paint".to_vec()),
+                    release: release_rx,
+                })),
+            );
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        {
+            let reg = registry.lock();
+            let Some(Entry::Live(s)) = reg.sessions.get("p") else {
+                panic!("pump removed the live session");
+            };
+            let text = crate::session::term_to_string(&s.headless.lock());
+            assert!(
+                text.contains("daemon stalled paint"),
+                "headless grid did not commit timed-out bytes: {text:?}"
+            );
+        }
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(3), pump)
+            .await
+            .expect("child pump did not exit after release")
+            .expect("child pump panicked");
     }
 
     /// A stale pump generation never touches the (re-born) session.

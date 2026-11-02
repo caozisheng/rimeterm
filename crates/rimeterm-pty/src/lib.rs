@@ -16,6 +16,7 @@ pub mod resize_throttle;
 pub mod session;
 pub mod sessiond;
 pub mod shell_detect;
+mod sync_timeout;
 
 pub use agent_detect::{AgentAvailability, ToolAvailability, detect_agent, detect_tool};
 pub use osc_bridge::{OSC_MAX_PAYLOAD_BYTES, OscScanner};

@@ -33,6 +33,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::osc_bridge::OscScanner;
+use crate::sync_timeout::SyncDriver;
 const PARSE_CHUNK_BYTES: usize = 1024;
 
 #[derive(Clone, Default)]
@@ -817,7 +818,8 @@ async fn remote_pump(
     // instead of occupying a Tokio worker or growing a local output queue.
     // Each protocol frame is capped at MAX_FRAME_BODY (1 MiB).
     let (parse_tx, parse_rx) = mpsc::channel(2);
-    tokio::task::spawn_blocking(move || remote_parse_loop(parse_rx, term, tx, dirty));
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || remote_parse_loop(parse_rx, term, tx, dirty, handle));
     loop {
         // Hidden-session pacing (see read_loop for rationale).
         if let Some(delay) = read_pacing_delay(&visible) {
@@ -847,35 +849,57 @@ fn remote_parse_loop(
     term: Arc<Mutex<Term<Listener>>>,
     tx: mpsc::UnboundedSender<SessionOutput>,
     dirty: RenderDirty,
+    handle: tokio::runtime::Handle,
 ) {
+    // A synchronized update that never receives its ESU must still be
+    // committed when the producer stalls (compile-load case). The timer
+    // lives on `handle` and dies with this driver; it never touches the
+    // socket or the registry.
+    let sync = SyncDriver::new_with(&handle, Arc::clone(&term), {
+        let dirty = dirty.clone();
+        let tx = tx.clone();
+        move || {
+            dirty.mark();
+            let _ = tx.send(SessionOutput::Redraw);
+        }
+    });
     // Parser/scanner state survives frame boundaries, including replay.
-    let mut processor: Processor = Processor::new();
     let mut osc_scanner = OscScanner::new();
     while let Some(frame) = rx.blocking_recv() {
         match frame {
             Frame::DaemonOutput(bytes) => {
-                for chunk in parse_chunks(&bytes) {
-                    let mut t = term.lock();
-                    processor.advance(&mut *t, chunk);
-                    parking_lot::MutexGuard::unlock_fair(t);
-                }
+                sync.advance(&bytes);
                 dirty.mark();
                 for payload in osc_scanner.feed(&bytes) {
                     if tx.send(SessionOutput::OscRimeterm { payload }).is_err() {
+                        let _ = sync.finish();
                         return;
                     }
                 }
                 if tx.send(SessionOutput::Redraw).is_err() {
+                    let _ = sync.finish();
                     return;
                 }
             }
             Frame::DaemonJson(DaemonMsg::Exited { status }) => {
                 debug!(status, "sessiond session exited");
+                // Flush parked synchronized bytes before the terminal is
+                // declared gone so the final painted frame is visible.
+                if sync.finish() {
+                    dirty.mark();
+                    let _ = tx.send(SessionOutput::Redraw);
+                }
                 let _ = tx.send(SessionOutput::Exited { status });
                 return;
             }
             _ => {}
         }
+    }
+    // Frame channel closed (daemon connection gone): commit anything the
+    // child painted inside a still-open synchronized update.
+    if sync.finish() {
+        dirty.mark();
+        let _ = tx.send(SessionOutput::Redraw);
     }
 }
 
@@ -908,7 +932,7 @@ fn term_scroll_metrics<L>(term: &Term<L>) -> ScrollMetrics {
 /// Note: `display_iter` yields cells in row-major order; wide-char
 /// spacers are emitted but we skip them so the printable width matches
 /// what the user sees.
-fn term_to_string<L: EventListener>(term: &Term<L>) -> String {
+pub(crate) fn term_to_string<L: EventListener>(term: &Term<L>) -> String {
     let cols = term.columns();
     let mut out = String::with_capacity(term.screen_lines() * (cols + 1));
     let mut current_row: Option<i32> = None;
@@ -1010,6 +1034,22 @@ mod remote_parser_tests {
     use crate::sessiond::transport::SessionConn;
     use std::time::Duration;
 
+    /// Reap a blocking parser behind a bounded guard so a broken
+    /// implementation cannot wedge the test process during shutdown.
+    fn reap_parser(parse: std::thread::JoinHandle<()>) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let joiner = std::thread::spawn(move || {
+            let result = parse.join();
+            let _ = done_tx.send(());
+            result
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "remote_parse_loop did not exit after its sender closed"
+        );
+        assert!(joiner.join().unwrap().is_ok(), "parser thread panicked");
+    }
+
     #[test]
     fn parser_preserves_split_sequences_and_emits_exit_after_output() {
         let term = Arc::new(Mutex::new(new_term_grid(80, 24)));
@@ -1029,7 +1069,17 @@ mod remote_parser_tests {
             .try_send(Frame::DaemonJson(DaemonMsg::Exited { status: 7 }))
             .unwrap();
         drop(frames_tx);
-        remote_parse_loop(frames_rx, Arc::clone(&term), events_tx, dirty.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        remote_parse_loop(
+            frames_rx,
+            Arc::clone(&term),
+            events_tx,
+            dirty.clone(),
+            runtime.handle().clone(),
+        );
 
         assert!(matches!(events_rx.try_recv(), Ok(SessionOutput::Redraw)));
         assert!(matches!(events_rx.try_recv(), Ok(SessionOutput::Redraw)));
@@ -1045,6 +1095,166 @@ mod remote_parser_tests {
         assert!(events_rx.try_recv().is_err());
         assert!(dirty.take());
         assert_eq!(term_to_string(&term.lock()).trim(), "red");
+    }
+
+    /// Regression for the compile-load freeze: BSU (`CSI ? 2026 h`) with no
+    /// following ESU must commit the buffered paint at vte's safe deadline.
+    /// A Redraw alone is not proof — the batch path emits one while the
+    /// grid is still blank — and idle must not keep redrawing.
+    #[tokio::test]
+    async fn sync_update_times_out_without_further_input() {
+        let term = Arc::new(Mutex::new(new_term_grid(40, 5)));
+        let probe = Arc::clone(&term);
+        let dirty = RenderDirty::default();
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+        frames_tx
+            .try_send(Frame::DaemonOutput(
+                b"\x1b[?2026hhello from a stalled agent".to_vec(),
+            ))
+            .unwrap();
+
+        // Plain thread: the parser is blocking and must not occupy the
+        // test runtime. The sender stays alive for the whole wait so the
+        // parser cannot mistake our EOF for the end of a synchronized
+        // update. The timer runs on the test runtime via this handle.
+        let handle = tokio::runtime::Handle::current();
+        let parse = std::thread::spawn(move || {
+            remote_parse_loop(frames_rx, term, events_tx, dirty, handle);
+        });
+
+        // Wait past the 150 ms safe timeout; a Redraw alone is not proof
+        // (the byte-batch path emits one even while bytes are buffered),
+        // so the visible grid is what must have changed.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            term_to_string(&probe.lock()).trim(),
+            "hello from a stalled agent",
+            "buffered synchronized bytes were not painted at timeout"
+        );
+
+        // Idle must be silent: the timeout fired once, it must not turn
+        // into a redraw pulse while no bytes arrive.
+        while events_rx.try_recv().is_ok() {}
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            events_rx.try_recv().is_err(),
+            "idle synchronized parser kept emitting output"
+        );
+
+        // After the forced commit the parser must resume normally: the
+        // next batch is painted without waiting for another deadline and
+        // without losing the earlier content.
+        frames_tx
+            .try_send(Frame::DaemonOutput(b" tail".to_vec()))
+            .unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("parser stopped after committing a timed-out update");
+        assert!(matches!(next, Some(SessionOutput::Redraw)));
+        assert_eq!(
+            term_to_string(&probe.lock()).trim(),
+            "hello from a stalled agent tail",
+            "bytes after the timeout were not parsed normally"
+        );
+
+        drop(frames_tx);
+        reap_parser(parse);
+    }
+
+    /// A complete synchronized frame (BSU … ESU inside one batch) must
+    /// commit immediately through the normal byte path, never wait for the
+    /// safe timeout, and never trigger a later timer redraw.
+    #[tokio::test]
+    async fn complete_sync_frame_commits_without_timeout() {
+        let term = Arc::new(Mutex::new(new_term_grid(40, 5)));
+        let probe = Arc::clone(&term);
+        let dirty = RenderDirty::default();
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+        frames_tx
+            .try_send(Frame::DaemonOutput(
+                b"\x1b[?2026hcomplete frame\x1b[?2026l".to_vec(),
+            ))
+            .unwrap();
+
+        let handle = tokio::runtime::Handle::current();
+        let parse = std::thread::spawn(move || {
+            remote_parse_loop(frames_rx, term, events_tx, dirty, handle);
+        });
+
+        let first = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("no redraw for a complete synchronized frame");
+        assert!(matches!(first, Some(SessionOutput::Redraw)));
+        assert_eq!(
+            term_to_string(&probe.lock()).trim(),
+            "complete frame",
+            "a completed frame must be visible via the byte path"
+        );
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            events_rx.try_recv().is_err(),
+            "timer emitted output for an already-completed frame"
+        );
+
+        drop(frames_tx);
+        reap_parser(parse);
+    }
+
+    /// A synchronized update spanning protocol frames must keep the grid
+    /// unchanged until its ESU arrives, then commit the whole buffered
+    /// paint — proving parser state survives frame boundaries and the
+    /// safe timeout does not cut a live frame short.
+    #[tokio::test]
+    async fn sync_frame_stays_buffered_until_esu_in_next_frame() {
+        let term = Arc::new(Mutex::new(new_term_grid(40, 5)));
+        let probe = Arc::clone(&term);
+        let dirty = RenderDirty::default();
+        let (frames_tx, frames_rx) = mpsc::channel(4);
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+
+        frames_tx
+            .try_send(Frame::DaemonOutput(b"\x1b[?2026hbuffered paint".to_vec()))
+            .unwrap();
+
+        let handle = tokio::runtime::Handle::current();
+        let parse = std::thread::spawn(move || {
+            remote_parse_loop(frames_rx, term, events_tx, dirty, handle);
+        });
+
+        // The batch's own Redraw arrives as soon as `advance` returns;
+        // vte has buffered the paint, so the grid must still be blank.
+        let redraw = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("first batch produced no redraw");
+        assert!(matches!(redraw, Some(SessionOutput::Redraw)));
+        assert_eq!(
+            term_to_string(&probe.lock()).trim(),
+            "",
+            "synchronized bytes leaked into the grid before their ESU"
+        );
+
+        // ESU in the next frame: the buffered paint commits immediately,
+        // together with the trailing bytes.
+        frames_tx
+            .try_send(Frame::DaemonOutput(b" rest\x1b[?2026l".to_vec()))
+            .unwrap();
+        let redraw = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("closing frame produced no redraw");
+        assert!(matches!(redraw, Some(SessionOutput::Redraw)));
+        assert_eq!(
+            term_to_string(&probe.lock()).trim(),
+            "buffered paint rest",
+            "closing ESU did not commit the buffered paint"
+        );
+
+        drop(frames_tx);
+        reap_parser(parse);
     }
 
     #[tokio::test]
@@ -1100,6 +1310,87 @@ mod remote_parser_tests {
                 .unwrap(),
             Some(SessionOutput::Exited { status: 0 })
         ));
+    }
+}
+
+#[cfg(test)]
+mod read_loop_sync_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// First read returns a painted-but-unterminated synchronized update,
+    /// then blocks like an idle pipe. The read loop is genuinely parked in
+    /// `read` (not at EOF), which is the compile-load case.
+    struct StalledReader {
+        first: Option<Vec<u8>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl std::io::Read for StalledReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(bytes) = self.first.take() {
+                buf[..bytes.len()].copy_from_slice(&bytes);
+                return Ok(bytes.len());
+            }
+            // Fail-safe: a broken loop exits on EOF instead of hanging
+            // the test process.
+            let _ = self.release.recv_timeout(Duration::from_secs(5));
+            Ok(0)
+        }
+    }
+
+    fn reap_read_loop(read: std::thread::JoinHandle<()>) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let joiner = std::thread::spawn(move || {
+            let result = read.join();
+            let _ = done_tx.send(());
+            result
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "read_loop did not exit after the reader was released"
+        );
+        assert!(joiner.join().unwrap().is_ok(), "read_loop panicked");
+    }
+
+    #[tokio::test]
+    async fn read_loop_commits_stalled_sync_update() {
+        let term = Arc::new(Mutex::new(new_term_grid(40, 5)));
+        let probe = Arc::clone(&term);
+        let dirty = RenderDirty::default();
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader = Box::new(StalledReader {
+            first: Some(b"\x1b[?2026hnative stalled paint".to_vec()),
+            release: release_rx,
+        });
+
+        // `read_loop` runs on a plain thread; entering the test runtime
+        // makes `Handle::current()` inside it (the driver's timer spawn)
+        // valid without changing the production call shape.
+        let handle = tokio::runtime::Handle::current();
+        let read = std::thread::spawn(move || {
+            let _enter = handle.enter();
+            read_loop(reader, term, tx, writer, dirty, SessionVisible::default());
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            term_to_string(&probe.lock()).trim(),
+            "native stalled paint",
+            "native read loop did not commit a stalled synchronized update"
+        );
+
+        while events.try_recv().is_ok() {}
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            events.try_recv().is_err(),
+            "idle native read loop kept emitting output"
+        );
+
+        let _ = release_tx.send(());
+        reap_read_loop(read);
     }
 }
 
@@ -1464,10 +1755,19 @@ fn read_loop(
 ) {
     // 8 KiB matches ConPTY internal ring size on modern Windows.
     let mut buf = [0u8; 8192];
-    // One Processor per session — it holds parser state (partial
-    // escape sequences across reads). Recreating it per iteration
-    // would drop mid-sequence bytes silently.
-    let mut processor: Processor = Processor::new();
+    // One shared parser + a Tokio timer: a synchronized update whose ESU
+    // never arrives (producer stalled) is committed when vte's 150 ms
+    // deadline expires, even though this thread is parked in `read`.
+    // `Handle::current()` is available here because `read_loop` runs in a
+    // `spawn_blocking` task.
+    let sync = SyncDriver::new(Arc::clone(&term), {
+        let dirty = dirty.clone();
+        let tx = tx.clone();
+        move || {
+            dirty.mark();
+            let _ = tx.send(SessionOutput::Redraw);
+        }
+    });
     // C18-D: OSC 1337 rimeterm scanner. Runs alongside the alacritty
     // Processor — non-destructive, sees the same bytes. Cross-chunk
     // state kept here (see osc_bridge.rs).
@@ -1482,17 +1782,17 @@ fn read_loop(
         match reader.read(&mut buf) {
             Ok(0) => {
                 debug!("pty read loop hit EOF");
+                // Commit anything painted inside an unterminated
+                // synchronized update before the session goes quiet.
+                if sync.finish() {
+                    dirty.mark();
+                    let _ = tx.send(SessionOutput::Redraw);
+                }
                 return;
             }
             Ok(n) => {
                 let slice = &buf[..n];
-                for chunk in parse_chunks(slice) {
-                    let mut t = term.lock();
-                    processor.advance(&mut *t, chunk);
-                    // Hand the grid directly to a waiting renderer instead of
-                    // immediately reacquiring it for the next parse chunk.
-                    parking_lot::MutexGuard::unlock_fair(t);
-                }
+                sync.advance(slice);
                 dirty.mark();
                 // Terminal-capability queries: many TUI apps (Ink / React
                 // in oh-my-pi, ncurses, prompt-toolkit) block on these
@@ -1506,16 +1806,22 @@ fn read_loop(
                 // state visible by the next frame.
                 for payload in osc_scanner.feed(slice) {
                     if tx.send(SessionOutput::OscRimeterm { payload }).is_err() {
+                        let _ = sync.finish();
                         return;
                     }
                 }
                 if tx.send(SessionOutput::Redraw).is_err() {
                     // Receiver dropped — session dead.
+                    let _ = sync.finish();
                     return;
                 }
             }
             Err(e) => {
                 warn!(error = %e, "pty read loop errored");
+                if sync.finish() {
+                    dirty.mark();
+                    let _ = tx.send(SessionOutput::Redraw);
+                }
                 return;
             }
         }
